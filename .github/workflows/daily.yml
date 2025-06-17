@@ -1,6 +1,7 @@
 name: Daily
 
 on:
+  push:
   pull_request:
     branches:
       # any PR to a release branch.

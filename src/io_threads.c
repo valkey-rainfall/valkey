@@ -68,7 +68,7 @@ static IoToMTQueue *IoToMTQueueCreate(size_t capacity) {
  *   1 - If the value was successfully added to the queue
  *   0 - If the queue was full and the value couldn't be added
  */
-static int IoToMTQueueProduce(uint64_t value, uint64_t counter) {
+static int IoToMTQueueProduce(uintptr_t value, uintptr_t counter) {
     IoToMTQueue *q = io_to_mt_queue;
     int first_try = counter == 0;
     /* Get the next producer slot if no slot is given */
@@ -1346,8 +1346,8 @@ static inline jobResponseType getJobResponseType(uint64_t jobData) {
     return type;
 }
 
-static inline void *getJobData(uint64_t jobData) {
-    return (void *)(jobData & CLIENT_PTR_MASK);
+static inline void *getJobData(uintptr_t jobData) {
+    return (void *)(uintptr_t)(jobData & CLIENT_PTR_MASK);
 }
 
 /* Function to handle read jobs */
@@ -1390,7 +1390,7 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 static void threadRespondJobList(void) {
     if (listLength(thread_delayed_jobs) == 0) return;
 
-    IoToMTQueueProduce((uint64_t)thread_delayed_jobs | (uint64_t)R_JOBLIST, 0);
+    IoToMTQueueProduce((uintptr_t)thread_delayed_jobs | (uintptr_t)R_JOBLIST, 0);
     thread_delayed_jobs = listCreate();
 }
 
@@ -1400,7 +1400,7 @@ void threadRespond(client *c, jobResponseType r) {
         threadRespondJobList();
     }
 
-    IoToMTQueueProduce((uint64_t)c | (uint64_t)r, 0);
+    IoToMTQueueProduce((uintptr_t)c | (uintptr_t)r, 0);
 }
 
 static void processClientIOCommandDone(client *c) {

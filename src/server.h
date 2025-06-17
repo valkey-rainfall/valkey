@@ -1748,8 +1748,8 @@ struct valkeyServer {
     long long stat_evictedscripts;                 /* Number of evicted lua scripts. */
     long long stat_total_eviction_exceeded_time;   /* Total time over the memory limit, unit us */
     monotime stat_last_eviction_exceeded_time;     /* Timestamp of current eviction start, unit us */
-    _Atomic long long stat_keyspace_hits;          /* Number of successful lookups of keys */
-    _Atomic long long stat_keyspace_misses;        /* Number of failed lookups of keys */
+    atomic_llong stat_keyspace_hits;          /* Number of successful lookups of keys */
+    atomic_llong stat_keyspace_misses;        /* Number of failed lookups of keys */
     long long stat_active_defrag_hits;             /* number of allocations moved */
     long long stat_active_defrag_misses;           /* number of allocations scanned but not moved */
     long long stat_active_defrag_key_hits;         /* number of keys with moved allocations */
@@ -1974,7 +1974,7 @@ struct valkeyServer {
     char replid2[CONFIG_RUN_ID_SIZE + 1];      /* replid inherited from primary*/
     long long primary_repl_offset;             /* My current replication offset */
     long long second_replid_offset;            /* Accept offsets up to this for replid2. */
-    _Atomic long long fsynced_reploff_pending; /* Largest replication offset to
+    atomic_llong fsynced_reploff_pending; /* Largest replication offset to
                                       * potentially have been fsynced, applied to
                                         fsynced_reploff only when AOF state is AOF_ON
                                         (not during the initial rewrite) */
