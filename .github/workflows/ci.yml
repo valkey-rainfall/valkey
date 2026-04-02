@@ -23,7 +23,7 @@ jobs:
   test-ubuntu-latest:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -60,7 +60,7 @@ jobs:
   test-ubuntu-latest-compatibility:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     strategy:
       fail-fast: false
@@ -108,7 +108,7 @@ jobs:
   test-ubuntu-latest-cmake-tls:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -130,7 +130,7 @@ jobs:
   test-sanitizer-address:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -160,7 +160,7 @@ jobs:
   test-rdma:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -196,7 +196,7 @@ jobs:
   test-tls-only:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -218,7 +218,7 @@ jobs:
   build-debian-old:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     container: debian:bullseye
     steps:
@@ -265,7 +265,7 @@ jobs:
   build-32bit:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -315,7 +315,7 @@ jobs:
   build-libc-malloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -333,7 +333,7 @@ jobs:
   build-almalinux8-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     container: almalinux:8
     steps:
@@ -355,7 +355,7 @@ jobs:
   format-yaml:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
+        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     steps:
       - name: Checkout code
