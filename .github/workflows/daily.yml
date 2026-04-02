@@ -74,7 +74,7 @@ jobs:
   test-ubuntu-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     # pull_request gate breakdown:
     # 1) (base != unstable) OR PR currently has run-extra-tests.
@@ -168,7 +168,7 @@ jobs:
   test-ubuntu-arm:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:arm-3.0
+        image:custom-arm-public.ecr.aws/ubuntu/ubuntu:24.04
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -231,7 +231,7 @@ jobs:
   test-ubuntu-jemalloc-fortify:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -299,7 +299,7 @@ jobs:
   test-ubuntu-libc-malloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -352,7 +352,7 @@ jobs:
   test-ubuntu-no-malloc-usable-size:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -405,7 +405,7 @@ jobs:
   test-ubuntu-32bit:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -491,7 +491,7 @@ jobs:
   test-ubuntu-tls:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -550,7 +550,7 @@ jobs:
   test-ubuntu-tls-no-tls:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -609,7 +609,7 @@ jobs:
   test-ubuntu-io-threads:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -656,7 +656,7 @@ jobs:
   test-ubuntu-tls-io-threads:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -707,7 +707,7 @@ jobs:
   test-ubuntu-reclaim-cache:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -799,7 +799,7 @@ jobs:
   test-valgrind-test:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -840,7 +840,7 @@ jobs:
   test-valgrind-misc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -893,7 +893,7 @@ jobs:
   test-valgrind-no-malloc-usable-size-test:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -934,7 +934,7 @@ jobs:
   test-valgrind-no-malloc-usable-size-misc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -987,7 +987,7 @@ jobs:
   test-sanitizer-address:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1056,7 +1056,7 @@ jobs:
   test-sanitizer-address-large-memory:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1131,7 +1131,7 @@ jobs:
   test-sanitizer-undefined:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1200,7 +1200,7 @@ jobs:
   test-sanitizer-undefined-large-memory:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1275,7 +1275,7 @@ jobs:
   test-sanitizer-force-defrag:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1337,7 +1337,7 @@ jobs:
   test-ubuntu-lttng:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1421,7 +1421,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
@@ -1499,7 +1499,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
@@ -1578,7 +1578,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
@@ -1761,7 +1761,7 @@ jobs:
   test-freebsd:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: false  # disabled — not supported on CodeBuild
     timeout-minutes: 1440
@@ -1789,7 +1789,7 @@ jobs:
   test-alpine-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1845,7 +1845,7 @@ jobs:
   test-alpine-libc-malloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1901,7 +1901,7 @@ jobs:
   reply-schemas-validator:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     timeout-minutes: 1440
     if: |
@@ -1960,7 +1960,7 @@ jobs:
   notify-about-job-results:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:linux-5.0
+        image:ubuntu-7.0
         instance-size:large
     if: always() && github.event_name == 'schedule'
     needs:
