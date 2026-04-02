@@ -23,7 +23,7 @@ jobs:
   test-ubuntu-latest:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -39,7 +39,7 @@ jobs:
         # Fail build if there are warnings
         # build with TLS just for compilation coverage
         run: |
-          sudo apt-get install pkg-config libgtest-dev libgmock-dev
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
           make -j4 all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_TLS=yes USE_LIBBACKTRACE=yes
       - name: test
         run: |
@@ -60,7 +60,7 @@ jobs:
   test-ubuntu-latest-compatibility:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     strategy:
       fail-fast: false
@@ -72,7 +72,7 @@ jobs:
     steps:
       - name: Install gtest
         run: |
-          sudo apt-get install pkg-config libgtest-dev libgmock-dev
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -108,7 +108,7 @@ jobs:
   test-ubuntu-latest-cmake-tls:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -130,7 +130,7 @@ jobs:
   test-sanitizer-address:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -145,7 +145,7 @@ jobs:
       - name: make
         # build with TLS module just for compilation coverage
         run: |
-          sudo apt-get install pkg-config libgtest-dev libgmock-dev
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
           make -j4 all-with-unit-tests SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module USE_LIBBACKTRACE=yes
       - name: testprep
         run: sudo apt-get install tcl8.6 tclx -y
@@ -160,7 +160,7 @@ jobs:
   test-rdma:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -196,7 +196,7 @@ jobs:
   test-tls-only:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -218,7 +218,7 @@ jobs:
   build-debian-old:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     container: debian:bullseye
     steps:
@@ -265,7 +265,7 @@ jobs:
   build-32bit:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -284,7 +284,7 @@ jobs:
       - name: Install gtest
         run: |
           sudo apt-get update
-          sudo apt-get install libgtest-dev
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
           mkdir -p /tmp/gtest32
           cd /tmp/gtest32
           cmake -B build32 \
@@ -315,7 +315,7 @@ jobs:
   build-libc-malloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - name: Install libbacktrace
@@ -333,7 +333,7 @@ jobs:
   build-almalinux8-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     container: almalinux:8
     steps:
@@ -355,7 +355,7 @@ jobs:
   format-yaml:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:custom-linux-public.ecr.aws/ubuntu/ubuntu:24.04
+        image:ubuntu-7.0
         instance-size:large
     steps:
       - name: Checkout code
