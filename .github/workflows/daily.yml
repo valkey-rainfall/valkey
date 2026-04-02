@@ -1633,6 +1633,7 @@ jobs:
           ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-macos-latest:
     if: false  # disabled — not supported on CodeBuild
+    runs-on: ubuntu-latest
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1665,6 +1666,7 @@ jobs:
         run: CFLAGS='-Werror' ./runtest-moduleapi --verbose --clients 1 --no-latency --dump-logs ${{github.event.inputs.test_args}}
   test-macos-latest-sentinel:
     if: false  # disabled — not supported on CodeBuild
+    runs-on: ubuntu-latest
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1694,6 +1696,7 @@ jobs:
         run: ./runtest-sentinel ${{github.event.inputs.cluster_test_args}}
   test-macos-latest-cluster:
     if: false  # disabled — not supported on CodeBuild
+    runs-on: ubuntu-latest
     timeout-minutes: 1440
     steps:
       - name: prep
