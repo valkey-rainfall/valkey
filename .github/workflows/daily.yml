@@ -114,7 +114,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo dnf install -y pkg-config cmake gcc-c++ && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo dnf install -y pkg-config cmake gcc-c++ && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -203,7 +203,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -271,7 +271,7 @@ jobs:
           update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100
           cd libbacktrace && ./configure && make && make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests CC=gcc OPT=-O3 SERVER_CFLAGS='-Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -445,7 +445,7 @@ jobs:
       - name: Install gtest
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
           mkdir -p /tmp/gtest32
           cd /tmp/gtest32
           cmake -B build32 \
@@ -870,7 +870,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make valgrind all-with-unit-tests SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -964,7 +964,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make valgrind all-with-unit-tests CFLAGS="-DNO_MALLOC_USABLE_SIZE" SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -1023,7 +1023,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests OPT=-O3 SANITIZER=address SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -1088,7 +1088,7 @@ jobs:
           repository: ${{ inputs.use_repo || github.event.inputs.use_repo || github.repository }}
           ref: ${{ inputs.use_git_ref || github.event.inputs.use_git_ref || github.ref }}
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests OPT=-O3 SANITIZER=address SERVER_CFLAGS='-Werror'
       - name: testprep
@@ -1167,7 +1167,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests OPT=-O3 SANITIZER=undefined SERVER_CFLAGS='-Werror' LUA_DEBUG=yes USE_LIBBACKTRACE=yes # we (ab)use this flow to also check Lua C API violations
       - name: testprep
@@ -1232,7 +1232,7 @@ jobs:
           repository: ${{ inputs.use_repo || github.event.inputs.use_repo || github.repository }}
           ref: ${{ inputs.use_git_ref || github.event.inputs.use_git_ref || github.ref }}
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests OPT=-O3 SANITIZER=undefined SERVER_CFLAGS='-Werror' LUA_DEBUG=yes
       - name: testprep
@@ -1307,7 +1307,7 @@ jobs:
           path: libbacktrace
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Install gtest
-        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+        run: sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: make
         run: make all-with-unit-tests OPT=-O3 SANITIZER=address DEBUG_FORCE_DEFRAG=yes USE_JEMALLOC=no SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
@@ -1958,11 +1958,8 @@ jobs:
       - name: validator
         run: ./utils/req-res-log-validator.py --verbose --fail-missing-reply-schemas ${{ (!contains(github.event.inputs.skiptests, 'valkey') && !contains(github.event.inputs.skiptests, 'module') && !contains(github.event.inputs.skiptests, 'sentinel') && !contains(github.event.inputs.skiptests, 'cluster')) && (inputs.test_args || github.event.inputs.test_args || '') == '' && (inputs.cluster_test_args || github.event.inputs.cluster_test_args || '') == '' && '--fail-commands-not-all-hit' || '' }}
   notify-about-job-results:
-    runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
-    if: always() && github.event_name == 'schedule'
+    if: false  # disabled — no Slack webhook configured
+    runs-on: ubuntu-latest
     needs:
       - test-ubuntu-jemalloc
       - test-ubuntu-arm

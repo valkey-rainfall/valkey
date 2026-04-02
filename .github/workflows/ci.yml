@@ -39,7 +39,7 @@ jobs:
         # Fail build if there are warnings
         # build with TLS just for compilation coverage
         run: |
-          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
           make -j4 all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_TLS=yes USE_LIBBACKTRACE=yes
       - name: test
         run: |
@@ -72,7 +72,7 @@ jobs:
     steps:
       - name: Install gtest
         run: |
-          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -145,7 +145,7 @@ jobs:
       - name: make
         # build with TLS module just for compilation coverage
         run: |
-          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
           make -j4 all-with-unit-tests SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module USE_LIBBACKTRACE=yes
       - name: testprep
         run: sudo apt-get install -y tcl8.6 tclx -y
@@ -284,7 +284,7 @@ jobs:
       - name: Install gtest
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
+          sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build
           mkdir -p /tmp/gtest32
           cd /tmp/gtest32
           cmake -B build32 \
