@@ -43,7 +43,7 @@ jobs:
           make -j4 all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_TLS=yes USE_LIBBACKTRACE=yes
       - name: test
         run: |
-          sudo apt-get install tcl8.6 tclx
+          sudo apt-get install -y tcl8.6 tclx
           ./runtest --verbose --tags -slow --dump-logs
       - name: module api test
         run: CFLAGS='-Werror' ./runtest-moduleapi --verbose --dump-logs
@@ -148,7 +148,7 @@ jobs:
           sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && sudo cmake --install build
           make -j4 all-with-unit-tests SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install tcl8.6 tclx -y
+        run: sudo apt-get install -y tcl8.6 tclx -y
       - name: test
         run: ./runtest --verbose --tags -slow --dump-logs
       - name: module api test
@@ -173,7 +173,7 @@ jobs:
       - name: Checkout Valkey
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: prepare-development-libraries
-        run: sudo apt-get install librdmacm-dev libibverbs-dev
+        run: sudo apt-get install -y librdmacm-dev libibverbs-dev
       - name: make-rdma-module
         run: make -j4 BUILD_RDMA=module USE_LIBBACKTRACE=yes
       - name: make-rdma-builtin
@@ -277,7 +277,7 @@ jobs:
       - name: Build libbacktrace (32-bit)
         run: |
           sudo apt-get update
-          sudo apt-get install libc6-dev-i386 libstdc++-11-dev-i386-cross gcc-multilib g++-multilib
+          sudo apt-get install -y libc6-dev-i386 libstdc++-11-dev-i386-cross gcc-multilib g++-multilib
           cd libbacktrace && ./configure CFLAGS="-m32" --prefix=/usr/local/libbacktrace32 && make && sudo make install
       - name: Checkout Valkey
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
