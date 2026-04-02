@@ -28,7 +28,7 @@ on:
         default: ""
       use_repo:
         description: "repo owner and name"
-        default: "valkey-io/valkey"
+        default: "valkey-rainfall/valkey"
       use_git_ref:
         description: "git branch or sha to use"
         default: "unstable"
@@ -58,7 +58,7 @@ on:
         description: "repo owner and name"
         required: false
         type: string
-        default: "valkey-io/valkey"
+        default: "valkey-rainfall/valkey"
       use_git_ref:
         description: "git branch or sha to use"
         required: false
@@ -72,7 +72,10 @@ permissions:
   pull-requests: read
 jobs:
   test-ubuntu-jemalloc:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     # pull_request gate breakdown:
     # 1) (base != unstable) OR PR currently has run-extra-tests.
     # 2) Exclude all labeled events, except unstable + newly added run-extra-tests.
@@ -80,7 +83,7 @@ jobs:
     # 4) unstable runs when run-extra-tests is added, and on later code updates while it remains.
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -163,10 +166,13 @@ jobs:
           sudo apt-get install tcl8.6 tclx
           ./runtest --verbose --tags compatible-redis --dump-logs --other-server-path tests/tmp/redis-7.0.15/src/redis-server
   test-ubuntu-arm:
-    runs-on: ubuntu-24.04-arm
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:arm-3.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -223,10 +229,13 @@ jobs:
             ./src/valkey-unit-tests --accurate
           fi
   test-ubuntu-jemalloc-fortify:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -288,10 +297,13 @@ jobs:
             ./src/valkey-unit-tests --accurate
           fi
   test-ubuntu-libc-malloc:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -338,10 +350,13 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'cluster')
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-no-malloc-usable-size:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -388,10 +403,13 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'cluster')
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-32bit:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -471,10 +489,13 @@ jobs:
             ./src/valkey-unit-tests --accurate
           fi
   test-ubuntu-tls:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -527,10 +548,13 @@ jobs:
         run: |
           ./runtest-cluster --tls ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-tls-no-tls:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -583,10 +607,13 @@ jobs:
         run: |
           ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-io-threads:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -627,10 +654,13 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'cluster')
         run: ./runtest-cluster --io-threads ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-tls-io-threads:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -675,10 +705,13 @@ jobs:
         run: |
           ./runtest-cluster --io-threads --tls ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-reclaim-cache:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -764,10 +797,13 @@ jobs:
           echo "$CACHE"
           if [ "$(( $CACHE-$CACHE0 ))" -gt "8000000" ]; then exit 1; fi
   test-valgrind-test:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'valgrind') && !contains(github.event.inputs.skiptests, 'valkey')
     timeout-minutes: 1440
@@ -802,10 +838,13 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest --valgrind --no-latency --verbose --clients 1 --timeout 2400 --dump-logs ${{github.event.inputs.test_args}}
   test-valgrind-misc:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'valgrind') && !(contains(github.event.inputs.skiptests, 'modules') && contains(github.event.inputs.skiptests, 'unittest'))
     timeout-minutes: 1440
@@ -852,10 +891,13 @@ jobs:
             if grep -q 0x err.txt; then cat err.txt; exit 1; fi
           fi
   test-valgrind-no-malloc-usable-size-test:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'valgrind') && !contains(github.event.inputs.skiptests, 'valkey')
     timeout-minutes: 1440
@@ -890,10 +932,13 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest --valgrind --no-latency --verbose --clients 1 --timeout 2400 --dump-logs ${{github.event.inputs.test_args}}
   test-valgrind-no-malloc-usable-size-misc:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'valgrind') && !(contains(github.event.inputs.skiptests, 'modules') && contains(github.event.inputs.skiptests, 'unittest'))
     timeout-minutes: 1440
@@ -940,10 +985,13 @@ jobs:
             if grep -q 0x err.txt; then cat err.txt; exit 1; fi
           fi
   test-sanitizer-address:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'sanitizer')
     timeout-minutes: 1440
@@ -1006,10 +1054,13 @@ jobs:
   # GitHub-hosted runners for public repos provide 16GB (ubuntu-latest).
   # These tests are borderline - monitoring memory usage to determine if they can run reliably.
   test-sanitizer-address-large-memory:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'sanitizer') &&
       !contains(github.event.inputs.skiptests, 'large-memory')
@@ -1078,10 +1129,13 @@ jobs:
             printf "Minimum free memory: %.1fGB\n" $(echo "$MIN_FREE/1024/1024" | bc -l)
           fi
   test-sanitizer-undefined:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'sanitizer')
     timeout-minutes: 1440
@@ -1144,10 +1198,13 @@ jobs:
   # GitHub-hosted runners for public repos provide 16GB (ubuntu-latest).
   # These tests are borderline - monitoring memory usage to determine if they can run reliably.
   test-sanitizer-undefined-large-memory:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'sanitizer') &&
       !contains(github.event.inputs.skiptests, 'large-memory')
@@ -1216,10 +1273,13 @@ jobs:
             printf "Minimum free memory: %.1fGB\n" $(echo "$MIN_FREE/1024/1024" | bc -l)
           fi
   test-sanitizer-force-defrag:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'sanitizer')
     timeout-minutes: 1440
@@ -1275,10 +1335,13 @@ jobs:
             ./src/valkey-unit-tests
           fi
   test-ubuntu-lttng:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -1330,7 +1393,7 @@ jobs:
   test-rpm-distros-jemalloc:
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -1356,7 +1419,10 @@ jobs:
           - name: test-fedorarawhide-jemalloc
             container: fedora:rawhide
     name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
     steps:
@@ -1405,7 +1471,7 @@ jobs:
   test-rpm-distros-tls-module:
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -1431,7 +1497,10 @@ jobs:
           - name: test-fedorarawhide-tls-module
             container: fedora:rawhide
     name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
     steps:
@@ -1486,7 +1555,7 @@ jobs:
   test-rpm-distros-tls-module-no-tls:
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' && github.event.pull_request.base.ref != 'unstable' && github.event.action != 'labeled')) &&
       !contains(github.event.inputs.skipjobs, 'tls')
     strategy:
@@ -1507,7 +1576,10 @@ jobs:
           - name: test-fedorarawhide-tls-module-no-tls
             container: fedora:rawhide
     name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
     steps:
@@ -1560,17 +1632,7 @@ jobs:
         run: |
           ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-macos-latest:
-    runs-on: macos-latest
-    if: |
-      (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
-        (github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref != 'unstable' ||
-            contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
-          (github.event.action != 'labeled' ||
-            (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
-        )) &&
-      !contains(github.event.inputs.skipjobs, 'macos') && !(contains(github.event.inputs.skiptests, 'valkey') && contains(github.event.inputs.skiptests, 'modules'))
+    if: false  # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1602,17 +1664,7 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'modules')
         run: CFLAGS='-Werror' ./runtest-moduleapi --verbose --clients 1 --no-latency --dump-logs ${{github.event.inputs.test_args}}
   test-macos-latest-sentinel:
-    runs-on: macos-latest
-    if: |
-      (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
-        (github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref != 'unstable' ||
-            contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
-          (github.event.action != 'labeled' ||
-            (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
-        )) &&
-      !contains(github.event.inputs.skipjobs, 'macos') && !contains(github.event.inputs.skiptests, 'sentinel')
+    if: false  # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1641,17 +1693,7 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'sentinel')
         run: ./runtest-sentinel ${{github.event.inputs.cluster_test_args}}
   test-macos-latest-cluster:
-    runs-on: macos-latest
-    if: |
-      (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
-        (github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref != 'unstable' ||
-            contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
-          (github.event.action != 'labeled' ||
-            (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
-        )) &&
-      !contains(github.event.inputs.skipjobs, 'macos') && !contains(github.event.inputs.skiptests, 'cluster')
+    if: false  # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1685,16 +1727,7 @@ jobs:
       matrix:
         os: [macos-14]
     runs-on: ${{ matrix.os }}
-    if: |
-      (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
-        (github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref != 'unstable' ||
-            contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
-          (github.event.action != 'labeled' ||
-            (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
-        )) &&
-      !contains(github.event.inputs.skipjobs, 'macos')
+    if: false  # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
@@ -1723,17 +1756,11 @@ jobs:
       - name: make
         run: make SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
   test-freebsd:
-    runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
-        (github.event_name == 'pull_request' &&
-          (github.event.pull_request.base.ref != 'unstable' ||
-            contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
-          (github.event.action != 'labeled' ||
-            (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
-        )) &&
-      !contains(github.event.inputs.skipjobs, 'freebsd')
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
+    if: false  # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1757,10 +1784,13 @@ jobs:
             gmake
             ./runtest --single unit/keyspace --single unit/auth --single unit/networking --single unit/protocol
   test-alpine-jemalloc:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -1810,10 +1840,13 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'cluster')
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-alpine-libc-malloc:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -1863,11 +1896,14 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'cluster')
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   reply-schemas-validator:
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
     timeout-minutes: 1440
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && github.repository == 'valkey-io/valkey') ||
+        (github.event_name == 'schedule') ||
         (github.event_name == 'pull_request' &&
           (github.event.pull_request.base.ref != 'unstable' ||
             contains(github.event.pull_request.labels.*.name, 'run-extra-tests')) &&
@@ -1919,8 +1955,11 @@ jobs:
       - name: validator
         run: ./utils/req-res-log-validator.py --verbose --fail-missing-reply-schemas ${{ (!contains(github.event.inputs.skiptests, 'valkey') && !contains(github.event.inputs.skiptests, 'module') && !contains(github.event.inputs.skiptests, 'sentinel') && !contains(github.event.inputs.skiptests, 'cluster')) && (inputs.test_args || github.event.inputs.test_args || '') == '' && (inputs.cluster_test_args || github.event.inputs.cluster_test_args || '') == '' && '--fail-commands-not-all-hit' || '' }}
   notify-about-job-results:
-    runs-on: ubuntu-latest
-    if: always() && github.event_name == 'schedule' && github.repository == 'valkey-io/valkey'
+    runs-on:
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        image:linux-5.0
+        instance-size:large
+    if: always() && github.event_name == 'schedule'
     needs:
       - test-ubuntu-jemalloc
       - test-ubuntu-arm
