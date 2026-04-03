@@ -20,9 +20,9 @@ permissions:
   contents: read
 
 jobs:
-  test-ubuntu-latest:
+  test-al-latest:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:linux-ec2:latest instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -33,15 +33,20 @@ jobs:
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Checkout Valkey
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: System tuning
+        run: |
+          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
       - name: make
         # Fail build if there are warnings
         # build with TLS just for compilation coverage
         run: |
-          (sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build)
+          sudo dnf install -y pkg-config cmake gcc gcc-c++ openssl-devel
+          (cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build --parallel && sudo cmake --install build)
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}
           make -j4 all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_TLS=yes USE_LIBBACKTRACE=yes
       - name: test
         run: |
-          sudo apt-get install -y tcl8.6 tclx
+          sudo dnf install -y tcl tclx
           ./runtest --verbose --tags -slow --dump-logs
       - name: module api test
         run: CFLAGS='-Werror' ./runtest-moduleapi --verbose --dump-logs
@@ -55,9 +60,9 @@ jobs:
         run: |
           make test-unit
 
-  test-ubuntu-latest-compatibility:
+  test-al-latest-compatibility:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:linux-ec2:latest instance-size:large
     strategy:
       fail-fast: false
       matrix:
@@ -66,9 +71,13 @@ jobs:
           - {version: "8.0.6", file: "valkey-8.0.6-noble-x86_64.tar.gz"}
           - {version: "8.1.4", file: "valkey-8.1.4-noble-x86_64.tar.gz"}
     steps:
+      - name: System tuning
+        run: |
+          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
       - name: Install gtest
         run: |
-          (sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build)
+          sudo dnf install -y pkg-config cmake gcc gcc-c++ openssl-devel
+          (cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build --parallel && sudo cmake --install build)
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -92,7 +101,7 @@ jobs:
 
       - name: Run compatibility tests against ${{ matrix.server.version }}
         run: |
-          sudo apt-get install -y tcl8.6 tclx
+          sudo dnf install -y tcl tclx
           ./runtest --verbose --tags "-slow needs:other-server" --dump-logs \
             --other-server-path tests/tmp/valkey-${{ matrix.server.version }}-noble-x86_64/bin/valkey-server
 
@@ -116,6 +125,7 @@ jobs:
       - name: test
         run: |
           sudo apt-get install -y tcl8.6 tclx tcl-tls
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
           ./utils/gen-test-certs.sh
           ./build-release/runtest --verbose --tags -slow --dump-logs --tls
       - name: unit tests
@@ -123,7 +133,7 @@ jobs:
 
   test-sanitizer-address:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:linux-ec2:latest instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -134,15 +144,19 @@ jobs:
       - run: cd libbacktrace && ./configure && make && sudo make install
       - name: Checkout Valkey
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: System tuning
+        run: |
+          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
       - name: make
         # build with TLS module just for compilation coverage
         run: |
-          (sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build)
+          sudo dnf install -y pkg-config cmake gcc gcc-c++ openssl-devel libasan
+          (cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build --parallel && sudo cmake --install build)
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}
           make -j4 all-with-unit-tests SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module USE_LIBBACKTRACE=yes
       - name: testprep
         run: |
-          sudo apt-get install -y tcl8.6 tclx -y
-          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
+          sudo dnf install -y tcl tclx
       - name: test
         run: ./runtest --verbose --tags -slow --dump-logs
       - name: module api test
