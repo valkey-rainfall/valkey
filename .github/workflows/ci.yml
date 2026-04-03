@@ -140,7 +140,9 @@ jobs:
           (sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build)
           make -j4 all-with-unit-tests SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx -y
+        run: |
+          sudo apt-get install -y tcl8.6 tclx -y
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         run: ./runtest --verbose --tags -slow --dump-logs
       - name: module api test
@@ -150,8 +152,8 @@ jobs:
           make test-unit
 
   test-rdma:
-    runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
+    if: false # disabled — needs kernel headers for RXE module, not available on CodeBuild
+    runs-on: ubuntu-latest
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -193,7 +195,9 @@ jobs:
       - name: generate-test-certificates
         run: ./utils/gen-test-certs.sh
       - name: install-test-dependencies
-        run: sudo apt-get install -y tcl8.6 tclx tcl-tls
+        run: |
+          sudo apt-get install -y tcl8.6 tclx tcl-tls
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: make-tls-module
         run: make -j4 BUILD_TLS=module SERVER_CFLAGS='-Werror'
       - name: test-tls-module
@@ -319,7 +323,7 @@ jobs:
   build-almalinux8-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
-    container: public.ecr.aws/almalinux/almalinux:8
+    container: almalinux:8
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

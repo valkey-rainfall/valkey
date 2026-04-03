@@ -203,7 +203,9 @@ jobs:
       - name: make
         run: make all-with-unit-tests SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} --verbose --dump-logs ${{github.event.inputs.test_args}}
@@ -269,7 +271,9 @@ jobs:
       - name: make
         run: make all-with-unit-tests CC=gcc OPT=-O3 SERVER_CFLAGS='-Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3' USE_LIBBACKTRACE=yes
       - name: testprep
-        run: apt-get install -y tcl8.6 tclx procps
+        run: |
+          apt-get install -y tcl8.6 tclx procps
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} --verbose --dump-logs ${{github.event.inputs.test_args}}
@@ -328,7 +332,9 @@ jobs:
       - name: make
         run: make MALLOC=libc SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} --verbose --dump-logs ${{github.event.inputs.test_args}}
@@ -379,7 +385,9 @@ jobs:
       - name: make
         run: make MALLOC=libc CFLAGS=-DNO_MALLOC_USABLE_SIZE SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} --verbose --dump-logs ${{github.event.inputs.test_args}}
@@ -453,7 +461,9 @@ jobs:
             GTEST_CFLAGS="-isystem /tmp/googletest-1.14.0/googletest/include -isystem /tmp/googletest-1.14.0/googlemock/include" \
             GTEST_LIBS="/usr/lib32/libgtest.a /usr/lib32/libgmock.a"
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} --verbose --dump-logs ${{github.event.inputs.test_args}}
@@ -630,7 +640,9 @@ jobs:
       - name: make
         run: make SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest --io-threads --accurate --verbose --tags network --dump-logs ${{github.event.inputs.test_args}}
@@ -1337,7 +1349,9 @@ jobs:
       - name: make
         run: make -j4 USE_LTTNG=yes USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} --verbose --dump-logs ${{github.event.inputs.test_args}}
@@ -1366,10 +1380,10 @@ jobs:
       matrix:
         include:
           - name: test-almalinux8-jemalloc
-            container: public.ecr.aws/almalinux/almalinux:8
+            container: almalinux:8
             install_epel: true
           - name: test-almalinux9-jemalloc
-            container: public.ecr.aws/almalinux/almalinux:9
+            container: almalinux:9
             install_epel: true
           - name: test-centosstream9-jemalloc
             container: quay.io/centos/centos:stream9
@@ -1442,10 +1456,10 @@ jobs:
       matrix:
         include:
           - name: test-almalinux8-tls-module
-            container: public.ecr.aws/almalinux/almalinux:8
+            container: almalinux:8
             install_epel: true
           - name: test-almalinux9-tls-module
-            container: public.ecr.aws/almalinux/almalinux:9
+            container: almalinux:9
             install_epel: true
           - name: test-centosstream9-tls-module
             container: quay.io/centos/centos:stream9
@@ -1519,10 +1533,10 @@ jobs:
       matrix:
         include:
           - name: test-almalinux8-tls-module-no-tls
-            container: public.ecr.aws/almalinux/almalinux:8
+            container: almalinux:8
             install_epel: true
           - name: test-almalinux9-tls-module-no-tls
-            container: public.ecr.aws/almalinux/almalinux:9
+            container: almalinux:9
             install_epel: true
           - name: test-centosstream9-tls-module-no-tls
             container: quay.io/centos/centos:stream9
@@ -1884,7 +1898,9 @@ jobs:
       - name: make
         run: make SERVER_CFLAGS='-Werror -DLOG_REQ_RES' USE_LIBBACKTRACE=yes
       - name: testprep
-        run: sudo apt-get install -y tcl8.6 tclx
+        run: |
+          sudo apt-get install -y tcl8.6 tclx
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: test
         if: true && !contains(github.event.inputs.skiptests, 'valkey')
         run: ./runtest --log-req-res --no-latency --dont-clean --force-resp3 --tags -slow --verbose --dump-logs  ${{github.event.inputs.test_args}}
