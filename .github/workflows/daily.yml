@@ -73,9 +73,7 @@ permissions:
 jobs:
   test-ubuntu-jemalloc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     # pull_request gate breakdown:
     # 1) (base != unstable) OR PR currently has run-extra-tests.
     # 2) Exclude all labeled events, except unstable + newly added run-extra-tests.
@@ -167,9 +165,7 @@ jobs:
           ./runtest --verbose --tags compatible-redis --dump-logs --other-server-path tests/tmp/redis-7.0.15/src/redis-server
   test-ubuntu-arm:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:arm-3.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:arm-3.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -230,9 +226,7 @@ jobs:
           fi
   test-ubuntu-jemalloc-fortify:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -298,9 +292,7 @@ jobs:
           fi
   test-ubuntu-libc-malloc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -351,9 +343,7 @@ jobs:
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-no-malloc-usable-size:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -404,9 +394,7 @@ jobs:
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-32bit:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -462,7 +450,7 @@ jobs:
       - name: make
         run: |
           make 32bit SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes \
-            GTEST_CFLAGS="-I/tmp/googletest-1.14.0/googletest/include -I/tmp/googletest-1.14.0/googlemock/include" \
+            GTEST_CFLAGS="-isystem /tmp/googletest-1.14.0/googletest/include -isystem /tmp/googletest-1.14.0/googlemock/include" \
             GTEST_LIBS="/usr/lib32/libgtest.a /usr/lib32/libgmock.a"
       - name: testprep
         run: sudo apt-get install -y tcl8.6 tclx
@@ -485,16 +473,14 @@ jobs:
         run: |
           if [ -f ./src/unit/valkey-unit-gtests ]; then
             make test-unit accurate=1 \
-              GTEST_CFLAGS="-I/tmp/googletest-1.14.0/googletest/include -I/tmp/googletest-1.14.0/googlemock/include" \
+              GTEST_CFLAGS="-isystem /tmp/googletest-1.14.0/googletest/include -isystem /tmp/googletest-1.14.0/googlemock/include" \
               GTEST_LIBS="/usr/lib32/libgtest.a /usr/lib32/libgmock.a"
           elif [ -f ./src/valkey-unit-tests ]; then
             ./src/valkey-unit-tests --accurate
           fi
   test-ubuntu-tls:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -551,9 +537,7 @@ jobs:
           ./runtest-cluster --tls ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-tls-no-tls:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -610,9 +594,7 @@ jobs:
           ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-io-threads:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -657,9 +639,7 @@ jobs:
         run: ./runtest-cluster --io-threads ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-tls-io-threads:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -708,9 +688,7 @@ jobs:
           ./runtest-cluster --io-threads --tls ${{github.event.inputs.cluster_test_args}}
   test-ubuntu-reclaim-cache:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -800,9 +778,7 @@ jobs:
           if [ "$(( $CACHE-$CACHE0 ))" -gt "8000000" ]; then exit 1; fi
   test-valgrind-test:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -841,9 +817,7 @@ jobs:
         run: ./runtest --valgrind --no-latency --verbose --clients 1 --timeout 2400 --dump-logs ${{github.event.inputs.test_args}}
   test-valgrind-misc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -894,9 +868,7 @@ jobs:
           fi
   test-valgrind-no-malloc-usable-size-test:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -935,9 +907,7 @@ jobs:
         run: ./runtest --valgrind --no-latency --verbose --clients 1 --timeout 2400 --dump-logs ${{github.event.inputs.test_args}}
   test-valgrind-no-malloc-usable-size-misc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -988,9 +958,7 @@ jobs:
           fi
   test-sanitizer-address:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1057,9 +1025,7 @@ jobs:
   # These tests are borderline - monitoring memory usage to determine if they can run reliably.
   test-sanitizer-address-large-memory:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1132,9 +1098,7 @@ jobs:
           fi
   test-sanitizer-undefined:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1201,9 +1165,7 @@ jobs:
   # These tests are borderline - monitoring memory usage to determine if they can run reliably.
   test-sanitizer-undefined-large-memory:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1276,9 +1238,7 @@ jobs:
           fi
   test-sanitizer-force-defrag:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1338,9 +1298,7 @@ jobs:
           fi
   test-ubuntu-lttng:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1422,9 +1380,7 @@ jobs:
             container: fedora:rawhide
     name: ${{ matrix.name }}
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
     steps:
@@ -1500,9 +1456,7 @@ jobs:
             container: fedora:rawhide
     name: ${{ matrix.name }}
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
     steps:
@@ -1579,9 +1533,7 @@ jobs:
             container: fedora:rawhide
     name: ${{ matrix.name }}
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     container: ${{ matrix.container }}
     timeout-minutes: 1440
     steps:
@@ -1634,7 +1586,7 @@ jobs:
         run: |
           ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-macos-latest:
-    if: false  # disabled — not supported on CodeBuild
+    if: false # disabled — not supported on CodeBuild
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     steps:
@@ -1667,7 +1619,7 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'modules')
         run: CFLAGS='-Werror' ./runtest-moduleapi --verbose --clients 1 --no-latency --dump-logs ${{github.event.inputs.test_args}}
   test-macos-latest-sentinel:
-    if: false  # disabled — not supported on CodeBuild
+    if: false # disabled — not supported on CodeBuild
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     steps:
@@ -1697,7 +1649,7 @@ jobs:
         if: true && !contains(github.event.inputs.skiptests, 'sentinel')
         run: ./runtest-sentinel ${{github.event.inputs.cluster_test_args}}
   test-macos-latest-cluster:
-    if: false  # disabled — not supported on CodeBuild
+    if: false # disabled — not supported on CodeBuild
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     steps:
@@ -1732,7 +1684,7 @@ jobs:
       matrix:
         os: [macos-14]
     runs-on: ${{ matrix.os }}
-    if: false  # disabled — not supported on CodeBuild
+    if: false # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
@@ -1762,10 +1714,8 @@ jobs:
         run: make SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
   test-freebsd:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
-    if: false  # disabled — not supported on CodeBuild
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
+    if: false # disabled — not supported on CodeBuild
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1790,9 +1740,7 @@ jobs:
             ./runtest --single unit/keyspace --single unit/auth --single unit/networking --single unit/protocol
   test-alpine-jemalloc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1846,9 +1794,7 @@ jobs:
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   test-alpine-libc-malloc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'schedule') ||
@@ -1902,9 +1848,7 @@ jobs:
         run: ./runtest-cluster ${{github.event.inputs.cluster_test_args}}
   reply-schemas-validator:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     timeout-minutes: 1440
     if: |
       (github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' ||
@@ -1960,7 +1904,7 @@ jobs:
       - name: validator
         run: ./utils/req-res-log-validator.py --verbose --fail-missing-reply-schemas ${{ (!contains(github.event.inputs.skiptests, 'valkey') && !contains(github.event.inputs.skiptests, 'module') && !contains(github.event.inputs.skiptests, 'sentinel') && !contains(github.event.inputs.skiptests, 'cluster')) && (inputs.test_args || github.event.inputs.test_args || '') == '' && (inputs.cluster_test_args || github.event.inputs.cluster_test_args || '') == '' && '--fail-commands-not-all-hit' || '' }}
   notify-about-job-results:
-    if: false  # disabled — no Slack webhook configured
+    if: false # disabled — no Slack webhook configured
     runs-on: ubuntu-latest
     needs:
       - test-ubuntu-jemalloc

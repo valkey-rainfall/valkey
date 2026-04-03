@@ -22,9 +22,7 @@ permissions:
 jobs:
   test-ubuntu-latest:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -59,9 +57,7 @@ jobs:
 
   test-ubuntu-latest-compatibility:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     strategy:
       fail-fast: false
       matrix:
@@ -107,9 +103,7 @@ jobs:
 
   test-ubuntu-latest-cmake-tls:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: cmake and make
@@ -129,9 +123,7 @@ jobs:
 
   test-sanitizer-address:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -159,9 +151,7 @@ jobs:
 
   test-rdma:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -173,7 +163,9 @@ jobs:
       - name: Checkout Valkey
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: prepare-development-libraries
-        run: sudo apt-get install -y librdmacm-dev libibverbs-dev
+        run: |
+          (sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build)
+          sudo apt-get install -y librdmacm-dev libibverbs-dev
       - name: make-rdma-module
         run: make -j4 BUILD_RDMA=module USE_LIBBACKTRACE=yes
       - name: make-rdma-builtin
@@ -195,9 +187,7 @@ jobs:
 
   test-tls-only:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: generate-test-certificates
@@ -217,9 +207,7 @@ jobs:
 
   build-debian-old:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     container: debian:bullseye
     steps:
       - name: Install libbacktrace
@@ -238,7 +226,7 @@ jobs:
         run: make -j4 SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
 
   build-macos-latest:
-    if: false  # disabled — no macOS on CodeBuild
+    if: false # disabled — no macOS on CodeBuild
     runs-on: macos-latest
     steps:
       - name: Install libbacktrace
@@ -264,9 +252,7 @@ jobs:
 
   build-32bit:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -306,19 +292,17 @@ jobs:
         # *cross version as well, but it is also added explicitly just in case.
         run: |
           make -j4 SERVER_CFLAGS='-Werror' 32bit USE_LIBBACKTRACE=yes LIBBACKTRACE_PREFIX=/usr/local/libbacktrace32 \
-            GTEST_CFLAGS="-I/tmp/googletest-1.14.0/googletest/include -I/tmp/googletest-1.14.0/googlemock/include" \
+            GTEST_CFLAGS="-isystem /tmp/googletest-1.14.0/googletest/include -isystem /tmp/googletest-1.14.0/googlemock/include" \
             GTEST_LIBS="/usr/lib32/libgtest.a /usr/lib32/libgmock.a"
       - name: unit tests
         run: |
           make test-unit \
-            GTEST_CFLAGS="-I/tmp/googletest-1.14.0/googletest/include -I/tmp/googletest-1.14.0/googlemock/include" \
+            GTEST_CFLAGS="-isystem /tmp/googletest-1.14.0/googletest/include -isystem /tmp/googletest-1.14.0/googlemock/include" \
             GTEST_LIBS="/usr/lib32/libgtest.a /usr/lib32/libgmock.a"
 
   build-libc-malloc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -334,9 +318,7 @@ jobs:
 
   build-almalinux8-jemalloc:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     container: almalinux:8
     steps:
       - name: Install libbacktrace
@@ -356,9 +338,7 @@ jobs:
 
   format-yaml:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        image:ubuntu-7.0
-        instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
