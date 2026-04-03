@@ -208,7 +208,7 @@ jobs:
   build-debian-old:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
-    container: debian:bullseye
+    container: public.ecr.aws/debian/debian:bullseye
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -319,7 +319,7 @@ jobs:
   build-almalinux8-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
-    container: almalinux:8
+    container: public.ecr.aws/almalinux/almalinux:8
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

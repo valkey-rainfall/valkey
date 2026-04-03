@@ -237,7 +237,7 @@ jobs:
             (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
         )) &&
       !contains(github.event.inputs.skipjobs, 'fortify')
-    container: ubuntu:plucky
+    container: public.ecr.aws/ubuntu/ubuntu:plucky
     timeout-minutes: 1440
     steps:
       - name: prep
@@ -1366,18 +1366,18 @@ jobs:
       matrix:
         include:
           - name: test-almalinux8-jemalloc
-            container: almalinux:8
+            container: public.ecr.aws/almalinux/almalinux:8
             install_epel: true
           - name: test-almalinux9-jemalloc
-            container: almalinux:9
+            container: public.ecr.aws/almalinux/almalinux:9
             install_epel: true
           - name: test-centosstream9-jemalloc
             container: quay.io/centos/centos:stream9
             install_epel: true
           - name: test-fedoralatest-jemalloc
-            container: fedora:latest
+            container: public.ecr.aws/docker/library/fedora:latest
           - name: test-fedorarawhide-jemalloc
-            container: fedora:rawhide
+            container: public.ecr.aws/docker/library/fedora:rawhide
     name: ${{ matrix.name }}
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
@@ -1442,18 +1442,18 @@ jobs:
       matrix:
         include:
           - name: test-almalinux8-tls-module
-            container: almalinux:8
+            container: public.ecr.aws/almalinux/almalinux:8
             install_epel: true
           - name: test-almalinux9-tls-module
-            container: almalinux:9
+            container: public.ecr.aws/almalinux/almalinux:9
             install_epel: true
           - name: test-centosstream9-tls-module
             container: quay.io/centos/centos:stream9
             install_epel: true
           - name: test-fedoralatest-tls-module
-            container: fedora:latest
+            container: public.ecr.aws/docker/library/fedora:latest
           - name: test-fedorarawhide-tls-module
-            container: fedora:rawhide
+            container: public.ecr.aws/docker/library/fedora:rawhide
     name: ${{ matrix.name }}
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
@@ -1519,18 +1519,18 @@ jobs:
       matrix:
         include:
           - name: test-almalinux8-tls-module-no-tls
-            container: almalinux:8
+            container: public.ecr.aws/almalinux/almalinux:8
             install_epel: true
           - name: test-almalinux9-tls-module-no-tls
-            container: almalinux:9
+            container: public.ecr.aws/almalinux/almalinux:9
             install_epel: true
           - name: test-centosstream9-tls-module-no-tls
             container: quay.io/centos/centos:stream9
             install_epel: true
           - name: test-fedoralatest-tls-module-no-tls
-            container: fedora:latest
+            container: public.ecr.aws/docker/library/fedora:latest
           - name: test-fedorarawhide-tls-module-no-tls
-            container: fedora:rawhide
+            container: public.ecr.aws/docker/library/fedora:rawhide
     name: ${{ matrix.name }}
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
@@ -1751,7 +1751,7 @@ jobs:
             (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
         )) &&
       !contains(github.event.inputs.skipjobs, 'alpine')
-    container: alpine:latest
+    container: public.ecr.aws/docker/library/alpine:latest
     steps:
       - name: prep
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
@@ -1805,7 +1805,7 @@ jobs:
             (github.event.pull_request.base.ref == 'unstable' && github.event.label.name == 'run-extra-tests'))
         )) &&
       !contains(github.event.inputs.skipjobs, 'alpine')
-    container: alpine:latest
+    container: public.ecr.aws/docker/library/alpine:latest
     steps:
       - name: prep
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
