@@ -35,7 +35,11 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: System tuning
         run: |
-          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
+          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1
+          echo "=== Ports in test range (21111-29110) ==="
+          ss -tlnp sport ge :21111 sport le :29110 || true
+          echo "=== Ephemeral port range ==="
+          cat /proc/sys/net/ipv4/ip_local_port_range
       - name: make
         # Fail build if there are warnings
         # build with TLS just for compilation coverage
@@ -73,7 +77,11 @@ jobs:
     steps:
       - name: System tuning
         run: |
-          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
+          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1
+          echo "=== Ports in test range (21111-29110) ==="
+          ss -tlnp sport ge :21111 sport le :29110 || true
+          echo "=== Ephemeral port range ==="
+          cat /proc/sys/net/ipv4/ip_local_port_range
       - name: Install gtest
         run: |
           sudo dnf install -y pkg-config cmake gcc gcc-c++ openssl-devel
@@ -125,7 +133,7 @@ jobs:
       - name: test
         run: |
           sudo apt-get install -y tcl8.6 tclx tcl-tls
-          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
+          sudo sysctl -w net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1 || true
           ./utils/gen-test-certs.sh
           ./build-release/runtest --verbose --tags -slow --dump-logs --tls
       - name: unit tests
@@ -146,7 +154,11 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: System tuning
         run: |
-          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
+          sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1
+          echo "=== Ports in test range (21111-29110) ==="
+          ss -tlnp sport ge :21111 sport le :29110 || true
+          echo "=== Ephemeral port range ==="
+          cat /proc/sys/net/ipv4/ip_local_port_range
       - name: make
         # build with TLS module just for compilation coverage
         run: |
@@ -211,7 +223,7 @@ jobs:
       - name: install-test-dependencies
         run: |
           sudo apt-get install -y tcl8.6 tclx tcl-tls
-          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 || true
+          sudo sysctl -w net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1 || true
       - name: make-tls-module
         run: make -j4 BUILD_TLS=module SERVER_CFLAGS='-Werror'
       - name: test-tls-module
