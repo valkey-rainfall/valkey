@@ -37,7 +37,7 @@ jobs:
         run: |
           sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1
           echo "=== Ports in test range (21111-29110) ==="
-          ss -tlnp sport ge :21111 sport le :29110 || true
+          sudo netstat -tlnp 2>/dev/null | awk '$4 ~ /:2[1-9][0-9]{3}$/' || cat /proc/net/tcp | awk 'BEGIN{print "local_address"} $2 ~ /:[5-7][0-9A-F]{3}/{print $2, $4}' || true
           echo "=== Ephemeral port range ==="
           cat /proc/sys/net/ipv4/ip_local_port_range
       - name: make
@@ -64,9 +64,9 @@ jobs:
         run: |
           make test-unit
 
-  test-al-latest-compatibility:
+  test-ubuntu-latest-compatibility:
     runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:linux-ec2:latest instance-size:large
+      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
     strategy:
       fail-fast: false
       matrix:
@@ -79,13 +79,12 @@ jobs:
         run: |
           sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1
           echo "=== Ports in test range (21111-29110) ==="
-          ss -tlnp sport ge :21111 sport le :29110 || true
+          sudo netstat -tlnp 2>/dev/null | awk '$4 ~ /:2[1-9][0-9]{3}$/' || cat /proc/net/tcp | awk 'BEGIN{print "local_address"} $2 ~ /:[5-7][0-9A-F]{3}/{print $2, $4}' || true
           echo "=== Ephemeral port range ==="
           cat /proc/sys/net/ipv4/ip_local_port_range
       - name: Install gtest
         run: |
-          sudo dnf install -y pkg-config cmake gcc gcc-c++ openssl-devel
-          (cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build --parallel && sudo cmake --install build)
+          (sudo apt-get install -y pkg-config cmake && cd /tmp && curl -sL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz | tar xz && cd googletest-1.14.0 && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib && cmake --build build --parallel && sudo cmake --install build)
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -109,7 +108,7 @@ jobs:
 
       - name: Run compatibility tests against ${{ matrix.server.version }}
         run: |
-          sudo dnf install -y tcl tclx
+          sudo apt-get install -y tcl8.6 tclx
           ./runtest --verbose --tags "-slow needs:other-server" --dump-logs \
             --other-server-path tests/tmp/valkey-${{ matrix.server.version }}-noble-x86_64/bin/valkey-server
 
@@ -156,7 +155,7 @@ jobs:
         run: |
           sudo sysctl -w vm.overcommit_memory=1 net.ipv4.ip_local_port_range="40000 65535" net.ipv4.tcp_tw_reuse=1
           echo "=== Ports in test range (21111-29110) ==="
-          ss -tlnp sport ge :21111 sport le :29110 || true
+          sudo netstat -tlnp 2>/dev/null | awk '$4 ~ /:2[1-9][0-9]{3}$/' || cat /proc/net/tcp | awk 'BEGIN{print "local_address"} $2 ~ /:[5-7][0-9A-F]{3}/{print $2, $4}' || true
           echo "=== Ephemeral port range ==="
           cat /proc/sys/net/ipv4/ip_local_port_range
       - name: make
@@ -349,7 +348,7 @@ jobs:
   build-almalinux8-jemalloc:
     runs-on:
       - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
-    container: almalinux:8
+    container: public.ecr.aws/almalinux/almalinux:8
     steps:
       - name: Install libbacktrace
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -359,7 +358,9 @@ jobs:
           path: libbacktrace
       - name: Build libbacktrace
         run: |
-          dnf -y install epel-release gcc gcc-c++ make procps-ng which git cmake
+          dnf -y install epel-release
+          dnf clean all && dnf makecache
+          dnf -y install gcc gcc-c++ make procps-ng which git cmake
           cd libbacktrace && ./configure && make && make install
       - name: Checkout Valkey
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
