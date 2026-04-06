@@ -65,8 +65,8 @@ jobs:
           make test-unit
 
   test-ubuntu-latest-compatibility:
-    runs-on:
-      - codebuild-valkey-ci-${{ github.run_id }}-${{ github.run_attempt }} image:ubuntu-7.0 instance-size:large
+    if: false # disabled — noble x86_64 binaries require Ubuntu 24.04, CodeBuild ubuntu-7.0 is 22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
