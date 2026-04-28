@@ -13,6 +13,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/hashtable.c
     ${CMAKE_SOURCE_DIR}/src/kvstore.c
     ${CMAKE_SOURCE_DIR}/src/sds.c
+    ${CMAKE_SOURCE_DIR}/src/vstr.c
     ${CMAKE_SOURCE_DIR}/src/zmalloc.c
     ${CMAKE_SOURCE_DIR}/src/lzf_c.c
     ${CMAKE_SOURCE_DIR}/src/lzf_d.c
