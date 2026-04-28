@@ -578,6 +578,7 @@ ENGINE_SERVER_OBJ = \
     valkey_strtod.o \
     vector.o \
     vset.o \
+    vstr.o \
     ziplist.o \
     zipmap.o \
     zmalloc.o \
