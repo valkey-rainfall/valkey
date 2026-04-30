@@ -82,6 +82,7 @@
 #include "connection.h" /* Connection abstraction */
 #include "memory_prefetch.h"
 #include "vset.h"
+#include "vstr.h"
 #include "trace/trace.h"
 #include "entry.h"
 #include "lrulfu.h"
@@ -925,6 +926,8 @@ typedef int (*rdbAuxFieldDecoder)(int flags, sds s);
 
 /* Client MULTI/EXEC state */
 typedef struct multiCmd {
+    /* TODO (vstr zero-copy PoC): Change to vstr * when client.argv changes.
+     * Queued commands must hold materialized (owned) vstr values. */
     robj **argv;
     int argv_len;
     int argc;
@@ -1264,6 +1267,8 @@ typedef struct ClientModuleData {
 typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
     int argc;
+    /* TODO (vstr zero-copy PoC): Change to vstr * when client.argv changes.
+     * See TODO comment on client.argv in this file. */
     robj **argv;
     int argv_len;
     int slot;
@@ -1296,8 +1301,34 @@ typedef struct client {
     uint64_t id; /* Client incremental unique ID. */
     connection *conn;
     /* Input buffer and command parsing fields */
-    sds querybuf;        /* Buffer we use to accumulate client queries. */
-    size_t qb_pos;       /* The position we have read in querybuf. */
+    sds querybuf;  /* Buffer we use to accumulate client queries. */
+    size_t qb_pos; /* The position we have read in querybuf. */
+    /* TODO (vstr zero-copy PoC — production change):
+     * Change argv type from `robj **` to `vstr *` so that command arguments
+     * are stored as inline vstr values instead of heap-allocated robj pointers.
+     *
+     * With vstr *argv, the RESP parser (parseMultibulk) would produce borrowed
+     * vstr references into the query buffer for normal arguments and owned sds
+     * vstr for big-argument optimizations, eliminating per-argument sds+robj
+     * heap allocations on the hot path.
+     *
+     * What would change:
+     *   - argv allocation: sizeof(robj *) → sizeof(vstr) per element
+     *   - argv access: c->argv[i] returns a vstr value, not an robj *
+     *   - Argument reading: objectGetVal(c->argv[i]) → vstrData(&c->argv[i])
+     *   - Argument freeing: decrRefCount(c->argv[i]) → vstrFree(&c->argv[i])
+     *     (no-op for borrowed vstr)
+     *   - All command implementations that access c->argv[i] as robj * must
+     *     be updated to use the vstr API
+     *   - parsedCommand.argv, multiCmd.argv, serverOp.argv, and
+     *     original_argv must also be updated for consistency
+     *   - Materialization (vstrMaterialize) required at boundaries where
+     *     arguments escape command execution (MULTI/EXEC, slowlog,
+     *     VM_HoldString, rewriteClientCommandVector, blocking commands)
+     *
+     * This change is deferred because it must be done atomically with the
+     * parser changes (Task 4.2) and the full command dispatch sweep (Task 4.3)
+     * to keep the codebase compilable. See design.md Component 6. */
     robj **argv;         /* Arguments of current command. */
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
@@ -1333,7 +1364,8 @@ typedef struct client {
     size_t bufpos;
     payloadHeader *last_header; /* Pointer to the last header in a buffer when using copy avoidance */
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
-    robj **original_argv;       /* Arguments of original command if arguments were rewritten. */
+    /* TODO (vstr zero-copy PoC): Change to vstr * when client.argv changes. */
+    robj **original_argv; /* Arguments of original command if arguments were rewritten. */
     /* Client flags and state indicators */
     union {
         uint64_t raw_flag;
@@ -1524,6 +1556,8 @@ extern clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUN
  * Currently only used to additionally propagate more commands to AOF/Replication
  * after the propagation of the executed command. */
 typedef struct serverOp {
+    /* TODO (vstr zero-copy PoC): Change to vstr * when client.argv changes.
+     * Propagated commands must hold materialized (owned) vstr values. */
     robj **argv;
     int argc, dbid, target, slot;
 } serverOp;
@@ -3870,8 +3904,36 @@ uint64_t dictSdsCaseHash(const void *key);
 uint64_t dictCStrHash(const void *key);
 uint64_t dictCStrCaseHash(const void *key);
 uint64_t dictEncObjHash(const void *key);
+uint64_t vstrHashCallback(const void *key);
 int dictSdsKeyCompare(const void *key1, const void *key2);
 int dictSdsKeyCaseCompare(const void *key1, const void *key2);
+int vstrCompareCallback(const void *key1, const void *key2);
+
+/* High-bit pointer tagging for vstr lookup keys in hashtable callbacks.
+ *
+ * On x86-64 and aarch64 with 48-bit virtual addresses, bits 48-63 of
+ * user-space pointers are always zero. We set bit 63 to tag a pointer
+ * as pointing to a vstr rather than an sds.
+ *
+ * TODO (production): Not portable to 32-bit or >48-bit VA platforms
+ * (Intel 5-level paging, ARM MTE). Replace with hashtable API returning
+ * keys by value (e.g., a generic htkey struct). */
+#define VSTR_TAG_BIT ((uintptr_t)1 << 63)
+
+static_assert(sizeof(void *) == 8, "High-bit pointer tagging requires 64-bit pointers");
+
+static inline void *vstrTagPtr(const vstr *v) {
+    return (void *)((uintptr_t)v | VSTR_TAG_BIT);
+}
+
+static inline int vstrIsTaggedPtr(const void *p) {
+    return ((uintptr_t)p & VSTR_TAG_BIT) != 0;
+}
+
+static inline const vstr *vstrUntagPtr(const void *p) {
+    return (const vstr *)((uintptr_t)p & ~VSTR_TAG_BIT);
+}
+
 int dictCStrKeyCompare(const void *key1, const void *key2);
 int dictCStrKeyCaseCompare(const void *key1, const void *key2);
 int dictEncObjKeyCompare(const void *key1, const void *key2);

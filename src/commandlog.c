@@ -102,6 +102,11 @@ void commandlogInit(void) {
  * configured max length. */
 static void commandlogPushEntryIfNeeded(client *c, robj **argv, int argc, long long value, int type) {
     if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return; /* The corresponding commandlog disabled */
+    /* TODO (vstr zero-copy PoC, Req 10.1, 10.2, 19.4): Materialize at slowlog boundary.
+     * When argv becomes vstr *, call vstrMaterialize() on every borrowed vstr
+     * argument before passing to commandlogCreateEntry, so captured args remain
+     * valid for the lifetime of the log entry. Eager materialization is used
+     * here; lazy materialization is not beneficial since all args are retained. */
     if (value >= server.commandlog[type].threshold)
         listAddNodeHead(server.commandlog[type].entries, commandlogCreateEntry(c, argv, argc, value, type));
 

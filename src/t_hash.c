@@ -240,7 +240,9 @@ int hashTypeGetValue(robj *o, sds field, unsigned char **vstr, unsigned int *vle
         }
     } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
         void *entry = NULL;
-        hashtableFind(objectGetVal(o), field, &entry);
+        struct vstr lk;
+        vstrInitBorrowed(&lk, field, sdslen(field));
+        hashtableFind(objectGetVal(o), vstrTagPtr(&lk), &entry);
         if (entry) {
             size_t len = 0;
             char *value = entryGetValue(entry, &len);
@@ -268,7 +270,9 @@ int hashTypeGetExpiry(robj *o, sds field, mstime_t *expiry) {
         }
     } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
         void *found_element = NULL;
-        if (hashtableFind(objectGetVal(o), field, &found_element)) {
+        struct vstr lk;
+        vstrInitBorrowed(&lk, field, sdslen(field));
+        if (hashtableFind(objectGetVal(o), vstrTagPtr(&lk), &found_element)) {
             if (expiry) *expiry = entryGetExpiry(found_element);
             return C_OK;
         }
@@ -321,7 +325,9 @@ int hashTypeExists(robj *o, sds field) {
 bool hashTypeHasStringRef(robj *o, sds field) {
     if (o->encoding == OBJ_ENCODING_LISTPACK) return false;
     hashtable *ht = objectGetVal(o);
-    void **entry_ref = hashtableFindRef(ht, field);
+    struct vstr lk;
+    vstrInitBorrowed(&lk, field, sdslen(field));
+    void **entry_ref = hashtableFindRef(ht, vstrTagPtr(&lk));
     return (entryHasStringRef(*entry_ref));
 }
 
@@ -337,7 +343,9 @@ int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len) {
     if (o->encoding == OBJ_ENCODING_LISTPACK) hashTypeConvert(o, OBJ_ENCODING_HASHTABLE);
 
     hashtable *ht = objectGetVal(o);
-    void **entry_ref = hashtableFindRef(ht, field);
+    struct vstr lk;
+    vstrInitBorrowed(&lk, field, sdslen(field));
+    void **entry_ref = hashtableFindRef(ht, vstrTagPtr(&lk));
     entry *entry = *entry_ref;
     mstime_t expiry = entryGetExpiry(entry);
     void *new_entry = entryUpdateAsStringRef(entry, buf, len, expiry);
@@ -419,7 +427,9 @@ int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool 
         hashTypeIgnoreTTL(o, true);
         hashtablePosition position;
         void *existing;
-        if (hashtableFindPositionForInsert(ht, field, &position, &existing)) {
+        vstr lk;
+        vstrInitBorrowed(&lk, field, sdslen(field));
+        if (hashtableFindPositionForInsert(ht, vstrTagPtr(&lk), &position, &existing)) {
             /* does not exist yet */
             entry *entry = entryCreate(field, v, expiry);
             hashtableInsertAtPosition(ht, entry, &position);
@@ -501,7 +511,9 @@ static expiryModificationResult hashTypeSetExpire(robj *o, sds field, mstime_t e
 
     hashtable *ht = objectGetVal(o);
     void **entry_ref = NULL;
-    if ((entry_ref = hashtableFindRef(ht, field))) {
+    struct vstr lk;
+    vstrInitBorrowed(&lk, field, sdslen(field));
+    if ((entry_ref = hashtableFindRef(ht, vstrTagPtr(&lk)))) {
         entry *current_entry = *entry_ref;
         mstime_t current_expire = entryGetExpiry(current_entry);
         if (flag) {
@@ -565,7 +577,9 @@ static expiryModificationResult hashTypePersist(robj *o, sds field) {
 
     hashtable *ht = objectGetVal(o);
     void **entry_ref = NULL;
-    if ((entry_ref = hashtableFindRef(ht, field))) {
+    struct vstr lk;
+    vstrInitBorrowed(&lk, field, sdslen(field));
+    if ((entry_ref = hashtableFindRef(ht, vstrTagPtr(&lk)))) {
         entry *current_entry = *entry_ref;
         mstime_t current_expire = entryGetExpiry(current_entry);
         if (current_expire != EXPIRY_NONE) {
@@ -600,7 +614,9 @@ bool hashTypeDelete(robj *o, sds field) {
     } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
         hashtable *ht = objectGetVal(o);
         void *entry = NULL;
-        deleted = hashtablePop(ht, field, &entry);
+        struct vstr lk;
+        vstrInitBorrowed(&lk, field, sdslen(field));
+        deleted = hashtablePop(ht, vstrTagPtr(&lk), &entry);
         if (deleted) {
             hashTypeUntrackEntry(o, entry);
             entryFree(entry);

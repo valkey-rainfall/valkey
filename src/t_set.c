@@ -35,6 +35,7 @@
 #include "server.h"
 #include "hashtable.h"
 #include "intset.h" /* Compact integer set structure */
+#include "vstr.h"
 
 /*-----------------------------------------------------------------------------
  * Set Commands
@@ -141,20 +142,22 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
 
     serverAssert(str);
     if (set->encoding == OBJ_ENCODING_HASHTABLE) {
-        /* Avoid duping the string if it is an sds string. */
-        sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
+        /* Use a stack-allocated vstr with tagged pointer for the lookup — no allocation. */
+        vstr v;
+        if (str_is_sds) {
+            vstrInitBorrowed(&v, (const char *)str, sdslen((sds)str));
+        } else {
+            vstrInitBorrowed(&v, str, len);
+        }
         hashtable *ht = objectGetVal(set);
         hashtablePosition position;
-        if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
-            /* Key doesn't already exist in the set. Add it but dup the key. */
-            if (sdsval == str) sdsval = sdsdup(sdsval);
+        if (hashtableFindPositionForInsert(ht, vstrTagPtr(&v), &position, NULL)) {
+            /* Key doesn't already exist in the set. Allocate sds only now. */
+            sds sdsval = str_is_sds ? sdsdup((sds)str) : sdsnewlen(str, len);
             hashtableInsertAtPosition(ht, sdsval, &position);
             return 1;
-        } else if (sdsval != str) {
-            /* String is already a member. Free our temporary sds copy. */
-            sdsfree(sdsval);
-            return 0;
         }
+        /* String is already a member. No allocation was made, nothing to free. */
     } else if (set->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
@@ -250,9 +253,13 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
     }
 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
-        sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
-        int deleted = hashtableDelete(objectGetVal(setobj), sdsval);
-        if (sdsval != str) sdsfree(sdsval); /* free temp copy */
+        vstr v;
+        if (str_is_sds) {
+            vstrInitBorrowed(&v, (const char *)str, sdslen((sds)str));
+        } else {
+            vstrInitBorrowed(&v, str, len);
+        }
+        int deleted = hashtableDelete(objectGetVal(setobj), vstrTagPtr(&v));
         return deleted;
     } else if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(setobj);
@@ -306,12 +313,13 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
         long long llval;
         return string2ll(str, len, &llval) && intsetFind(objectGetVal(set), llval);
     } else if (set->encoding == OBJ_ENCODING_HASHTABLE && str_is_sds) {
-        return hashtableFind(objectGetVal(set), (sds)str, NULL);
+        vstr v;
+        vstrInitBorrowed(&v, (const char *)str, sdslen((sds)str));
+        return hashtableFind(objectGetVal(set), vstrTagPtr(&v), NULL);
     } else if (set->encoding == OBJ_ENCODING_HASHTABLE) {
-        sds sdsval = sdsnewlen(str, len);
-        int result = hashtableFind(objectGetVal(set), sdsval, NULL);
-        sdsfree(sdsval);
-        return result;
+        vstr v;
+        vstrInitBorrowed(&v, str, len);
+        return hashtableFind(objectGetVal(set), vstrTagPtr(&v), NULL);
     } else {
         serverPanic("Unknown set encoding");
     }
