@@ -2972,6 +2972,11 @@ ValkeyModuleString *VM_HoldString(ValkeyModuleCtx *ctx, ValkeyModuleString *str)
         return VM_CreateStringFromString(ctx, str);
     }
 
+    /* TODO (vstr zero-copy PoC, Req 11.1, 11.2, 19.4): Materialize at VM_HoldString boundary.
+     * When c->argv becomes vstr *, if 'str' originates from a borrowed vstr
+     * argument, call vstrMaterialize() before returning the retained string to
+     * the module. This ensures the module-held string outlives the query buffer.
+     * Eager materialization is correct here since the module explicitly retains. */
     incrRefCount(str);
     if (ctx != NULL) {
         /*

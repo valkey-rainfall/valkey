@@ -436,6 +436,11 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     list *l;
     int j;
 
+    /* TODO (vstr zero-copy PoC, Req 13.1, 13.2, 19.4): Materialize at blocking boundary.
+     * When c->argv becomes vstr *, call vstrMaterialize() on every borrowed vstr
+     * in c->argv before deferring execution (BLPOP, BRPOP, BLMOVE, etc.).
+     * Deferred arguments must survive query buffer reuse. Eager materialization
+     * is correct here since all args are retained until unblock. */
     initClientBlockingState(c);
 
     if (!c->flag.reexecuting_command) {

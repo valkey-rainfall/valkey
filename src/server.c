@@ -437,6 +437,59 @@ uint64_t sdsHashConfigurableSeed(const void *key) {
     return genHashFunctionConfigurableSeed(key, sdslen(key));
 }
 
+/* --- High-bit pointer tagging for vstr/sds polymorphism ---
+ *
+ * Hashtable callbacks need to handle two key types: vstr * (from callers doing
+ * lookups) and sds (from stored entries when entryGetKey is NULL). We use
+ * high-bit pointer tagging: bit 63 is set on vstr pointers. On x86-64 and
+ * aarch64 with 48-bit virtual addresses, user-space pointers never have
+ * bit 63 set, so this is a safe discriminator.
+ *
+ * TODO: Production implementation should change the hashtable API to pass keys
+ * by value (returning vstr from entryGetKey), eliminating the need for
+ * pointer tagging.
+ *
+ * We use high-bit pointer tagging to distinguish vstr lookup keys from plain
+ * sds entries. On x86-64 and aarch64, user-space pointers use at most 48 bits.
+ * We set bit 63 to tag a pointer as pointing to a vstr. The callbacks check
+ * the tag to determine the key type, then mask it off before dereferencing.
+ * This replaces the previous magic-number wrapper struct approach. */
+
+/* Extract (data, len) from a key that may be a tagged vstr * or a plain sds.
+ *
+ * Discrimination: if bit 63 is set, the pointer is a tagged vstr *. We mask
+ * off the tag and dereference the vstr. Otherwise it is a plain sds. */
+static inline void vstrOrSdsGetBytes(const void *key, const char **data, size_t *len) {
+    if (vstrIsTaggedPtr(key)) {
+        const vstr *v = vstrUntagPtr(key);
+        *data = vstrData(v);
+        *len = vstrLen(v);
+    } else {
+        /* Plain sds from entryGetKey or stored entry. */
+        *data = (const char *)key;
+        *len = sdslen((const sds)key);
+    }
+}
+
+/* Hash callback that accepts either a tagged vstr * or a plain sds. */
+uint64_t vstrHashCallback(const void *key) {
+    const char *data;
+    size_t len;
+    vstrOrSdsGetBytes(key, &data, &len);
+    return genHashFunctionConfigurableSeed(data, len);
+}
+
+/* Compare callback that accepts either tagged vstr * or plain sds for
+ * each argument. Returns 1 when byte sequences are identical, 0 otherwise. */
+int vstrCompareCallback(const void *key1, const void *key2) {
+    const char *d1, *d2;
+    size_t l1, l2;
+    vstrOrSdsGetBytes(key1, &d1, &l1);
+    vstrOrSdsGetBytes(key2, &d2, &l2);
+    if (l1 != l2) return 0;
+    return memcmp(d1, d2, l1) == 0;
+}
+
 uint64_t dictSdsCaseHash(const void *key) {
     return dictGenCaseHashFunction(key, sdslen(key));
 }
@@ -619,10 +672,12 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
-/* Set hashtable type. Items are SDS strings */
+/* Set hashtable type. Items are SDS strings.
+ * Hash and compare callbacks accept both tagged vstr * (from lookup callers)
+ * and plain sds (from stored entries). No entryGetKey needed. */
 hashtableType setHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashFunction = vstrHashCallback,
+    .keyCompare = vstrCompareCallback,
     .entryDestructor = dictSdsDestructor};
 
 const void *zsetHashtableGetKey(const void *element) {
@@ -630,11 +685,14 @@ const void *zsetHashtableGetKey(const void *element) {
     return zslGetNodeElement(node);
 }
 
-/* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
+/* Sorted sets hash (note: a skiplist is used in addition to the hash table).
+ * entryGetKey returns plain sds; vstrHashCallback / vstrCompareCallback handle
+ * both plain sds (from stored entries) and tagged vstr * (from lookup
+ * callers) via the high-bit tag check in vstrOrSdsGetBytes(). */
 hashtableType zsetHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashFunction = vstrHashCallback,
     .entryGetKey = zsetHashtableGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .keyCompare = vstrCompareCallback,
 };
 
 uint64_t hashtableSdsHash(const void *key) {
@@ -659,12 +717,15 @@ void hashtableObjectDestructor(void *val) {
     decrRefCount(val);
 }
 
-/* Kvstore->keys, keys are sds strings, vals are Objects. */
+/* Kvstore->keys, keys are sds strings, vals are Objects.
+ * entryGetKey returns plain sds; vstrHashCallback / vstrCompareCallback handle
+ * both plain sds (from stored entries) and tagged vstr * (from lookup
+ * callers) via the high-bit tag check in vstrOrSdsGetBytes(). */
 hashtableType kvstoreKeysHashtableType = {
     .entryPrefetchValue = hashtableObjectPrefetchValue,
     .entryGetKey = hashtableObjectGetKey,
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashFunction = vstrHashCallback,
+    .keyCompare = vstrCompareCallback,
     .entryDestructor = hashtableObjectDestructor,
     .resizeAllowed = hashtableResizeAllowed,
     .rehashingStarted = kvstoreHashtableRehashingStarted,
@@ -673,12 +734,14 @@ hashtableType kvstoreKeysHashtableType = {
     .getMetadataSize = kvstoreHashtableMetadataSize,
 };
 
-/* Kvstore->expires */
+/* Kvstore->expires.
+ * entryGetKey returns plain sds; vstr-aware callbacks handle both sds and
+ * tagged vstr * via the high-bit tag check. */
 hashtableType kvstoreExpiresHashtableType = {
     .entryPrefetchValue = hashtableObjectPrefetchValue,
     .entryGetKey = hashtableObjectGetKey,
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashFunction = vstrHashCallback,
+    .keyCompare = vstrCompareCallback,
     .entryDestructor = NULL, /* shared with keyspace table */
     .resizeAllowed = hashtableResizeAllowed,
     .rehashingStarted = kvstoreHashtableRehashingStarted,
@@ -686,6 +749,11 @@ hashtableType kvstoreExpiresHashtableType = {
     .trackMemUsage = kvstoreHashtableTrackMemUsage,
     .getMetadataSize = kvstoreHashtableMetadataSize,
 };
+
+/* TODO (vstr PoC): Non-targeted hashtable types below (commandSetType,
+ * originalCommandSetType, subcommandSetType, sdsReplyHashtableType, etc.)
+ * still use sds-based hash/compare callbacks. For full consistency, these
+ * should be migrated to vstr-aware callbacks in a production implementation. */
 
 /* Command set, hashed by current command name, stores serverCommand structs. */
 hashtableType commandSetType = {.entryGetKey = hashtableCommandGetCurrentName,
@@ -705,7 +773,9 @@ hashtableType subcommandSetType = {.entryGetKey = hashtableSubcommandGetKey,
                                    .keyCompare = dictCStrKeyCaseCompare,
                                    .instant_rehashing = 1};
 
-/* Hash type hash table (note that small hashes are represented with listpacks) */
+/* Hash type hash table (note that small hashes are represented with listpacks).
+ * entryGetKey returns plain sds; vstr-aware callbacks handle both sds and
+ * tagged vstr * via the high-bit tag check. */
 const void *hashHashtableTypeGetKey(const void *entry) {
     return (const void *)entryGetField(entry);
 }
@@ -721,17 +791,17 @@ size_t hashHashtableTypeMetadataSize(void) {
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashFunction = vstrHashCallback,
     .entryGetKey = hashHashtableTypeGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .keyCompare = vstrCompareCallback,
     .entryDestructor = hashHashtableTypeDestructor,
     .getMetadataSize = hashHashtableTypeMetadataSize,
 };
 
 hashtableType hashWithVolatileItemsHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashFunction = vstrHashCallback,
     .entryGetKey = hashHashtableTypeGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .keyCompare = vstrCompareCallback,
     .entryDestructor = hashHashtableTypeDestructor,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
@@ -3890,6 +3960,12 @@ void call(client *c, int flags) {
      * as an entry point is if a module triggers RM_Call outside of call()
      * context (for example, in a timer).
      * In that case, the module is in charge of propagation. */
+
+    /* TODO (vstr zero-copy PoC, Req 8.3): Command dispatch path update.
+     * When c->argv becomes vstr *, every c->cmd->proc(c) implementation
+     * that accesses c->argv[i] as robj * must switch to vstrData() /
+     * vstrLen() for reading argument bytes. See the detailed scope list
+     * in the Req 19.3 TODO in parseMultibulk (src/networking.c). */
 
     /* Call the command. */
     dirty = server.dirty;
@@ -7210,8 +7286,8 @@ void dismissMemoryInChild(void) {
     /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
     if (server.thp_enabled) return;
 
-        /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-         * so we avoid these pointless loops when they're not going to do anything. */
+    /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
+     * so we avoid these pointless loops when they're not going to do anything. */
 #if defined(USE_JEMALLOC) && defined(__linux__)
     listIter li;
     listNode *ln;

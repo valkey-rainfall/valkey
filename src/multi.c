@@ -110,6 +110,12 @@ void queueMultiCommand(client *c, uint64_t cmd_flags) {
     mc = c->mstate->commands + c->mstate->count;
     mc->cmd = c->cmd;
     mc->argc = c->argc;
+
+    /* TODO (vstr zero-copy PoC, Req 9.1, 9.2, 19.4): Materialize at MULTI/EXEC boundary.
+     * When c->argv becomes vstr *, iterate mc->argv[0..argc-1] and call
+     * vstrMaterialize() on each borrowed vstr before the query buffer advances.
+     * The PoC uses eager materialization here; production could defer to
+     * execCommand if profiling shows the cost is significant. */
     mc->argv = c->argv;
     mc->argv_len = c->argv_len;
     mc->slot = c->slot;

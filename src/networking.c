@@ -3319,6 +3319,10 @@ void resetClient(client *c) {
     serverCommandProc *prevcmd = c->cmd ? c->cmd->proc : NULL;
     serverCommandProc *prevParentCmd = c->cmd && c->cmd->parent ? c->cmd->parent->proc : NULL;
 
+    /* TODO (vstr zero-copy PoC, Req 8.3): After argv becomes vstr *,
+     * freeClientArgv handles cleanup via vstrFree (no-op for borrowed).
+     * Ensure query buffer trimming (sdsrange in trimQueryBuffer) is
+     * deferred until after this point so borrowed references are still valid. */
     freeClientArgv(c);
     freeClientOriginalArgv(c);
     c->redact_arg_bitmap = 0;
@@ -3669,6 +3673,8 @@ static int parseMultibulk(client *c,
         /* Setup argv array */
         if (*argv) zfree(*argv);
         *argv_len = min(c->multibulklen, 1024);
+        /* TODO (vstr zero-copy PoC): When argv becomes vstr *, change
+         * sizeof(robj *) to sizeof(vstr) here and in the realloc below. */
         *argv = zmalloc(sizeof(robj *) * *argv_len);
         *argv_len_sum = 0;
 
@@ -3796,6 +3802,16 @@ static int parseMultibulk(client *c,
              * just use the current sds string. */
             if (!is_replicated && c->qb_pos == 0 && c->bulklen >= PROTO_MBULK_BIG_ARG &&
                 sdslen(c->querybuf) == (size_t)(c->bulklen + 2)) {
+                /* TODO (vstr zero-copy PoC, Req 8.2): Big-argument optimization.
+                 * When argv becomes vstr *, replace the createObject() call with:
+                 *
+                 *     sdsIncrLen(c->querybuf, -2);
+                 *     vstrInitSds(&(*argv)[*argc], c->querybuf);
+                 *     (*argc)++;
+                 *
+                 * This transfers ownership of the querybuf sds to the vstr
+                 * directly, avoiding the robj wrapper allocation. The querybuf
+                 * is then replaced with a fresh sds as before. */
                 (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
                 *argv_len_sum += c->bulklen;
                 sdsIncrLen(c->querybuf, -2); /* remove CRLF */
@@ -3804,6 +3820,18 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
+                /* TODO (vstr zero-copy PoC, Req 8.1): Normal-sized argument.
+                 * When argv becomes vstr *, replace the createStringObject()
+                 * call with a zero-copy borrowed reference:
+                 *
+                 *     vstrInitBorrowed(&(*argv)[*argc],
+                 *                      c->querybuf + c->qb_pos,
+                 *                      c->bulklen);
+                 *     (*argc)++;
+                 *
+                 * This eliminates the sds + robj allocation entirely for read
+                 * commands. The borrowed vstr points directly into the query
+                 * buffer, which must remain stable until commandProcessed(). */
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
@@ -3812,6 +3840,33 @@ static int parseMultibulk(client *c,
             c->multibulklen--;
         }
     }
+
+    /* TODO (vstr zero-copy PoC, Req 8.4): Query buffer stability.
+     * When argv uses borrowed vstr references into c->querybuf, the query
+     * buffer MUST NOT be trimmed or reallocated during command execution.
+     * Buffer advancement (sdsrange / qb_pos reset) must be deferred until
+     * after commandProcessed() completes. The current code already advances
+     * qb_pos inline, which is safe because it doesn't reallocate; but the
+     * sdsrange() call in the big-argument path above (and in
+     * trimQueryBuffer()) must be guarded so it only runs after the command
+     * handler has finished reading borrowed argv data. */
+
+    /* TODO (vstr zero-copy PoC, Req 19.3): Remaining robj-to-vstr conversion
+     * boundaries. Changing parseMultibulk to produce vstr instead of robj
+     * requires updating every call site that reads c->argv[i] as robj *.
+     * This is a codebase-wide sweep of hundreds of call sites across ~50
+     * source files, including:
+     *   - All command implementations (src/t_string.c, t_list.c, t_set.c,
+     *     t_zset.c, t_hash.c, t_stream.c, etc.)
+     *   - Command dispatch and argument validation (src/server.c)
+     *   - Argument freeing in resetClient / freeClientArgv
+     *   - tryObjectEncoding call sites (defer encoding to storage point)
+     *   - Replication argument forwarding (src/replication.c)
+     *   - Module API argument access (src/module.c)
+     *   - ACL and auth argument inspection
+     *   - Scripting argument passing (src/script*.c)
+     * For the PoC, the hashtable callback migration (Phases 1-3) demonstrates
+     * the core zero-copy value. The parser change is the next production step. */
 
     /* We're done when c->multibulklen == 0 */
     if (c->multibulklen == 0) {
@@ -5964,6 +6019,12 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
     int j;
     robj **argv; /* The new argument vector */
 
+    /* TODO (vstr zero-copy PoC, Req 12.1, 12.2, 19.4): Materialize at rewrite boundary.
+     * When c->argv becomes vstr *, materialize any borrowed vstr arguments from
+     * the original argv that are retained or referenced by the new argv. The new
+     * argument vector must contain only owned representations that do not
+     * reference the original query buffer. Eager materialization is appropriate
+     * since the rewritten argv replaces the original entirely. */
     argv = zmalloc(sizeof(robj *) * argc);
     va_start(ap, argc);
     for (j = 0; j < argc; j++) {

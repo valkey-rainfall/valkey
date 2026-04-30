@@ -802,8 +802,8 @@ void dismissObject(robj *o, size_t size_hint) {
     /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
     if (server.thp_enabled) return;
 
-        /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-         * so we avoid these pointless loops when they're not going to do anything. */
+    /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
+     * so we avoid these pointless loops when they're not going to do anything. */
 #if defined(USE_JEMALLOC) && defined(__linux__)
     if (o->refcount != 1) return;
     switch (o->type) {
@@ -862,6 +862,13 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values) {
 }
 
 /* Try to encode a string object in order to save space */
+/* TODO (vstr zero-copy PoC, Req 8.3): When argv changes from robj * to vstr *,
+ * tryObjectEncoding can no longer be called directly on argv elements.
+ * Encoding (INT, EMBSTR optimizations) should be deferred to the storage
+ * point — i.e., when the value is inserted into the database via dbAdd /
+ * setKey. Command implementations that currently do
+ *   c->argv[i] = tryObjectEncoding(c->argv[i])
+ * will instead encode at the point of robj creation from vstrTakeSds(). */
 robj *tryObjectEncodingEx(robj *o, int try_trim) {
     long value;
     sds s = objectGetVal(o);
