@@ -1333,6 +1333,9 @@ typedef struct client {
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
+    vstr *vargv;         /* Parallel argument array: vstr values from parser. */
+    int vargv_len;       /* Allocated capacity of vargv (in vstr units). */
+    int vargc;           /* Number of arguments in vargv for current command. */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
@@ -2912,6 +2915,8 @@ void resetClientIOState(client *c);
 void discardCommandQueue(client *c);
 void freeClientOriginalArgv(client *c);
 void freeClientArgv(client *c);
+void freeClientVargv(client *c);
+void materializeVargv(client *c);
 void sendReplyToClient(connection *conn);
 int isDeferredReplyEnabled(client *c);
 void initDeferredReplyBuffer(client *c);
@@ -3458,6 +3463,7 @@ connListener *listenerByType(int type);
 int changeListener(connListener *listener);
 struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name);
 struct serverCommand *lookupCommand(robj **argv, int argc);
+struct serverCommand *lookupCommandFromVargv(vstr *vargv, int vargc);
 struct serverCommand *lookupCommandBySdsLogic(hashtable *commands, sds s);
 struct serverCommand *lookupCommandBySds(sds s);
 struct serverCommand *lookupCommandByCStringLogic(hashtable *commands, const char *s);
@@ -3729,6 +3735,8 @@ robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyReadWithFlags(serverDb *db, robj *key, int flags);
 robj *lookupKeyWriteWithFlags(serverDb *db, robj *key, int flags);
+robj *lookupKeyReadVstr(serverDb *db, const vstr *key, client *c);
+int getKVStoreIndexForKeyVstr(const vstr *v);
 robj *objectCommandLookup(client *c, robj *key);
 robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply);
 int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);

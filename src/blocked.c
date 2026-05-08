@@ -436,11 +436,13 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     list *l;
     int j;
 
-    /* TODO (vstr zero-copy PoC, Req 13.1, 13.2, 19.4): Materialize at blocking boundary.
-     * When c->argv becomes vstr *, call vstrMaterialize() on every borrowed vstr
-     * in c->argv before deferring execution (BLPOP, BRPOP, BLMOVE, etc.).
-     * Deferred arguments must survive query buffer reuse. Eager materialization
-     * is correct here since all args are retained until unblock. */
+    /* TODO (zero-copy-get, Req 14.1, 14.2): Materialize at blocking command boundary.
+     * Currently the parser populates both c->argv (robj **) and c->vargv in
+     * parallel, so blocking commands read from c->argv unchanged. GET/MGET never
+     * block, so this boundary is not exercised by converted commands today.
+     * When blocking commands are converted to the zero-copy path, their vargv
+     * entries must be materialized at the point of deferral so that deferred
+     * arguments survive query buffer reuse until unblock. */
     initClientBlockingState(c);
 
     if (!c->flag.reexecuting_command) {

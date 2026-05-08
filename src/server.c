@@ -3582,6 +3582,57 @@ struct serverCommand *lookupCommand(robj **argv, int argc) {
     return lookupCommandLogic(server.commands, argv, argc, 0);
 }
 
+/* Look up a command from a vargv array (vstr-based arguments).
+ *
+ * Extracts the command name from vargv[0], copies it to a stack buffer,
+ * null-terminates it, and performs a case-insensitive lookup against
+ * server.commands. Handles subcommand lookup from vargv[1] when the base
+ * command has a subcommands_ht and vargc > 1.
+ *
+ * Returns NULL if the command is not found or if the command name exceeds
+ * 63 bytes (no valid command is that long). */
+struct serverCommand *lookupCommandFromVargv(vstr *vargv, int vargc) {
+    /* TODO (zero-copy-get): The stack-buffer null-termination + memcpy can be
+     * eliminated by migrating commandSetType to vstr-aware callbacks (a
+     * case-insensitive vstrHashCallback / vstrCompareCallback variant). This
+     * would allow passing the vstr directly to hashtableFind without copying.
+     * Deferred because the memcpy cost is negligible for short command names
+     * and the migration touches the command table infrastructure. */
+    const char *name = vstrData(&vargv[0]);
+    size_t namelen = vstrLen(&vargv[0]);
+
+    /* Command names are always short (≤20 bytes). Return NULL for anything
+     * that doesn't fit — no valid Valkey command exceeds 63 bytes. */
+    if (namelen >= 64) return NULL;
+
+    /* The commandSetType hashFunction is dictSdsCaseHash which calls sdslen(),
+     * so we must pass a proper sds to hashtableFind, not a raw char buffer. */
+    sds name_sds = sdsnewlen(name, namelen);
+
+    void *entry = NULL;
+    hashtableFind(server.commands, name_sds, &entry);
+    struct serverCommand *base_cmd = entry;
+
+    if (!base_cmd) {
+        sdsfree(name_sds);
+        return NULL;
+    }
+    sdsfree(name_sds);
+
+    if (vargc == 1 || !base_cmd->subcommands_ht) return base_cmd;
+
+    /* Subcommand lookup — subcommandSetType uses dictCStrCaseHash (strlen-based),
+     * so a null-terminated stack buffer is sufficient here. */
+    const char *subname = vstrData(&vargv[1]);
+    size_t subnamelen = vstrLen(&vargv[1]);
+    char subbuf[64];
+    if (subnamelen >= sizeof(subbuf)) return NULL;
+    memcpy(subbuf, subname, subnamelen);
+    subbuf[subnamelen] = '\0';
+
+    return lookupSubcommand(base_cmd, subbuf);
+}
+
 struct serverCommand *lookupCommandBySdsLogic(hashtable *commands, sds s) {
     int argc, j;
     sds *strings = sdssplitlen(s, sdslen(s), "|", 1, &argc);

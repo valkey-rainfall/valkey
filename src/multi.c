@@ -111,11 +111,12 @@ void queueMultiCommand(client *c, uint64_t cmd_flags) {
     mc->cmd = c->cmd;
     mc->argc = c->argc;
 
-    /* TODO (vstr zero-copy PoC, Req 9.1, 9.2, 19.4): Materialize at MULTI/EXEC boundary.
-     * When c->argv becomes vstr *, iterate mc->argv[0..argc-1] and call
-     * vstrMaterialize() on each borrowed vstr before the query buffer advances.
-     * The PoC uses eager materialization here; production could defer to
-     * execCommand if profiling shows the cost is significant. */
+    /* TODO (zero-copy-get, Req 10.1, 10.2): Materialize at MULTI/EXEC boundary.
+     * Currently the parser populates both c->argv (robj **) and c->vargv in
+     * parallel, so queueMultiCommand reads from c->argv unchanged. When the
+     * parser stops populating c->argv for converted commands, vargv entries
+     * must be materialized here at queue time so that deferred arguments
+     * survive query buffer reuse across subsequent commands. */
     mc->argv = c->argv;
     mc->argv_len = c->argv_len;
     mc->slot = c->slot;

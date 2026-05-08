@@ -147,6 +147,12 @@ static void commandlogGetReply(client *c, int type, long count) {
 }
 
 /* Log the last command a client executed into the commandlog. */
+/* TODO (zero-copy-get, Req 11.1, 11.2): Materialize at slowlog boundary.
+ * Currently the parser populates both c->argv (robj **) and c->vargv in
+ * parallel, so this function reads from c->argv (via c->original_argv or
+ * c->argv) unchanged. When the parser stops populating c->argv for converted
+ * commands, the slowlog must read from c->vargv and materialize each entry
+ * into an owned copy for storage in the log entry. */
 void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd) {
     /* Some commands may contain sensitive data that should not be available in the commandlog.
      */

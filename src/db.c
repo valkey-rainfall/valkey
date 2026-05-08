@@ -144,6 +144,102 @@ robj *lookupKeyRead(serverDb *db, robj *key) {
     return lookupKeyReadWithFlags(db, key, LOOKUP_NONE);
 }
 
+/* Returns which dict index should be used with kvstore for a given vstr key. */
+int getKVStoreIndexForKeyVstr(const vstr *v) {
+    return server.cluster_enabled ? keyHashSlot(vstrData(v), (int)vstrLen(v)) : 0;
+}
+
+/* Zero-copy key lookup for read operations using a vstr key.
+ *
+ * Performs kvstore lookup via vstr (no allocation on the hot path), handles
+ * LRU/LFU update on the value, and handles expiry and key-miss notifications
+ * on the cold path (materializing a temporary key robj only when needed).
+ *
+ * This is the vstr equivalent of lookupKeyRead() with LOOKUP_NONE flags.
+ *
+ * TODO: The propagation layer (alsoPropagate, replicationFeedReplicas,
+ * feedAppendOnlyFile) could be refactored to accept raw bytes directly,
+ * eliminating the need to create a temporary robj on the expiry path.
+ * Similarly, notifyKeyspaceEvent could accept raw bytes. This would make
+ * the expiry path zero-alloc too, but it touches replication infrastructure
+ * and is deferred. */
+robj *lookupKeyReadVstr(serverDb *db, const vstr *key, client *c) {
+    if (server.lazy_expire_disabled) goto do_lookup;
+
+    int dict_index = getKVStoreIndexForKeyVstr(key);
+    void *existing = NULL;
+    kvstoreHashtableFind(db->keys, dict_index, vstrTagPtr(key), &existing);
+    robj *val = existing;
+
+    if (val) {
+        /* Check if the key is expired. Use the same expiration policy as
+         * the standard lookupKey → expireIfNeededWithDictIndex path. */
+        if (objectIsExpired(val)) {
+            expirationPolicy policy = getExpirationPolicyWithFlags(0);
+            if (policy == POLICY_IGNORE_EXPIRE) {
+                /* Treat as valid — fall through to LRU update. */
+            } else if (policy == POLICY_KEEP_EXPIRED) {
+                /* Key is expired but we must not delete it. Return NULL. */
+                server.stat_keyspace_misses++;
+                return NULL;
+            } else {
+                /* POLICY_DELETE_EXPIRED: materialize key robj for expiry
+                 * propagation (cold path), delete and propagate. */
+                robj *keyobj = createStringObject(vstrData(key), vstrLen(key));
+                deleteExpiredKeyAndPropagateWithDictIndex(db, keyobj, dict_index);
+                decrRefCount(keyobj);
+                server.stat_keyspace_misses++;
+                return NULL;
+            }
+        }
+
+        /* Update the access time for the ageing algorithm.
+         * Don't do it if we have a saving child, as this will trigger
+         * a copy on write madness. */
+        int no_touch = (c && c->flag.no_touch);
+        if (!no_touch && !hasActiveChildProcess()) {
+            serverAssert(val->refcount != OBJ_SHARED_REFCOUNT);
+            val->lru = lrulfu_touch(val->lru);
+        }
+
+        server.stat_keyspace_hits++;
+    } else {
+        /* Key miss — notify if enabled (cold path). */
+        if (server.notify_keyspace_events & NOTIFY_KEY_MISS) {
+            robj *keyobj = createStringObject(vstrData(key), vstrLen(key));
+            notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", keyobj, db->id);
+            decrRefCount(keyobj);
+        }
+        server.stat_keyspace_misses++;
+    }
+
+    return val;
+
+do_lookup: {
+    /* lazy_expire_disabled: skip expiry checks entirely, treat all keys as valid. */
+    int di = getKVStoreIndexForKeyVstr(key);
+    void *found = NULL;
+    kvstoreHashtableFind(db->keys, di, vstrTagPtr(key), &found);
+    robj *v = found;
+    if (v) {
+        int no_touch = (c && c->flag.no_touch);
+        if (!no_touch && !hasActiveChildProcess()) {
+            serverAssert(v->refcount != OBJ_SHARED_REFCOUNT);
+            v->lru = lrulfu_touch(v->lru);
+        }
+        server.stat_keyspace_hits++;
+    } else {
+        if (server.notify_keyspace_events & NOTIFY_KEY_MISS) {
+            robj *keyobj = createStringObject(vstrData(key), vstrLen(key));
+            notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", keyobj, db->id);
+            decrRefCount(keyobj);
+        }
+        server.stat_keyspace_misses++;
+    }
+    return v;
+}
+}
+
 /* Lookup a key for write operations, and as a side effect, if needed, expires
  * the key if its TTL is reached. It's equivalent to lookupKey() with the
  * LOOKUP_WRITE flag added.

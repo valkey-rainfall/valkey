@@ -152,6 +152,7 @@ static int parseMultibulk(client *c,
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
+void resetSharedQueryBuf(client *c);
 
 typedef enum {
     PARSE_OK = 0,
@@ -314,6 +315,11 @@ client *createClient(connection *conn) {
     c->argv = NULL;
     c->argv_len = 0;
     c->argv_len_sum = 0;
+    /* TODO: The vargv array is retained across commands to avoid per-command
+     * zmalloc/zfree. It is only freed in freeClient(). */
+    c->vargv = NULL;
+    c->vargv_len = 0;
+    c->vargc = 0;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->nread = 0;
@@ -1891,6 +1897,49 @@ void freeClientArgv(client *c) {
     c->argv = NULL;
 }
 
+void freeClientVargv(client *c) {
+    /* TODO (zero-copy-get): When all vargv entries are borrowed (the common
+     * read-command case), tryOffloadFreeArgvToIOThreads can be skipped entirely,
+     * eliminating cache-line bouncing between the main thread and IO threads
+     * for read commands. */
+    for (int j = 0; j < c->vargc; j++) {
+        vstrFree(&c->vargv[j]); /* no-op for borrowed, sdsfree for owned */
+    }
+    c->vargc = 0;
+
+    /* Release the shared query buffer now that borrowed references are cleared.
+     * For converted commands, resetSharedQueryBuf was deferred until this point
+     * to keep borrowed vstr references valid through execution. */
+    if (c->querybuf == thread_shared_qb) {
+        debugServerAssert(!(c->querybuf == thread_shared_qb && ProcessingEventsWhileBlocked));
+        resetSharedQueryBuf(c);
+    }
+}
+
+/* Materialize vargv entries into c->argv (robj **) for non-converted commands.
+ * Called after command lookup determines the command is not converted.
+ * After this call, c->argv[0..argc-1] contains robj entries identical to what
+ * the old parser would have produced. */
+void materializeVargv(client *c) {
+    /* Allocate or grow c->argv if needed. Reuse existing allocation when large enough. */
+    if (c->argv == NULL || c->argv_len < c->vargc) {
+        zfree(c->argv);
+        c->argv_len = c->vargc;
+        c->argv = zmalloc(sizeof(robj *) * c->argv_len);
+    }
+    c->argc = c->vargc;
+    c->argv_len_sum = 0;
+
+    for (int j = 0; j < c->vargc; j++) {
+        c->argv[j] = createStringObject(vstrData(&c->vargv[j]), vstrLen(&c->vargv[j]));
+        c->argv_len_sum += vstrLen(&c->vargv[j]);
+    }
+
+    /* TODO (zero-copy-get): High-value candidates for future zero-copy conversion
+     * (skip materialization like GET/MGET): SET, SADD, SISMEMBER, HGET, HSET,
+     * ZADD, LPUSH, RPUSH. Each would need a vargv-aware command handler. */
+}
+
 /* Close all the replicas connections. This is useful in chained replication
  * when we resync with our own primary and want to force all our replicas to
  * resync with us as well. */
@@ -2137,6 +2186,10 @@ void freeClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    zfree(c->vargv);
+    c->vargv = NULL;
+    c->vargv_len = 0;
+    c->vargc = 0;
     discardCommandQueue(c);
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
@@ -3251,12 +3304,9 @@ void resetClient(client *c) {
     serverCommandProc *prevcmd = c->cmd ? c->cmd->proc : NULL;
     serverCommandProc *prevParentCmd = c->cmd && c->cmd->parent ? c->cmd->parent->proc : NULL;
 
-    /* TODO (vstr zero-copy PoC, Req 8.3): After argv becomes vstr *,
-     * freeClientArgv handles cleanup via vstrFree (no-op for borrowed).
-     * Ensure query buffer trimming (sdsrange in trimQueryBuffer) is
-     * deferred until after this point so borrowed references are still valid. */
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    freeClientVargv(c);
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
     c->slot = -1;
@@ -3560,6 +3610,9 @@ static int parseMultibulk(client *c,
         /* The client (argc) should have been reset */
         serverAssertWithInfo(c, NULL, *argc == 0);
 
+        /* Reset vargc for the new command, parallel to argc reset. */
+        c->vargc = 0;
+
         /* Multi bulk length cannot be read without a \r\n */
         newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
         if (newline == NULL) {
@@ -3604,6 +3657,14 @@ static int parseMultibulk(client *c,
          * sizeof(robj *) to sizeof(vstr) here and in the realloc below. */
         *argv = zmalloc(sizeof(robj *) * *argv_len);
         *argv_len_sum = 0;
+
+        /* Setup vargv array (parallel to argv). Initial allocation uses the
+         * same starting size as argv. The array is retained across commands
+         * (freed only in freeClient), so we only allocate if needed. */
+        if (c->vargv_len < min(c->multibulklen, 1024)) {
+            c->vargv_len = min(c->multibulklen, 1024);
+            c->vargv = zrealloc(c->vargv, sizeof(vstr) * c->vargv_len);
+        }
 
         /* Per-slot network bytes-in calculation.
          *
@@ -3718,6 +3779,13 @@ static int parseMultibulk(client *c,
                 *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
             }
 
+            /* Grow vargv in parallel with argv when needed */
+            if (c->vargc >= c->vargv_len) {
+                c->vargv_len = min(c->vargv_len < INT_MAX / 2 ? c->vargv_len * 2 : INT_MAX,
+                                   c->vargc + c->multibulklen);
+                c->vargv = zrealloc(c->vargv, sizeof(vstr) * c->vargv_len);
+            }
+
             /* Check that what follows argv is a real \r\n */
             if (unlikely(c->querybuf[c->qb_pos + c->bulklen] != '\r' ||
                          c->querybuf[c->qb_pos + c->bulklen + 1] != '\n')) {
@@ -3739,6 +3807,13 @@ static int parseMultibulk(client *c,
                  * This transfers ownership of the querybuf sds to the vstr
                  * directly, avoiding the robj wrapper allocation. The querybuf
                  * is then replaced with a fresh sds as before. */
+
+                /* Produce borrowed vstr BEFORE ownership transfer. The robj
+                 * created below keeps the sds alive through command execution,
+                 * so the borrowed reference remains valid. */
+                vstrInitBorrowed(&c->vargv[c->vargc], c->querybuf, c->bulklen);
+                c->vargc++;
+
                 (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
                 *argv_len_sum += c->bulklen;
                 sdsIncrLen(c->querybuf, -2); /* remove CRLF */
@@ -3759,6 +3834,12 @@ static int parseMultibulk(client *c,
                  * This eliminates the sds + robj allocation entirely for read
                  * commands. The borrowed vstr points directly into the query
                  * buffer, which must remain stable until commandProcessed(). */
+
+                /* Produce borrowed vstr referencing the query buffer directly.
+                 * The querybuf remains stable through command execution. */
+                vstrInitBorrowed(&c->vargv[c->vargc], c->querybuf + c->qb_pos, c->bulklen);
+                c->vargc++;
+
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
@@ -5936,12 +6017,12 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
     int j;
     robj **argv; /* The new argument vector */
 
-    /* TODO (vstr zero-copy PoC, Req 12.1, 12.2, 19.4): Materialize at rewrite boundary.
-     * When c->argv becomes vstr *, materialize any borrowed vstr arguments from
-     * the original argv that are retained or referenced by the new argv. The new
-     * argument vector must contain only owned representations that do not
-     * reference the original query buffer. Eager materialization is appropriate
-     * since the rewritten argv replaces the original entirely. */
+    /* TODO (zero-copy-get, Req 13.1, 13.2): Materialize at rewriteClientCommandVector boundary.
+     * Currently the parser populates both c->argv (robj **) and c->vargv in
+     * parallel, so rewriteClientCommandVector operates on c->argv unchanged.
+     * When c->argv is no longer populated for converted commands, vargv entries
+     * must be materialized before rewriting so the new argument vector contains
+     * only owned representations that do not reference the query buffer. */
     argv = zmalloc(sizeof(robj *) * argc);
     va_start(ap, argc);
     for (j = 0; j < argc; j++) {

@@ -299,8 +299,26 @@ int getGenericCommand(client *c) {
     return C_OK;
 }
 
+/* Zero-copy GET handler. Reads the key directly from vargv (borrowed vstr
+ * reference into the query buffer) and performs the lookup without allocating
+ * an robj for the key argument. */
+void getCommandZeroCopy(client *c) {
+    robj *val = lookupKeyReadVstr(c->db, &c->vargv[1], c);
+    if (val == NULL) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
+
+    if (val->type != OBJ_STRING) {
+        addReplyErrorObject(c, shared.wrongtypeerr);
+        return;
+    }
+
+    addReplyBulk(c, val);
+}
+
 void getCommand(client *c) {
-    getGenericCommand(c);
+    getCommandZeroCopy(c);
 }
 
 /*
@@ -503,12 +521,13 @@ void getrangeCommand(client *c) {
     }
 }
 
-void mgetCommand(client *c) {
-    int j;
-
-    addReplyArrayLen(c, c->argc - 1);
-    for (j = 1; j < c->argc; j++) {
-        robj *o = lookupKeyRead(c->db, c->argv[j]);
+/* Zero-copy MGET handler. Reads keys directly from vargv (borrowed vstr
+ * references into the query buffer) and performs lookups without allocating
+ * robj for the key arguments. */
+void mgetCommandZeroCopy(client *c) {
+    addReplyArrayLen(c, c->vargc - 1);
+    for (int j = 1; j < c->vargc; j++) {
+        robj *o = lookupKeyReadVstr(c->db, &c->vargv[j], c);
         if (o == NULL) {
             addReplyNull(c);
         } else {
@@ -519,6 +538,10 @@ void mgetCommand(client *c) {
             }
         }
     }
+}
+
+void mgetCommand(client *c) {
+    mgetCommandZeroCopy(c);
 }
 
 void msetGenericCommand(client *c, int nx) {

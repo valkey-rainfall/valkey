@@ -520,6 +520,10 @@ void IOThreadFreeArgv(void *data) {
 /* This function attempts to offload the client's argv to an IO thread.
  * Returns C_OK if the client's argv were successfully offloaded to an IO thread,
  * C_ERR otherwise. */
+/* TODO (zero-copy-get): Borrowed vstr arguments (VSTR_BORROWED) require no
+ * cross-thread free — vstrFree is a no-op for them. When vargv is used,
+ * this offload path can be skipped entirely for all-borrowed argument vectors,
+ * avoiding the cache-line bouncing between the main thread and IO threads. */
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
     if (server.active_io_threads_num <= 1 || argc == 0) {
         return C_ERR;

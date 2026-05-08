@@ -2963,11 +2963,12 @@ ValkeyModuleString *VM_HoldString(ValkeyModuleCtx *ctx, ValkeyModuleString *str)
         return VM_CreateStringFromString(ctx, str);
     }
 
-    /* TODO (vstr zero-copy PoC, Req 11.1, 11.2, 19.4): Materialize at VM_HoldString boundary.
-     * When c->argv becomes vstr *, if 'str' originates from a borrowed vstr
-     * argument, call vstrMaterialize() before returning the retained string to
-     * the module. This ensures the module-held string outlives the query buffer.
-     * Eager materialization is correct here since the module explicitly retains. */
+    /* TODO (zero-copy-get, Req 12.1, 12.2): Materialize at VM_HoldString boundary.
+     * Currently the parser populates both c->argv (robj **) and c->vargv in
+     * parallel, so VM_HoldString operates on robj from c->argv unchanged.
+     * When c->argv is no longer populated for converted commands, VM_HoldString
+     * must detect if 'str' originates from a borrowed vstr argument and call
+     * vstrMaterialize() before returning the retained string to the module. */
     incrRefCount(str);
     if (ctx != NULL) {
         /*
