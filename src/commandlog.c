@@ -163,6 +163,20 @@ void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd) {
     robj **argv = c->original_argv ? c->original_argv : c->argv;
     int argc = c->original_argv ? c->original_argc : c->argc;
 
+    /* For converted commands (GET/MGET zero-copy path), argv may be NULL.
+     * Materialize from vargv on demand — this only fires when the command
+     * actually exceeds a commandlog threshold (rare for fast read commands). */
+    robj **materialized_argv = NULL;
+    if (argv == NULL && c->vargc > 0) {
+        argc = c->vargc;
+        materialized_argv = zmalloc(sizeof(robj *) * argc);
+        for (int j = 0; j < argc; j++) {
+            materialized_argv[j] = createStringObject(vstrData(&c->vargv[j]), vstrLen(&c->vargv[j]));
+        }
+        argv = materialized_argv;
+    }
+    if (argv == NULL) return;
+
     /* In script, client will be replaced with its caller, so commandlog needs to use the metrics
      * of the client that currently executing the command. */
     long duration = c->duration;
@@ -178,6 +192,14 @@ void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd) {
     commandlogPushEntryIfNeeded(c, argv, argc, duration, COMMANDLOG_TYPE_SLOW);
     commandlogPushEntryIfNeeded(c, argv, argc, net_input_bytes_curr_cmd, COMMANDLOG_TYPE_LARGE_REQUEST);
     commandlogPushEntryIfNeeded(c, argv, argc, net_output_bytes_curr_cmd, COMMANDLOG_TYPE_LARGE_REPLY);
+
+    /* Free the materialized argv if we created one for a converted command. */
+    if (materialized_argv != NULL) {
+        for (int j = 0; j < argc; j++) {
+            decrRefCount(materialized_argv[j]);
+        }
+        zfree(materialized_argv);
+    }
 }
 
 /* The SLOWLOG command. Implements all the subcommands needed to handle the

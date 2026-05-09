@@ -4103,7 +4103,9 @@ void call(client *c, int flags) {
     if (update_command_stats && !reprocessing_command && !(c->cmd->flags & (CMD_SKIP_MONITOR | CMD_ADMIN))) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
         int argc = c->original_argv ? c->original_argc : c->argc;
-        replicationFeedMonitors(c, server.monitors, c->db->id, argv, argc);
+        if (argv != NULL) {
+            replicationFeedMonitors(c, server.monitors, c->db->id, argv, argc);
+        }
     }
 
     /* Populate the per-command and per-slot statistics that we show in INFO commandstats and CLUSTER SLOT-STATS,
@@ -4341,9 +4343,42 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
     }
 }
 
-/* Prepare the client's current command. See prepareCommandGeneric(). */
+/* Prepare the client's current command. See prepareCommandGeneric().
+ * When c->argv is NULL (vargv-only path from the parser), uses
+ * lookupCommandFromVargv for command lookup and computes the cluster slot
+ * directly from vargv for simple key commands. */
 void prepareCommand(client *c) {
-    prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot);
+    if (c->argv != NULL) {
+        /* Queued commands or inline commands — argv is already populated. */
+        prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot);
+        return;
+    }
+
+    /* vargv-only path: the parser produced only vargv, no argv. */
+    if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) || c->argc == 0) return;
+    debugServerAssert(c->parsed_cmd == NULL && !(c->read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
+
+    c->parsed_cmd = lookupCommandFromVargv(c->vargv, c->vargc);
+    if (!c->parsed_cmd) {
+        c->read_flags |= READ_FLAGS_COMMAND_NOT_FOUND;
+    } else if (!commandCheckArity(c->parsed_cmd, c->argc, NULL)) {
+        c->read_flags |= READ_FLAGS_BAD_ARITY;
+    } else if (server.cluster_enabled) {
+        /* For simple key commands (GET, MGET, and most others), compute the
+         * slot from vargv[1]. For commands with complex key patterns, defer
+         * slot calculation to after materialization. */
+        if (c->parsed_cmd->proc == getCommand && c->vargc >= 2) {
+            c->slot = keyHashSlot(vstrData(&c->vargv[1]), (int)vstrLen(&c->vargv[1]));
+        } else if (c->parsed_cmd->proc == mgetCommand && c->vargc >= 2) {
+            /* MGET: compute slot from first key, check cross-slot later in processCommand. */
+            c->slot = keyHashSlot(vstrData(&c->vargv[1]), (int)vstrLen(&c->vargv[1]));
+        } else {
+            /* Non-converted commands will have slot computed after materialization
+             * via unprepareCommand + prepareCommand in processCommand. We set
+             * slot = -1 here; it will be recomputed after materializeVargv. */
+            c->slot = -1;
+        }
+    }
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
@@ -4392,8 +4427,14 @@ int processCommand(client *c) {
 
     /* only run command filter if not reprocessing command */
     if (!client_reprocessing_command) {
-        moduleCallCommandFilters(c);
-        reqresAppendRequest(c);
+        /* For converted commands (GET/MGET), c->argv is NULL. Module command
+         * filters and reqres logging require argv, but we only reach here with
+         * argv==NULL when no module filters are registered (checked in
+         * processInputBuffer). Skip these calls for the zero-copy path. */
+        if (c->argv != NULL) {
+            moduleCallCommandFilters(c);
+            reqresAppendRequest(c);
+        }
     }
 
     /* If we're inside a module blocked context yielding that wants to avoid
@@ -4412,7 +4453,8 @@ int processCommand(client *c) {
         struct serverCommand *cmd = c->parsed_cmd;
         if (!cmd) {
             /* Handle possible security attacks. */
-            if (!strcasecmp(objectGetVal(c->argv[0]), "host:") || !strcasecmp(objectGetVal(c->argv[0]), "post")) {
+            if (c->argv != NULL &&
+                (!strcasecmp(objectGetVal(c->argv[0]), "host:") || !strcasecmp(objectGetVal(c->argv[0]), "post"))) {
                 securityWarningCommand(c);
                 return C_ERR;
             }
@@ -7232,12 +7274,12 @@ void dismissClientMemory(client *c) {
     dismissMemory(c->buf, c->buf_usable_size);
     if (c->querybuf) dismissSds(c->querybuf);
     /* Dismiss argv array only if we estimate it contains a big buffer. */
-    if (c->argc && c->argv_len_sum / c->argc >= server.page_size) {
+    if (c->argc && c->argv != NULL && c->argv_len_sum / c->argc >= server.page_size) {
         for (int i = 0; i < c->argc; i++) {
             dismissObject(c->argv[i], 0);
         }
     }
-    if (c->argc) dismissMemory(c->argv, c->argc * sizeof(robj *));
+    if (c->argc && c->argv != NULL) dismissMemory(c->argv, c->argc * sizeof(robj *));
 
     /* Dismiss the reply array only if the average buffer size is bigger
      * than a page. */

@@ -2112,6 +2112,16 @@ int ACLCheckAllPerm(client *c, int *idxptr) {
     return ACLCheckAllUserCommandPerm(c->user, c->cmd, c->argv, c->argc, dbid, idxptr);
 }
 
+/* Returns non-zero if the user's root selector has ALLCOMMANDS and ALLKEYS,
+ * meaning ACL checks will not inspect command arguments. Used by the zero-copy
+ * path to determine if materialization can be skipped. */
+int ACLUserHasUnrestrictedAccess(user *u) {
+    if (u == NULL) return 1;
+    if (listLength(u->selectors) == 0) return 0;
+    aclSelector *root = (aclSelector *)listNodeValue(listFirst(u->selectors));
+    return (root->flags & SELECTOR_FLAG_ALLCOMMANDS) && (root->flags & SELECTOR_FLAG_ALLKEYS);
+}
+
 /* If 'new' can access all channels 'original' could then return NULL;
    Otherwise return a list of channels that the new user can access */
 static list *getUpcomingChannelList(user *new, user *original) {

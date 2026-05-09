@@ -11291,6 +11291,11 @@ int VM_UnregisterCommandFilter(ValkeyModuleCtx *ctx, ValkeyModuleCommandFilter *
     return VALKEYMODULE_OK;
 }
 
+/* Returns non-zero if any module command filters are registered. */
+int moduleHasCommandFilters(void) {
+    return listLength(moduleCommandFilters) > 0;
+}
+
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 

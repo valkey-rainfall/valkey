@@ -1877,11 +1877,15 @@ void freeClientOriginalArgv(client *c) {
 }
 
 void freeClientArgv(client *c) {
-    /* TODO (vstr zero-copy PoC, Req 8.3): When c->argv becomes vstr *,
-     * replace decrRefCount(c->argv[j]) with vstrFree(&c->argv[j]).
-     * vstrFree is a no-op for borrowed vstr (the common read-command case),
-     * and calls sdsfree for owned sds vstr. The tryOffloadFreeArgvToIOThreads
-     * path also needs updating — borrowed vstr requires no cross-thread free. */
+    /* For converted commands (GET/MGET), argv is never populated. */
+    if (c->argv == NULL) {
+        c->argc = 0;
+        c->cmd = NULL;
+        c->parsed_cmd = NULL;
+        c->argv_len_sum = 0;
+        c->argv_len = 0;
+        return;
+    }
 
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
@@ -3560,6 +3564,26 @@ void parseMultibulkBuffer(client *c) {
            sdslen(c->querybuf) > c->qb_pos &&
            c->querybuf[c->qb_pos] == '*') {
         c->reqtype = PROTO_REQ_MULTIBULK;
+
+        /* Before parsing the next command, materialize the first command's
+         * vargv into c->argv if not already done. The pipeline loop will
+         * overwrite c->vargv. */
+        if (queue->len == 0 && c->argv == NULL && c->vargc > 0) {
+            /* Materialize the first command's vargv into c->argv. */
+            c->argv_len = c->vargc;
+            c->argv = zmalloc(sizeof(robj *) * c->argv_len);
+            c->argv_len_sum = 0;
+            for (int j = 0; j < c->vargc; j++) {
+                c->argv[j] = createStringObject(vstrData(&c->vargv[j]), vstrLen(&c->vargv[j]));
+                c->argv_len_sum += vstrLen(&c->vargv[j]);
+            }
+            /* Clean up vargv entries for the first command. */
+            for (int j = 0; j < c->vargc; j++) {
+                vstrFree(&c->vargv[j]);
+            }
+            c->vargc = 0;
+        }
+
         /* Push a new parser state to the command queue */
         if (queue->len == queue->cap) {
             if (queue->cap == 0) {
@@ -3577,6 +3601,23 @@ void parseMultibulkBuffer(client *c) {
                               &p->argv_len_sum, &p->input_bytes);
         p->read_flags = flag;
         p->slot = -1;
+
+        /* For pipelined commands, materialize vargv into p->argv immediately
+         * since c->vargv will be overwritten by the next command's parse. */
+        if (flag & READ_FLAGS_PARSING_COMPLETED) {
+            p->argv_len = c->vargc;
+            p->argv = zmalloc(sizeof(robj *) * p->argv_len);
+            p->argv_len_sum = 0;
+            for (int j = 0; j < c->vargc; j++) {
+                p->argv[j] = createStringObject(vstrData(&c->vargv[j]), vstrLen(&c->vargv[j]));
+                p->argv_len_sum += vstrLen(&c->vargv[j]);
+            }
+            /* Clean up vargv entries for this queued command. */
+            for (int j = 0; j < c->vargc; j++) {
+                vstrFree(&c->vargv[j]);
+            }
+            c->vargc = 0;
+        }
     }
 }
 
@@ -3606,11 +3647,16 @@ static int parseMultibulk(client *c,
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
     int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
 
+    /* The parser now only produces vargv. argv is not populated here;
+     * materialization happens later for non-converted commands. */
+    (void)argv;
+    (void)argv_len;
+
     if (c->multibulklen == 0) {
         /* The client (argc) should have been reset */
         serverAssertWithInfo(c, NULL, *argc == 0);
 
-        /* Reset vargc for the new command, parallel to argc reset. */
+        /* Reset vargc for the new command. */
         c->vargc = 0;
 
         /* Multi bulk length cannot be read without a \r\n */
@@ -3650,16 +3696,13 @@ static int parseMultibulk(client *c,
         c->multibulklen = ll;
         c->bulklen = -1;
 
-        /* Setup argv array */
-        if (*argv) zfree(*argv);
-        *argv_len = min(c->multibulklen, 1024);
-        /* TODO (vstr zero-copy PoC): When argv becomes vstr *, change
-         * sizeof(robj *) to sizeof(vstr) here and in the realloc below. */
-        *argv = zmalloc(sizeof(robj *) * *argv_len);
+        /* argv is no longer allocated here — materialization populates it
+         * later for non-converted commands. */
+        *argv = NULL;
+        *argv_len = 0;
         *argv_len_sum = 0;
 
-        /* Setup vargv array (parallel to argv). Initial allocation uses the
-         * same starting size as argv. The array is retained across commands
+        /* Setup vargv array. The array is retained across commands
          * (freed only in freeClient), so we only allocate if needed. */
         if (c->vargv_len < min(c->multibulklen, 1024)) {
             c->vargv_len = min(c->multibulklen, 1024);
@@ -3752,6 +3795,12 @@ static int parseMultibulk(client *c,
                         /* Let the client take the ownership of the shared buffer. */
                         initSharedQueryBuf();
                     }
+                    /* Materialize any borrowed vargv entries before sdsrange
+                     * shifts/reallocates the buffer, which would invalidate
+                     * borrowed pointers into the old buffer contents. */
+                    for (int k = 0; k < c->vargc; k++) {
+                        vstrMaterialize(&c->vargv[k]);
+                    }
                     sdsrange(c->querybuf, c->qb_pos, -1);
                     c->qb_pos = 0;
                     /* Hint the sds library about the amount of bytes this string is
@@ -3772,75 +3821,35 @@ static int parseMultibulk(client *c,
             /* Not enough data (+2 == trailing \r\n) */
             break;
         } else {
-            /* Check if we have space in argv, grow if needed */
-            if (*argc >= *argv_len) {
-                *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
-                                *argc + c->multibulklen);
-                *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
-            }
-
-            /* Grow vargv in parallel with argv when needed */
+            /* Grow vargv when needed */
             if (c->vargc >= c->vargv_len) {
                 c->vargv_len = min(c->vargv_len < INT_MAX / 2 ? c->vargv_len * 2 : INT_MAX,
                                    c->vargc + c->multibulklen);
                 c->vargv = zrealloc(c->vargv, sizeof(vstr) * c->vargv_len);
             }
 
-            /* Check that what follows argv is a real \r\n */
+            /* Check that what follows the argument is a real \r\n */
             if (unlikely(c->querybuf[c->qb_pos + c->bulklen] != '\r' ||
                          c->querybuf[c->qb_pos + c->bulklen + 1] != '\n')) {
                 return READ_FLAGS_ERROR_INVALID_CRLF;
             }
 
-            /* Optimization: if a non-replicated client's buffer contains JUST our bulk element
-             * instead of creating a new object by *copying* the sds we
-             * just use the current sds string. */
+            /* Big-argument optimization: if the buffer contains JUST this bulk
+             * element, transfer ownership of the querybuf sds to the vstr. */
             if (!is_replicated && c->qb_pos == 0 && c->bulklen >= PROTO_MBULK_BIG_ARG &&
                 sdslen(c->querybuf) == (size_t)(c->bulklen + 2)) {
-                /* TODO (vstr zero-copy PoC, Req 8.2): Big-argument optimization.
-                 * When argv becomes vstr *, replace the createObject() call with:
-                 *
-                 *     sdsIncrLen(c->querybuf, -2);
-                 *     vstrInitSds(&(*argv)[*argc], c->querybuf);
-                 *     (*argc)++;
-                 *
-                 * This transfers ownership of the querybuf sds to the vstr
-                 * directly, avoiding the robj wrapper allocation. The querybuf
-                 * is then replaced with a fresh sds as before. */
-
-                /* Produce borrowed vstr BEFORE ownership transfer. The robj
-                 * created below keeps the sds alive through command execution,
-                 * so the borrowed reference remains valid. */
-                vstrInitBorrowed(&c->vargv[c->vargc], c->querybuf, c->bulklen);
+                sdsIncrLen(c->querybuf, -2); /* strip trailing \r\n */
+                vstrInitSds(&c->vargv[c->vargc], c->querybuf);
                 c->vargc++;
-
-                (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
                 *argv_len_sum += c->bulklen;
-                sdsIncrLen(c->querybuf, -2); /* remove CRLF */
                 /* Assume that if we saw a fat argument we'll see another one
                  * likely... */
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                /* TODO (vstr zero-copy PoC, Req 8.1): Normal-sized argument.
-                 * When argv becomes vstr *, replace the createStringObject()
-                 * call with a zero-copy borrowed reference:
-                 *
-                 *     vstrInitBorrowed(&(*argv)[*argc],
-                 *                      c->querybuf + c->qb_pos,
-                 *                      c->bulklen);
-                 *     (*argc)++;
-                 *
-                 * This eliminates the sds + robj allocation entirely for read
-                 * commands. The borrowed vstr points directly into the query
-                 * buffer, which must remain stable until commandProcessed(). */
-
-                /* Produce borrowed vstr referencing the query buffer directly.
-                 * The querybuf remains stable through command execution. */
+                /* Normal-sized argument: borrowed reference into querybuf. */
                 vstrInitBorrowed(&c->vargv[c->vargc], c->querybuf + c->qb_pos, c->bulklen);
                 c->vargc++;
-
-                (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }
@@ -3849,39 +3858,22 @@ static int parseMultibulk(client *c,
         }
     }
 
-    /* TODO (vstr zero-copy PoC, Req 8.4): Query buffer stability.
-     * When argv uses borrowed vstr references into c->querybuf, the query
-     * buffer MUST NOT be trimmed or reallocated during command execution.
-     * Buffer advancement (sdsrange / qb_pos reset) must be deferred until
-     * after commandProcessed() completes. The current code already advances
-     * qb_pos inline, which is safe because it doesn't reallocate; but the
-     * sdsrange() call in the big-argument path above (and in
-     * trimQueryBuffer()) must be guarded so it only runs after the command
-     * handler has finished reading borrowed argv data. */
-
-    /* TODO (vstr zero-copy PoC, Req 19.3): Remaining robj-to-vstr conversion
-     * boundaries. Changing parseMultibulk to produce vstr instead of robj
-     * requires updating every call site that reads c->argv[i] as robj *.
-     * This is a codebase-wide sweep of hundreds of call sites across ~50
-     * source files, including:
-     *   - All command implementations (src/t_string.c, t_list.c, t_set.c,
-     *     t_zset.c, t_hash.c, t_stream.c, etc.)
-     *   - Command dispatch and argument validation (src/server.c)
-     *   - Argument freeing in resetClient / freeClientArgv
-     *   - tryObjectEncoding call sites (defer encoding to storage point)
-     *   - Replication argument forwarding (src/replication.c)
-     *   - Module API argument access (src/module.c)
-     *   - ACL and auth argument inspection
-     *   - Scripting argument passing (src/script*.c)
-     * For the PoC, the hashtable callback migration (Phases 1-3) demonstrates
-     * the core zero-copy value. The parser change is the next production step. */
-
     /* We're done when c->multibulklen == 0 */
     if (c->multibulklen == 0) {
+        /* Set argc from vargc so callers can read the argument count. */
+        *argc = c->vargc;
         /* Per-slot network bytes-in calculation, 3rd and 4th components. */
-        *net_input_bytes_curr_cmd += (*argv_len_sum + (*argc * 2));
+        *net_input_bytes_curr_cmd += (*argv_len_sum + (c->vargc * 2));
         c->reqtype = 0;
         return READ_FLAGS_PARSING_COMPLETED;
+    }
+
+    /* Incomplete parse — the command spans multiple reads. Materialize any
+     * borrowed vargv entries now, because readToQueryBuf may reallocate
+     * c->querybuf (via sdsMakeRoomFor) before the next parse call, which
+     * would invalidate borrowed pointers into the old buffer. */
+    for (int k = 0; k < c->vargc; k++) {
+        vstrMaterialize(&c->vargv[k]);
     }
     return 0;
 }
@@ -4099,10 +4091,12 @@ void discardCommandQueue(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     while (queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off++];
-        for (int j = 0; j < p->argc; j++) {
-            decrRefCount(p->argv[j]);
+        if (p->argv != NULL) {
+            for (int j = 0; j < p->argc; j++) {
+                decrRefCount(p->argv[j]);
+            }
+            zfree(p->argv);
         }
-        zfree(p->argv);
     }
     zfree(queue->cmds);
     queue->cmds = NULL;
@@ -4154,15 +4148,17 @@ static void prefetchCommandQueueKeys(client *c) {
     if (max_keys <= 1) return; /* No point to prefetch a single key */
 
     /* If the command is valid, add keys to incremental find batch. */
-    if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
+    if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY) && c->argv != NULL) {
         num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
                                           key_incr_states, num_keys, max_keys);
     } else {
-        /* Command is already found to be incomplete, non-existing, etc. */
+        /* Command is already found to be incomplete, non-existing, etc.
+         * Also covers converted commands where c->argv is NULL. */
         debugServerAssert(!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
                           c->argc == 0 ||
                           (c->read_flags & READ_FLAGS_COMMAND_NOT_FOUND) ||
-                          (c->read_flags & READ_FLAGS_BAD_ARITY));
+                          (c->read_flags & READ_FLAGS_BAD_ARITY) ||
+                          c->argv == NULL);
     }
 
     cmdQueue *queue = &c->cmd_queue;
@@ -4235,10 +4231,37 @@ int processInputBuffer(client *c) {
             continue;
         }
 
-        if (c->querybuf == thread_shared_qb) {
+        /* Determine if this is a converted command (GET/MGET) that can skip
+         * materialization and use vargv directly. */
+        int is_converted = 0;
+        if (c->argv == NULL && c->parsed_cmd != NULL &&
+            (c->parsed_cmd->proc == getCommand || c->parsed_cmd->proc == mgetCommand)) {
+            /* Converted command: skip materialization if safe. Module command
+             * filters and ACL key checks require c->argv. Fall back to
+             * materialization if any module filters are registered, if the
+             * user has key/command restrictions, or if the client is in a
+             * MULTI transaction (queued commands need argv for deferred exec). */
+            if (!moduleHasCommandFilters() && ACLUserHasUnrestrictedAccess(c->user) && !c->flag.multi) {
+                is_converted = 1;
+            }
+        }
+
+        if (!is_converted && c->argv == NULL) {
+            /* Non-converted command (or converted with module filters): materialize
+             * vargv into c->argv so the existing processing pipeline works. */
+            materializeVargv(c);
+            /* Recompute command lookup and cluster slot from materialized argv
+             * for non-converted commands that need accurate slot info. */
+            if (c->parsed_cmd != NULL && server.cluster_enabled && c->slot == -1) {
+                c->slot = clusterSlotByCommand(c->parsed_cmd, c->argv, c->argc, &c->read_flags);
+            }
+        }
+
+        if (c->querybuf == thread_shared_qb && !is_converted) {
             /* Before processing the command, reset the shared query buffer to its default state.
              * This avoids unintentionally modifying the shared qb during processCommand as we may use
-             * the shared qb for other clients during processEventsWhileBlocked */
+             * the shared qb for other clients during processEventsWhileBlocked.
+             * For converted commands, defer this until freeClientVargv. */
             resetSharedQueryBuf(c);
         }
 
