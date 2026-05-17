@@ -2186,6 +2186,7 @@ int freeClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    if (c->vargv) { zfree(c->vargv); c->vargv = NULL; }
     discardCommandQueue(c);
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
@@ -2272,8 +2273,10 @@ void resetSharedQueryBuf(client *c) {
     serverAssert(c->querybuf == thread_shared_qb);
     size_t remaining = sdslen(c->querybuf) - c->qb_pos;
 
-    /* Force client ownership if there's unparsed data OR borrowed vargv refs. */
-    if (remaining > 0 || c->vargc > 0 || c->cmd_queue.len > 0) {
+    /* Force client ownership if there's unparsed data OR queued commands with
+     * borrowed vargv refs (pipeline). For a single command, the buffer is
+     * stable through execution on the single-threaded path. */
+    if (remaining > 0 || c->cmd_queue.len > 0) {
         /* Let the client take ownership of the shared buffer. */
         initSharedQueryBuf();
         return;
@@ -2294,12 +2297,15 @@ void trimClientQueryBuffer(client *c) {
         return;
     }
 
-    serverAssert(c->qb_pos <= sdslen(c->querybuf));
-
     /* Skip trim if borrowed vargv refs point into this buffer. */
-    if (c->vargc > 0 || c->cmd_queue.len > 0) {
+    if (c->vargc > 0) {
         return;
     }
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        if (c->cmd_queue.cmds[i].vargv != NULL) return;
+    }
+
+    serverAssert(c->qb_pos <= sdslen(c->querybuf));
 
     if (c->qb_pos > 0) {
         sdsrange(c->querybuf, c->qb_pos, -1);
@@ -3335,6 +3341,12 @@ void resetClient(client *c) {
     freeClientArgv(c);
     freeClientOriginalArgv(c);
     c->vargc = 0; /* Borrowed refs consumed — just reset count, buffer stays owned. */
+    /* Free oversized vargv to avoid memory bloat from large commands. */
+    if (c->vargv_len > 1024) {
+        zfree(c->vargv);
+        c->vargv = NULL;
+        c->vargv_len = 0;
+    }
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4187,8 +4199,19 @@ static void prefetchCommandQueueKeys(client *c) {
 
     /* If the command is valid, add keys to incremental find batch. */
     if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
-        num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
-                                          key_incr_states, num_keys, max_keys);
+        if (c->argv == NULL && c->vargc > 0 && (c->parsed_cmd->proc == getCommand || c->parsed_cmd->proc == mgetCommand)) {
+            /* Zero-copy: prefetch keys directly from vargv. */
+            int key_end = (c->parsed_cmd->proc == mgetCommand) ? c->vargc : 2;
+            int kvstore_idx = server.cluster_enabled ? keyHashSlot(vstrData(&c->vargv[1]), (int)vstrLen(&c->vargv[1])) : 0;
+            hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
+            if (ht) {
+                for (int j = 1; j < key_end && num_keys < max_keys; j++)
+                    hashtableIncrementalFindInit(&key_incr_states[num_keys++], ht, vstrTagPtr(&c->vargv[j]));
+            }
+        } else {
+            num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
+                                              key_incr_states, num_keys, max_keys);
+        }
     } else {
         /* Command is already found to be incomplete, non-existing, etc. */
         debugServerAssert(!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
@@ -4210,8 +4233,18 @@ static void prefetchCommandQueueKeys(client *c) {
                               (p->read_flags & READ_FLAGS_BAD_ARITY));
             continue;
         }
-        num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
-                                          key_incr_states, num_keys, max_keys);
+        if (p->vargc > 0 && (p->cmd->proc == getCommand || p->cmd->proc == mgetCommand)) {
+            int key_end = (p->cmd->proc == mgetCommand) ? p->vargc : 2;
+            int kvstore_idx = server.cluster_enabled ? keyHashSlot(vstrData(&p->vargv[1]), (int)vstrLen(&p->vargv[1])) : 0;
+            hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
+            if (ht) {
+                for (int j = 1; j < key_end && num_keys < max_keys; j++)
+                    hashtableIncrementalFindInit(&key_incr_states[num_keys++], ht, vstrTagPtr(&p->vargv[j]));
+            }
+        } else {
+            num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
+                                              key_incr_states, num_keys, max_keys);
+        }
     }
     if (num_keys <= 1) return; /* No point to prefetch a single key */
 

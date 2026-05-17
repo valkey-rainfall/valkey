@@ -314,7 +314,7 @@ int getGenericCommand(client *c) {
 }
 
 void getCommand(client *c) {
-    if (c->vargc > 0) {
+    if (c->argv == NULL && c->vargc > 0) {
         /* Zero-copy path: lookup key directly from vargv. */
         robj *val = lookupKeyReadVstr(c->db, &c->vargv[1]);
         if (val == NULL) {
@@ -540,7 +540,7 @@ void getrangeCommand(client *c) {
 }
 
 void mgetCommand(client *c) {
-    if (c->vargc > 0) {
+    if (c->argv == NULL && c->vargc > 0) {
         /* Zero-copy path: lookup keys directly from vargv. */
         addReplyArrayLen(c, c->argc - 1);
         for (int j = 1; j < c->argc; j++) {
