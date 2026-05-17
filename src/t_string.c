@@ -525,8 +525,8 @@ void getrangeCommand(client *c) {
  * references into the query buffer) and performs lookups without allocating
  * robj for the key arguments. */
 void mgetCommandZeroCopy(client *c) {
-    addReplyArrayLen(c, c->vargc - 1);
-    for (int j = 1; j < c->vargc; j++) {
+    addReplyArrayLen(c, c->argc - 1);
+    for (int j = 1; j < c->argc; j++) {
         robj *o = lookupKeyReadVstr(c->db, &c->vargv[j], c);
         if (o == NULL) {
             addReplyNull(c);

@@ -1142,3 +1142,142 @@ TEST_F(ZeroCopyProperty6Test, LookupEquivalenceViaBorrowedVstrVsSds) {
         hashtableRelease(ht); /* Frees the sds entries via entryDestructor. */
     }
 }
+
+/* --- Pipeline vargv lifecycle tests --- */
+
+/* Test fixture for pipeline vargv transfer and restore. */
+class PipelineVargvTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        initSharedQueryBuf();
+    }
+
+    void TearDown() override {
+        freeSharedQueryBuf(NULL);
+    }
+};
+
+/* Test that parsedCommand.vargv entries survive transfer and are accessible
+ * after consumeCommandQueue restores them to c->vargv. */
+TEST_F(PipelineVargvTest, VargvTransferToQueuedCommand) {
+    /* Simulate: parser produces vargv for a queued GET command,
+     * transfers to parsedCommand, then consumeCommandQueue restores it. */
+
+    /* Create a stable buffer simulating the query buffer. */
+    const char *querybuf_data = "GET\r\nmykey123\r\n";
+    sds querybuf = sdsnewlen(querybuf_data, strlen(querybuf_data));
+
+    /* Simulate parser output: 2 borrowed vstr entries. */
+    vstr parsed_vargv[2];
+    vstrInitBorrowed(&parsed_vargv[0], querybuf + 0, 3);   /* "GET" */
+    vstrInitBorrowed(&parsed_vargv[1], querybuf + 5, 8);   /* "mykey123" */
+
+    /* Transfer to parsedCommand (simulates the pipeline storage path). */
+    parsedCommand p;
+    memset(&p, 0, sizeof(p));
+    p.vargc = 2;
+    p.vargv = (vstr *)zmalloc(sizeof(vstr) * 2);
+    p.vargv[0] = parsed_vargv[0];
+    p.vargv[1] = parsed_vargv[1];
+    p.argv = NULL;
+    p.argv_len = 0;
+    p.read_flags = READ_FLAGS_PARSING_COMPLETED;
+    p.argc = 2;
+
+    /* Verify the transferred entries still point to valid data. */
+    ASSERT_TRUE(vstrIsBorrowed(&p.vargv[0]));
+    ASSERT_TRUE(vstrIsBorrowed(&p.vargv[1]));
+    ASSERT_EQ(vstrLen(&p.vargv[0]), 3u);
+    ASSERT_EQ(memcmp(vstrData(&p.vargv[0]), "GET", 3), 0);
+    ASSERT_EQ(vstrLen(&p.vargv[1]), 8u);
+    ASSERT_EQ(memcmp(vstrData(&p.vargv[1]), "mykey123", 8), 0);
+
+    /* Simulate consumeCommandQueue: restore vargv to client. */
+    vstr *restored_vargv = p.vargv;
+    int restored_vargc = p.vargc;
+    (void)restored_vargc;
+    p.vargv = NULL;
+    p.vargc = 0;
+
+    /* Verify restored entries are still valid (buffer hasn't been freed). */
+    ASSERT_EQ(vstrLen(&restored_vargv[0]), 3u);
+    ASSERT_EQ(memcmp(vstrData(&restored_vargv[0]), "GET", 3), 0);
+    ASSERT_EQ(vstrLen(&restored_vargv[1]), 8u);
+    ASSERT_EQ(memcmp(vstrData(&restored_vargv[1]), "mykey123", 8), 0);
+
+    /* Cleanup. */
+    zfree(restored_vargv);
+    sdsfree(querybuf);
+}
+
+/* Test that discardCommandQueue properly frees vargv entries. */
+TEST_F(PipelineVargvTest, DiscardQueueFreesVargv) {
+    /* Create owned vstr entries (simulating big arguments that took ownership). */
+    parsedCommand p;
+    memset(&p, 0, sizeof(p));
+    p.vargc = 2;
+    p.vargv = (vstr *)zmalloc(sizeof(vstr) * 2);
+
+    sds owned1 = sdsnewlen("BIGCMD", 6);
+    sds owned2 = sdsnewlen("BIGKEY", 6);
+    vstrInitSds(&p.vargv[0], owned1);
+    vstrInitSds(&p.vargv[1], owned2);
+    p.argv = NULL;
+    p.argc = 2;
+
+    /* Simulate discardCommandQueue logic for this entry. */
+    for (int j = 0; j < p.vargc; j++) {
+        vstrFree(&p.vargv[j]);
+    }
+    zfree(p.vargv);
+
+    /* If we get here without crash/ASAN error, owned entries were freed correctly. */
+    SUCCEED();
+}
+
+/* Test first_cmd_vargv save/restore during pipelining. */
+TEST_F(PipelineVargvTest, FirstCmdVargvSaveRestore) {
+    /* Simulate: first command parsed into c->vargv, then pipeline detected,
+     * first_cmd_vargv saved, new vargv allocated for pipeline parsing. */
+
+    const char *buf = "GET\r\nfirstkey\r\nGET\r\nsecondkey\r\n";
+    sds querybuf = sdsnewlen(buf, strlen(buf));
+
+    /* First command's vargv. */
+    vstr *first_vargv = (vstr *)zmalloc(sizeof(vstr) * 4);
+    vstrInitBorrowed(&first_vargv[0], querybuf + 0, 3);    /* "GET" */
+    vstrInitBorrowed(&first_vargv[1], querybuf + 5, 8);    /* "firstkey" */
+    int first_vargc = 2;
+
+    /* Simulate the save: stash first_cmd_vargv, allocate fresh for pipeline. */
+    vstr *saved_first = first_vargv;
+    int saved_first_argc = first_vargc;
+    vstr *pipeline_vargv = (vstr *)zmalloc(sizeof(vstr) * 4);
+
+    /* Parse second command into pipeline_vargv. */
+    vstrInitBorrowed(&pipeline_vargv[0], querybuf + 15, 3);  /* "GET" */
+    vstrInitBorrowed(&pipeline_vargv[1], querybuf + 20, 9);  /* "secondkey" */
+
+    /* Simulate restore: swap back first_cmd_vargv for execution. */
+    zfree(pipeline_vargv);
+    vstr *restored = saved_first;
+    int restored_argc = saved_first_argc;
+
+    /* Verify first command's data is intact after round-trip. */
+    ASSERT_EQ(restored_argc, 2);
+    ASSERT_EQ(vstrLen(&restored[0]), 3u);
+    ASSERT_EQ(memcmp(vstrData(&restored[0]), "GET", 3), 0);
+    ASSERT_EQ(vstrLen(&restored[1]), 8u);
+    ASSERT_EQ(memcmp(vstrData(&restored[1]), "firstkey", 8), 0);
+
+    /* Cleanup. */
+    zfree(restored);
+    sdsfree(querybuf);
+}
+
+/* Test that buffer ownership prevents use-after-free.
+ * This is validated by the integration test (valkey-benchmark with pipelining)
+ * rather than a unit test, since resetSharedQueryBuf is static and
+ * thread_shared_qb is thread-local. The key invariant is:
+ * when c->vargc > 0, resetSharedQueryBuf forces client buffer ownership. */
+

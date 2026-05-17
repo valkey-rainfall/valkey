@@ -1267,14 +1267,15 @@ typedef struct ClientModuleData {
 typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
     int argc;
-    /* TODO (vstr zero-copy PoC): Change to vstr * when client.argv changes.
-     * See TODO comment on client.argv in this file. */
     robj **argv;
     int argv_len;
     int slot;
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    /* Per-command vstr storage for zero-copy pipelining. */
+    vstr *vargv;
+    int vargc;
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1336,6 +1337,8 @@ typedef struct client {
     vstr *vargv;         /* Parallel argument array: vstr values from parser. */
     int vargv_len;       /* Allocated capacity of vargv (in vstr units). */
     int vargc;           /* Number of arguments in vargv for current command. */
+    vstr *first_cmd_vargv; /* Saved vargv for first command when pipelining. */
+    int first_cmd_vargc;   /* Argument count for first_cmd_vargv. */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */

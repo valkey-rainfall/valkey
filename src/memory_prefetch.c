@@ -182,7 +182,7 @@ static void prefetchCommands(void) {
     /* Prefetch argv's for all clients */
     for (size_t i = 0; i < batch->client_count; i++) {
         client *c = batch->clients[i];
-        if (!c || c->argc <= 1) continue;
+        if (!c || c->argc <= 1 || c->argv == NULL) continue;
         /* Skip prefetching first argv (cmd name) it was already looked up by the I/O thread. */
         for (int j = 1; j < c->argc; j++) {
             valkey_prefetch(c->argv[j]);
@@ -192,7 +192,7 @@ static void prefetchCommands(void) {
     /* Prefetch the argv->ptr if required */
     for (size_t i = 0; i < batch->client_count; i++) {
         client *c = batch->clients[i];
-        if (!c || c->argc <= 1) continue;
+        if (!c || c->argc <= 1 || c->argv == NULL) continue;
         for (int j = 1; j < c->argc; j++) {
             if (c->argv[j]->encoding == OBJ_ENCODING_RAW) {
                 valkey_prefetch(objectGetVal(c->argv[j]));
@@ -266,7 +266,7 @@ int addCommandToBatchAndProcessIfFull(client *c) {
     batch->clients[batch->client_count++] = c;
 
     /* Client's next command */
-    if (c->parsed_cmd && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
+    if (c->parsed_cmd && !(c->read_flags & READ_FLAGS_BAD_ARITY) && c->argv != NULL) {
         c->read_flags |= READ_FLAGS_PREFETCHED;
         addCommandToBatch(c->parsed_cmd, c->argv, c->argc, c->db, c->slot);
     }
@@ -274,7 +274,7 @@ int addCommandToBatchAndProcessIfFull(client *c) {
     /* Commands in the queue. */
     for (int j = c->cmd_queue.off; j < c->cmd_queue.len && batch->key_count < batch->max_prefetch_size; j++) {
         parsedCommand *p = &c->cmd_queue.cmds[j];
-        if (!p->cmd) continue; /* Error or incomplete command. */
+        if (!p->cmd || p->argv == NULL) continue; /* Error, incomplete, or zero-copy command. */
         p->read_flags |= READ_FLAGS_PREFETCHED;
         addCommandToBatch(p->cmd, p->argv, p->argc, c->db, p->slot);
     }

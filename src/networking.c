@@ -320,6 +320,8 @@ client *createClient(connection *conn) {
     c->vargv = NULL;
     c->vargv_len = 0;
     c->vargc = 0;
+    c->first_cmd_vargv = NULL;
+    c->first_cmd_vargc = 0;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->nread = 0;
@@ -1902,18 +1904,24 @@ void freeClientArgv(client *c) {
 }
 
 void freeClientVargv(client *c) {
-    /* TODO (zero-copy-get): When all vargv entries are borrowed (the common
-     * read-command case), tryOffloadFreeArgvToIOThreads can be skipped entirely,
-     * eliminating cache-line bouncing between the main thread and IO threads
-     * for read commands. */
     for (int j = 0; j < c->vargc; j++) {
         vstrFree(&c->vargv[j]); /* no-op for borrowed, sdsfree for owned */
     }
     c->vargc = 0;
 
-    /* Release the shared query buffer now that borrowed references are cleared.
-     * For converted commands, resetSharedQueryBuf was deferred until this point
-     * to keep borrowed vstr references valid through execution. */
+    /* Check if any queued commands still have borrowed vargv refs. */
+    int has_queued_vargv = 0;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        if (c->cmd_queue.cmds[i].vargv != NULL) {
+            has_queued_vargv = 1;
+            break;
+        }
+    }
+    if (has_queued_vargv || c->first_cmd_vargv != NULL) {
+        return; /* Still have borrowed refs — defer buffer release. */
+    }
+
+    /* All borrowed refs consumed. Release the shared query buffer. */
     if (c->querybuf == thread_shared_qb) {
         debugServerAssert(!(c->querybuf == thread_shared_qb && ProcessingEventsWhileBlocked));
         resetSharedQueryBuf(c);
@@ -2279,7 +2287,9 @@ void resetSharedQueryBuf(client *c) {
     serverAssert(c->querybuf == thread_shared_qb);
     size_t remaining = sdslen(c->querybuf) - c->qb_pos;
 
-    if (remaining > 0) {
+    /* Keep the buffer if there's unparsed data OR if the client has borrowed
+     * vstr references pointing into this buffer (zero-copy path). */
+    if (remaining > 0 || c->vargc > 0) {
         /* Let the client take ownership of the shared buffer. */
         initSharedQueryBuf();
         return;
@@ -2301,6 +2311,11 @@ void trimClientQueryBuffer(client *c) {
     }
 
     serverAssert(c->qb_pos <= sdslen(c->querybuf));
+
+    /* Skip trim if borrowed vargv refs point into this buffer. */
+    if (c->vargc > 0 || c->first_cmd_vargv != NULL || c->cmd_queue.len > 0) {
+        return;
+    }
 
     if (c->qb_pos > 0) {
         sdsrange(c->querybuf, c->qb_pos, -1);
@@ -3565,22 +3580,12 @@ void parseMultibulkBuffer(client *c) {
            c->querybuf[c->qb_pos] == '*') {
         c->reqtype = PROTO_REQ_MULTIBULK;
 
-        /* Before parsing the next command, materialize the first command's
-         * vargv into c->argv if not already done. The pipeline loop will
-         * overwrite c->vargv. */
+        /* Before parsing the next command, save the first command's vargv.
+         * Allocate a fresh vargv array for the pipeline loop to parse into. */
         if (queue->len == 0 && c->argv == NULL && c->vargc > 0) {
-            /* Materialize the first command's vargv into c->argv. */
-            c->argv_len = c->vargc;
-            c->argv = zmalloc(sizeof(robj *) * c->argv_len);
-            c->argv_len_sum = 0;
-            for (int j = 0; j < c->vargc; j++) {
-                c->argv[j] = createStringObject(vstrData(&c->vargv[j]), vstrLen(&c->vargv[j]));
-                c->argv_len_sum += vstrLen(&c->vargv[j]);
-            }
-            /* Clean up vargv entries for the first command. */
-            for (int j = 0; j < c->vargc; j++) {
-                vstrFree(&c->vargv[j]);
-            }
+            c->first_cmd_vargv = c->vargv;
+            c->first_cmd_vargc = c->vargc;
+            c->vargv = zmalloc(sizeof(vstr) * c->vargv_len);
             c->vargc = 0;
         }
 
@@ -3602,20 +3607,18 @@ void parseMultibulkBuffer(client *c) {
         p->read_flags = flag;
         p->slot = -1;
 
-        /* For pipelined commands, materialize vargv into p->argv immediately
-         * since c->vargv will be overwritten by the next command's parse. */
+        /* Transfer vargv entries to per-command storage instead of materializing.
+         * Borrowed refs remain valid because we keep the querybuf alive. */
         if (flag & READ_FLAGS_PARSING_COMPLETED) {
-            p->argv_len = c->vargc;
-            p->argv = zmalloc(sizeof(robj *) * p->argv_len);
+            p->vargc = c->vargc;
+            p->vargv = zmalloc(sizeof(vstr) * p->vargc);
             p->argv_len_sum = 0;
             for (int j = 0; j < c->vargc; j++) {
-                p->argv[j] = createStringObject(vstrData(&c->vargv[j]), vstrLen(&c->vargv[j]));
+                p->vargv[j] = c->vargv[j];
                 p->argv_len_sum += vstrLen(&c->vargv[j]);
             }
-            /* Clean up vargv entries for this queued command. */
-            for (int j = 0; j < c->vargc; j++) {
-                vstrFree(&c->vargv[j]);
-            }
+            p->argv = NULL;
+            p->argv_len = 0;
             c->vargc = 0;
         }
     }
@@ -3965,6 +3968,15 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.pending_command) {
         c->flag.pending_command = 0;
+        /* Restore first command's vargv if it was saved during pipelining. */
+        if (c->first_cmd_vargv != NULL) {
+            zfree(c->vargv);
+            c->vargv = c->first_cmd_vargv;
+            c->vargc = c->first_cmd_vargc;
+            c->vargv_len = c->first_cmd_vargc;
+            c->first_cmd_vargv = NULL;
+            c->first_cmd_vargc = 0;
+        }
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
@@ -4078,6 +4090,15 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
+    /* Restore per-command vargv for zero-copy dispatch. */
+    if (p->vargv != NULL) {
+        if (c->vargv) zfree(c->vargv);
+        c->vargv = p->vargv;
+        c->vargc = p->vargc;
+        c->vargv_len = p->vargc;
+        p->vargv = NULL;
+        p->vargc = 0;
+    }
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
          * I/O threads, we want to free it in I/O threads too, to avoid
@@ -4096,6 +4117,12 @@ void discardCommandQueue(client *c) {
                 decrRefCount(p->argv[j]);
             }
             zfree(p->argv);
+        }
+        if (p->vargv != NULL) {
+            for (int j = 0; j < p->vargc; j++) {
+                vstrFree(&p->vargv[j]);
+            }
+            zfree(p->vargv);
         }
     }
     zfree(queue->cmds);
@@ -4174,6 +4201,7 @@ static void prefetchCommandQueueKeys(client *c) {
                               (p->read_flags & READ_FLAGS_BAD_ARITY));
             continue;
         }
+        if (p->argv == NULL) continue; /* Zero-copy queued command, skip prefetch. */
         num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
                                           key_incr_states, num_keys, max_keys);
     }
@@ -4241,7 +4269,8 @@ int processInputBuffer(client *c) {
              * materialization if any module filters are registered, if the
              * user has key/command restrictions, or if the client is in a
              * MULTI transaction (queued commands need argv for deferred exec). */
-            if (!moduleHasCommandFilters() && ACLUserHasUnrestrictedAccess(c->user) && !c->flag.multi) {
+            if (!moduleHasCommandFilters() && ACLUserHasUnrestrictedAccess(c->user) &&
+                !c->flag.multi && server.io_threads_num <= 1) {
                 is_converted = 1;
             }
         }

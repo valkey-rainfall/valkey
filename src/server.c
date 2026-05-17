@@ -4389,7 +4389,26 @@ void prepareCommandQueue(client *c) {
     /* Commands in client's command queue. */
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
-        prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
+        if (p->argv != NULL) {
+            prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
+        } else if (p->vargv != NULL) {
+            /* Zero-copy path: queued command has vargv, no argv. */
+            if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) || p->vargc == 0) continue;
+            debugServerAssert(p->cmd == NULL && !(p->read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
+            p->cmd = lookupCommandFromVargv(p->vargv, p->vargc);
+            if (!p->cmd) {
+                p->read_flags |= READ_FLAGS_COMMAND_NOT_FOUND;
+            } else if (!commandCheckArity(p->cmd, p->vargc, NULL)) {
+                p->read_flags |= READ_FLAGS_BAD_ARITY;
+            } else if (server.cluster_enabled) {
+                /* For converted commands, compute slot from vargv[1]. */
+                if ((p->cmd->proc == getCommand || p->cmd->proc == mgetCommand) && p->vargc >= 2) {
+                    p->slot = keyHashSlot(vstrData(&p->vargv[1]), (int)vstrLen(&p->vargv[1]));
+                } else {
+                    p->slot = -1; /* Will be recomputed after materialization. */
+                }
+            }
+        }
     }
 }
 
