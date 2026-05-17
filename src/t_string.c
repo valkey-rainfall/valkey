@@ -314,7 +314,19 @@ int getGenericCommand(client *c) {
 }
 
 void getCommand(client *c) {
-    getGenericCommand(c);
+    if (c->vargc > 0) {
+        /* Zero-copy path: lookup key directly from vargv. */
+        robj *val = lookupKeyReadVstr(c->db, &c->vargv[1]);
+        if (val == NULL) {
+            addReply(c, shared.null[c->resp]);
+        } else if (val->type != OBJ_STRING) {
+            addReplyErrorObject(c, shared.wrongtypeerr);
+        } else {
+            addReplyBulk(c, val);
+        }
+    } else {
+        getGenericCommand(c);
+    }
 }
 
 /*
@@ -528,15 +540,27 @@ void getrangeCommand(client *c) {
 }
 
 void mgetCommand(client *c) {
-    int j;
-
-    addReplyArrayLen(c, c->argc - 1);
-    for (j = 1; j < c->argc; j++) {
-        robj *o = lookupKeyRead(c->db, c->argv[j]);
-        if (o == NULL) {
-            addReplyNull(c);
-        } else {
-            if (o->type != OBJ_STRING) {
+    if (c->vargc > 0) {
+        /* Zero-copy path: lookup keys directly from vargv. */
+        addReplyArrayLen(c, c->argc - 1);
+        for (int j = 1; j < c->argc; j++) {
+            robj *o = lookupKeyReadVstr(c->db, &c->vargv[j]);
+            if (o == NULL) {
+                addReplyNull(c);
+            } else if (o->type != OBJ_STRING) {
+                addReplyNull(c);
+            } else {
+                addReplyBulk(c, o);
+            }
+        }
+    } else {
+        /* Fallback: materialized argv path. */
+        addReplyArrayLen(c, c->argc - 1);
+        for (int j = 1; j < c->argc; j++) {
+            robj *o = lookupKeyRead(c->db, c->argv[j]);
+            if (o == NULL) {
+                addReplyNull(c);
+            } else if (o->type != OBJ_STRING) {
                 addReplyNull(c);
             } else {
                 addReplyBulk(c, o);

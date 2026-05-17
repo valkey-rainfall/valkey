@@ -1280,14 +1280,15 @@ typedef struct ClientModuleData {
 typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
     int argc;
-    /* TODO (vstr zero-copy PoC): Change to vstr * when client.argv changes.
-     * See TODO comment on client.argv in this file. */
     robj **argv;
     int argv_len;
     int slot;
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    /* Per-command vstr storage for zero-copy pipelining. */
+    vstr *vargv;
+    int vargc;
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1346,6 +1347,9 @@ typedef struct client {
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
+    vstr *vargv;         /* Zero-copy argument refs into querybuf. */
+    int vargv_len;       /* Allocated capacity of vargv array. */
+    int vargc;           /* Number of vargv entries for current command. */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
@@ -3765,6 +3769,7 @@ long long getExpire(serverDb *db, robj *key);
 robj *setExpire(client *c, serverDb *db, robj *key, long long when);
 int checkAlreadyExpired(mstime_t when);
 robj *lookupKeyRead(serverDb *db, robj *key);
+robj *lookupKeyReadVstr(serverDb *db, const vstr *key);
 robj *lookupKeyWrite(serverDb *db, robj *key);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);

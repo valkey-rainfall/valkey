@@ -145,6 +145,25 @@ robj *lookupKeyRead(serverDb *db, robj *key) {
     return lookupKeyReadWithFlags(db, key, LOOKUP_NONE);
 }
 
+/* Zero-copy key lookup: find a value by key data without requiring an robj.
+ * Uses tagged vstr pointer for hashtable lookup. Skips expiry check (caller
+ * must handle or accept stale reads for the PoC). Updates stats. */
+robj *lookupKeyReadVstr(serverDb *db, const vstr *key) {
+    int dict_index = server.cluster_enabled ? keyHashSlot(vstrData(key), (int)vstrLen(key)) : 0;
+    void *existing = NULL;
+    kvstoreHashtableFind(db->keys, dict_index, vstrTagPtr(key), &existing);
+    robj *val = existing;
+    if (val) {
+        if (!hasActiveChildProcess()) {
+            val->lru = lrulfu_touch(val->lru);
+        }
+        server.stat_keyspace_hits++;
+    } else {
+        server.stat_keyspace_misses++;
+    }
+    return val;
+}
+
 /* Lookup a key for write operations, and as a side effect, if needed, expires
  * the key if its TTL is reached. It's equivalent to lookupKey() with the
  * LOOKUP_WRITE flag added.

@@ -320,6 +320,9 @@ client *createClient(connection *conn) {
     c->argv = NULL;
     c->argv_len = 0;
     c->argv_len_sum = 0;
+    c->vargv = NULL;
+    c->vargv_len = 0;
+    c->vargc = 0;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
@@ -2269,7 +2272,8 @@ void resetSharedQueryBuf(client *c) {
     serverAssert(c->querybuf == thread_shared_qb);
     size_t remaining = sdslen(c->querybuf) - c->qb_pos;
 
-    if (remaining > 0) {
+    /* Force client ownership if there's unparsed data OR borrowed vargv refs. */
+    if (remaining > 0 || c->vargc > 0 || c->cmd_queue.len > 0) {
         /* Let the client take ownership of the shared buffer. */
         initSharedQueryBuf();
         return;
@@ -2291,6 +2295,11 @@ void trimClientQueryBuffer(client *c) {
     }
 
     serverAssert(c->qb_pos <= sdslen(c->querybuf));
+
+    /* Skip trim if borrowed vargv refs point into this buffer. */
+    if (c->vargc > 0 || c->cmd_queue.len > 0) {
+        return;
+    }
 
     if (c->qb_pos > 0) {
         sdsrange(c->querybuf, c->qb_pos, -1);
@@ -3325,6 +3334,7 @@ void resetClient(client *c) {
      * deferred until after this point so borrowed references are still valid. */
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    c->vargc = 0; /* Borrowed refs consumed — just reset count, buffer stays owned. */
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -3600,6 +3610,14 @@ void parseMultibulkBuffer(client *c) {
                               &p->argv_len_sum, &p->input_bytes);
         p->read_flags = flag;
         p->slot = -1;
+        /* Transfer vargv to per-command storage for zero-copy pipelining. */
+        if (flag & READ_FLAGS_PARSING_COMPLETED && c->vargc > 0) {
+            p->vargv = c->vargv;
+            p->vargc = c->vargc;
+            /* Allocate fresh vargv for next command's parse. */
+            c->vargv = zmalloc(sizeof(vstr) * c->vargv_len);
+            c->vargc = 0;
+        }
     }
 }
 
@@ -3673,10 +3691,13 @@ static int parseMultibulk(client *c,
         /* Setup argv array */
         if (*argv) zfree(*argv);
         *argv_len = min(c->multibulklen, 1024);
-        /* TODO (vstr zero-copy PoC): When argv becomes vstr *, change
-         * sizeof(robj *) to sizeof(vstr) here and in the realloc below. */
         *argv = zmalloc(sizeof(robj *) * *argv_len);
         *argv_len_sum = 0;
+        /* Setup parallel vargv array for zero-copy refs. */
+        if (c->vargv) zfree(c->vargv);
+        c->vargv_len = *argv_len;
+        c->vargv = zmalloc(sizeof(vstr) * c->vargv_len);
+        c->vargc = 0;
 
         /* Per-slot network bytes-in calculation.
          *
@@ -3789,6 +3810,8 @@ static int parseMultibulk(client *c,
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
                                 *argc + c->multibulklen);
                 *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                c->vargv_len = *argv_len;
+                c->vargv = zrealloc(c->vargv, sizeof(vstr) * c->vargv_len);
             }
 
             /* Check that what follows argv is a real \r\n */
@@ -3815,6 +3838,8 @@ static int parseMultibulk(client *c,
                 (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
                 *argv_len_sum += c->bulklen;
                 sdsIncrLen(c->querybuf, -2); /* remove CRLF */
+                /* Big args: skip vargv (ownership transferred to robj). Rare path. */
+                if (c->vargv) c->vargc++;
                 /* Assume that if we saw a fat argument we'll see another one
                  * likely... */
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
@@ -3834,6 +3859,11 @@ static int parseMultibulk(client *c,
                  * buffer, which must remain stable until commandProcessed(). */
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
+                /* Also produce a borrowed vstr ref for zero-copy dispatch. */
+                if (c->vargv) {
+                    vstrInitBorrowed(&c->vargv[c->vargc], c->querybuf + c->qb_pos, c->bulklen);
+                    c->vargc++;
+                }
                 c->qb_pos += c->bulklen + 2;
             }
             c->bulklen = -1;
@@ -4078,6 +4108,15 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
+    /* Restore per-command vargv for zero-copy dispatch. */
+    if (p->vargv != NULL) {
+        if (c->vargv) zfree(c->vargv);
+        c->vargv = p->vargv;
+        c->vargc = p->vargc;
+        c->vargv_len = p->vargc;
+        p->vargv = NULL;
+        p->vargc = 0;
+    }
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
          * I/O threads, we want to free it in I/O threads too, to avoid
@@ -4095,6 +4134,7 @@ void discardCommandQueue(client *c) {
             decrRefCount(p->argv[j]);
         }
         zfree(p->argv);
+        if (p->vargv) zfree(p->vargv); /* Borrowed refs — just free the array. */
     }
     zfree(queue->cmds);
     queue->cmds = NULL;
