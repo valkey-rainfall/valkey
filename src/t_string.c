@@ -316,7 +316,7 @@ int getGenericCommand(client *c) {
 void getCommand(client *c) {
     if (c->argv == NULL && c->vargc > 0) {
         /* Zero-copy path: lookup key directly from vargv. */
-        robj *val = lookupKeyReadVstr(c->db, &c->vargv[1]);
+        robj *val = lookupKeyReadVstr(c->db, &c->vargv_base[1]);
         if (val == NULL) {
             addReply(c, shared.null[c->resp]);
         } else if (val->type != OBJ_STRING) {
@@ -544,7 +544,7 @@ void mgetCommand(client *c) {
         /* Zero-copy path: lookup keys directly from vargv. */
         addReplyArrayLen(c, c->argc - 1);
         for (int j = 1; j < c->argc; j++) {
-            robj *o = lookupKeyReadVstr(c->db, &c->vargv[j]);
+            robj *o = lookupKeyReadVstr(c->db, &c->vargv_base[j]);
             if (o == NULL) {
                 addReplyNull(c);
             } else if (o->type != OBJ_STRING) {

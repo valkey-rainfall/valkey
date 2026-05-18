@@ -321,8 +321,10 @@ client *createClient(connection *conn) {
     c->argv_len = 0;
     c->argv_len_sum = 0;
     c->vargv = NULL;
+    c->vargv_base = NULL;
     c->vargv_len = 0;
     c->vargc = 0;
+    c->vargc_total = 0;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
@@ -2302,7 +2304,7 @@ void trimClientQueryBuffer(client *c) {
         return;
     }
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-        if (c->cmd_queue.cmds[i].vargv != NULL) return;
+        if (c->cmd_queue.cmds[i].vargc > 0) return;
     }
 
     serverAssert(c->qb_pos <= sdslen(c->querybuf));
@@ -3341,6 +3343,8 @@ void resetClient(client *c) {
     freeClientArgv(c);
     freeClientOriginalArgv(c);
     c->vargc = 0; /* Borrowed refs consumed — just reset count, buffer stays owned. */
+    c->vargc_total = 0;
+    c->vargv_base = c->vargv;
     /* Free oversized vargv to avoid memory bloat from large commands. */
     if (c->vargv_len > 1024) {
         zfree(c->vargv);
@@ -3622,12 +3626,11 @@ void parseMultibulkBuffer(client *c) {
                               &p->argv_len_sum, &p->input_bytes);
         p->read_flags = flag;
         p->slot = -1;
-        /* Transfer vargv to per-command storage for zero-copy pipelining. */
+        /* Record vargv offset for zero-copy pipelining (no allocation). */
         if (flag & READ_FLAGS_PARSING_COMPLETED && c->vargc > 0) {
-            p->vargv = c->vargv;
+            p->vargv_off = c->vargc_total;
             p->vargc = c->vargc;
-            /* Allocate fresh vargv for next command's parse. */
-            c->vargv = zmalloc(sizeof(vstr) * c->vargv_len);
+            c->vargc_total += c->vargc;
             c->vargc = 0;
         }
     }
@@ -3705,11 +3708,15 @@ static int parseMultibulk(client *c,
         *argv_len = min(c->multibulklen, 1024);
         *argv = zmalloc(sizeof(robj *) * *argv_len);
         *argv_len_sum = 0;
-        /* Setup parallel vargv array for zero-copy refs. */
-        if (c->vargv) zfree(c->vargv);
-        c->vargv_len = *argv_len;
-        c->vargv = zmalloc(sizeof(vstr) * c->vargv_len);
+        /* Setup parallel vargv array for zero-copy refs (reuse if big enough). */
+        if (c->vargv_len < *argv_len) {
+            if (c->vargv) zfree(c->vargv);
+            c->vargv_len = *argv_len;
+            c->vargv = zmalloc(sizeof(vstr) * c->vargv_len);
+        }
         c->vargc = 0;
+        c->vargc_total = 0;
+        c->vargv_base = c->vargv;
 
         /* Per-slot network bytes-in calculation.
          *
@@ -3822,8 +3829,13 @@ static int parseMultibulk(client *c,
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
                                 *argc + c->multibulklen);
                 *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
-                c->vargv_len = *argv_len;
-                c->vargv = zrealloc(c->vargv, sizeof(vstr) * c->vargv_len);
+                /* Grow vargv pool if needed for total pipeline entries. */
+                int needed = c->vargc_total + *argv_len;
+                if (c->vargv_len < needed) {
+                    c->vargv_len = needed;
+                    c->vargv = zrealloc(c->vargv, sizeof(vstr) * c->vargv_len);
+                    c->vargv_base = c->vargv + c->vargc_total;
+                }
             }
 
             /* Check that what follows argv is a real \r\n */
@@ -3873,7 +3885,7 @@ static int parseMultibulk(client *c,
                 *argv_len_sum += c->bulklen;
                 /* Also produce a borrowed vstr ref for zero-copy dispatch. */
                 if (c->vargv) {
-                    vstrInitBorrowed(&c->vargv[c->vargc], c->querybuf + c->qb_pos, c->bulklen);
+                    vstrInitBorrowed(&c->vargv[c->vargc_total + c->vargc], c->querybuf + c->qb_pos, c->bulklen);
                     c->vargc++;
                 }
                 c->qb_pos += c->bulklen + 2;
@@ -4120,14 +4132,10 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
-    /* Restore per-command vargv for zero-copy dispatch. */
-    if (p->vargv != NULL) {
-        if (c->vargv) zfree(c->vargv);
-        c->vargv = p->vargv;
+    /* Restore per-command vargv slice for zero-copy dispatch. */
+    if (p->vargc > 0) {
         c->vargc = p->vargc;
-        c->vargv_len = p->vargc;
-        p->vargv = NULL;
-        p->vargc = 0;
+        c->vargv_base = c->vargv + p->vargv_off;
     }
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
@@ -4146,7 +4154,6 @@ void discardCommandQueue(client *c) {
             decrRefCount(p->argv[j]);
         }
         zfree(p->argv);
-        if (p->vargv) zfree(p->vargv); /* Borrowed refs — just free the array. */
     }
     zfree(queue->cmds);
     queue->cmds = NULL;
@@ -4202,11 +4209,11 @@ static void prefetchCommandQueueKeys(client *c) {
         if (c->argv == NULL && c->vargc > 0 && (c->parsed_cmd->proc == getCommand || c->parsed_cmd->proc == mgetCommand)) {
             /* Zero-copy: prefetch keys directly from vargv. */
             int key_end = (c->parsed_cmd->proc == mgetCommand) ? c->vargc : 2;
-            int kvstore_idx = server.cluster_enabled ? keyHashSlot(vstrData(&c->vargv[1]), (int)vstrLen(&c->vargv[1])) : 0;
+            int kvstore_idx = server.cluster_enabled ? keyHashSlot(vstrData(&c->vargv_base[1]), (int)vstrLen(&c->vargv_base[1])) : 0;
             hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
             if (ht) {
                 for (int j = 1; j < key_end && num_keys < max_keys; j++)
-                    hashtableIncrementalFindInit(&key_incr_states[num_keys++], ht, vstrTagPtr(&c->vargv[j]));
+                    hashtableIncrementalFindInit(&key_incr_states[num_keys++], ht, vstrTagPtr(&c->vargv_base[j]));
             }
         } else {
             num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
@@ -4234,12 +4241,13 @@ static void prefetchCommandQueueKeys(client *c) {
             continue;
         }
         if (p->vargc > 0 && (p->cmd->proc == getCommand || p->cmd->proc == mgetCommand)) {
+            vstr *pv = c->vargv + p->vargv_off;
             int key_end = (p->cmd->proc == mgetCommand) ? p->vargc : 2;
-            int kvstore_idx = server.cluster_enabled ? keyHashSlot(vstrData(&p->vargv[1]), (int)vstrLen(&p->vargv[1])) : 0;
+            int kvstore_idx = server.cluster_enabled ? keyHashSlot(vstrData(&pv[1]), (int)vstrLen(&pv[1])) : 0;
             hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
             if (ht) {
                 for (int j = 1; j < key_end && num_keys < max_keys; j++)
-                    hashtableIncrementalFindInit(&key_incr_states[num_keys++], ht, vstrTagPtr(&p->vargv[j]));
+                    hashtableIncrementalFindInit(&key_incr_states[num_keys++], ht, vstrTagPtr(&pv[j]));
             }
         } else {
             num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,

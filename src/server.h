@@ -1286,8 +1286,8 @@ typedef struct parsedCommand {
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
-    /* Per-command vstr storage for zero-copy pipelining. */
-    vstr *vargv;
+    /* Zero-copy pipelining: offset into client's vargv pool. */
+    int vargv_off;
     int vargc;
 } parsedCommand;
 
@@ -1347,9 +1347,11 @@ typedef struct client {
     int argc;            /* Num of arguments of current command. */
     int argv_len;        /* Size of argv array (may be more than argc) */
     size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
-    vstr *vargv;         /* Zero-copy argument refs into querybuf. */
+    vstr *vargv;         /* Zero-copy argument refs into querybuf (pool for all pipelined cmds). */
+    vstr *vargv_base;    /* Points to current command's first vargv entry (into vargv pool). */
     int vargv_len;       /* Allocated capacity of vargv array. */
     int vargc;           /* Number of vargv entries for current command. */
+    int vargc_total;     /* Total vargv entries across all pipelined commands. */
     int reqtype;         /* Request protocol type: PROTO_REQ_* */
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
