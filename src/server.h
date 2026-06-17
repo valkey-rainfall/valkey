@@ -1296,50 +1296,15 @@ typedef struct LastWrittenBuf {
 typedef struct slotMigrationJob slotMigrationJob;
 
 typedef struct client {
-    /* Basic client information and connection. */
-    uint64_t id; /* Client incremental unique ID. */
-    connection *conn;
-    /* Input buffer and command parsing fields */
-    sds querybuf;        /* Buffer we use to accumulate client queries. */
-    size_t qb_pos;       /* The position we have read in querybuf. */
-    robj **argv;         /* Arguments of current command. */
-    int argc;            /* Num of arguments of current command. */
-    int argv_len;        /* Size of argv array (may be more than argc) */
-    size_t argv_len_sum; /* Sum of lengths of objects in argv list. */
-    int reqtype;         /* Request protocol type: PROTO_REQ_* */
-    int multibulklen;    /* Number of multi bulk arguments left to read. */
-    long bulklen;        /* Length of bulk argument in multi bulk request. */
-    long long woff;      /* Last write global replication offset. */
-    cmdQueue cmd_queue;  /* Parsed commands queue */
-    /* Command execution state and command information */
+    /* === HOT CACHELINE 0: Command dispatch + lookup (accessed every command) === */
     struct serverCommand *cmd;        /* Current command. */
-    struct serverCommand *lastcmd;    /* Last command executed. */
-    struct serverCommand *realcmd;    /* The original command that was executed by the client */
-    struct serverCommand *parsed_cmd; /* The command that was parsed. */
-    time_t last_interaction;          /* Time of the last interaction, used for timeout */
     serverDb *db;                     /* Pointer to currently SELECTed DB. */
-    /* Client state structs. */
-    ClientPubSubData *pubsub_data;    /* Required for: pubsub commands and tracking. lazily initialized when first needed */
-    ClientReplicationData *repl_data; /* Required for Replication operations. lazily initialized when first needed */
-    ClientModuleData *module_data;    /* Required for Module operations. lazily initialized when first needed */
-    multiState *mstate;               /* MULTI/EXEC state, lazily initialized when first needed */
-    blockingState *bstate;            /* Blocking state, lazily initialized when first needed */
-    /* Output buffer and reply handling */
-    long duration;                       /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
-    char *buf;                           /* Output buffer */
-    size_t buf_usable_size;              /* Usable size of buffer. */
-    list *reply;                         /* List of reply objects to send to the client. */
-    listNode *io_last_reply_block;       /* Last client reply block when sent to IO thread */
-    size_t io_last_bufpos;               /* The client's bufpos at the time it was sent to the IO thread */
-    LastWrittenBuf io_last_written;      /* Track state for last written buffer */
-    unsigned long long reply_bytes;      /* Tot bytes of objects in reply list. */
-    listNode clients_pending_write_node; /* list node in clients_pending_write or in clients_pending_io_write list */
-    size_t bufpos;
-    payloadHeader *last_header; /* Pointer to the last header in a buffer when using copy avoidance */
-    int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
-    robj **original_argv;       /* Arguments of original command if arguments were rewritten. */
-    uint32_t redact_arg_bitmap; /* Bitmap of argument indexes that should be redacted in logs. */
-    /* Client flags and state indicators */
+    robj **argv;                      /* Arguments of current command. */
+    int argc;                         /* Num of arguments of current command. */
+    uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
+    volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
+    volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
+    uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     union {
         struct {
             uint64_t raw_flag1;
@@ -1347,41 +1312,74 @@ typedef struct client {
         };
         struct ClientFlags flag;
     };
-    /* Cache Locality: Grouped with 'flag' for getClientType() hot path. */
     slotMigrationJob *slot_migration_job; /* Pointer to the slot migration job, or NULL. */
-    uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
-    volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
-    volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
-    uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
-    uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
-    /* In updateClientMemoryUsage() we track the memory usage of
-     * each client and add it to the sum of all the clients of a given type,
-     * however we need to remember what was the old contribution of each
-     * client, and in which category the client was, in order to remove it
-     * before adding it the new value. */
+    connection *conn;
+
+    /* === HOT CACHELINE 1: Reply buffer (accessed in addReply on every command) === */
+    char *buf;                           /* Output buffer */
+    size_t bufpos;                       /* Current position in output buffer. */
+    size_t buf_usable_size;              /* Usable size of buffer. */
+    list *reply;                         /* List of reply objects to send to the client. */
+    payloadHeader *last_header;          /* Pointer to the last header in a buffer when using copy avoidance */
+    unsigned long long reply_bytes;      /* Tot bytes of objects in reply list. */
+    int slot;                            /* The slot the client is executing against. Set to -1 if no slot is being used */
+    uint16_t write_flags;                /* Client Write flags - used to communicate the client write state. */
+
+    /* === HOT CACHELINE 2: Parsing + IO thread handoff === */
+    sds querybuf;           /* Buffer we use to accumulate client queries. */
+    size_t qb_pos;          /* The position we have read in querybuf. */
+    cmdQueue cmd_queue;     /* Parsed commands queue */
+    int reqtype;            /* Request protocol type: PROTO_REQ_* */
+    int multibulklen;       /* Number of multi bulk arguments left to read. */
+    long bulklen;           /* Length of bulk argument in multi bulk request. */
+    int read_flags;         /* Client Read flags - used to communicate the client read state. */
+
+    /* === WARM: IO thread write state === */
+    listNode clients_pending_write_node; /* list node in clients_pending_write or in clients_pending_io_write list */
+    listNode *io_last_reply_block;       /* Last client reply block when sent to IO thread */
+    size_t io_last_bufpos;               /* The client's bufpos at the time it was sent to the IO thread */
+    LastWrittenBuf io_last_written;      /* Track state for last written buffer */
+    _Atomic(size_t) io_tracked_reply_len; /* Total size of BULK_STR_REF replies tracked by I/O threads. */
+    int nwritten;                        /* Number of bytes of the last write. */
+    int nread;                           /* Number of bytes of the last read. */
+
+    /* === WARM: Command metadata (call() path) === */
+    struct serverCommand *lastcmd;    /* Last command executed. */
+    struct serverCommand *realcmd;    /* The original command that was executed by the client */
+    struct serverCommand *parsed_cmd; /* The command that was parsed. */
+    long duration;                    /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
+    int original_argc;                /* Num of arguments of original command if arguments were rewritten. */
+    robj **original_argv;             /* Arguments of original command if arguments were rewritten. */
+    uint32_t redact_arg_bitmap;       /* Bitmap of argument indexes that should be redacted in logs. */
+    int argv_len;                     /* Size of argv array (may be more than argc) */
+    size_t argv_len_sum;              /* Sum of lengths of objects in argv list. */
+
+    /* === COLD: Client identity and connection state === */
+    uint64_t id;                 /* Client incremental unique ID. */
+    long long woff;              /* Last write global replication offset. */
+    time_t last_interaction;     /* Time of the last interaction, used for timeout */
     uint8_t last_memory_type;
-    uint8_t capa; /* Client capabilities: CLIENT_CAPA* macros. */
-    /* Statistics and metrics */
+    uint8_t capa;                /* Client capabilities: CLIENT_CAPA* macros. */
+
+    /* === COLD: Client state structs (lazily initialized, NULL for normal GET/SET clients) === */
+    ClientPubSubData *pubsub_data;    /* Required for: pubsub commands and tracking. lazily initialized when first needed */
+    ClientReplicationData *repl_data; /* Required for Replication operations. lazily initialized when first needed */
+    ClientModuleData *module_data;    /* Required for Module operations. lazily initialized when first needed */
+    multiState *mstate;               /* MULTI/EXEC state, lazily initialized when first needed */
+    blockingState *bstate;            /* Blocking state, lazily initialized when first needed */
+
+    /* === COLD: Statistics and metrics === */
     unsigned long long net_input_bytes;           /* Total network input bytes read from this client. */
-    unsigned long long net_input_bytes_curr_cmd;  /* Total network input bytes read for the* execution of this client's current command. */
+    unsigned long long net_input_bytes_curr_cmd;  /* Total network input bytes read for the execution of this client's current command. */
     unsigned long long net_output_bytes;          /* Total network output bytes sent to this client. */
     unsigned long long commands_processed;        /* Total count of commands this client executed. */
     unsigned long long net_output_bytes_curr_cmd; /* Total network output bytes sent to this client, by the current command. */
-    _Atomic(size_t) io_tracked_reply_len;         /* Total size of BULK_STR_REF replies tracked by I/O threads. */
     size_t buf_peak;                              /* Peak used size of buffer in last 5 sec interval. */
-    int nwritten;                                 /* Number of bytes of the last write. */
-    int nread;                                    /* Number of bytes of the last read. */
-    int read_flags;                               /* Client Read flags - used to communicate the client read state. */
-    int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
-    /* In updateClientMemoryUsage() we track the memory usage of
-     * each client and add it to the sum of all the clients of a given type,
-     * however we need to remember what was the old contribution of each
-     * client, and in which category the client was, in order to remove it
-     * before adding it the new value. */
     size_t last_memory_usage;
-    /* Fields after this point are less frequently used */
+
+    /* === COLD: Rarely accessed fields === */
     listNode *client_list_node;        /* list node in client list */
     mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
     size_t querybuf_peak;              /* Recent (100ms or more) peak of querybuf size. */
