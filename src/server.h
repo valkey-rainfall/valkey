@@ -1271,6 +1271,8 @@ typedef struct parsedCommand {
     robj **argv;
     int argv_len;
     int slot;
+    uint64_t key_hash;
+    int key_hash_valid;
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
@@ -1373,6 +1375,8 @@ typedef struct client {
     int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
+    uint64_t key_hash;                            /* Pre-computed hash of the first key, set by IO thread. */
+    int key_hash_valid;                           /* Whether key_hash is valid for the current command. */
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -3912,6 +3916,7 @@ void startEvictionTimeProc(void);
 
 /* Keys hashing/comparison functions for dict.c and hashtable.c hash tables. */
 uint8_t *getConfigurableHashSeed(void);
+uint64_t sdsHashConfigurableSeed(const void *key);
 uint64_t dictSdsHash(const void *key);
 uint64_t dictSdsCaseHash(const void *key);
 uint64_t dictCStrHash(const void *key);

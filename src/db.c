@@ -49,6 +49,7 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
+static robj *dbFindWithDictIndexAndHash(serverDb *db, sds key, int dict_index, uint64_t hash);
 
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
@@ -80,7 +81,17 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * in the replication link. */
 robj *lookupKey(serverDb *db, robj *key, int flags) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+    robj *val;
+    /* Use pre-computed hash from IO thread when available. The hash is only
+     * valid for the first key lookup per command (single-key commands like
+     * GET/SET always benefit; multi-key commands benefit for the first key). */
+    if (server.current_client && server.current_client->key_hash_valid) {
+        uint64_t hash = server.current_client->key_hash;
+        server.current_client->key_hash_valid = 0;
+        val = dbFindWithDictIndexAndHash(db, objectGetVal(key), dict_index, hash);
+    } else {
+        val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+    }
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the primary. We forbid it on readonly replicas, but
@@ -2267,6 +2278,12 @@ int dbExpandExpires(serverDb *db, uint64_t db_size, int try_expand) {
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index) {
     void *existing = NULL;
     kvstoreHashtableFind(db->keys, dict_index, key, &existing);
+    return existing;
+}
+
+static robj *dbFindWithDictIndexAndHash(serverDb *db, sds key, int dict_index, uint64_t hash) {
+    void *existing = NULL;
+    kvstoreHashtableFindWithHash(db->keys, dict_index, key, hash, &existing);
     return existing;
 }
 

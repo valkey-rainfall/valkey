@@ -144,6 +144,7 @@ void hashtableSetCanAbortShrink(bool can_abort);
 
 /* Entries */
 bool hashtableFind(hashtable *ht, const void *key, void **found);
+bool hashtableFindWithHash(hashtable *ht, const void *key, uint64_t hash, void **found);
 void **hashtableFindRef(hashtable *ht, const void *key);
 bool hashtableAdd(hashtable *ht, void *entry);
 bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing);
@@ -155,6 +156,7 @@ void **hashtableTwoPhasePopFindRef(hashtable *ht, const void *key, hashtablePosi
 void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *position);
 bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void *new_entry);
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key);
+void hashtableIncrementalFindInitWithHash(hashtableIncrementalFindState *state, hashtable *ht, const void *key, uint64_t hash);
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
 

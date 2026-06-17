@@ -336,6 +336,7 @@ client *createClient(connection *conn) {
     c->raw_flag2 = 0;
     c->capa = 0;
     c->slot = -1;
+    c->key_hash_valid = 0;
     c->ctime = c->last_interaction = server.unixtime;
     c->duration = 0;
     clientSetDefaultAuth(c);
@@ -3329,6 +3330,7 @@ void resetClient(client *c) {
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
     c->slot = -1;
+    c->key_hash_valid = 0;
     c->flag.executing_command = 0;
     c->flag.replication_done = 0;
     c->flag.buffered_reply = 0;
@@ -4027,6 +4029,8 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
+    c->key_hash = p->key_hash;
+    c->key_hash_valid = p->key_hash_valid;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
          * I/O threads, we want to free it in I/O threads too, to avoid
@@ -6570,6 +6574,38 @@ void evictClients(void) {
 
 /* IO threads functions */
 
+/* Pre-compute the hash of the first key for each parsed command. This runs on
+ * the IO thread after command lookup, so the hash is ready for the main thread
+ * to use during key lookup, avoiding the expensive SipHash computation on the
+ * critical path. Only handles simple commands where the first key position is
+ * statically known via key_specs[0]. */
+static void preHashSingleCommand(struct serverCommand *cmd, robj **argv, int argc,
+                                 int read_flags, uint64_t *key_hash, int *key_hash_valid) {
+    *key_hash_valid = 0;
+    if (!cmd || (read_flags & READ_FLAGS_BAD_ARITY) || cmd->key_specs_num == 0) return;
+    /* Fast path: first key spec uses a static index (covers GET, SET, etc.) */
+    if (cmd->key_specs[0].begin_search_type == KSPEC_BS_INDEX) {
+        int pos = cmd->key_specs[0].bs.index.pos;
+        if (pos > 0 && pos < argc) {
+            sds key = objectGetVal(argv[pos]);
+            *key_hash = sdsHashConfigurableSeed(key);
+            *key_hash_valid = 1;
+        }
+    }
+}
+
+static void preHashCommandKeys(client *c) {
+    /* Pre-hash the current command's first key. */
+    preHashSingleCommand(c->parsed_cmd, c->argv, c->argc, c->read_flags,
+                         &c->key_hash, &c->key_hash_valid);
+    /* Pre-hash pipelined commands in the queue. */
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        parsedCommand *p = &c->cmd_queue.cmds[i];
+        preHashSingleCommand(p->cmd, p->argv, p->argc, p->read_flags,
+                             &p->key_hash, &p->key_hash_valid);
+    }
+}
+
 void ioThreadReadQueryFromClient(client *c) {
     serverAssert(c->io_read_state == CLIENT_PENDING_IO);
 
@@ -6598,6 +6634,7 @@ void ioThreadReadQueryFromClient(client *c) {
     parseInputBuffer(c);
     trimCommandQueue(c);
     prepareCommandQueue(c);
+    preHashCommandKeys(c);
 
     /* Parsing was not completed - let the main-thread handle it. */
     if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {

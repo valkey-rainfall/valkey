@@ -884,6 +884,12 @@ bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found) {
     return hashtableFind(ht, key, found);
 }
 
+bool kvstoreHashtableFindWithHash(kvstore *kvs, int didx, void *key, uint64_t hash, void **found) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return false;
+    return hashtableFindWithHash(ht, key, hash, found);
+}
+
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     if (!ht) return NULL;
