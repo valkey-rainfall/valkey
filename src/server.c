@@ -766,20 +766,31 @@ static uint64_t zsetHashtableHashEntry(const void *entry) {
     return genHashFunctionConfigurableSeed(ele, sdslen(ele));
 }
 
+static uint64_t zsetHashtableHashKey(const void *key) {
+    const stringRef *ref = key;
+    return genHashFunctionConfigurableSeed(ref->buf, ref->len);
+}
+
 static int zsetHashtableKeyCompare(const void *entry, const void *key) {
     sds ele = zslGetNodeElement((const zskiplistNode *)entry);
-    return dictSdsKeyCompare(ele, key);
+    const stringRef *ref = key;
+    size_t ele_len = sdslen(ele);
+    if (ele_len != ref->len) return 0;
+    return memcmp(ele, ref->buf, ref->len) == 0;
 }
 
 static int zsetHashtableEntryCompare(const void *entry1, const void *entry2) {
     sds e1 = zslGetNodeElement((const zskiplistNode *)entry1);
     sds e2 = zslGetNodeElement((const zskiplistNode *)entry2);
-    return dictSdsKeyCompare(e1, e2);
+    size_t l1 = sdslen(e1);
+    size_t l2 = sdslen(e2);
+    if (l1 != l2) return 0;
+    return memcmp(e1, e2, l1) == 0;
 }
 
 /* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
 hashtableType zsetHashtableType = {
-    .hashKey = sdsHashConfigurableSeed,
+    .hashKey = zsetHashtableHashKey,
     .hashEntry = zsetHashtableHashEntry,
     .keyCompare = zsetHashtableKeyCompare,
     .entryCompare = zsetHashtableEntryCompare,
@@ -853,7 +864,8 @@ static uint64_t commandSetHashEntry(const void *entry) {
 
 static int commandSetKeyCompare(const void *entry, const void *key) {
     struct serverCommand *cmd = (struct serverCommand *)entry;
-    return dictCStrKeyCaseCompare(cmd->current_name, key);
+    const stringRef *ref = key;
+    return stringRefCaseEqualCStr(ref, cmd->current_name);
 }
 
 static int commandSetEntryCompare(const void *entry1, const void *entry2) {
@@ -862,8 +874,13 @@ static int commandSetEntryCompare(const void *entry1, const void *entry2) {
     return dictCStrKeyCaseCompare(c1->current_name, c2->current_name);
 }
 
+static uint64_t commandSetHashKey(const void *key) {
+    const stringRef *ref = key;
+    return stringRefCaseHash(ref);
+}
+
 /* Command set, hashed by current command name, stores serverCommand structs. */
-hashtableType commandSetType = {.hashKey = dictSdsCaseHash,
+hashtableType commandSetType = {.hashKey = commandSetHashKey,
                                 .hashEntry = commandSetHashEntry,
                                 .keyCompare = commandSetKeyCompare,
                                 .entryCompare = commandSetEntryCompare,
@@ -876,7 +893,8 @@ static uint64_t originalCommandSetHashEntry(const void *entry) {
 
 static int originalCommandSetKeyCompare(const void *entry, const void *key) {
     struct serverCommand *cmd = (struct serverCommand *)entry;
-    return dictCStrKeyCaseCompare(cmd->fullname, key);
+    const stringRef *ref = key;
+    return stringRefCaseEqualCStr(ref, cmd->fullname);
 }
 
 static int originalCommandSetEntryCompare(const void *entry1, const void *entry2) {
@@ -885,8 +903,13 @@ static int originalCommandSetEntryCompare(const void *entry1, const void *entry2
     return dictCStrKeyCaseCompare(c1->fullname, c2->fullname);
 }
 
+static uint64_t originalCommandSetHashKey(const void *key) {
+    const stringRef *ref = key;
+    return stringRefCaseHash(ref);
+}
+
 /* Command set, hashed by original command name, stores serverCommand structs. */
-hashtableType originalCommandSetType = {.hashKey = dictSdsCaseHash,
+hashtableType originalCommandSetType = {.hashKey = originalCommandSetHashKey,
                                         .hashEntry = originalCommandSetHashEntry,
                                         .keyCompare = originalCommandSetKeyCompare,
                                         .entryCompare = originalCommandSetEntryCompare,
@@ -899,7 +922,8 @@ static uint64_t subcommandSetHashEntry(const void *entry) {
 
 static int subcommandSetKeyCompare(const void *entry, const void *key) {
     struct serverCommand *cmd = (struct serverCommand *)entry;
-    return dictCStrKeyCaseCompare(cmd->declared_name, key);
+    const stringRef *ref = key;
+    return stringRefCaseEqualCStr(ref, cmd->declared_name);
 }
 
 static int subcommandSetEntryCompare(const void *entry1, const void *entry2) {
@@ -908,8 +932,13 @@ static int subcommandSetEntryCompare(const void *entry1, const void *entry2) {
     return dictCStrKeyCaseCompare(c1->declared_name, c2->declared_name);
 }
 
+static uint64_t subcommandSetHashKey(const void *key) {
+    const stringRef *ref = key;
+    return stringRefCaseHash(ref);
+}
+
 /* Sub-command set, hashed by char* string, stores serverCommand structs. */
-hashtableType subcommandSetType = {.hashKey = dictCStrCaseHash,
+hashtableType subcommandSetType = {.hashKey = subcommandSetHashKey,
                                    .hashEntry = subcommandSetHashEntry,
                                    .keyCompare = subcommandSetKeyCompare,
                                    .entryCompare = subcommandSetEntryCompare,
@@ -3718,14 +3747,16 @@ void serverOpArrayFree(serverOpArray *oa) {
 
 bool isContainerCommandBySds(sds s) {
     void *entry;
-    bool found_command = hashtableFind(server.commands, s, &entry);
+    stringRef ref = STRINGREF_FROM_SDS(s);
+    bool found_command = hashtableFind(server.commands, &ref, &entry);
     struct serverCommand *base_cmd = entry;
     return found_command && base_cmd->subcommands_ht;
 }
 
 struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name) {
     void *entry = NULL;
-    hashtableFind(container->subcommands_ht, sub_name, &entry);
+    stringRef ref = STRINGREF_FROM_SDS(sub_name);
+    hashtableFind(container->subcommands_ht, &ref, &entry);
     struct serverCommand *subcommand = entry;
     return subcommand;
 }
@@ -3740,7 +3771,9 @@ struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_
  */
 struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int argc, int strict) {
     void *entry = NULL;
-    bool found_command = hashtableFind(commands, objectGetVal(argv[0]), &entry);
+    sds name = objectGetVal(argv[0]);
+    stringRef ref = STRINGREF_FROM_SDS(name);
+    bool found_command = hashtableFind(commands, &ref, &entry);
     struct serverCommand *base_cmd = entry;
     bool has_subcommands = found_command && base_cmd->subcommands_ht;
     if (argc == 1 || !has_subcommands) {
@@ -3786,10 +3819,18 @@ struct serverCommand *lookupCommandBySds(sds s) {
 }
 
 struct serverCommand *lookupCommandByCStringLogic(hashtable *commands, const char *s) {
-    struct serverCommand *cmd;
-    sds name = sdsnew(s);
-
-    cmd = lookupCommandBySdsLogic(commands, name);
+    size_t len = strlen(s);
+    /* Check for subcommand delimiter '|' */
+    const char *delim = memchr(s, '|', len);
+    if (!delim) {
+        stringRef ref = stringRefCreate(s, len);
+        void *entry = NULL;
+        hashtableFind(commands, &ref, &entry);
+        return entry;
+    }
+    /* Has subcommand — fall through to lookupCommandBySdsLogic for split handling */
+    sds name = sdsnewlen(s, len);
+    struct serverCommand *cmd = lookupCommandBySdsLogic(commands, name);
     sdsfree(name);
     return cmd;
 }

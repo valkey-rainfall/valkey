@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 
 /* Forward declare sds type to avoid circular includes. */
 typedef char *sds;
@@ -54,9 +55,18 @@ static inline int stringRefCmp(const stringRef *a, const stringRef *b) {
     return 0;
 }
 
+/* Case-insensitive equality check against a null-terminated C string.
+ * Returns 1 if equal, 0 otherwise (matches dict*Compare convention). */
+static inline int stringRefCaseEqualCStr(const stringRef *ref, const char *cstr) {
+    size_t clen = strlen(cstr);
+    if (ref->len != clen) return 0;
+    return strncasecmp(ref->buf, cstr, clen) == 0;
+}
+
 /* Hash — uses the same siphash as hashtableGenHashFunction.
  * Declared here, implemented in stringref.c to avoid exposing siphash. */
 uint64_t stringRefHash(const stringRef *ref);
+uint64_t stringRefCaseHash(const stringRef *ref);
 
 /* Materialization — allocates a new sds copy. Caller owns the result.
  * Declared here, implemented in stringref.c to avoid including sds.h. */
