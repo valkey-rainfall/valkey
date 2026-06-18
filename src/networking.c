@@ -4061,7 +4061,9 @@ static int addKeysToIncrFindBatch(client *c,
                                   int argc,
                                   hashtableIncrementalFindState *incr_states,
                                   int num,
-                                  int max) {
+                                  int max,
+                                  uint64_t first_key_hash,
+                                  int first_key_hash_valid) {
     getKeysResult result;
     initGetKeysResult(&result);
     int numkeys = getKeysFromCommand(cmd, argv, argc, &result);
@@ -4076,7 +4078,12 @@ static int addKeysToIncrFindBatch(client *c,
             for (int i = 0; i < numkeys && num < max; i++) {
                 hashtableIncrementalFindState *incr_state = &incr_states[num++];
                 robj *keyobj = argv[result.keys[i].pos];
-                hashtableIncrementalFindInit(incr_state, ht, objectGetVal(keyobj));
+                if (i == 0 && first_key_hash_valid) {
+                    hashtableIncrementalFindInitWithHash(incr_state, ht,
+                                                        objectGetVal(keyobj), first_key_hash);
+                } else {
+                    hashtableIncrementalFindInit(incr_state, ht, objectGetVal(keyobj));
+                }
             }
         }
     }
@@ -4101,7 +4108,8 @@ static void prefetchCommandQueueKeys(client *c) {
     /* If the command is valid, add keys to incremental find batch. */
     if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
         num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
-                                          key_incr_states, num_keys, max_keys);
+                                          key_incr_states, num_keys, max_keys,
+                                          c->key_hash, c->key_hash_valid);
     } else {
         /* Command is already found to be incomplete, non-existing, etc. */
         debugServerAssert(!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
@@ -4124,7 +4132,8 @@ static void prefetchCommandQueueKeys(client *c) {
             continue;
         }
         num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
-                                          key_incr_states, num_keys, max_keys);
+                                          key_incr_states, num_keys, max_keys,
+                                          p->key_hash, p->key_hash_valid);
     }
     if (num_keys <= 1) return; /* No point to prefetch a single key */
 

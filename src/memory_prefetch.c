@@ -35,6 +35,8 @@ typedef struct PrefetchCommandsBatch {
     void **keys;                    /* Array of keys to prefetch in the current batch */
     client **clients;               /* Array of clients in the current batch */
     hashtable **keys_tables;        /* Main table for each key */
+    uint64_t *key_hashes;           /* Pre-computed hashes from IO thread (0 = not available) */
+    int *key_hash_valid;            /* Whether key_hashes[i] is valid */
     KeyPrefetchInfo *prefetch_info; /* Prefetch info for each key */
 } PrefetchCommandsBatch;
 
@@ -49,6 +51,8 @@ void freePrefetchCommandsBatch(void) {
     zfree(batch->keys);
     zfree(batch->keys_tables);
     zfree(batch->slots);
+    zfree(batch->key_hashes);
+    zfree(batch->key_hash_valid);
     zfree(batch->prefetch_info);
     zfree(batch);
     batch = NULL;
@@ -68,6 +72,8 @@ void prefetchCommandsBatchInit(void) {
     batch->keys = zcalloc(max_prefetch_size * sizeof(void *));
     batch->keys_tables = zcalloc(max_prefetch_size * sizeof(hashtable *));
     batch->slots = zcalloc(max_prefetch_size * sizeof(int));
+    batch->key_hashes = zcalloc(max_prefetch_size * sizeof(uint64_t));
+    batch->key_hash_valid = zcalloc(max_prefetch_size * sizeof(int));
     batch->prefetch_info = zcalloc(max_prefetch_size * sizeof(KeyPrefetchInfo));
 }
 
@@ -115,7 +121,12 @@ static void initBatchInfo(hashtable **tables) {
             continue;
         }
         info->state = PREFETCH_ENTRY;
-        hashtableIncrementalFindInit(&info->hashtab_state, tables[i], batch->keys[i]);
+        if (batch->key_hash_valid[i]) {
+            hashtableIncrementalFindInitWithHash(&info->hashtab_state, tables[i],
+                                                batch->keys[i], batch->key_hashes[i]);
+        } else {
+            hashtableIncrementalFindInit(&info->hashtab_state, tables[i], batch->keys[i]);
+        }
     }
 }
 
@@ -243,7 +254,8 @@ void processClientsCommandsBatch(void) {
 }
 
 /* Get a command's keys and add them to the current prefetching batch. */
-static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot) {
+static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot,
+                              uint64_t key_hash, int key_hash_valid) {
     getKeysResult result;
     initGetKeysResult(&result);
     int num_keys = getKeysFromCommand(cmd, argv, argc, &result);
@@ -251,6 +263,13 @@ static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, 
         batch->keys[batch->key_count] = argv[result.keys[i].pos];
         batch->slots[batch->key_count] = slot >= 0 ? slot : 0;
         batch->keys_tables[batch->key_count] = kvstoreGetHashtable(db->keys, batch->slots[batch->key_count]);
+        /* Pass pre-computed hash only for the first key */
+        if (i == 0 && key_hash_valid) {
+            batch->key_hashes[batch->key_count] = key_hash;
+            batch->key_hash_valid[batch->key_count] = 1;
+        } else {
+            batch->key_hash_valid[batch->key_count] = 0;
+        }
         batch->key_count++;
     }
     getKeysFreeResult(&result);
@@ -268,7 +287,8 @@ int addCommandToBatchAndProcessIfFull(client *c) {
     /* Client's next command */
     if (c->parsed_cmd && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
         c->read_flags |= READ_FLAGS_PREFETCHED;
-        addCommandToBatch(c->parsed_cmd, c->argv, c->argc, c->db, c->slot);
+        addCommandToBatch(c->parsed_cmd, c->argv, c->argc, c->db, c->slot,
+                          c->key_hash, c->key_hash_valid);
     }
 
     /* Commands in the queue. */
@@ -276,7 +296,8 @@ int addCommandToBatchAndProcessIfFull(client *c) {
         parsedCommand *p = &c->cmd_queue.cmds[j];
         if (!p->cmd) continue; /* Error or incomplete command. */
         p->read_flags |= READ_FLAGS_PREFETCHED;
-        addCommandToBatch(p->cmd, p->argv, p->argc, c->db, p->slot);
+        addCommandToBatch(p->cmd, p->argv, p->argc, c->db, p->slot,
+                          p->key_hash, p->key_hash_valid);
     }
 
     /* If the batch is full, process it.
