@@ -548,6 +548,7 @@ ENGINE_SERVER_OBJ = \
     script.o \
     scripting_engine.o \
     sds.o \
+    stringref.o \
     sentinel.o \
     server.o \
     setcpuaffinity.o \
@@ -599,6 +600,7 @@ ENGINE_CLI_OBJ = \
     mt19937-64.o \
     release.o \
     sds.o \
+    stringref.o \
     serverassert.o \
     sha256.o \
     siphash.o \
@@ -626,6 +628,7 @@ ENGINE_BENCHMARK_OBJ = \
     release.o \
     sds.o \
     serverassert.o \
+    stringref.o \
     sha256.o \
     siphash.o \
     strl.o \

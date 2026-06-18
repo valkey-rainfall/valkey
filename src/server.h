@@ -598,13 +598,7 @@ typedef enum { LOG_TIMESTAMP_LEGACY = 0,
 typedef enum { RDB_VERSION_CHECK_STRICT = 0,
                RDB_VERSION_CHECK_RELAXED } rdb_version_check_type;
 
-/* Structure representing a non-owning view of a buffer.
- * A stringRef struct does not manage the underlying memory, so its destruction
- * will not free the buffer. */
-typedef struct stringRef {
-    const char *buf; /* Pointer to the externalized buffer */
-    size_t len;      /* Length of the buffer */
-} stringRef;
+#include "stringref.h"
 
 /* common sets of actions to pause/unpause */
 #define PAUSE_ACTIONS_CLIENT_WRITE_SET \
