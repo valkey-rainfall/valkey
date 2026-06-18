@@ -300,6 +300,21 @@ static uint64_t sdsHash(const void *key) {
     return dictGenHashFunction(key, sdslen(key));
 }
 
+static uint64_t dictEntryHashSdsLocal(const void *entry) {
+    const dictEntry *de = entry;
+    return sdsHash(de->key);
+}
+
+static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key) {
+    const dictEntry *de = entry;
+    return sdsKeyCompare(de->key, key);
+}
+
+static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2) {
+    const dictEntry *de1 = entry1, *de2 = entry2;
+    return sdsKeyCompare(de1->key, de2->key);
+}
+
 static void dictEntryDestructorSdsKeyConfigVal(void *entry) {
     dictEntry *de = entry;
     sdsfree(dictGetKey(de));
@@ -309,9 +324,10 @@ static void dictEntryDestructorSdsKeyConfigVal(void *entry) {
 
 /* Dictionary type for config entries */
 static dictType configDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = sdsHash,
-    .keyCompare = sdsKeyCompare,
+    .hashEntry = dictEntryHashSdsLocal,
+    .keyCompare = dictEntryKeyCompareSdsLocal,
+    .entryCompare = dictEntryCompareEntrySdsLocal,
     .entryDestructor = dictEntryDestructorSdsKeyConfigVal,
 };
 

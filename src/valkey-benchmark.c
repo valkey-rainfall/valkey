@@ -267,6 +267,9 @@ static int parseCommandTemplate(int argc, char **argv);
 /* Dict callbacks */
 static uint64_t dictSdsHash(const void *key);
 static int dictSdsKeyCompare(const void *key1, const void *key2);
+static uint64_t dictEntryHashSdsLocal(const void *entry);
+static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key);
+static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2);
 
 /* Implementation */
 static long long ustime(void) {
@@ -316,10 +319,26 @@ static int dictSdsKeyCompare(const void *key1, const void *key2) {
     return memcmp(key1, key2, l1) == 0;
 }
 
+static uint64_t dictEntryHashSdsLocal(const void *entry) {
+    const dictEntry *de = entry;
+    return dictSdsHash(de->key);
+}
+
+static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key) {
+    const dictEntry *de = entry;
+    return dictSdsKeyCompare(de->key, key);
+}
+
+static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2) {
+    const dictEntry *de1 = entry1, *de2 = entry2;
+    return dictSdsKeyCompare(de1->key, de2->key);
+}
+
 static dictType dtype = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    .hashEntry = dictEntryHashSdsLocal,
+    .keyCompare = dictEntryKeyCompareSdsLocal,
+    .entryCompare = dictEntryCompareEntrySdsLocal,
     .entryDestructor = zfree,
 };
 

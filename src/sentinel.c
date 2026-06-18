@@ -447,9 +447,10 @@ static void dictEntryDestructorInstancesValue(void *entry) {
 }
 
 dictType instancesDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    .hashEntry = dictEntryHashSds,
+    .keyCompare = dictEntryKeyCompareSds,
+    .entryCompare = dictEntryCompareEntrySds,
     .entryDestructor = dictEntryDestructorInstancesValue,
 };
 
@@ -458,17 +459,19 @@ dictType instancesDictType = {
  * This is useful into sentinelGetObjectiveLeader() function in order to
  * count the votes and understand who is the leader. */
 dictType leaderVotesDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    .hashEntry = dictEntryHashSds,
+    .keyCompare = dictEntryKeyCompareSds,
+    .entryCompare = dictEntryCompareEntrySds,
     .entryDestructor = zfree,
 };
 
 /* Instance renamed commands table. */
 dictType renamedCommandsDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    .hashEntry = dictEntryHashSdsCase,
+    .keyCompare = dictEntryKeyCompareSdsCase,
+    .entryCompare = dictEntryCompareEntrySdsCase,
     .entryDestructor = dictEntryDestructorSdsKeyValue,
 };
 

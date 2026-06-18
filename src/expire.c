@@ -609,9 +609,10 @@ void expireReplicaKeys(void) {
 void rememberReplicaKeyWithExpire(serverDb *db, robj *key) {
     if (replicaKeysWithExpire == NULL) {
         static dictType dt = {
-            .entryGetKey = dictEntryGetKey,
             .hashKey = dictSdsHash,
-            .keyCompare = dictSdsKeyCompare,
+            .hashEntry = dictEntryHashSds,
+            .keyCompare = dictEntryKeyCompareSds,
+            .entryCompare = dictEntryCompareEntrySds,
             .entryDestructor = dictEntryDestructorSdsKey,
         };
         replicaKeysWithExpire = dictCreate(&dt);

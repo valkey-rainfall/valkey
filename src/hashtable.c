@@ -404,11 +404,6 @@ static inline void freeEntry(hashtable *ht, void *entry) {
 
 static inline int compareKeys(hashtable *ht, const void *entry, const void *key) {
     if (ht->type->keyCompare != NULL) {
-        if (ht->type->entryGetKey != NULL && ht->type->hashEntry == NULL) {
-            /* Legacy path: keyCompare expects (key, key), extract key from entry. */
-            const void *entry_key = ht->type->entryGetKey(entry);
-            return ht->type->keyCompare(entry_key, key);
-        }
         return ht->type->keyCompare(entry, key);
     } else {
         return entry == key;
@@ -418,11 +413,6 @@ static inline int compareKeys(hashtable *ht, const void *entry, const void *key)
 static inline int compareEntries(hashtable *ht, const void *entry1, const void *entry2) {
     if (ht->type->entryCompare != NULL) {
         return ht->type->entryCompare(entry1, entry2);
-    } else if (ht->type->entryGetKey != NULL && ht->type->keyCompare != NULL) {
-        /* Legacy fallback. */
-        const void *key1 = ht->type->entryGetKey(entry1);
-        const void *key2 = ht->type->entryGetKey(entry2);
-        return ht->type->keyCompare(key1, key2);
     } else {
         return compareKeys(ht, entry1, entry2);
     }
@@ -439,9 +429,6 @@ static inline uint64_t hashKey(hashtable *ht, const void *key) {
 static inline uint64_t hashEntry(hashtable *ht, const void *entry) {
     if (ht->type->hashEntry != NULL) {
         return ht->type->hashEntry(entry);
-    } else if (ht->type->entryGetKey != NULL) {
-        /* Legacy fallback. */
-        return hashKey(ht, ht->type->entryGetKey(entry));
     } else {
         return hashKey(ht, entry);
     }

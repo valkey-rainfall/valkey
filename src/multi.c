@@ -325,20 +325,30 @@ typedef struct watchedKey {
     unsigned expired : 1; /* Flag that we're watching an already expired key. */
 } watchedKey;
 
-/* Callback used for watchedKeysHashtableType where the entries are watchedKey *
- * and it already contains the key. */
-static const void *watchedKeyGetKey(const void *entry) {
+static uint64_t watchedKeyHashEntry(const void *entry) {
     const watchedKey *wk = entry;
-    return wk->key;
+    return dictEncObjHash(wk->key);
+}
+
+static int watchedKeyKeyCompare(const void *entry, const void *key) {
+    const watchedKey *wk = entry;
+    return dictEncObjKeyCompare(wk->key, key);
+}
+
+static int watchedKeyEntryCompare(const void *entry1, const void *entry2) {
+    const watchedKey *wk1 = entry1;
+    const watchedKey *wk2 = entry2;
+    return dictEncObjKeyCompare(wk1->key, wk2->key);
 }
 
 /* Hashtable type for client's per-db watched keys lookup.
  * Entries are watchedKey* stored directly, no destructor needed since the
  * actual memory is managed by the multiState->watched_keys list. */
 hashtableType watchedKeysHashtableType = {
-    .entryGetKey = watchedKeyGetKey,
     .hashKey = dictEncObjHash,
-    .keyCompare = dictEncObjKeyCompare,
+    .hashEntry = watchedKeyHashEntry,
+    .keyCompare = watchedKeyKeyCompare,
+    .entryCompare = watchedKeyEntryCompare,
 };
 
 /* Attach a watchedKey to the list of clients watching that key. */

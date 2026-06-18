@@ -1042,16 +1042,18 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state);
  * like "maxmemory" -> list of line numbers (first line is zero).
  */
 dictType optionToLineDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    .hashEntry = dictEntryHashSdsCase,
+    .keyCompare = dictEntryKeyCompareSdsCase,
+    .entryCompare = dictEntryCompareEntrySdsCase,
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
 
 dictType optionSetDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    .hashEntry = dictEntryHashSdsCase,
+    .keyCompare = dictEntryKeyCompareSdsCase,
+    .entryCompare = dictEntryCompareEntrySdsCase,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 

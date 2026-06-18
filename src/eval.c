@@ -81,9 +81,10 @@ static void dictEntryDestructorSdsKeyScriptValue(void *entry) {
 
 /* evalCtx.scripts sha (as sds string) -> scripts (as evalScript) cache. */
 dictType shaScriptObjectDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictCStrCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    .hashEntry = dictEntryHashCStrCase,
+    .keyCompare = dictEntryKeyCompareSdsCase,
+    .entryCompare = dictEntryCompareEntrySdsCase,
     .entryDestructor = dictEntryDestructorSdsKeyScriptValue,
 };
 

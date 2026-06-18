@@ -247,9 +247,10 @@ static_assert(offsetof(clusterMsg, type) + sizeof(uint16_t) == RCVBUF_MIN_READ_L
 /* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
  * clusterNode structures. */
 dictType clusterNodesDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    .hashEntry = dictEntryHashSds,
+    .keyCompare = dictEntryKeyCompareSds,
+    .entryCompare = dictEntryCompareEntrySds,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
@@ -257,17 +258,19 @@ dictType clusterNodesDictType = {
  * we can re-add this node. The goal is to avoid reading a removed
  * node for some time. */
 dictType clusterNodesBlackListDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    .hashEntry = dictEntryHashSdsCase,
+    .keyCompare = dictEntryKeyCompareSdsCase,
+    .entryCompare = dictEntryCompareEntrySdsCase,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Cluster shards hash table, mapping shard id to list of nodes */
 dictType clusterSdsToListType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    .hashEntry = dictEntryHashSds,
+    .keyCompare = dictEntryKeyCompareSds,
+    .entryCompare = dictEntryCompareEntrySds,
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
 
@@ -276,16 +279,29 @@ static uint64_t dictPtrHash(const void *key) {
     return dictGenHashFunction((const char *)&key, sizeof(key));
 }
 
-static int dictPtrCompare(const void *key1, const void *key2) {
-    return key1 == key2;
-}
 
 /* Dictionary type for mapping hash slots to cluster nodes.
  * Keys are slot numbers encoded directly as pointer values, values are clusterNode pointers. */
+static uint64_t dictEntryHashPtrLocal(const void *entry) {
+    const dictEntry *de = entry;
+    return dictGenHashFunction((const char *)&de->key, sizeof(de->key));
+}
+
+static int dictEntryKeyComparePtrLocal(const void *entry, const void *key) {
+    const dictEntry *de = entry;
+    return de->key == key;
+}
+
+static int dictEntryCompareEntryPtrLocal(const void *entry1, const void *entry2) {
+    const dictEntry *de1 = entry1, *de2 = entry2;
+    return de1->key == de2->key;
+}
+
 dictType clusterSlotDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictPtrHash,
-    .keyCompare = dictPtrCompare,
+    .hashEntry = dictEntryHashPtrLocal,
+    .keyCompare = dictEntryKeyComparePtrLocal,
+    .entryCompare = dictEntryCompareEntryPtrLocal,
     .entryDestructor = zfree,
 };
 

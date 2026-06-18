@@ -3926,6 +3926,30 @@ void dictEntryDestructorSdsKey(void *entry);
 void dictEntryDestructorSdsKeyValue(void *entry);
 void dictEntryDestructorSdsKeyListValue(void *entry);
 
+/* dictEntry-based hashtableType wrappers: hash entry, compare entry vs key,
+ * compare two entries. Used by dict types that store dictEntry* with de->key. */
+uint64_t dictEntryHashSds(const void *entry);
+uint64_t dictEntryHashSdsCase(const void *entry);
+uint64_t dictEntryHashCStr(const void *entry);
+uint64_t dictEntryHashCStrCase(const void *entry);
+uint64_t dictEntryHashObj(const void *entry);
+uint64_t dictEntryHashEncObj(const void *entry);
+uint64_t dictEntryHashPtr(const void *entry);
+int dictEntryKeyCompareSds(const void *entry, const void *key);
+int dictEntryKeyCompareSdsCase(const void *entry, const void *key);
+int dictEntryKeyCompareCStrCase(const void *entry, const void *key);
+int dictEntryKeyCompareCStr(const void *entry, const void *key);
+int dictEntryKeyCompareObj(const void *entry, const void *key);
+int dictEntryKeyCompareEncObj(const void *entry, const void *key);
+int dictEntryKeyComparePtr(const void *entry, const void *key);
+int dictEntryCompareEntrySds(const void *entry1, const void *entry2);
+int dictEntryCompareEntrySdsCase(const void *entry1, const void *entry2);
+int dictEntryCompareEntryCStrCase(const void *entry1, const void *entry2);
+int dictEntryCompareEntryCStr(const void *entry1, const void *entry2);
+int dictEntryCompareEntryObj(const void *entry1, const void *entry2);
+int dictEntryCompareEntryEncObj(const void *entry1, const void *entry2);
+int dictEntryCompareEntryPtr(const void *entry1, const void *entry2);
+
 /* Git SHA1 */
 char *serverGitSHA1(void);
 char *serverGitDirty(void);

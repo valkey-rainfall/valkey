@@ -66,10 +66,6 @@ typedef struct {
      * If NULL, falls back to keyCompare(entry1, entry2) which is correct
      * for homogeneous types where entries and keys are the same type. */
     int (*entryCompare)(const void *entry1, const void *entry2);
-    /* DEPRECATED: Extract a key from an entry. Will be removed once all types
-     * are migrated to provide hashEntry + keyCompare(entry, key) directly.
-     * Currently used as fallback in hashtable.c when hashEntry is NULL. */
-    const void *(*entryGetKey)(const void *entry);
     /* Check for entry access should be masked or not. Masked access will just treat the entry as not-exist. */
     bool (*validateEntry)(hashtable *ht, void *entry);
     /* Callback to free an entry when it's overwritten or deleted.

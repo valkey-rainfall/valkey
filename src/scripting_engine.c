@@ -67,9 +67,10 @@ static engineManager engineMgr = {
 };
 
 dictType engineDictType = {
-    .entryGetKey = dictEntryGetKey,
     .hashKey = dictCStrCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    .hashEntry = dictEntryHashCStrCase,
+    .keyCompare = dictEntryKeyCompareSdsCase,
+    .entryCompare = dictEntryCompareEntrySdsCase,
     .entryDestructor = zfree,
 };
 

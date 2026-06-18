@@ -234,6 +234,7 @@ int setTypeRemove(robj *setobj, sds value) {
  * Returns 1 if the value was deleted and 0 if it was not a member of the set. */
 int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str_is_sds) {
     char tmpbuf[LONG_STR_SIZE];
+    (void)str_is_sds;
     if (!str) {
         if (setobj->encoding == OBJ_ENCODING_INTSET) {
             int success;
@@ -285,6 +286,7 @@ int setTypeIsMember(robj *subject, sds value) {
  * Returns 1 if the value is a member of the set and 0 if it isn't. */
 int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds) {
     char tmpbuf[LONG_STR_SIZE];
+    (void)str_is_sds;
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) return intsetFind(objectGetVal(set), llval);
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);

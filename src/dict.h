@@ -125,11 +125,6 @@ static inline void *dictGetKey(const dictEntry *de) {
     return de->key;
 }
 
-/* Callback for dictType.entryGetKey, which expects void pointers. */
-static inline const void *dictEntryGetKey(const void *entry) {
-    return dictGetKey((const dictEntry *)entry);
-}
-
 static inline void *dictGetVal(const dictEntry *de) {
     return de->v.val;
 }
