@@ -337,7 +337,7 @@ static const void *watchedKeyGetKey(const void *entry) {
  * actual memory is managed by the multiState->watched_keys list. */
 hashtableType watchedKeysHashtableType = {
     .entryGetKey = watchedKeyGetKey,
-    .hashFunction = dictEncObjHash,
+    .hashKey = dictEncObjHash,
     .keyCompare = dictEncObjKeyCompare,
 };
 

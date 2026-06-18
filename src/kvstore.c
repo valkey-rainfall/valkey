@@ -870,7 +870,7 @@ unsigned long kvstoreHashtableDefragTables(kvstore *kvs, unsigned long cursor, v
 }
 
 uint64_t kvstoreGetHash(kvstore *kvs, const void *key) {
-    return kvs->dtype->hashFunction(key);
+    return kvs->dtype->hashKey(key);
 }
 
 bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found) {

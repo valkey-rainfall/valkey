@@ -310,7 +310,7 @@ static void dictEntryDestructorSdsKeyConfigVal(void *entry) {
 /* Dictionary type for config entries */
 static dictType configDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = sdsHash,
+    .hashKey = sdsHash,
     .keyCompare = sdsKeyCompare,
     .entryDestructor = dictEntryDestructorSdsKeyConfigVal,
 };

@@ -902,7 +902,7 @@ static void cliInitHelp(void) {
     /* Dict type for a set of strings, used to collect names of command groups. */
     dictType groupsdt = {
         .entryGetKey = dictEntryGetKey,
-        .hashFunction = dictSdsHash,
+        .hashKey = dictSdsHash,
         .keyCompare = dictSdsKeyCompare,
         .entryDestructor = dictEntryDestructorSdsKeyNoVal,
     };
@@ -3681,14 +3681,14 @@ typedef struct clusterManagerLink {
 
 static dictType clusterManagerDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorSdsVal,
 };
 
 static dictType clusterManagerLinkDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorSdsKeyListVal,
 };
@@ -9238,7 +9238,7 @@ static void dictEntryDestructorTypeinfoVal(void *entry) {
 
 static dictType typeinfoDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorTypeinfoVal,
 };

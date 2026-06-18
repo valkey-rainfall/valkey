@@ -419,7 +419,7 @@ static inline int compareEntries(hashtable *ht, const void *entry1, const void *
     if (ht->type->entryCompare != NULL) {
         return ht->type->entryCompare(entry1, entry2);
     } else if (ht->type->entryGetKey != NULL && ht->type->keyCompare != NULL) {
-        /* Legacy fallback: extract keys from both entries, compare symmetrically. */
+        /* Legacy fallback. */
         const void *key1 = ht->type->entryGetKey(entry1);
         const void *key2 = ht->type->entryGetKey(entry2);
         return ht->type->keyCompare(key1, key2);
@@ -429,8 +429,8 @@ static inline int compareEntries(hashtable *ht, const void *entry1, const void *
 }
 
 static inline uint64_t hashKey(hashtable *ht, const void *key) {
-    if (ht->type->hashFunction != NULL) {
-        return ht->type->hashFunction(key);
+    if (ht->type->hashKey != NULL) {
+        return ht->type->hashKey(key);
     } else {
         return hashtableGenHashFunction((const char *)&key, sizeof(key));
     }
@@ -440,7 +440,7 @@ static inline uint64_t hashEntry(hashtable *ht, const void *entry) {
     if (ht->type->hashEntry != NULL) {
         return ht->type->hashEntry(entry);
     } else if (ht->type->entryGetKey != NULL) {
-        /* Legacy fallback: extract key, then hash it. */
+        /* Legacy fallback. */
         return hashKey(ht, ht->type->entryGetKey(entry));
     } else {
         return hashKey(ht, entry);

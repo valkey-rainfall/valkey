@@ -598,7 +598,7 @@ void dictEntryDestructorSdsKeyHeapValue(void *entry) {
  * dummy pointers. */
 dictType objectKeyPointerValueDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictEncObjHash,
+    .hashKey = dictEncObjHash,
     .keyCompare = dictEncObjKeyCompare,
     .entryDestructor = dictEntryDestructorObjectKey,
 };
@@ -607,21 +607,21 @@ dictType objectKeyPointerValueDictType = {
  * not NULL, calling zfree(). */
 dictType objectKeyHeapPointerValueDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictEncObjHash,
+    .hashKey = dictEncObjHash,
     .keyCompare = dictEncObjKeyCompare,
     .entryDestructor = dictEntryDestructorObjectKeyHeapValue,
 };
 
 /* Generic hashtable type: set of robj elements */
 hashtableType objectHashtableType = {
-    .hashFunction = dictEncObjHash,
+    .hashKey = dictEncObjHash,
     .keyCompare = dictEncObjKeyCompare,
     .entryDestructor = dictObjectDestructor,
 };
 
 /* Set hashtable type. Items are SDS strings */
 hashtableType setHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashKey = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictSdsDestructor};
 
@@ -632,7 +632,7 @@ const void *zsetHashtableGetKey(const void *element) {
 
 /* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
 hashtableType zsetHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashKey = sdsHashConfigurableSeed,
     .entryGetKey = zsetHashtableGetKey,
     .keyCompare = dictSdsKeyCompare,
 };
@@ -663,7 +663,7 @@ void hashtableObjectDestructor(void *val) {
 hashtableType kvstoreKeysHashtableType = {
     .entryPrefetchValue = hashtableObjectPrefetchValue,
     .entryGetKey = hashtableObjectGetKey,
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashKey = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashtableObjectDestructor,
     .resizeAllowed = hashtableResizeAllowed,
@@ -677,7 +677,7 @@ hashtableType kvstoreKeysHashtableType = {
 hashtableType kvstoreExpiresHashtableType = {
     .entryPrefetchValue = hashtableObjectPrefetchValue,
     .entryGetKey = hashtableObjectGetKey,
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashKey = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = NULL, /* shared with keyspace table */
     .resizeAllowed = hashtableResizeAllowed,
@@ -689,19 +689,19 @@ hashtableType kvstoreExpiresHashtableType = {
 
 /* Command set, hashed by current command name, stores serverCommand structs. */
 hashtableType commandSetType = {.entryGetKey = hashtableCommandGetCurrentName,
-                                .hashFunction = dictSdsCaseHash,
+                                .hashKey = dictSdsCaseHash,
                                 .keyCompare = dictCStrKeyCaseCompare,
                                 .instant_rehashing = 1};
 
 /* Command set, hashed by original command name, stores serverCommand structs. */
 hashtableType originalCommandSetType = {.entryGetKey = hashtableCommandGetOriginalName,
-                                        .hashFunction = dictSdsCaseHash,
+                                        .hashKey = dictSdsCaseHash,
                                         .keyCompare = dictCStrKeyCaseCompare,
                                         .instant_rehashing = 1};
 
 /* Sub-command set, hashed by char* string, stores serverCommand structs. */
 hashtableType subcommandSetType = {.entryGetKey = hashtableSubcommandGetKey,
-                                   .hashFunction = dictCStrCaseHash,
+                                   .hashKey = dictCStrCaseHash,
                                    .keyCompare = dictCStrKeyCaseCompare,
                                    .instant_rehashing = 1};
 
@@ -721,7 +721,7 @@ size_t hashHashtableTypeMetadataSize(void) {
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashKey = sdsHashConfigurableSeed,
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
@@ -729,7 +729,7 @@ hashtableType hashHashtableType = {
 };
 
 hashtableType hashWithVolatileItemsHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
+    .hashKey = sdsHashConfigurableSeed,
     .entryGetKey = hashHashtableTypeGetKey,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
@@ -739,7 +739,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
 
 /* Hashtable type without destructor */
 hashtableType sdsReplyHashtableType = {
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCompare};
 
 /* Keylist hash table type has unencoded Objects as keys and
@@ -747,7 +747,7 @@ hashtableType sdsReplyHashtableType = {
  * map swapped keys to a list of clients waiting for this keys to be loaded. */
 dictType keylistDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictObjHash,
+    .hashKey = dictObjHash,
     .keyCompare = dictObjKeyCompare,
     .entryDestructor = dictEntryDestructorObjectKeyListValue,
 };
@@ -756,7 +756,7 @@ dictType keylistDictType = {
  * hashtables as values. It's used for PUBSUB command to track clients subscribing the patterns. */
 dictType objToHashtableDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictObjHash,
+    .hashKey = dictObjHash,
     .keyCompare = dictObjKeyCompare,
     .entryDestructor = dictEntryDestructorObjectKeyHashtableValue,
 };
@@ -781,7 +781,7 @@ void hashtableChannelsDestructor(void *entry) {
  * each dict stores a pointer to the channel name. */
 hashtableType kvstoreChannelHashtableType = {
     .entryGetKey = hashtableChannelsGetKey,
-    .hashFunction = dictObjHash,
+    .hashKey = dictObjHash,
     .keyCompare = dictObjKeyCompare,
     .entryDestructor = hashtableChannelsDestructor,
     .rehashingStarted = kvstoreHashtableRehashingStarted,
@@ -794,7 +794,7 @@ hashtableType kvstoreChannelHashtableType = {
  * values are pointer to ValkeyModule struct. */
 dictType modulesDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
@@ -802,7 +802,7 @@ dictType modulesDictType = {
 /* Migrate cache dict type. */
 dictType migrateCacheDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
@@ -811,7 +811,7 @@ dictType migrateCacheDictType = {
  * The keys stored in dict are sds though. */
 dictType stringSetDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrCaseHash,
+    .hashKey = dictCStrCaseHash,
     .keyCompare = dictCStrKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
@@ -820,7 +820,7 @@ dictType stringSetDictType = {
  * The key and value do not have a destructor. */
 dictType externalStringType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrCaseHash,
+    .hashKey = dictCStrCaseHash,
     .keyCompare = dictCStrKeyCaseCompare,
     .entryDestructor = zfree,
 };
@@ -829,7 +829,7 @@ dictType externalStringType = {
  * allocated object as the value. */
 dictType sdsHashDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
@@ -840,7 +840,7 @@ size_t clientHashtableTypeMetadataSize(void) {
 
 /* Hashtable type: set of clients, with a metadata field to store one pointer. */
 hashtableType clientHashtableType = {
-    .hashFunction = hashtableClientHash,
+    .hashKey = hashtableClientHash,
     .keyCompare = hashtableClientKeyCompare,
     .getMetadataSize = clientHashtableTypeMetadataSize,
 };

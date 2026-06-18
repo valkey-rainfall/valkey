@@ -448,7 +448,7 @@ static void dictEntryDestructorInstancesValue(void *entry) {
 
 dictType instancesDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorInstancesValue,
 };
@@ -459,7 +459,7 @@ dictType instancesDictType = {
  * count the votes and understand who is the leader. */
 dictType leaderVotesDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = zfree,
 };
@@ -467,7 +467,7 @@ dictType leaderVotesDictType = {
 /* Instance renamed commands table. */
 dictType renamedCommandsDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKeyValue,
 };

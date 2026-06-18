@@ -1043,14 +1043,14 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state);
  */
 dictType optionToLineDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
 
 dictType optionSetDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };

@@ -52,30 +52,23 @@ typedef struct {
     /* Hash a lookup key (the argument passed to hashtableFind/Delete/etc).
      * Defaults to hashing the bits in the pointer, effectively treating
      * the pointer as an integer. */
-    uint64_t (*hashFunction)(const void *key);
+    uint64_t (*hashKey)(const void *key);
     /* Hash a stored entry (used for insert, rehash, expand).
-     * If NULL, uses hashFunction(entry) — i.e. entry IS the key.
-     * If entryGetKey is set, falls back to hashFunction(entryGetKey(entry)). */
+     * If NULL, uses hashKey(entry) — i.e. entry IS the key. */
     uint64_t (*hashEntry)(const void *entry);
     /* Compare a stored entry against a lookup key. Returns non-zero if equal.
      * entry: a stored entry in the hashtable
      * key: the lookup key passed to hashtableFind/Delete
      * For homogeneous types (entry IS the key), both args are the same type.
-     * Defaults to pointer equality.
-     * If entryGetKey is set and keyCompare uses the old symmetric signature,
-     * the entry's key is extracted before comparison (legacy fallback). */
+     * Defaults to pointer equality. */
     int (*keyCompare)(const void *entry, const void *key);
     /* Compare two stored entries for equality (used for insert dedup).
      * If NULL, falls back to keyCompare(entry1, entry2) which is correct
-     * for homogeneous types where entries and keys are the same type.
-     * If entryGetKey is set, falls back to
-     * keyCompare(entryGetKey(entry1), entryGetKey(entry2)). */
+     * for homogeneous types where entries and keys are the same type. */
     int (*entryCompare)(const void *entry1, const void *entry2);
-    /* DEPRECATED: Extract a key from an entry for hashing and comparison.
-     * Retained for backward compatibility. New code should provide hashEntry
-     * and a keyCompare that handles (entry, lookup_key) directly.
-     * When set, provides fallback behavior for hashEntry, keyCompare, and
-     * entryCompare if those are NULL. */
+    /* DEPRECATED: Extract a key from an entry. Will be removed once all types
+     * are migrated to provide hashEntry + keyCompare(entry, key) directly.
+     * Currently used as fallback in hashtable.c when hashEntry is NULL. */
     const void *(*entryGetKey)(const void *entry);
     /* Check for entry access should be masked or not. Masked access will just treat the entry as not-exist. */
     bool (*validateEntry)(hashtable *ht, void *entry);

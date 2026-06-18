@@ -248,7 +248,7 @@ static_assert(offsetof(clusterMsg, type) + sizeof(uint16_t) == RCVBUF_MIN_READ_L
  * clusterNode structures. */
 dictType clusterNodesDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
@@ -258,7 +258,7 @@ dictType clusterNodesDictType = {
  * node for some time. */
 dictType clusterNodesBlackListDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
@@ -266,7 +266,7 @@ dictType clusterNodesBlackListDictType = {
 /* Cluster shards hash table, mapping shard id to list of nodes */
 dictType clusterSdsToListType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
+    .hashKey = dictSdsHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
@@ -284,7 +284,7 @@ static int dictPtrCompare(const void *key1, const void *key2) {
  * Keys are slot numbers encoded directly as pointer values, values are clusterNode pointers. */
 dictType clusterSlotDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictPtrHash,
+    .hashKey = dictPtrHash,
     .keyCompare = dictPtrCompare,
     .entryDestructor = zfree,
 };
