@@ -141,20 +141,16 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
 
     serverAssert(str);
     if (set->encoding == OBJ_ENCODING_HASHTABLE) {
-        /* Avoid duping the string if it is an sds string. */
-        sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
         hashtable *ht = objectGetVal(set);
         hashtablePosition position;
-        if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
-            /* Key doesn't already exist in the set. Add it but dup the key. */
-            if (sdsval == str) sdsval = sdsdup(sdsval);
+        stringRef ref = stringRefCreate(str, len);
+        if (hashtableFindPositionForInsert(ht, &ref, &position, NULL)) {
+            /* Key doesn't already exist in the set. Add it. */
+            sds sdsval = str_is_sds ? sdsdup((sds)str) : sdsnewlen(str, len);
             hashtableInsertAtPosition(ht, sdsval, &position);
             return 1;
-        } else if (sdsval != str) {
-            /* String is already a member. Free our temporary sds copy. */
-            sdsfree(sdsval);
-            return 0;
         }
+        return 0;
     } else if (set->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
@@ -250,10 +246,8 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
     }
 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
-        sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
-        int deleted = hashtableDelete(objectGetVal(setobj), sdsval);
-        if (sdsval != str) sdsfree(sdsval); /* free temp copy */
-        return deleted;
+        stringRef ref = stringRefCreate(str, len);
+        return hashtableDelete(objectGetVal(setobj), &ref);
     } else if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(setobj);
         unsigned char *p = lpFirst(lp);
@@ -305,13 +299,9 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
     } else if (set->encoding == OBJ_ENCODING_INTSET) {
         long long llval;
         return string2ll(str, len, &llval) && intsetFind(objectGetVal(set), llval);
-    } else if (set->encoding == OBJ_ENCODING_HASHTABLE && str_is_sds) {
-        return hashtableFind(objectGetVal(set), (sds)str, NULL);
     } else if (set->encoding == OBJ_ENCODING_HASHTABLE) {
-        sds sdsval = sdsnewlen(str, len);
-        int result = hashtableFind(objectGetVal(set), sdsval, NULL);
-        sdsfree(sdsval);
-        return result;
+        stringRef ref = stringRefCreate(str, len);
+        return hashtableFind(objectGetVal(set), &ref, NULL);
     } else {
         serverPanic("Unknown set encoding");
     }
@@ -1151,7 +1141,8 @@ void srandmemberWithCountCommand(client *c) {
         while (size > count) {
             void *element;
             hashtableFairRandomEntry(ht, &element);
-            hashtableDelete(ht, element);
+            stringRef ref = STRINGREF_FROM_SDS((sds)element);
+            hashtableDelete(ht, &ref);
             sdsfree((sds)element);
             size--;
         }

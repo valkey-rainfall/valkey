@@ -619,10 +619,27 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
-/* Set hashtable type. Items are SDS strings */
+/* Set hashtable type. Items are SDS strings, lookup keys are stringRef*. */
+static uint64_t setHashtableHashKey(const void *key) {
+    const stringRef *ref = key;
+    return genHashFunctionConfigurableSeed(ref->buf, ref->len);
+}
+
+static int setHashtableKeyCompare(const void *entry, const void *key) {
+    const stringRef *ref = key;
+    size_t entry_len = sdslen((sds)entry);
+    if (entry_len != ref->len) return 0;
+    return memcmp(entry, ref->buf, ref->len) == 0;
+}
+
+static uint64_t setHashtableHashEntry(const void *entry) {
+    return genHashFunctionConfigurableSeed(entry, sdslen((sds)entry));
+}
+
 hashtableType setHashtableType = {
-    .hashKey = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = setHashtableHashKey,
+    .hashEntry = setHashtableHashEntry,
+    .keyCompare = setHashtableKeyCompare,
     .entryDestructor = dictSdsDestructor};
 
 const void *zsetHashtableGetKey(const void *element) {
