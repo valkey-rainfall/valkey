@@ -746,9 +746,8 @@ static uint64_t setHashtableHashKey(const void *key) {
 
 static int setHashtableKeyCompare(const void *entry, const void *key) {
     const stringRef *ref = key;
-    size_t entry_len = sdslen((sds)entry);
-    if (entry_len != ref->len) return 0;
-    return memcmp(entry, ref->buf, ref->len) == 0;
+    stringRef entry_ref = stringRefCreate((const char *)entry, sdslen((sds)entry));
+    return stringRefEqual(&entry_ref, ref);
 }
 
 static uint64_t setHashtableHashEntry(const void *entry) {
@@ -774,18 +773,16 @@ static uint64_t zsetHashtableHashKey(const void *key) {
 static int zsetHashtableKeyCompare(const void *entry, const void *key) {
     sds ele = zslGetNodeElement((const zskiplistNode *)entry);
     const stringRef *ref = key;
-    size_t ele_len = sdslen(ele);
-    if (ele_len != ref->len) return 0;
-    return memcmp(ele, ref->buf, ref->len) == 0;
+    stringRef entry_ref = stringRefCreate(ele, sdslen(ele));
+    return stringRefEqual(&entry_ref, ref);
 }
 
 static int zsetHashtableEntryCompare(const void *entry1, const void *entry2) {
     sds e1 = zslGetNodeElement((const zskiplistNode *)entry1);
     sds e2 = zslGetNodeElement((const zskiplistNode *)entry2);
-    size_t l1 = sdslen(e1);
-    size_t l2 = sdslen(e2);
-    if (l1 != l2) return 0;
-    return memcmp(e1, e2, l1) == 0;
+    stringRef r1 = stringRefCreate(e1, sdslen(e1));
+    stringRef r2 = stringRefCreate(e2, sdslen(e2));
+    return stringRefEqual(&r1, &r2);
 }
 
 /* Sorted sets hash (note: a skiplist is used in addition to the hash table) */

@@ -55,6 +55,13 @@ static inline int stringRefCmp(const stringRef *a, const stringRef *b) {
     return 0;
 }
 
+/* Equality check. Returns 1 if equal, 0 otherwise.
+ * Short-circuits on length mismatch before touching memory. */
+static inline int stringRefEqual(const stringRef *a, const stringRef *b) {
+    if (a->len != b->len) return 0;
+    return memcmp(a->buf, b->buf, a->len) == 0;
+}
+
 /* Case-insensitive equality check against a null-terminated C string.
  * Returns 1 if equal, 0 otherwise (matches dict*Compare convention). */
 static inline int stringRefCaseEqualCStr(const stringRef *ref, const char *cstr) {
