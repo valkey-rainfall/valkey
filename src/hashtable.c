@@ -650,6 +650,7 @@ static bucket *fetchEntriesForExpand(bucket *b, void *buf[], int *size, int max_
  * Uses batch processing to optimize memory access patterns. */
 static void rehashStepExpand(hashtable *ht) {
     void *entry_buf[FETCH_ENTRY_BUFFER_SIZE_WHEN_EXPAND];
+    uint64_t hash_buf[FETCH_ENTRY_BUFFER_SIZE_WHEN_EXPAND];
     size_t idx = ht->rehash_idx;
     bucket *b = ht->tables[0] + idx;
     int size = 0;
@@ -659,8 +660,11 @@ static void rehashStepExpand(hashtable *ht) {
         /* Key optimization: no loop-carried dependency enables concurrent memory access,
          * reducing CPU stall cycles. */
         for (int i = 0; i < size; i++) {
-            uint64_t hash = hashEntry(ht, entry_buf[i]);
-            rehashEntry(ht, entry_buf[i], hash, highBits(hash));
+            hash_buf[i] = hashEntry(ht, entry_buf[i]);
+        }
+
+        for (int i = 0; i < size; i++) {
+            rehashEntry(ht, entry_buf[i], hash_buf[i], highBits(hash_buf[i]));
         }
     }
 
