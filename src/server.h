@@ -3457,7 +3457,7 @@ void setupSignalHandlers(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
 connListener *listenerByType(int type);
 int changeListener(connListener *listener);
-struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name);
+struct serverCommand *lookupSubcommand(struct serverCommand *container, const char *sub_name, size_t len);
 struct serverCommand *lookupCommand(robj **argv, int argc);
 struct serverCommand *lookupCommandBySdsLogic(hashtable *commands, sds s);
 struct serverCommand *lookupCommandBySds(sds s);

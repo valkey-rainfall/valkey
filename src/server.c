@@ -3532,12 +3532,11 @@ bool isContainerCommandBySds(sds s) {
     return found_command && base_cmd->subcommands_ht;
 }
 
-struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name) {
+struct serverCommand *lookupSubcommand(struct serverCommand *container, const char *sub_name, size_t len) {
     void *entry = NULL;
-    stringRef ref = stringRefFromSds(sub_name);
+    stringRef ref = stringRefCreate(sub_name, len);
     hashtableFind(container->subcommands_ht, &ref, &entry);
-    struct serverCommand *subcommand = entry;
-    return subcommand;
+    return entry;
 }
 
 /* Look up a command by argv and argc
@@ -3562,7 +3561,7 @@ struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int a
     } else { /* argc > 1 && has_subcommands */
         if (strict && argc != 2) return NULL;
         /* Note: Currently we support just one level of subcommands */
-        return lookupSubcommand(base_cmd, objectGetVal(argv[1]));
+        return lookupSubcommand(base_cmd, objectGetVal(argv[1]), sdslen(objectGetVal(argv[1])));
     }
 }
 
@@ -3599,7 +3598,6 @@ struct serverCommand *lookupCommandBySds(sds s) {
 
 struct serverCommand *lookupCommandByCStringLogic(hashtable *commands, const char *s) {
     size_t len = strlen(s);
-    /* Check for subcommand delimiter '|' */
     const char *delim = memchr(s, '|', len);
     if (!delim) {
         stringRef ref = stringRefCreate(s, len);
@@ -3607,11 +3605,14 @@ struct serverCommand *lookupCommandByCStringLogic(hashtable *commands, const cha
         hashtableFind(commands, &ref, &entry);
         return entry;
     }
-    /* Has subcommand — fall through to lookupCommandBySdsLogic for split handling */
-    sds name = sdsnewlen(s, len);
-    struct serverCommand *cmd = lookupCommandBySdsLogic(commands, name);
-    sdsfree(name);
-    return cmd;
+    /* Has subcommand delimiter — split without allocation */
+    size_t base_len = delim - s;
+    stringRef ref = stringRefCreate(s, base_len);
+    void *entry = NULL;
+    if (!hashtableFind(commands, &ref, &entry)) return NULL;
+    struct serverCommand *base_cmd = entry;
+    if (!base_cmd->subcommands_ht) return NULL;
+    return lookupSubcommand(base_cmd, delim + 1, len - base_len - 1);
 }
 
 struct serverCommand *lookupCommandByCString(const char *s) {

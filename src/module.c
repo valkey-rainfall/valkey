@@ -1555,7 +1555,7 @@ int VM_CreateSubcommand(ValkeyModuleCommand *parent,
 
     /* Check if the command name is busy within the parent command. */
     sds declared_name = sdsnew(name);
-    if (parent_cmd->subcommands_ht && lookupSubcommand(parent_cmd, declared_name) != NULL) {
+    if (parent_cmd->subcommands_ht && lookupSubcommand(parent_cmd, name, strlen(name)) != NULL) {
         sdsfree(declared_name);
         return VALKEYMODULE_ERR;
     }
