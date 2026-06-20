@@ -598,7 +598,6 @@ typedef enum { LOG_TIMESTAMP_LEGACY = 0,
 typedef enum { RDB_VERSION_CHECK_STRICT = 0,
                RDB_VERSION_CHECK_RELAXED } rdb_version_check_type;
 
-#include "stringref.h"
 
 /* common sets of actions to pause/unpause */
 #define PAUSE_ACTIONS_CLIENT_WRITE_SET \

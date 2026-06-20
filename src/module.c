@@ -56,6 +56,7 @@
  * function names. For details, see the script src/modules/gendoc.rb.
  * -------------------------------------------------------------------------- */
 #include "server.h"
+#include "stringref.h"
 #include "cluster.h"
 #include "commandlog.h"
 #include "rdb.h"

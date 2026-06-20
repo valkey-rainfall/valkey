@@ -61,6 +61,7 @@
  * from tail to head, useful for ZREVRANGE. */
 
 #include "server.h"
+#include "stringref.h"
 #include "intset.h" /* Compact integer set structure */
 #include "mt19937-64.h"
 #include <math.h>

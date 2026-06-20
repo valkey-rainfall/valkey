@@ -33,6 +33,7 @@
  */
 
 #include "server.h"
+#include "stringref.h"
 #include "hashtable.h"
 #include "intset.h" /* Compact integer set structure */
 

@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "stringref.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
