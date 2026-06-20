@@ -2350,7 +2350,7 @@ static int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
     if (op->type == OBJ_SET) {
         char *str = val->ele ? val->ele : (char *)val->estr;
         size_t len = val->ele ? sdslen(val->ele) : val->elen;
-        if (setTypeIsMemberAux(op->subject, str, len, val->ell, val->ele != NULL)) {
+        if (setTypeIsMemberAux(op->subject, str, len, val->ell)) {
             *score = 1.0;
             return 1;
         } else {

@@ -116,7 +116,7 @@ static void maybeConvertToIntset(robj *set) {
  * If the value was already member of the set, nothing is done and 0 is
  * returned, otherwise the new element is added and 1 is returned. */
 int setTypeAdd(robj *subject, sds value) {
-    return setTypeAddAux(subject, value, sdslen(value), 0, 1);
+    return setTypeAddAux(subject, value, sdslen(value), 0);
 }
 
 /* Add member. This function is optimized for the different encodings. The
@@ -125,8 +125,7 @@ int setTypeAdd(robj *subject, sds value) {
  * is set to NULL and llval is provided instead.
  *
  * Returns 1 if the value was added and 0 if it was already a member. */
-int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds) {
-    (void)str_is_sds;
+int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval) {
     char tmpbuf[LONG_STR_SIZE];
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) {
@@ -223,7 +222,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
 /* Deletes a value provided as an sds string from the set. Returns 1 if the
  * value was deleted and 0 if it was not a member of the set. */
 int setTypeRemove(robj *setobj, sds value) {
-    return setTypeRemoveAux(setobj, value, sdslen(value), 0, 1);
+    return setTypeRemoveAux(setobj, value, sdslen(value), 0);
 }
 
 /* Remove a member. This function is optimized for the different encodings. The
@@ -232,9 +231,8 @@ int setTypeRemove(robj *setobj, sds value) {
  * is set to NULL and llval is provided instead.
  *
  * Returns 1 if the value was deleted and 0 if it was not a member of the set. */
-int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str_is_sds) {
+int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval) {
     char tmpbuf[LONG_STR_SIZE];
-    (void)str_is_sds;
     if (!str) {
         if (setobj->encoding == OBJ_ENCODING_INTSET) {
             int success;
@@ -274,7 +272,7 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
 /* Check if an sds string is a member of the set. Returns 1 if the value is a
  * member of the set and 0 if it isn't. */
 int setTypeIsMember(robj *subject, sds value) {
-    return setTypeIsMemberAux(subject, value, sdslen(value), 0, 1);
+    return setTypeIsMemberAux(subject, value, sdslen(value), 0);
 }
 
 /* Membership checking optimized for the different encodings. The value can be
@@ -283,9 +281,8 @@ int setTypeIsMember(robj *subject, sds value) {
  * and llval is provided instead.
  *
  * Returns 1 if the value is a member of the set and 0 if it isn't. */
-int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds) {
+int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval) {
     char tmpbuf[LONG_STR_SIZE];
-    (void)str_is_sds;
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) return intsetFind(objectGetVal(set), llval);
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
@@ -450,12 +447,12 @@ robj *setTypePopRandom(robj *set) {
         char *str;
         size_t len = 0;
         int64_t llele = 0;
-        int encoding = setTypeRandomElement(set, &str, &len, &llele);
+        (void)setTypeRandomElement(set, &str, &len, &llele);
         if (str)
             obj = createStringObject(str, len);
         else
             obj = createStringObjectFromLongLong(llele);
-        setTypeRemoveAux(set, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE);
+        setTypeRemoveAux(set, str, len, llele);
     }
     return obj;
 }
@@ -878,7 +875,7 @@ void spopWithCountCommand(client *c) {
                 p = lpNextRandom(lp, p, &index, remaining - i, 0);
                 unsigned int len;
                 str = (char *)lpGetValue(p, &len, (long long *)&llele);
-                setTypeAddAux(newset, str, len, llele, 0);
+                setTypeAddAux(newset, str, len, llele);
                 ps[i] = p;
                 p = lpNext(lp, p);
                 index++;
@@ -888,12 +885,12 @@ void spopWithCountCommand(client *c) {
             objectSetVal(set, lp);
         } else {
             while (remaining--) {
-                int encoding = setTypeRandomElement(set, &str, &len, &llele);
+                (void)setTypeRandomElement(set, &str, &len, &llele);
                 if (!newset) {
                     newset = str ? createSetListpackObject() : createIntsetObject();
                 }
-                setTypeAddAux(newset, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE);
-                setTypeRemoveAux(set, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE);
+                setTypeAddAux(newset, str, len, llele);
+                setTypeRemoveAux(set, str, len, llele);
             }
         }
         /* Transfer the old set to the client. */
@@ -1332,7 +1329,7 @@ void sinterGenericCommand(client *c,
     while ((encoding = setTypeNext(si, &str, &len, &intobj)) != -1) {
         for (j = 1; j < setnum; j++) {
             if (sets[j] == sets[0]) continue;
-            if (!setTypeIsMemberAux(sets[j], str, len, intobj, encoding == OBJ_ENCODING_HASHTABLE)) break;
+            if (!setTypeIsMemberAux(sets[j], str, len, intobj)) break;
         }
 
         /* Only take action when all sets contain the member */
@@ -1361,7 +1358,7 @@ void sinterGenericCommand(client *c,
                         only_integers = 0;
                     }
                 }
-                setTypeAddAux(dstset, str, len, intobj, encoding == OBJ_ENCODING_HASHTABLE);
+                setTypeAddAux(dstset, str, len, intobj);
             }
         }
     }
@@ -1532,7 +1529,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
 
             si = setTypeInitIterator(sets[j]);
             while ((encoding = setTypeNext(si, &str, &len, &llval)) != -1) {
-                cardinality += setTypeAddAux(dstset, str, len, llval, encoding == OBJ_ENCODING_HASHTABLE);
+                cardinality += setTypeAddAux(dstset, str, len, llval);
             }
             setTypeReleaseIterator(si);
         }
@@ -1552,11 +1549,11 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
             for (j = 1; j < setnum; j++) {
                 if (!sets[j]) continue;        /* no key is an empty set. */
                 if (sets[j] == sets[0]) break; /* same set! */
-                if (setTypeIsMemberAux(sets[j], str, len, llval, encoding == OBJ_ENCODING_HASHTABLE)) break;
+                if (setTypeIsMemberAux(sets[j], str, len, llval)) break;
             }
             if (j == setnum) {
                 /* There is no other set with this element. Add it. */
-                cardinality += setTypeAddAux(dstset, str, len, llval, encoding == OBJ_ENCODING_HASHTABLE);
+                cardinality += setTypeAddAux(dstset, str, len, llval);
             }
         }
         setTypeReleaseIterator(si);
@@ -1574,9 +1571,9 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
             si = setTypeInitIterator(sets[j]);
             while ((encoding = setTypeNext(si, &str, &len, &llval)) != -1) {
                 if (j == 0) {
-                    cardinality += setTypeAddAux(dstset, str, len, llval, encoding == OBJ_ENCODING_HASHTABLE);
+                    cardinality += setTypeAddAux(dstset, str, len, llval);
                 } else {
-                    cardinality -= setTypeRemoveAux(dstset, str, len, llval, encoding == OBJ_ENCODING_HASHTABLE);
+                    cardinality -= setTypeRemoveAux(dstset, str, len, llval);
                 }
             }
             setTypeReleaseIterator(si);
