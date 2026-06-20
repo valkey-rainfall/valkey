@@ -190,11 +190,6 @@ static int orig_termios_saved = 0;
 static struct termios orig_termios; /* To restore terminal at exit.*/
 
 /* Dict Helpers */
-static uint64_t localDictSdsHash(const void *key);
-static int localDictSdsKeyCompare(const void *key1, const void *key2);
-static uint64_t dictEntryHashSdsLocal(const void *entry);
-static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key);
-static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2);
 
 /* Cluster Manager Command Info */
 typedef struct clusterManagerCommand {
@@ -381,32 +376,6 @@ static sds getDotfilePath(char *envoverride, char *envoverride_old, char *dotfil
     return dotPath;
 }
 
-static uint64_t localDictSdsHash(const void *key) {
-    return dictGenHashFunction(key, sdslen(key));
-}
-
-static int localDictSdsKeyCompare(const void *key1, const void *key2) {
-    int l1, l2;
-    l1 = sdslen((sds)key1);
-    l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
-    return memcmp(key1, key2, l1) == 0;
-}
-
-static uint64_t dictEntryHashSdsLocal(const void *entry) {
-    const dictEntry *de = entry;
-    return localDictSdsHash(de->key);
-}
-
-static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key) {
-    const dictEntry *de = entry;
-    return localDictSdsKeyCompare(de->key, key);
-}
-
-static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2) {
-    const dictEntry *de1 = entry1, *de2 = entry2;
-    return localDictSdsKeyCompare(de1->key, de2->key);
-}
 
 static void dictEntryDestructorSdsKeyNoVal(void *entry) {
     dictEntry *de = entry;
@@ -919,10 +888,7 @@ static void cliLegacyInitHelp(dict *groups) {
 static void cliInitHelp(void) {
     /* Dict type for a set of strings, used to collect names of command groups. */
     dictType groupsdt = {
-        .hashKey = localDictSdsHash,
-        .hashEntry = dictEntryHashSdsLocal,
-        .keyCompare = dictEntryKeyCompareSdsLocal,
-        .entryCompare = dictEntryCompareEntrySdsLocal,
+        DICT_TYPE_SDS,
         .entryDestructor = dictEntryDestructorSdsKeyNoVal,
     };
     valkeyReply *commandTable;
@@ -3699,18 +3665,12 @@ typedef struct clusterManagerLink {
 } clusterManagerLink;
 
 static dictType clusterManagerDictType = {
-    .hashKey = localDictSdsHash,
-    .hashEntry = dictEntryHashSdsLocal,
-    .keyCompare = dictEntryKeyCompareSdsLocal,
-    .entryCompare = dictEntryCompareEntrySdsLocal,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsVal,
 };
 
 static dictType clusterManagerLinkDictType = {
-    .hashKey = localDictSdsHash,
-    .hashEntry = dictEntryHashSdsLocal,
-    .keyCompare = dictEntryKeyCompareSdsLocal,
-    .entryCompare = dictEntryCompareEntrySdsLocal,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKeyListVal,
 };
 
@@ -9258,10 +9218,7 @@ static void dictEntryDestructorTypeinfoVal(void *entry) {
 }
 
 static dictType typeinfoDictType = {
-    .hashKey = localDictSdsHash,
-    .hashEntry = dictEntryHashSdsLocal,
-    .keyCompare = dictEntryKeyCompareSdsLocal,
-    .entryCompare = dictEntryCompareEntrySdsLocal,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorTypeinfoVal,
 };
 

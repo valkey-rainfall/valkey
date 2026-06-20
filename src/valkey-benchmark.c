@@ -265,11 +265,6 @@ int runFuzzerClients(const char *host, int port, int max_commands, int parallel_
 static int parseCommandTemplate(int argc, char **argv);
 
 /* Dict callbacks */
-static uint64_t localDictSdsHash(const void *key);
-static int localDictSdsKeyCompare(const void *key1, const void *key2);
-static uint64_t dictEntryHashSdsLocal(const void *entry);
-static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key);
-static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2);
 
 /* Implementation */
 static long long ustime(void) {
@@ -307,38 +302,9 @@ static bool isBenchmarkFinished(int request_count) {
     return false;
 }
 
-static uint64_t localDictSdsHash(const void *key) {
-    return dictGenHashFunction(key, sdslen(key));
-}
-
-static int localDictSdsKeyCompare(const void *key1, const void *key2) {
-    int l1, l2;
-    l1 = sdslen((sds)key1);
-    l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
-    return memcmp(key1, key2, l1) == 0;
-}
-
-static uint64_t dictEntryHashSdsLocal(const void *entry) {
-    const dictEntry *de = entry;
-    return localDictSdsHash(de->key);
-}
-
-static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key) {
-    const dictEntry *de = entry;
-    return localDictSdsKeyCompare(de->key, key);
-}
-
-static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2) {
-    const dictEntry *de1 = entry1, *de2 = entry2;
-    return localDictSdsKeyCompare(de1->key, de2->key);
-}
 
 static dictType dtype = {
-    .hashKey = localDictSdsHash,
-    .hashEntry = dictEntryHashSdsLocal,
-    .keyCompare = dictEntryKeyCompareSdsLocal,
-    .entryCompare = dictEntryCompareEntrySdsLocal,
+    DICT_TYPE_SDS,
     .entryDestructor = zfree,
 };
 

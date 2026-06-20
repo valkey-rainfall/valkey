@@ -265,34 +265,10 @@ dictType clusterSdsToListType = {
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
 
-static uint64_t dictPtrHash(const void *key) {
-    /* We hash the pointer value itself. */
-    return dictGenHashFunction((const char *)&key, sizeof(key));
-}
-
-
 /* Dictionary type for mapping hash slots to cluster nodes.
  * Keys are slot numbers encoded directly as pointer values, values are clusterNode pointers. */
-static uint64_t dictEntryHashPtrLocal(const void *entry) {
-    const dictEntry *de = entry;
-    return dictGenHashFunction((const char *)&de->key, sizeof(de->key));
-}
-
-static int dictEntryKeyComparePtrLocal(const void *entry, const void *key) {
-    const dictEntry *de = entry;
-    return de->key == key;
-}
-
-static int dictEntryCompareEntryPtrLocal(const void *entry1, const void *entry2) {
-    const dictEntry *de1 = entry1, *de2 = entry2;
-    return de1->key == de2->key;
-}
-
 dictType clusterSlotDictType = {
-    .hashKey = dictPtrHash,
-    .hashEntry = dictEntryHashPtrLocal,
-    .keyCompare = dictEntryKeyComparePtrLocal,
-    .entryCompare = dictEntryCompareEntryPtrLocal,
+    DICT_TYPE_PTR,
     .entryDestructor = zfree,
 };
 

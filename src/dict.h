@@ -329,6 +329,7 @@ DICT_DEFINE_ENTRY_CALLBACKS(SdsCase, dictSdsCaseHash, dictSdsKeyCaseCompare)
 DICT_DEFINE_ENTRY_CALLBACKS(CStr, dictCStrHash, dictCStrKeyCompare)
 DICT_DEFINE_ENTRY_CALLBACKS(CStrCase, dictCStrCaseHash, dictCStrKeyCaseCompare)
 DICT_DEFINE_ENTRY_CALLBACKS(EncObj, dictEncObjHash, dictEncObjKeyCompare)
+DICT_DEFINE_ENTRY_CALLBACKS(Ptr, dictPtrHash, dictPtrKeyCompare)
 
 /* Convenience macros for one-line dictType definitions. */
 #define DICT_TYPE_SDS        DICT_TYPE_BASE(Sds, dictSdsHash)
@@ -336,5 +337,6 @@ DICT_DEFINE_ENTRY_CALLBACKS(EncObj, dictEncObjHash, dictEncObjKeyCompare)
 #define DICT_TYPE_CSTR       DICT_TYPE_BASE(CStr, dictCStrHash)
 #define DICT_TYPE_CSTR_CASE  DICT_TYPE_BASE(CStrCase, dictCStrCaseHash)
 #define DICT_TYPE_ENCOBJ     DICT_TYPE_BASE(EncObj, dictEncObjHash)
+#define DICT_TYPE_PTR        DICT_TYPE_BASE(Ptr, dictPtrHash)
 
 #endif /* __DICT_H */

@@ -35,4 +35,8 @@ int dictCStrKeyCaseCompare(const void *key1, const void *key2);
 uint64_t dictEncObjHash(const void *key);
 int dictEncObjKeyCompare(const void *key1, const void *key2);
 
+/* Pointer hash/compare (identity by pointer value) */
+uint64_t dictPtrHash(const void *key);
+int dictPtrKeyCompare(const void *key1, const void *key2);
+
 #endif /* HASHFUNCTIONS_H */

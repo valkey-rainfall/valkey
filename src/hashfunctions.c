@@ -64,3 +64,12 @@ uint64_t dictCStrCaseHash(const void *key) {
 int dictCStrKeyCaseCompare(const void *key1, const void *key2) {
     return strcasecmp(key1, key2) == 0;
 }
+
+/* Pointer hash/compare (identity by pointer value) */
+uint64_t dictPtrHash(const void *key) {
+    return hashtableGenHashFunction((const char *)&key, sizeof(key));
+}
+
+int dictPtrKeyCompare(const void *key1, const void *key2) {
+    return key1 == key2;
+}
