@@ -13,6 +13,7 @@
 uint64_t genHashFunctionConfigurableSeed(const char *buf, size_t len);
 uint64_t sdsHashConfigurableSeed(const void *key);
 uint8_t *getConfigurableHashSeed(void);
+void setConfigurableHashSeed(uint8_t *seed);
 
 /* SDS hash/compare (case-sensitive) */
 uint64_t dictSdsHash(const void *key);

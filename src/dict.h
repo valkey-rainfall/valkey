@@ -37,6 +37,7 @@
 #include "hashtable.h"
 #include "zmalloc.h"
 #include <stdint.h>
+#include "hashfunctions.h"
 
 #define DICT_OK 0
 #define DICT_ERR 1
@@ -322,7 +323,6 @@ static inline dictEntry *dictNext(dictIterator *iter) {
     .entryCompare = dictEntryCompareEntry##suffix
 
 /* Include hash/compare function declarations and generate dictEntry wrappers. */
-#include "hashfunctions.h"
 
 DICT_DEFINE_ENTRY_CALLBACKS(Sds, dictSdsHash, dictSdsKeyCompare)
 DICT_DEFINE_ENTRY_CALLBACKS(SdsCase, dictSdsCaseHash, dictSdsKeyCaseCompare)
