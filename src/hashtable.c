@@ -402,7 +402,7 @@ static inline void freeEntry(hashtable *ht, void *entry) {
     if (ht->type->entryDestructor) ht->type->entryDestructor(entry);
 }
 
-static inline int compareKeys(hashtable *ht, const void *entry, const void *key) {
+static inline bool compareKeys(hashtable *ht, const void *entry, const void *key) {
     if (ht->type->keyCompare != NULL) {
         return ht->type->keyCompare(entry, key);
     } else {
@@ -410,7 +410,7 @@ static inline int compareKeys(hashtable *ht, const void *entry, const void *key)
     }
 }
 
-static inline int compareEntries(hashtable *ht, const void *entry1, const void *entry2) {
+static inline bool compareEntries(hashtable *ht, const void *entry1, const void *entry2) {
     if (ht->type->entryCompare != NULL) {
         return ht->type->entryCompare(entry1, entry2);
     } else {

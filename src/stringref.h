@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "sds.h"
 
 /* A non-owning view of a string buffer. Does not manage memory.
@@ -28,13 +29,11 @@ size_t stringRefLen(const stringRef *ref);
 /* Comparison — memcmp semantics (negative/0/positive) */
 int stringRefCmp(const stringRef *a, const stringRef *b);
 
-/* Equality check. Returns 1 if equal, 0 otherwise.
- * Short-circuits on length mismatch before touching memory. */
-int stringRefEqual(const stringRef *a, const stringRef *b);
+/* Equality check. Short-circuits on length mismatch before touching memory. */
+bool stringRefEqual(const stringRef *a, const stringRef *b);
 
-/* Case-insensitive equality check against a null-terminated C string.
- * Returns 1 if equal, 0 otherwise. */
-int stringRefCaseEqualCStr(const stringRef *ref, const char *cstr);
+/* Case-insensitive equality check against a null-terminated C string. */
+bool stringRefCaseEqualCStr(const stringRef *ref, const char *cstr);
 
 /* Hash */
 uint64_t stringRefHash(const stringRef *ref);

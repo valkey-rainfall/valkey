@@ -386,7 +386,7 @@ void dictSdsDestructor(void *val) {
     sdsfree(val);
 }
 
-int dictObjKeyCompare(const void *key1, const void *key2) {
+bool dictObjKeyCompare(const void *key1, const void *key2) {
     const robj *o1 = key1, *o2 = key2;
     return dictSdsKeyCompare(objectGetVal(o1), objectGetVal(o2));
 }
@@ -402,11 +402,11 @@ uint64_t hashtableClientHash(const void *key) {
 }
 
 /* Hashtable compare function for client */
-int hashtableClientKeyCompare(const void *key1, const void *key2) {
+bool hashtableClientKeyCompare(const void *key1, const void *key2) {
     return ((client *)key1)->id == ((client *)key2)->id;
 }
 
-int dictEncObjKeyCompare(const void *key1, const void *key2) {
+bool dictEncObjKeyCompare(const void *key1, const void *key2) {
     robj *o1 = (robj *)key1, *o2 = (robj *)key2;
     int cmp;
 
@@ -547,7 +547,7 @@ static uint64_t setHashtableHashKey(const void *key) {
     return genHashFunctionConfigurableSeed(ref->buf, ref->len);
 }
 
-static int setHashtableKeyCompare(const void *entry, const void *key) {
+static bool setHashtableKeyCompare(const void *entry, const void *key) {
     const stringRef *ref = key;
     stringRef entry_ref = stringRefCreate((const char *)entry, sdslen((sds)entry));
     return stringRefEqual(&entry_ref, ref);
@@ -573,14 +573,14 @@ static uint64_t zsetHashtableHashKey(const void *key) {
     return genHashFunctionConfigurableSeed(ref->buf, ref->len);
 }
 
-static int zsetHashtableKeyCompare(const void *entry, const void *key) {
+static bool zsetHashtableKeyCompare(const void *entry, const void *key) {
     sds ele = zslGetNodeElement((const zskiplistNode *)entry);
     const stringRef *ref = key;
     stringRef entry_ref = stringRefCreate(ele, sdslen(ele));
     return stringRefEqual(&entry_ref, ref);
 }
 
-static int zsetHashtableEntryCompare(const void *entry1, const void *entry2) {
+static bool zsetHashtableEntryCompare(const void *entry1, const void *entry2) {
     sds e1 = zslGetNodeElement((const zskiplistNode *)entry1);
     sds e2 = zslGetNodeElement((const zskiplistNode *)entry2);
     stringRef r1 = stringRefCreate(e1, sdslen(e1));
@@ -619,11 +619,11 @@ static uint64_t kvstoreKeysHashEntry(const void *entry) {
     return sdsHashConfigurableSeed(key);
 }
 
-static int kvstoreKeysKeyCompare(const void *entry, const void *key) {
+static bool kvstoreKeysKeyCompare(const void *entry, const void *key) {
     return dictSdsKeyCompare(objectGetKey(entry), key);
 }
 
-static int kvstoreKeysEntryCompare(const void *entry1, const void *entry2) {
+static bool kvstoreKeysEntryCompare(const void *entry1, const void *entry2) {
     return dictSdsKeyCompare(objectGetKey(entry1), objectGetKey(entry2));
 }
 
@@ -662,13 +662,13 @@ static uint64_t commandSetHashEntry(const void *entry) {
     return dictSdsCaseHash(cmd->current_name);
 }
 
-static int commandSetKeyCompare(const void *entry, const void *key) {
+static bool commandSetKeyCompare(const void *entry, const void *key) {
     struct serverCommand *cmd = (struct serverCommand *)entry;
     const stringRef *ref = key;
     return stringRefCaseEqualCStr(ref, cmd->current_name);
 }
 
-static int commandSetEntryCompare(const void *entry1, const void *entry2) {
+static bool commandSetEntryCompare(const void *entry1, const void *entry2) {
     struct serverCommand *c1 = (struct serverCommand *)entry1;
     struct serverCommand *c2 = (struct serverCommand *)entry2;
     return dictCStrKeyCaseCompare(c1->current_name, c2->current_name);
@@ -691,13 +691,13 @@ static uint64_t originalCommandSetHashEntry(const void *entry) {
     return dictSdsCaseHash(cmd->fullname);
 }
 
-static int originalCommandSetKeyCompare(const void *entry, const void *key) {
+static bool originalCommandSetKeyCompare(const void *entry, const void *key) {
     struct serverCommand *cmd = (struct serverCommand *)entry;
     const stringRef *ref = key;
     return stringRefCaseEqualCStr(ref, cmd->fullname);
 }
 
-static int originalCommandSetEntryCompare(const void *entry1, const void *entry2) {
+static bool originalCommandSetEntryCompare(const void *entry1, const void *entry2) {
     struct serverCommand *c1 = (struct serverCommand *)entry1;
     struct serverCommand *c2 = (struct serverCommand *)entry2;
     return dictCStrKeyCaseCompare(c1->fullname, c2->fullname);
@@ -720,13 +720,13 @@ static uint64_t subcommandSetHashEntry(const void *entry) {
     return dictCStrCaseHash(cmd->declared_name);
 }
 
-static int subcommandSetKeyCompare(const void *entry, const void *key) {
+static bool subcommandSetKeyCompare(const void *entry, const void *key) {
     struct serverCommand *cmd = (struct serverCommand *)entry;
     const stringRef *ref = key;
     return stringRefCaseEqualCStr(ref, cmd->declared_name);
 }
 
-static int subcommandSetEntryCompare(const void *entry1, const void *entry2) {
+static bool subcommandSetEntryCompare(const void *entry1, const void *entry2) {
     struct serverCommand *c1 = (struct serverCommand *)entry1;
     struct serverCommand *c2 = (struct serverCommand *)entry2;
     return dictCStrKeyCaseCompare(c1->declared_name, c2->declared_name);
@@ -750,11 +750,11 @@ static uint64_t hashHashtableTypeHashEntry(const void *entry) {
     return genHashFunctionConfigurableSeed(field, sdslen(field));
 }
 
-static int hashHashtableTypeKeyCompare(const void *entry, const void *key) {
+static bool hashHashtableTypeKeyCompare(const void *entry, const void *key) {
     return dictSdsKeyCompare(entryGetField(entry), key);
 }
 
-static int hashHashtableTypeEntryCompare(const void *entry1, const void *entry2) {
+static bool hashHashtableTypeEntryCompare(const void *entry1, const void *entry2) {
     return dictSdsKeyCompare(entryGetField(entry1), entryGetField(entry2));
 }
 
@@ -815,13 +815,13 @@ static uint64_t hashtableChannelsHashEntry(const void *entry) {
     return dictObjHash(channel);
 }
 
-static int hashtableChannelsKeyCompare(const void *entry, const void *key) {
+static bool hashtableChannelsKeyCompare(const void *entry, const void *key) {
     hashtable *ht = (hashtable *)entry;
     robj *channel = *((robj **)hashtableMetadata(ht));
     return dictObjKeyCompare(channel, key);
 }
 
-static int hashtableChannelsEntryCompare(const void *entry1, const void *entry2) {
+static bool hashtableChannelsEntryCompare(const void *entry1, const void *entry2) {
     hashtable *ht1 = (hashtable *)entry1;
     hashtable *ht2 = (hashtable *)entry2;
     robj *c1 = *((robj **)hashtableMetadata(ht1));

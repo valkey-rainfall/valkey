@@ -61,11 +61,11 @@ typedef struct {
      * key: the lookup key passed to hashtableFind/Delete
      * For homogeneous types (entry IS the key), both args are the same type.
      * Defaults to pointer equality. */
-    int (*keyCompare)(const void *entry, const void *key);
+    bool (*keyCompare)(const void *entry, const void *key);
     /* Compare two stored entries for equality (used for insert dedup).
      * If NULL, falls back to keyCompare(entry1, entry2) which is correct
      * for homogeneous types where entries and keys are the same type. */
-    int (*entryCompare)(const void *entry1, const void *entry2);
+    bool (*entryCompare)(const void *entry1, const void *entry2);
     /* Check for entry access should be masked or not. Masked access will just treat the entry as not-exist. */
     bool (*validateEntry)(hashtable *ht, void *entry);
     /* Callback to free an entry when it's overwritten or deleted.

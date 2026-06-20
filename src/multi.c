@@ -330,12 +330,12 @@ static uint64_t watchedKeyHashEntry(const void *entry) {
     return dictEncObjHash(wk->key);
 }
 
-static int watchedKeyKeyCompare(const void *entry, const void *key) {
+static bool watchedKeyKeyCompare(const void *entry, const void *key) {
     const watchedKey *wk = entry;
     return dictEncObjKeyCompare(wk->key, key);
 }
 
-static int watchedKeyEntryCompare(const void *entry1, const void *entry2) {
+static bool watchedKeyEntryCompare(const void *entry1, const void *entry2) {
     const watchedKey *wk1 = entry1;
     const watchedKey *wk2 = entry2;
     return dictEncObjKeyCompare(wk1->key, wk2->key);

@@ -189,8 +189,6 @@ int spectrum_palette_size;
 static int orig_termios_saved = 0;
 static struct termios orig_termios; /* To restore terminal at exit.*/
 
-/* Dict Helpers */
-
 /* Cluster Manager Command Info */
 typedef struct clusterManagerCommand {
     char *name;

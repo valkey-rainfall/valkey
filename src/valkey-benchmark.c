@@ -264,8 +264,6 @@ static long long showThroughput(struct aeEventLoop *eventLoop, long long id, voi
 int runFuzzerClients(const char *host, int port, int max_commands, int parallel_clients, int cluster_mode, int num_keys, cliSSLconfig *ssl_config, const char *log_level, int fuzz_flags);
 static int parseCommandTemplate(int argc, char **argv);
 
-/* Dict callbacks */
-
 /* Implementation */
 static long long ustime(void) {
     struct timeval tv;

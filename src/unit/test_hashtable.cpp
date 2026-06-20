@@ -78,7 +78,7 @@ static uint64_t hashentry(const void *entry) {
     return hashfunc(e->data);
 }
 
-static int keycmp(const void *entry, const void *key) {
+static bool keycmp(const void *entry, const void *key) {
     const keyval *e = (const keyval *)entry;
     return strcmp((const char *)e->data, (const char *)key) == 0;
 }

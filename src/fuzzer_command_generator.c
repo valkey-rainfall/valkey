@@ -297,7 +297,6 @@ static void dictEntryDestructorSdsKeyConfigVal(void *entry) {
 /* Dictionary type for config entries */
 static dictType configDictType = {
     DICT_TYPE_SDS,
-
     .entryDestructor = dictEntryDestructorSdsKeyConfigVal,
 };
 
@@ -948,6 +947,7 @@ static void freeCommandEntry(CommandEntry *command) {
     zfree(command->argv);
     command->argv = NULL;
 }
+
 /* Check if a command should be filtered out from the command registry as they may make the server untestable */
 static int shouldFilterCommand(const sds cmdName, int fuzz_flags) {
     static const char *filteredCommands[] = {

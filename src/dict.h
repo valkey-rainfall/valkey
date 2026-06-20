@@ -299,26 +299,26 @@ static inline dictEntry *dictNext(dictIterator *iter) {
  * Usage: DICT_DEFINE_ENTRY_CALLBACKS(Sds, dictSdsHash, dictSdsKeyCompare)
  * Generates: dictEntryHashSds, dictEntryKeyCompareSds, dictEntryEntryCompareSds
  */
-#define DICT_DEFINE_ENTRY_CALLBACKS(suffix, hashFn, cmpFn)                     \
-    static inline uint64_t dictEntryHash##suffix(const void *entry) {           \
-        return hashFn(dictGetKey((const dictEntry *)entry));                    \
-    }                                                                          \
-    static inline int dictEntryKeyCompare##suffix(const void *entry,            \
-                                                  const void *key) {           \
-        return cmpFn(dictGetKey((const dictEntry *)entry), key);               \
-    }                                                                          \
-    static inline int dictEntryCompareEntry##suffix(const void *e1,             \
-                                                    const void *e2) {          \
-        return cmpFn(dictGetKey((const dictEntry *)e1),                         \
-                     dictGetKey((const dictEntry *)e2));                        \
+#define DICT_DEFINE_ENTRY_CALLBACKS(suffix, hashFn, cmpFn)             \
+    static inline uint64_t dictEntryHash##suffix(const void *entry) {  \
+        return hashFn(dictGetKey((const dictEntry *)entry));           \
+    }                                                                  \
+    static inline bool dictEntryKeyCompare##suffix(const void *entry,  \
+                                                   const void *key) {  \
+        return cmpFn(dictGetKey((const dictEntry *)entry), key);       \
+    }                                                                  \
+    static inline bool dictEntryCompareEntry##suffix(const void *e1,   \
+                                                     const void *e2) { \
+        return cmpFn(dictGetKey((const dictEntry *)e1),                \
+                     dictGetKey((const dictEntry *)e2));               \
     }
 
 /* Macro to define a dictType initializer with dictEntry base callbacks.
  * Usage: dictType myType = { DICT_TYPE_SDS, .entryDestructor = myDestructor };
  */
-#define DICT_TYPE_BASE(suffix, hashKeyFn) \
-    .hashKey = hashKeyFn, \
-    .hashEntry = dictEntryHash##suffix, \
+#define DICT_TYPE_BASE(suffix, hashKeyFn)      \
+    .hashKey = hashKeyFn,                      \
+    .hashEntry = dictEntryHash##suffix,        \
     .keyCompare = dictEntryKeyCompare##suffix, \
     .entryCompare = dictEntryCompareEntry##suffix
 
@@ -332,11 +332,11 @@ DICT_DEFINE_ENTRY_CALLBACKS(EncObj, dictEncObjHash, dictEncObjKeyCompare)
 DICT_DEFINE_ENTRY_CALLBACKS(Ptr, dictPtrHash, dictPtrKeyCompare)
 
 /* Convenience macros for one-line dictType definitions. */
-#define DICT_TYPE_SDS        DICT_TYPE_BASE(Sds, dictSdsHash)
-#define DICT_TYPE_SDS_CASE   DICT_TYPE_BASE(SdsCase, dictSdsCaseHash)
-#define DICT_TYPE_CSTR       DICT_TYPE_BASE(CStr, dictCStrHash)
-#define DICT_TYPE_CSTR_CASE  DICT_TYPE_BASE(CStrCase, dictCStrCaseHash)
-#define DICT_TYPE_ENCOBJ     DICT_TYPE_BASE(EncObj, dictEncObjHash)
-#define DICT_TYPE_PTR        DICT_TYPE_BASE(Ptr, dictPtrHash)
+#define DICT_TYPE_SDS DICT_TYPE_BASE(Sds, dictSdsHash)
+#define DICT_TYPE_SDS_CASE DICT_TYPE_BASE(SdsCase, dictSdsCaseHash)
+#define DICT_TYPE_CSTR DICT_TYPE_BASE(CStr, dictCStrHash)
+#define DICT_TYPE_CSTR_CASE DICT_TYPE_BASE(CStrCase, dictCStrCaseHash)
+#define DICT_TYPE_ENCOBJ DICT_TYPE_BASE(EncObj, dictEncObjHash)
+#define DICT_TYPE_PTR DICT_TYPE_BASE(Ptr, dictPtrHash)
 
 #endif /* __DICT_H */

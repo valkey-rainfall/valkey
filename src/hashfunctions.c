@@ -31,7 +31,7 @@ uint64_t dictSdsHash(const void *key) {
     return hashtableGenHashFunction(key, sdslen(key));
 }
 
-int dictSdsKeyCompare(const void *key1, const void *key2) {
+bool dictSdsKeyCompare(const void *key1, const void *key2) {
     int l1 = sdslen((sds)key1);
     int l2 = sdslen((sds)key2);
     if (l1 != l2) return 0;
@@ -43,7 +43,7 @@ uint64_t dictSdsCaseHash(const void *key) {
     return hashtableGenCaseHashFunction(key, sdslen(key));
 }
 
-int dictSdsKeyCaseCompare(const void *key1, const void *key2) {
+bool dictSdsKeyCaseCompare(const void *key1, const void *key2) {
     return strcasecmp(key1, key2) == 0;
 }
 
@@ -52,7 +52,7 @@ uint64_t dictCStrHash(const void *key) {
     return hashtableGenHashFunction(key, strlen(key));
 }
 
-int dictCStrKeyCompare(const void *key1, const void *key2) {
+bool dictCStrKeyCompare(const void *key1, const void *key2) {
     return strcmp(key1, key2) == 0;
 }
 
@@ -61,7 +61,7 @@ uint64_t dictCStrCaseHash(const void *key) {
     return hashtableGenCaseHashFunction(key, strlen(key));
 }
 
-int dictCStrKeyCaseCompare(const void *key1, const void *key2) {
+bool dictCStrKeyCaseCompare(const void *key1, const void *key2) {
     return strcasecmp(key1, key2) == 0;
 }
 
@@ -70,6 +70,6 @@ uint64_t dictPtrHash(const void *key) {
     return hashtableGenHashFunction((const char *)&key, sizeof(key));
 }
 
-int dictPtrKeyCompare(const void *key1, const void *key2) {
+bool dictPtrKeyCompare(const void *key1, const void *key2) {
     return key1 == key2;
 }

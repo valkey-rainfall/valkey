@@ -32,13 +32,13 @@ int stringRefCmp(const stringRef *a, const stringRef *b) {
 }
 
 /* Equality check */
-int stringRefEqual(const stringRef *a, const stringRef *b) {
+bool stringRefEqual(const stringRef *a, const stringRef *b) {
     if (a->len != b->len) return 0;
     return memcmp(a->buf, b->buf, a->len) == 0;
 }
 
 /* Case-insensitive equality against C string */
-int stringRefCaseEqualCStr(const stringRef *ref, const char *cstr) {
+bool stringRefCaseEqualCStr(const stringRef *ref, const char *cstr) {
     size_t clen = strlen(cstr);
     if (ref->len != clen) return 0;
     return strncasecmp(ref->buf, cstr, clen) == 0;

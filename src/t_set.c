@@ -126,6 +126,7 @@ int setTypeAdd(robj *subject, sds value) {
  *
  * Returns 1 if the value was added and 0 if it was already a member. */
 int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds) {
+    (void)str_is_sds;
     char tmpbuf[LONG_STR_SIZE];
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) {
@@ -137,7 +138,6 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         /* Convert int to string. */
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
         str = tmpbuf;
-        str_is_sds = 0;
     }
 
     serverAssert(str);
@@ -147,8 +147,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         stringRef ref = stringRefCreate(str, len);
         if (hashtableFindPositionForInsert(ht, &ref, &position, NULL)) {
             /* Key doesn't already exist in the set. Add it. */
-            sds sdsval = str_is_sds ? sdsdup((sds)str) : sdsnewlen(str, len);
-            hashtableInsertAtPosition(ht, sdsval, &position);
+            hashtableInsertAtPosition(ht, sdsnewlen(str, len), &position);
             return 1;
         }
         return 0;
@@ -244,7 +243,6 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
         }
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
         str = tmpbuf;
-        str_is_sds = 0;
     }
 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
@@ -292,7 +290,6 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
         if (set->encoding == OBJ_ENCODING_INTSET) return intsetFind(objectGetVal(set), llval);
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
         str = tmpbuf;
-        str_is_sds = 0;
     }
 
     if (set->encoding == OBJ_ENCODING_LISTPACK) {
