@@ -12986,10 +12986,7 @@ size_t moduleGetMemUsage(robj *key, robj *val, size_t sample_size, int dbid) {
  * this gets queries from modules. */
 
 dictType moduleAPIDictType = {
-    .hashKey = dictCStrHash,
-    .hashEntry = dictEntryHashCStr,
-    .keyCompare = dictEntryKeyCompareCStr,
-    .entryCompare = dictEntryCompareEntryCStr,
+    DICT_TYPE_CSTR,
     .entryDestructor = zfree,
 };
 
@@ -13014,10 +13011,7 @@ void moduleInitModulesSystemLast(void) {
 }
 
 dictType sdsKeyValueHashDictType = {
-    .hashKey = dictSdsCaseHash,
-    .hashEntry = dictEntryHashSdsCase,
-    .keyCompare = dictEntryKeyCompareSdsCase,
-    .entryCompare = dictEntryCompareEntrySdsCase,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyValue,
 };
 

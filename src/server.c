@@ -522,20 +522,14 @@ void dictEntryDestructorSdsKeyHeapValue(void *entry) {
 /* Generic hash table type where keys are Objects, Values
  * dummy pointers. */
 dictType objectKeyPointerValueDictType = {
-    .hashKey = dictEncObjHash,
-    .hashEntry = dictEntryHashEncObj,
-    .keyCompare = dictEntryKeyCompareEncObj,
-    .entryCompare = dictEntryCompareEntryEncObj,
+    DICT_TYPE_ENCOBJ,
     .entryDestructor = dictEntryDestructorObjectKey,
 };
 
 /* Like objectKeyPointerValueDictType(), but values can be destroyed, if
  * not NULL, calling zfree(). */
 dictType objectKeyHeapPointerValueDictType = {
-    .hashKey = dictEncObjHash,
-    .hashEntry = dictEntryHashEncObj,
-    .keyCompare = dictEntryKeyCompareEncObj,
-    .entryCompare = dictEntryCompareEntryEncObj,
+    DICT_TYPE_ENCOBJ,
     .entryDestructor = dictEntryDestructorObjectKeyHeapValue,
 };
 
@@ -801,20 +795,14 @@ hashtableType sdsReplyHashtableType = {
  * lists as values. It's used for blocking operations (BLPOP) and to
  * map swapped keys to a list of clients waiting for this keys to be loaded. */
 dictType keylistDictType = {
-    .hashKey = dictObjHash,
-    .hashEntry = dictEntryHashObj,
-    .keyCompare = dictEntryKeyCompareObj,
-    .entryCompare = dictEntryCompareEntryObj,
+    DICT_TYPE_OBJ,
     .entryDestructor = dictEntryDestructorObjectKeyListValue,
 };
 
 /* objToHashtableDictType has unencoded Objects as keys and
  * hashtables as values. It's used for PUBSUB command to track clients subscribing the patterns. */
 dictType objToHashtableDictType = {
-    .hashKey = dictObjHash,
-    .hashEntry = dictEntryHashObj,
-    .keyCompare = dictEntryKeyCompareObj,
-    .entryCompare = dictEntryCompareEntryObj,
+    DICT_TYPE_OBJ,
     .entryDestructor = dictEntryDestructorObjectKeyHashtableValue,
 };
 
@@ -866,49 +854,34 @@ hashtableType kvstoreChannelHashtableType = {
 /* Modules system dictionary type. Keys are module name,
  * values are pointer to ValkeyModule struct. */
 dictType modulesDictType = {
-    .hashKey = dictSdsCaseHash,
-    .hashEntry = dictEntryHashSdsCase,
-    .keyCompare = dictEntryKeyCompareSdsCase,
-    .entryCompare = dictEntryCompareEntrySdsCase,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Migrate cache dict type. */
 dictType migrateCacheDictType = {
-    .hashKey = dictSdsHash,
-    .hashEntry = dictEntryHashSds,
-    .keyCompare = dictEntryKeyCompareSds,
-    .entryCompare = dictEntryCompareEntrySds,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Dict for for case-insensitive search using null terminated C strings.
  * The keys stored in dict are sds though. */
 dictType stringSetDictType = {
-    .hashKey = dictCStrCaseHash,
-    .hashEntry = dictEntryHashCStrCase,
-    .keyCompare = dictEntryKeyCompareCStrCase,
-    .entryCompare = dictEntryCompareEntryCStrCase,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Dict for for case-insensitive search using null terminated C strings.
  * The key and value do not have a destructor. */
 dictType externalStringType = {
-    .hashKey = dictCStrCaseHash,
-    .hashEntry = dictEntryHashCStrCase,
-    .keyCompare = dictEntryKeyCompareCStrCase,
-    .entryCompare = dictEntryCompareEntryCStrCase,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = zfree,
 };
 
 /* Dict for case-insensitive search using sds objects with a zmalloc
  * allocated object as the value. */
 dictType sdsHashDictType = {
-    .hashKey = dictSdsCaseHash,
-    .hashEntry = dictEntryHashSdsCase,
-    .keyCompare = dictEntryKeyCompareSdsCase,
-    .entryCompare = dictEntryCompareEntrySdsCase,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 

@@ -46,10 +46,7 @@ static void dictEntryDestructorHeapKeyValue(void *entry) {
 }
 
 dictType latencyTimeSeriesDictType = {
-    .hashKey = dictCStrHash,
-    .hashEntry = dictEntryHashCStr,
-    .keyCompare = dictEntryKeyCompareCStr,
-    .entryCompare = dictEntryCompareEntryCStr,
+    DICT_TYPE_CSTR,
     .entryDestructor = dictEntryDestructorHeapKeyValue,
 };
 

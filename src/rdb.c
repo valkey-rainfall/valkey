@@ -152,10 +152,7 @@ static void dictEntryDestructorSdsKeyHeapValue(void *entry) {
 }
 
 dictType rdbAuxFieldDictType = {
-    .hashKey = dictSdsCaseHash,
-    .hashEntry = dictEntryHashSdsCase,
-    .keyCompare = dictEntryKeyCompareSdsCase,
-    .entryCompare = dictEntryCompareEntrySdsCase,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 

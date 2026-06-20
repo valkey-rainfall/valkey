@@ -247,10 +247,7 @@ static_assert(offsetof(clusterMsg, type) + sizeof(uint16_t) == RCVBUF_MIN_READ_L
 /* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
  * clusterNode structures. */
 dictType clusterNodesDictType = {
-    .hashKey = dictSdsHash,
-    .hashEntry = dictEntryHashSds,
-    .keyCompare = dictEntryKeyCompareSds,
-    .entryCompare = dictEntryCompareEntrySds,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
@@ -258,19 +255,13 @@ dictType clusterNodesDictType = {
  * we can re-add this node. The goal is to avoid reading a removed
  * node for some time. */
 dictType clusterNodesBlackListDictType = {
-    .hashKey = dictSdsCaseHash,
-    .hashEntry = dictEntryHashSdsCase,
-    .keyCompare = dictEntryKeyCompareSdsCase,
-    .entryCompare = dictEntryCompareEntrySdsCase,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Cluster shards hash table, mapping shard id to list of nodes */
 dictType clusterSdsToListType = {
-    .hashKey = dictSdsHash,
-    .hashEntry = dictEntryHashSds,
-    .keyCompare = dictEntryKeyCompareSds,
-    .entryCompare = dictEntryCompareEntrySds,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
 
