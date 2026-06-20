@@ -3526,7 +3526,7 @@ void serverOpArrayFree(serverOpArray *oa) {
 
 bool isContainerCommandBySds(sds s) {
     void *entry;
-    stringRef ref = STRINGREF_FROM_SDS(s);
+    stringRef ref = stringRefFromSds(s);
     bool found_command = hashtableFind(server.commands, &ref, &entry);
     struct serverCommand *base_cmd = entry;
     return found_command && base_cmd->subcommands_ht;
@@ -3534,7 +3534,7 @@ bool isContainerCommandBySds(sds s) {
 
 struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name) {
     void *entry = NULL;
-    stringRef ref = STRINGREF_FROM_SDS(sub_name);
+    stringRef ref = stringRefFromSds(sub_name);
     hashtableFind(container->subcommands_ht, &ref, &entry);
     struct serverCommand *subcommand = entry;
     return subcommand;
@@ -3551,7 +3551,7 @@ struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_
 struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int argc, int strict) {
     void *entry = NULL;
     sds name = objectGetVal(argv[0]);
-    stringRef ref = STRINGREF_FROM_SDS(name);
+    stringRef ref = stringRefFromSds(name);
     bool found_command = hashtableFind(commands, &ref, &entry);
     struct serverCommand *base_cmd = entry;
     bool has_subcommands = found_command && base_cmd->subcommands_ht;

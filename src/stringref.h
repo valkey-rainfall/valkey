@@ -5,9 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <strings.h>
-
-/* Forward declare sds type to avoid circular includes. */
-typedef char *sds;
+#include "sds.h"
 
 /* A non-owning view of a string buffer. Does not manage memory.
  *
@@ -27,14 +25,8 @@ static inline stringRef stringRefCreate(const char *buf, size_t len) {
 }
 
 static inline stringRef stringRefFromSds(sds s) {
-    /* sds stores length before the pointer; we call sdslen indirectly.
-     * To avoid including sds.h here, caller should use stringRefCreate
-     * with the known length, or use the macro below after including sds.h. */
-    return (stringRef){.buf = s, .len = 0}; /* placeholder — see STRINGREF_FROM_SDS */
+    return (stringRef){.buf = s, .len = sdslen(s)};
 }
-
-/* Use this macro when sds.h is included (provides sdslen). */
-#define STRINGREF_FROM_SDS(s) ((stringRef){.buf = (s), .len = sdslen(s)})
 
 /* Access */
 static inline const char *stringRefBuf(const stringRef *ref) {
