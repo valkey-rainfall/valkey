@@ -3,8 +3,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
-#include <strings.h>
 #include "sds.h"
 
 /* A non-owning view of a string buffer. Does not manage memory.
@@ -20,55 +18,29 @@ typedef struct stringRef {
 } stringRef;
 
 /* Construction */
-static inline stringRef stringRefCreate(const char *buf, size_t len) {
-    return (stringRef){.buf = buf, .len = len};
-}
-
-static inline stringRef stringRefFromSds(sds s) {
-    return (stringRef){.buf = s, .len = sdslen(s)};
-}
+stringRef stringRefCreate(const char *buf, size_t len);
+stringRef stringRefFromSds(sds s);
 
 /* Access */
-static inline const char *stringRefBuf(const stringRef *ref) {
-    return ref->buf;
-}
+const char *stringRefBuf(const stringRef *ref);
+size_t stringRefLen(const stringRef *ref);
 
-static inline size_t stringRefLen(const stringRef *ref) {
-    return ref->len;
-}
-
-/* Comparison — memcmp semantics (0 = equal) */
-static inline int stringRefCmp(const stringRef *a, const stringRef *b) {
-    size_t minlen = a->len < b->len ? a->len : b->len;
-    int cmp = memcmp(a->buf, b->buf, minlen);
-    if (cmp != 0) return cmp;
-    if (a->len < b->len) return -1;
-    if (a->len > b->len) return 1;
-    return 0;
-}
+/* Comparison — memcmp semantics (negative/0/positive) */
+int stringRefCmp(const stringRef *a, const stringRef *b);
 
 /* Equality check. Returns 1 if equal, 0 otherwise.
  * Short-circuits on length mismatch before touching memory. */
-static inline int stringRefEqual(const stringRef *a, const stringRef *b) {
-    if (a->len != b->len) return 0;
-    return memcmp(a->buf, b->buf, a->len) == 0;
-}
+int stringRefEqual(const stringRef *a, const stringRef *b);
 
 /* Case-insensitive equality check against a null-terminated C string.
- * Returns 1 if equal, 0 otherwise (matches dict*Compare convention). */
-static inline int stringRefCaseEqualCStr(const stringRef *ref, const char *cstr) {
-    size_t clen = strlen(cstr);
-    if (ref->len != clen) return 0;
-    return strncasecmp(ref->buf, cstr, clen) == 0;
-}
+ * Returns 1 if equal, 0 otherwise. */
+int stringRefCaseEqualCStr(const stringRef *ref, const char *cstr);
 
-/* Hash — uses the same siphash as hashtableGenHashFunction.
- * Declared here, implemented in stringref.c to avoid exposing siphash. */
+/* Hash */
 uint64_t stringRefHash(const stringRef *ref);
 uint64_t stringRefCaseHash(const stringRef *ref);
 
-/* Materialization — allocates a new sds copy. Caller owns the result.
- * Declared here, implemented in stringref.c to avoid including sds.h. */
+/* Materialization — allocates a new sds copy. Caller owns the result. */
 sds stringRefToSds(const stringRef *ref);
 
 #endif /* STRINGREF_H */
