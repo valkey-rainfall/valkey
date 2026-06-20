@@ -190,8 +190,8 @@ static int orig_termios_saved = 0;
 static struct termios orig_termios; /* To restore terminal at exit.*/
 
 /* Dict Helpers */
-static uint64_t dictSdsHash(const void *key);
-static int dictSdsKeyCompare(const void *key1, const void *key2);
+static uint64_t localDictSdsHash(const void *key);
+static int localDictSdsKeyCompare(const void *key1, const void *key2);
 static uint64_t dictEntryHashSdsLocal(const void *entry);
 static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key);
 static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2);
@@ -381,11 +381,11 @@ static sds getDotfilePath(char *envoverride, char *envoverride_old, char *dotfil
     return dotPath;
 }
 
-static uint64_t dictSdsHash(const void *key) {
+static uint64_t localDictSdsHash(const void *key) {
     return dictGenHashFunction(key, sdslen(key));
 }
 
-static int dictSdsKeyCompare(const void *key1, const void *key2) {
+static int localDictSdsKeyCompare(const void *key1, const void *key2) {
     int l1, l2;
     l1 = sdslen((sds)key1);
     l2 = sdslen((sds)key2);
@@ -395,17 +395,17 @@ static int dictSdsKeyCompare(const void *key1, const void *key2) {
 
 static uint64_t dictEntryHashSdsLocal(const void *entry) {
     const dictEntry *de = entry;
-    return dictSdsHash(de->key);
+    return localDictSdsHash(de->key);
 }
 
 static int dictEntryKeyCompareSdsLocal(const void *entry, const void *key) {
     const dictEntry *de = entry;
-    return dictSdsKeyCompare(de->key, key);
+    return localDictSdsKeyCompare(de->key, key);
 }
 
 static int dictEntryCompareEntrySdsLocal(const void *entry1, const void *entry2) {
     const dictEntry *de1 = entry1, *de2 = entry2;
-    return dictSdsKeyCompare(de1->key, de2->key);
+    return localDictSdsKeyCompare(de1->key, de2->key);
 }
 
 static void dictEntryDestructorSdsKeyNoVal(void *entry) {
@@ -919,7 +919,7 @@ static void cliLegacyInitHelp(dict *groups) {
 static void cliInitHelp(void) {
     /* Dict type for a set of strings, used to collect names of command groups. */
     dictType groupsdt = {
-        .hashKey = dictSdsHash,
+        .hashKey = localDictSdsHash,
         .hashEntry = dictEntryHashSdsLocal,
         .keyCompare = dictEntryKeyCompareSdsLocal,
         .entryCompare = dictEntryCompareEntrySdsLocal,
@@ -3699,7 +3699,7 @@ typedef struct clusterManagerLink {
 } clusterManagerLink;
 
 static dictType clusterManagerDictType = {
-    .hashKey = dictSdsHash,
+    .hashKey = localDictSdsHash,
     .hashEntry = dictEntryHashSdsLocal,
     .keyCompare = dictEntryKeyCompareSdsLocal,
     .entryCompare = dictEntryCompareEntrySdsLocal,
@@ -3707,7 +3707,7 @@ static dictType clusterManagerDictType = {
 };
 
 static dictType clusterManagerLinkDictType = {
-    .hashKey = dictSdsHash,
+    .hashKey = localDictSdsHash,
     .hashEntry = dictEntryHashSdsLocal,
     .keyCompare = dictEntryKeyCompareSdsLocal,
     .entryCompare = dictEntryCompareEntrySdsLocal,
@@ -9258,7 +9258,7 @@ static void dictEntryDestructorTypeinfoVal(void *entry) {
 }
 
 static dictType typeinfoDictType = {
-    .hashKey = dictSdsHash,
+    .hashKey = localDictSdsHash,
     .hashEntry = dictEntryHashSdsLocal,
     .keyCompare = dictEntryKeyCompareSdsLocal,
     .entryCompare = dictEntryCompareEntrySdsLocal,
