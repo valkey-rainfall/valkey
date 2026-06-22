@@ -214,6 +214,10 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
 unsigned long moduleNotifyKeyspaceSubscribersCnt(void);
 void firePostExecutionUnitJobs(void);
 void moduleCallCommandFilters(client *c);
+/* Fast-path check: avoid cross-TU function call when no modules are listening. */
+extern int commandResultSuccessListeners;
+extern int commandResultFailureListeners;
+
 void moduleFireCommandResultEvent(client *c,
                                   struct serverCommand *cmd,
                                   int command_failed,

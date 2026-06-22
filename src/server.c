@@ -3983,8 +3983,12 @@ void call(client *c, int flags) {
         command_failed = 1;
     }
 
-    /* Fire command result event for subscribed modules. */
-    moduleFireCommandResultEvent(c, real_cmd, command_failed, duration, dirty);
+    /* Fire command result event for subscribed modules.
+     * Skip the cross-TU function call entirely when no modules are listening
+     * (avoids ~2.5% main-thread overhead from argument prep + call). */
+    if (command_failed ? commandResultFailureListeners : commandResultSuccessListeners) {
+        moduleFireCommandResultEvent(c, real_cmd, command_failed, duration, dirty);
+    }
 
     /* After executing command, we will close the client after writing entire
      * reply if it is set 'CLIENT_CLOSE_AFTER_COMMAND' flag. */
@@ -4101,9 +4105,12 @@ void call(client *c, int flags) {
     }
 
     /* Record peak memory after each command and before the eviction that runs
-     * before the next command. */
-    size_t zmalloc_used = zmalloc_used_memory();
-    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+     * before the next command. Sample every 64 commands to reduce overhead
+     * (zmalloc_used_memory is ~4.7% of main-thread CPU per flamegraph). */
+    if ((server.stat_numcommands & 63) == 0) {
+        size_t zmalloc_used = zmalloc_used_memory();
+        if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    }
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);
