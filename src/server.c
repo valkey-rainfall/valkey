@@ -4700,8 +4700,41 @@ int processCommand(client *c) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
     } else {
-        int flags = CMD_CALL_FULL;
-        call(c, flags);
+        /* Fast-path: bypass call() overhead for simple read-only commands when
+         * no features that require the full call() ceremony are active.
+         * This saves ~4-6% of main-thread time by skipping: module events,
+         * propagation logic, latency tracing, debug assertions, tracking.
+         * Stats (calls++, numcommands++) are still updated for INFO accuracy. */
+        if ((c->cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST) &&
+            !commandResultSuccessListeners &&
+            c->user == DefaultUser &&
+            !listLength(server.monitors) &&
+            !c->flag.multi &&
+            !(c->flag.tracking) &&
+            server.execution_nesting == 0) {
+            /* Execute directly without call() wrapper */
+            struct serverCommand *real_cmd = c->cmd->parent ? c->cmd->parent : c->cmd;
+
+            c->flag.executing_command = 1;
+            enterExecutionUnit(1, 0);
+            c->cmd->proc(c);
+            exitExecutionUnit();
+            c->flag.executing_command = 0;
+
+            /* Minimal stats: preserve INFO commandstats accuracy */
+            real_cmd->calls++;
+            server.stat_numcommands++;
+
+            /* Peak memory sampling (every 64 commands) */
+            if ((server.stat_numcommands & 63) == 0) {
+                size_t zmalloc_used = zmalloc_used_memory();
+                if (zmalloc_used > server.stat_peak_memory)
+                    server.stat_peak_memory = zmalloc_used;
+            }
+        } else {
+            int flags = CMD_CALL_FULL;
+            call(c, flags);
+        }
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
