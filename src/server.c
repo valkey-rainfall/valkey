@@ -855,7 +855,7 @@ hashtableType kvstoreChannelHashtableType = {
 /* Modules system dictionary type. Keys are module name,
  * values are pointer to ValkeyModule struct. */
 dictType modulesDictType = {
-    DICT_TYPE_SDS_CASE,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 

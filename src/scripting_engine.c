@@ -67,7 +67,7 @@ static engineManager engineMgr = {
 };
 
 dictType engineDictType = {
-    DICT_TYPE_SDS_CASE,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = zfree,
 };
 
