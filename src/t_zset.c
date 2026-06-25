@@ -514,7 +514,8 @@ static unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, ha
         zskiplistNode *next = x->level[0].forward;
         zslDeleteNode(zsl, x, update);
         sds ele = zslGetNodeElement(x);
-        hashtablePop(ht, ele, NULL);
+        stringRef ref = stringRefFromSds(ele);
+        hashtablePop(ht, &ref, NULL);
         zslFreeNode(x);
         removed++;
         x = next;
@@ -1619,7 +1620,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
  * element was not there). */
 static int zsetRemoveFromSkiplist(zset *zs, sds ele) {
     void *entry;
-    if (!hashtablePop(zs->ht, ele, &entry)) return 0;
+    stringRef ref = stringRefFromSds(ele);
+    if (!hashtablePop(zs->ht, &ref, &entry)) return 0;
     zskiplistNode *node = entry;
 
     /* hashtable only contains pointers to skiplist nodes. Nothing to free. */
