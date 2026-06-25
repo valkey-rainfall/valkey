@@ -1138,8 +1138,7 @@ void srandmemberWithCountCommand(client *c) {
         while (size > count) {
             void *element;
             hashtableFairRandomEntry(ht, &element);
-            stringRef ref = stringRefFromSds((sds)element);
-            hashtableDelete(ht, &ref);
+            hashtableDelete(ht, element);
             sdsfree((sds)element);
             size--;
         }
