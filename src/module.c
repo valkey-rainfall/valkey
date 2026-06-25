@@ -13231,7 +13231,7 @@ int moduleFreeCommand(struct ValkeyModule *module, struct serverCommand *cmd) {
             struct serverCommand *sub = next;
             if (moduleFreeCommand(module, sub) != C_OK) continue;
 
-            serverAssert(hashtableDelete(cmd->subcommands_ht, sub->declared_name));
+            serverAssert(hashtableDelete(cmd->subcommands_ht, &(stringRef){sub->declared_name, sdslen((sds)sub->declared_name)}));
             sdsfree((sds)sub->declared_name);
             sdsfree(sub->fullname);
             zfree(sub);
@@ -13254,8 +13254,8 @@ void moduleUnregisterCommands(struct ValkeyModule *module) {
         struct serverCommand *cmd = next;
         if (moduleFreeCommand(module, cmd) != C_OK) continue;
 
-        serverAssert(hashtableDelete(server.commands, cmd->fullname));
-        serverAssert(hashtableDelete(server.orig_commands, cmd->fullname));
+        serverAssert(hashtableDelete(server.commands, &(stringRef){cmd->fullname, sdslen(cmd->fullname)}));
+        serverAssert(hashtableDelete(server.orig_commands, &(stringRef){cmd->fullname, sdslen(cmd->fullname)}));
         sdsfree((sds)cmd->declared_name);
         sdsfree(cmd->fullname);
         zfree(cmd);
