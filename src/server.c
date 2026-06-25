@@ -553,6 +553,14 @@ static bool setHashtableKeyCompare(const void *entry, const void *key) {
     return stringRefEqual(&entry_ref, ref);
 }
 
+static bool setHashtableEntryCompare(const void *entry1, const void *entry2) {
+    sds s1 = (sds)entry1;
+    sds s2 = (sds)entry2;
+    size_t l1 = sdslen(s1), l2 = sdslen(s2);
+    if (l1 != l2) return false;
+    return memcmp(s1, s2, l1) == 0;
+}
+
 static uint64_t setHashtableHashEntry(const void *entry) {
     return genHashFunctionConfigurableSeed(entry, sdslen((sds)entry));
 }
@@ -561,6 +569,7 @@ hashtableType setHashtableType = {
     .hashKey = setHashtableHashKey,
     .hashEntry = setHashtableHashEntry,
     .keyCompare = setHashtableKeyCompare,
+    .entryCompare = setHashtableEntryCompare,
     .entryDestructor = dictSdsDestructor};
 
 static uint64_t zsetHashtableHashEntry(const void *entry) {
