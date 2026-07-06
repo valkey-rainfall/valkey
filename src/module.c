@@ -9385,6 +9385,11 @@ int VM_SubscribeToKeyspaceEvents(ValkeyModuleCtx *ctx, int types, ValkeyModuleNo
 }
 
 void firePostExecutionUnitJobs(void) {
+    /* Nothing to do: avoid the execution_nesting inc/dec and setup below.
+     * This is the common case for every command that does not schedule a
+     * post-notification job, so keep it a single cheap branch. */
+    if (listLength(modulePostExecUnitJobs) == 0) return;
+
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent
      * recursive calls to firePostExecutionUnitJobs.
