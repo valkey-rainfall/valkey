@@ -32,6 +32,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "stringref.h"
 #include "connection.h"
 #include "monotonic.h"
 #include "cluster.h"
@@ -376,21 +377,6 @@ void dictHashtableDestructor(void *val) {
     hashtableRelease((hashtable *)val);
 }
 
-/* Returns 1 when keys match */
-int dictSdsKeyCompare(const void *key1, const void *key2) {
-    int l1, l2;
-    l1 = sdslen((sds)key1);
-    l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
-    return memcmp(key1, key2, l1) == 0;
-}
-
-/* A case insensitive version used for the command lookup table and other
- * places where case insensitive non binary-safe comparison is needed. */
-int dictSdsKeyCaseCompare(const void *key1, const void *key2) {
-    return strcasecmp(key1, key2) == 0;
-}
-
 void dictObjectDestructor(void *val) {
     if (val == NULL) return; /* Lazy freeing will set value to NULL. */
     decrRefCount(val);
@@ -400,7 +386,7 @@ void dictSdsDestructor(void *val) {
     sdsfree(val);
 }
 
-int dictObjKeyCompare(const void *key1, const void *key2) {
+bool dictObjKeyCompare(const void *key1, const void *key2) {
     const robj *o1 = key1, *o2 = key2;
     return dictSdsKeyCompare(objectGetVal(o1), objectGetVal(o2));
 }
@@ -410,68 +396,17 @@ uint64_t dictObjHash(const void *key) {
     return dictGenHashFunction(objectGetVal(o), sdslen((sds)objectGetVal(o)));
 }
 
-uint64_t dictSdsHash(const void *key) {
-    return dictGenHashFunction(key, sdslen(key));
-}
-
-/* Hash function using a configurable seed (set via hash-seed config).
- * Used for data hashtables (keys, sets, zsets, hashes) where deterministic
- * iteration order across cluster nodes is needed. */
-static uint8_t configurable_hash_seed[16];
-
-extern uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k);
-
-void setConfigurableHashSeed(uint8_t *seed) {
-    memcpy(configurable_hash_seed, seed, sizeof(configurable_hash_seed));
-}
-
-uint8_t *getConfigurableHashSeed(void) {
-    return configurable_hash_seed;
-}
-
-uint64_t genHashFunctionConfigurableSeed(const char *buf, size_t len) {
-    return siphash((const uint8_t *)buf, len, configurable_hash_seed);
-}
-
-uint64_t sdsHashConfigurableSeed(const void *key) {
-    return genHashFunctionConfigurableSeed(key, sdslen(key));
-}
-
-uint64_t dictSdsCaseHash(const void *key) {
-    return dictGenCaseHashFunction(key, sdslen(key));
-}
-
-/* Dict hash function for null terminated string */
-uint64_t dictCStrHash(const void *key) {
-    return dictGenHashFunction(key, strlen(key));
-}
-
-/* Dict hash function for null terminated string */
-uint64_t dictCStrCaseHash(const void *key) {
-    return dictGenCaseHashFunction(key, strlen((char *)key));
-}
-
 /* Hash function for client */
 uint64_t hashtableClientHash(const void *key) {
     return ((client *)key)->id;
 }
 
 /* Hashtable compare function for client */
-int hashtableClientKeyCompare(const void *key1, const void *key2) {
+bool hashtableClientKeyCompare(const void *key1, const void *key2) {
     return ((client *)key1)->id == ((client *)key2)->id;
 }
 
-/* Dict compare function for null terminated string */
-int dictCStrKeyCompare(const void *key1, const void *key2) {
-    return strcmp(key1, key2) == 0;
-}
-
-/* Dict case insensitive compare function for null terminated string */
-int dictCStrKeyCaseCompare(const void *key1, const void *key2) {
-    return strcasecmp(key1, key2) == 0;
-}
-
-int dictEncObjKeyCompare(const void *key1, const void *key2) {
+bool dictEncObjKeyCompare(const void *key1, const void *key2) {
     robj *o1 = (robj *)key1, *o2 = (robj *)key2;
     int cmp;
 
@@ -518,20 +453,11 @@ int hashtableResizeAllowed(size_t moreMem, double usedRatio) {
     return !overMaxmemoryAfterAlloc(moreMem);
 }
 
-const void *hashtableCommandGetCurrentName(const void *element) {
-    struct serverCommand *command = (struct serverCommand *)element;
-    return command->current_name;
-}
+/* dictEntry wrappers for robj keys (local to server.c) */
+DICT_DEFINE_ENTRY_CALLBACKS(Obj, dictObjHash, dictObjKeyCompare)
 
-const void *hashtableCommandGetOriginalName(const void *element) {
-    struct serverCommand *command = (struct serverCommand *)element;
-    return command->fullname;
-}
+#define DICT_TYPE_OBJ DICT_TYPE_BASE(Obj, dictObjHash)
 
-const void *hashtableSubcommandGetKey(const void *element) {
-    struct serverCommand *command = (struct serverCommand *)element;
-    return command->declared_name;
-}
 
 /* Entry destructor that frees object key and the dictEntry itself */
 void dictEntryDestructorObjectKey(void *entry) {
@@ -597,52 +523,90 @@ void dictEntryDestructorSdsKeyHeapValue(void *entry) {
 /* Generic hash table type where keys are Objects, Values
  * dummy pointers. */
 dictType objectKeyPointerValueDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictEncObjHash,
-    .keyCompare = dictEncObjKeyCompare,
+    DICT_TYPE_ENCOBJ,
     .entryDestructor = dictEntryDestructorObjectKey,
 };
 
 /* Like objectKeyPointerValueDictType(), but values can be destroyed, if
  * not NULL, calling zfree(). */
 dictType objectKeyHeapPointerValueDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictEncObjHash,
-    .keyCompare = dictEncObjKeyCompare,
+    DICT_TYPE_ENCOBJ,
     .entryDestructor = dictEntryDestructorObjectKeyHeapValue,
 };
 
 /* Generic hashtable type: set of robj elements */
 hashtableType objectHashtableType = {
-    .hashFunction = dictEncObjHash,
+    .hashKey = dictEncObjHash,
     .keyCompare = dictEncObjKeyCompare,
     .entryDestructor = dictObjectDestructor,
 };
 
-/* Set hashtable type. Items are SDS strings */
+/* Set hashtable type. Items are SDS strings, lookup keys are stringRef*. */
+static uint64_t setHashtableHashKey(const void *key) {
+    const stringRef *ref = key;
+    return genHashFunctionConfigurableSeed(ref->buf, ref->len);
+}
+
+static bool setHashtableKeyCompare(const void *entry, const void *key) {
+    const stringRef *ref = key;
+    stringRef entry_ref = stringRefCreate((const char *)entry, sdslen((sds)entry));
+    return stringRefEqual(&entry_ref, ref);
+}
+
+static bool setHashtableEntryCompare(const void *entry1, const void *entry2) {
+    sds s1 = (sds)entry1;
+    sds s2 = (sds)entry2;
+    size_t l1 = sdslen(s1), l2 = sdslen(s2);
+    if (l1 != l2) return false;
+    return memcmp(s1, s2, l1) == 0;
+}
+
+static uint64_t setHashtableHashEntry(const void *entry) {
+    return genHashFunctionConfigurableSeed(entry, sdslen((sds)entry));
+}
+
 hashtableType setHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = setHashtableHashKey,
+    .hashEntry = setHashtableHashEntry,
+    .keyCompare = setHashtableKeyCompare,
+    .entryCompare = setHashtableEntryCompare,
     .entryDestructor = dictSdsDestructor};
 
-const void *zsetHashtableGetKey(const void *element) {
-    const zskiplistNode *node = element;
-    return zslGetNodeElement(node);
+static uint64_t zsetHashtableHashEntry(const void *entry) {
+    sds ele = zslGetNodeElement((const zskiplistNode *)entry);
+    return genHashFunctionConfigurableSeed(ele, sdslen(ele));
+}
+
+static uint64_t zsetHashtableHashKey(const void *key) {
+    const stringRef *ref = key;
+    return genHashFunctionConfigurableSeed(ref->buf, ref->len);
+}
+
+static bool zsetHashtableKeyCompare(const void *entry, const void *key) {
+    sds ele = zslGetNodeElement((const zskiplistNode *)entry);
+    const stringRef *ref = key;
+    stringRef entry_ref = stringRefCreate(ele, sdslen(ele));
+    return stringRefEqual(&entry_ref, ref);
+}
+
+static bool zsetHashtableEntryCompare(const void *entry1, const void *entry2) {
+    sds e1 = zslGetNodeElement((const zskiplistNode *)entry1);
+    sds e2 = zslGetNodeElement((const zskiplistNode *)entry2);
+    stringRef r1 = stringRefCreate(e1, sdslen(e1));
+    stringRef r2 = stringRefCreate(e2, sdslen(e2));
+    return stringRefEqual(&r1, &r2);
 }
 
 /* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
 hashtableType zsetHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .entryGetKey = zsetHashtableGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = zsetHashtableHashKey,
+    .hashEntry = zsetHashtableHashEntry,
+    .keyCompare = zsetHashtableKeyCompare,
+    .entryCompare = zsetHashtableEntryCompare,
 };
 
 uint64_t hashtableSdsHash(const void *key) {
     return hashtableGenHashFunction((const char *)key, sdslen((char *)key));
-}
-
-const void *hashtableObjectGetKey(const void *entry) {
-    return objectGetKey(entry);
 }
 
 /* Prefetch the value if it's not embedded. */
@@ -659,12 +623,26 @@ void hashtableObjectDestructor(void *val) {
     decrRefCount(val);
 }
 
+static uint64_t kvstoreKeysHashEntry(const void *entry) {
+    sds key = objectGetKey(entry);
+    return sdsHashConfigurableSeed(key);
+}
+
+static bool kvstoreKeysKeyCompare(const void *entry, const void *key) {
+    return dictSdsKeyCompare(objectGetKey(entry), key);
+}
+
+static bool kvstoreKeysEntryCompare(const void *entry1, const void *entry2) {
+    return dictSdsKeyCompare(objectGetKey(entry1), objectGetKey(entry2));
+}
+
 /* Kvstore->keys, keys are sds strings, vals are Objects. */
 hashtableType kvstoreKeysHashtableType = {
     .entryPrefetchValue = hashtableObjectPrefetchValue,
-    .entryGetKey = hashtableObjectGetKey,
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = sdsHashConfigurableSeed,
+    .hashEntry = kvstoreKeysHashEntry,
+    .keyCompare = kvstoreKeysKeyCompare,
+    .entryCompare = kvstoreKeysEntryCompare,
     .entryDestructor = hashtableObjectDestructor,
     .resizeAllowed = hashtableResizeAllowed,
     .rehashingStarted = kvstoreHashtableRehashingStarted,
@@ -676,9 +654,10 @@ hashtableType kvstoreKeysHashtableType = {
 /* Kvstore->expires */
 hashtableType kvstoreExpiresHashtableType = {
     .entryPrefetchValue = hashtableObjectPrefetchValue,
-    .entryGetKey = hashtableObjectGetKey,
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = sdsHashConfigurableSeed,
+    .hashEntry = kvstoreKeysHashEntry,
+    .keyCompare = kvstoreKeysKeyCompare,
+    .entryCompare = kvstoreKeysEntryCompare,
     .entryDestructor = NULL, /* shared with keyspace table */
     .resizeAllowed = hashtableResizeAllowed,
     .rehashingStarted = kvstoreHashtableRehashingStarted,
@@ -687,27 +666,105 @@ hashtableType kvstoreExpiresHashtableType = {
     .getMetadataSize = kvstoreHashtableMetadataSize,
 };
 
+static uint64_t commandSetHashEntry(const void *entry) {
+    struct serverCommand *cmd = (struct serverCommand *)entry;
+    return dictSdsCaseHash(cmd->current_name);
+}
+
+static bool commandSetKeyCompare(const void *entry, const void *key) {
+    struct serverCommand *cmd = (struct serverCommand *)entry;
+    const stringRef *ref = key;
+    return stringRefCaseEqualCStr(ref, cmd->current_name);
+}
+
+static bool commandSetEntryCompare(const void *entry1, const void *entry2) {
+    struct serverCommand *c1 = (struct serverCommand *)entry1;
+    struct serverCommand *c2 = (struct serverCommand *)entry2;
+    return dictCStrKeyCaseCompare(c1->current_name, c2->current_name);
+}
+
+static uint64_t commandSetHashKey(const void *key) {
+    const stringRef *ref = key;
+    return stringRefCaseHash(ref);
+}
+
 /* Command set, hashed by current command name, stores serverCommand structs. */
-hashtableType commandSetType = {.entryGetKey = hashtableCommandGetCurrentName,
-                                .hashFunction = dictSdsCaseHash,
-                                .keyCompare = dictCStrKeyCaseCompare,
+hashtableType commandSetType = {.hashKey = commandSetHashKey,
+                                .hashEntry = commandSetHashEntry,
+                                .keyCompare = commandSetKeyCompare,
+                                .entryCompare = commandSetEntryCompare,
                                 .instant_rehashing = 1};
 
+static uint64_t originalCommandSetHashEntry(const void *entry) {
+    struct serverCommand *cmd = (struct serverCommand *)entry;
+    return dictSdsCaseHash(cmd->fullname);
+}
+
+static bool originalCommandSetKeyCompare(const void *entry, const void *key) {
+    struct serverCommand *cmd = (struct serverCommand *)entry;
+    const stringRef *ref = key;
+    return stringRefCaseEqualCStr(ref, cmd->fullname);
+}
+
+static bool originalCommandSetEntryCompare(const void *entry1, const void *entry2) {
+    struct serverCommand *c1 = (struct serverCommand *)entry1;
+    struct serverCommand *c2 = (struct serverCommand *)entry2;
+    return dictCStrKeyCaseCompare(c1->fullname, c2->fullname);
+}
+
+static uint64_t originalCommandSetHashKey(const void *key) {
+    const stringRef *ref = key;
+    return stringRefCaseHash(ref);
+}
+
 /* Command set, hashed by original command name, stores serverCommand structs. */
-hashtableType originalCommandSetType = {.entryGetKey = hashtableCommandGetOriginalName,
-                                        .hashFunction = dictSdsCaseHash,
-                                        .keyCompare = dictCStrKeyCaseCompare,
+hashtableType originalCommandSetType = {.hashKey = originalCommandSetHashKey,
+                                        .hashEntry = originalCommandSetHashEntry,
+                                        .keyCompare = originalCommandSetKeyCompare,
+                                        .entryCompare = originalCommandSetEntryCompare,
                                         .instant_rehashing = 1};
 
+static uint64_t subcommandSetHashEntry(const void *entry) {
+    struct serverCommand *cmd = (struct serverCommand *)entry;
+    return dictCStrCaseHash(cmd->declared_name);
+}
+
+static bool subcommandSetKeyCompare(const void *entry, const void *key) {
+    struct serverCommand *cmd = (struct serverCommand *)entry;
+    const stringRef *ref = key;
+    return stringRefCaseEqualCStr(ref, cmd->declared_name);
+}
+
+static bool subcommandSetEntryCompare(const void *entry1, const void *entry2) {
+    struct serverCommand *c1 = (struct serverCommand *)entry1;
+    struct serverCommand *c2 = (struct serverCommand *)entry2;
+    return dictCStrKeyCaseCompare(c1->declared_name, c2->declared_name);
+}
+
+static uint64_t subcommandSetHashKey(const void *key) {
+    const stringRef *ref = key;
+    return stringRefCaseHash(ref);
+}
+
 /* Sub-command set, hashed by char* string, stores serverCommand structs. */
-hashtableType subcommandSetType = {.entryGetKey = hashtableSubcommandGetKey,
-                                   .hashFunction = dictCStrCaseHash,
-                                   .keyCompare = dictCStrKeyCaseCompare,
+hashtableType subcommandSetType = {.hashKey = subcommandSetHashKey,
+                                   .hashEntry = subcommandSetHashEntry,
+                                   .keyCompare = subcommandSetKeyCompare,
+                                   .entryCompare = subcommandSetEntryCompare,
                                    .instant_rehashing = 1};
 
 /* Hash type hash table (note that small hashes are represented with listpacks) */
-const void *hashHashtableTypeGetKey(const void *entry) {
-    return (const void *)entryGetField(entry);
+static uint64_t hashHashtableTypeHashEntry(const void *entry) {
+    sds field = entryGetField(entry);
+    return genHashFunctionConfigurableSeed(field, sdslen(field));
+}
+
+static bool hashHashtableTypeKeyCompare(const void *entry, const void *key) {
+    return dictSdsKeyCompare(entryGetField(entry), key);
+}
+
+static bool hashHashtableTypeEntryCompare(const void *entry1, const void *entry2) {
+    return dictSdsKeyCompare(entryGetField(entry1), entryGetField(entry2));
 }
 
 void hashHashtableTypeDestructor(void *entry) {
@@ -721,17 +778,19 @@ size_t hashHashtableTypeMetadataSize(void) {
 extern bool hashHashtableTypeValidate(hashtable *ht, void *entry);
 
 hashtableType hashHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .entryGetKey = hashHashtableTypeGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = sdsHashConfigurableSeed,
+    .hashEntry = hashHashtableTypeHashEntry,
+    .keyCompare = hashHashtableTypeKeyCompare,
+    .entryCompare = hashHashtableTypeEntryCompare,
     .entryDestructor = hashHashtableTypeDestructor,
     .getMetadataSize = hashHashtableTypeMetadataSize,
 };
 
 hashtableType hashWithVolatileItemsHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .entryGetKey = hashHashtableTypeGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .hashKey = sdsHashConfigurableSeed,
+    .hashEntry = hashHashtableTypeHashEntry,
+    .keyCompare = hashHashtableTypeKeyCompare,
+    .entryCompare = hashHashtableTypeEntryCompare,
     .entryDestructor = hashHashtableTypeDestructor,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
@@ -739,33 +798,44 @@ hashtableType hashWithVolatileItemsHashtableType = {
 
 /* Hashtable type without destructor */
 hashtableType sdsReplyHashtableType = {
-    .hashFunction = dictSdsCaseHash,
+    .hashKey = dictSdsCaseHash,
     .keyCompare = dictSdsKeyCompare};
 
 /* Keylist hash table type has unencoded Objects as keys and
  * lists as values. It's used for blocking operations (BLPOP) and to
  * map swapped keys to a list of clients waiting for this keys to be loaded. */
 dictType keylistDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictObjHash,
-    .keyCompare = dictObjKeyCompare,
+    DICT_TYPE_OBJ,
     .entryDestructor = dictEntryDestructorObjectKeyListValue,
 };
 
 /* objToHashtableDictType has unencoded Objects as keys and
  * hashtables as values. It's used for PUBSUB command to track clients subscribing the patterns. */
 dictType objToHashtableDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictObjHash,
-    .keyCompare = dictObjKeyCompare,
+    DICT_TYPE_OBJ,
     .entryDestructor = dictEntryDestructorObjectKeyHashtableValue,
 };
 
 /* Callback used for hash tables where the entries are dicts and the key
  * (channel name) is stored in each dict's metadata. */
-const void *hashtableChannelsGetKey(const void *entry) {
+static uint64_t hashtableChannelsHashEntry(const void *entry) {
     hashtable *ht = (hashtable *)entry;
-    return *((const void **)hashtableMetadata(ht));
+    robj *channel = *((robj **)hashtableMetadata(ht));
+    return dictObjHash(channel);
+}
+
+static bool hashtableChannelsKeyCompare(const void *entry, const void *key) {
+    hashtable *ht = (hashtable *)entry;
+    robj *channel = *((robj **)hashtableMetadata(ht));
+    return dictObjKeyCompare(channel, key);
+}
+
+static bool hashtableChannelsEntryCompare(const void *entry1, const void *entry2) {
+    hashtable *ht1 = (hashtable *)entry1;
+    hashtable *ht2 = (hashtable *)entry2;
+    robj *c1 = *((robj **)hashtableMetadata(ht1));
+    robj *c2 = *((robj **)hashtableMetadata(ht2));
+    return dictObjKeyCompare(c1, c2);
 }
 
 void hashtableChannelsDestructor(void *entry) {
@@ -780,9 +850,10 @@ void hashtableChannelsDestructor(void *entry) {
  * channels. The elements are dicts where the keys are clients. The metadata in
  * each dict stores a pointer to the channel name. */
 hashtableType kvstoreChannelHashtableType = {
-    .entryGetKey = hashtableChannelsGetKey,
-    .hashFunction = dictObjHash,
-    .keyCompare = dictObjKeyCompare,
+    .hashKey = dictObjHash,
+    .hashEntry = hashtableChannelsHashEntry,
+    .keyCompare = hashtableChannelsKeyCompare,
+    .entryCompare = hashtableChannelsEntryCompare,
     .entryDestructor = hashtableChannelsDestructor,
     .rehashingStarted = kvstoreHashtableRehashingStarted,
     .rehashingCompleted = kvstoreHashtableRehashingCompleted,
@@ -793,44 +864,34 @@ hashtableType kvstoreChannelHashtableType = {
 /* Modules system dictionary type. Keys are module name,
  * values are pointer to ValkeyModule struct. */
 dictType modulesDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Migrate cache dict type. */
 dictType migrateCacheDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Dict for for case-insensitive search using null terminated C strings.
  * The keys stored in dict are sds though. */
 dictType stringSetDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrCaseHash,
-    .keyCompare = dictCStrKeyCaseCompare,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
 /* Dict for for case-insensitive search using null terminated C strings.
  * The key and value do not have a destructor. */
 dictType externalStringType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrCaseHash,
-    .keyCompare = dictCStrKeyCaseCompare,
+    DICT_TYPE_CSTR_CASE,
     .entryDestructor = zfree,
 };
 
 /* Dict for case-insensitive search using sds objects with a zmalloc
  * allocated object as the value. */
 dictType sdsHashDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
 
@@ -840,7 +901,7 @@ size_t clientHashtableTypeMetadataSize(void) {
 
 /* Hashtable type: set of clients, with a metadata field to store one pointer. */
 hashtableType clientHashtableType = {
-    .hashFunction = hashtableClientHash,
+    .hashKey = hashtableClientHash,
     .keyCompare = hashtableClientKeyCompare,
     .getMetadataSize = clientHashtableTypeMetadataSize,
 };
@@ -3486,16 +3547,17 @@ void serverOpArrayFree(serverOpArray *oa) {
 
 bool isContainerCommandBySds(sds s) {
     void *entry;
-    bool found_command = hashtableFind(server.commands, s, &entry);
+    stringRef ref = stringRefFromSds(s);
+    bool found_command = hashtableFind(server.commands, &ref, &entry);
     struct serverCommand *base_cmd = entry;
     return found_command && base_cmd->subcommands_ht;
 }
 
-struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name) {
+struct serverCommand *lookupSubcommand(struct serverCommand *container, const char *sub_name, size_t len) {
     void *entry = NULL;
-    hashtableFind(container->subcommands_ht, sub_name, &entry);
-    struct serverCommand *subcommand = entry;
-    return subcommand;
+    stringRef ref = stringRefCreate(sub_name, len);
+    hashtableFind(container->subcommands_ht, &ref, &entry);
+    return entry;
 }
 
 /* Look up a command by argv and argc
@@ -3508,7 +3570,9 @@ struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_
  */
 struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int argc, int strict) {
     void *entry = NULL;
-    bool found_command = hashtableFind(commands, objectGetVal(argv[0]), &entry);
+    sds name = objectGetVal(argv[0]);
+    stringRef ref = stringRefFromSds(name);
+    bool found_command = hashtableFind(commands, &ref, &entry);
     struct serverCommand *base_cmd = entry;
     bool has_subcommands = found_command && base_cmd->subcommands_ht;
     if (argc == 1 || !has_subcommands) {
@@ -3518,7 +3582,7 @@ struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int a
     } else { /* argc > 1 && has_subcommands */
         if (strict && argc != 2) return NULL;
         /* Note: Currently we support just one level of subcommands */
-        return lookupSubcommand(base_cmd, objectGetVal(argv[1]));
+        return lookupSubcommand(base_cmd, objectGetVal(argv[1]), sdslen(objectGetVal(argv[1])));
     }
 }
 
@@ -3554,12 +3618,22 @@ struct serverCommand *lookupCommandBySds(sds s) {
 }
 
 struct serverCommand *lookupCommandByCStringLogic(hashtable *commands, const char *s) {
-    struct serverCommand *cmd;
-    sds name = sdsnew(s);
-
-    cmd = lookupCommandBySdsLogic(commands, name);
-    sdsfree(name);
-    return cmd;
+    size_t len = strlen(s);
+    const char *delim = memchr(s, '|', len);
+    if (!delim) {
+        stringRef ref = stringRefCreate(s, len);
+        void *entry = NULL;
+        hashtableFind(commands, &ref, &entry);
+        return entry;
+    }
+    /* Has subcommand delimiter — split without allocation */
+    size_t base_len = delim - s;
+    stringRef ref = stringRefCreate(s, base_len);
+    void *entry = NULL;
+    if (!hashtableFind(commands, &ref, &entry)) return NULL;
+    struct serverCommand *base_cmd = entry;
+    if (!base_cmd->subcommands_ht) return NULL;
+    return lookupSubcommand(base_cmd, delim + 1, len - base_len - 1);
 }
 
 struct serverCommand *lookupCommandByCString(const char *s) {

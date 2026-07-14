@@ -598,13 +598,6 @@ typedef enum { LOG_TIMESTAMP_LEGACY = 0,
 typedef enum { RDB_VERSION_CHECK_STRICT = 0,
                RDB_VERSION_CHECK_RELAXED } rdb_version_check_type;
 
-/* Structure representing a non-owning view of a buffer.
- * A stringRef struct does not manage the underlying memory, so its destruction
- * will not free the buffer. */
-typedef struct stringRef {
-    const char *buf; /* Pointer to the externalized buffer */
-    size_t len;      /* Length of the buffer */
-} stringRef;
 
 /* common sets of actions to pause/unpause */
 #define PAUSE_ACTIONS_CLIENT_WRITE_SET \
@@ -3478,7 +3471,7 @@ void initLibbacktraceFrameState(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
 connListener *listenerByType(int type);
 int changeListener(connListener *listener);
-struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name);
+struct serverCommand *lookupSubcommand(struct serverCommand *container, const char *sub_name, size_t len);
 struct serverCommand *lookupCommand(robj **argv, int argc);
 struct serverCommand *lookupCommandBySdsLogic(hashtable *commands, sds s);
 struct serverCommand *lookupCommandBySds(sds s);
@@ -3565,11 +3558,11 @@ unsigned long long dbScan(serverDb *db, unsigned long long cursor, kvstoreScanFu
 /* Set data type */
 robj *setTypeCreate(sds value, size_t size_hint);
 int setTypeAdd(robj *subject, sds value);
-int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
+int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval);
 int setTypeRemove(robj *subject, sds value);
-int setTypeRemoveAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
+int setTypeRemoveAux(robj *set, char *str, size_t len, int64_t llval);
 int setTypeIsMember(robj *subject, sds value);
-int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
+int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval);
 setTypeIterator *setTypeInitIterator(robj *subject);
 void setTypeReleaseIterator(setTypeIterator *si);
 int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele);
@@ -3928,18 +3921,7 @@ void evictionPoolAlloc(void);
 int performEvictions(void);
 void startEvictionTimeProc(void);
 
-/* Keys hashing/comparison functions for dict.c and hashtable.c hash tables. */
-uint8_t *getConfigurableHashSeed(void);
-uint64_t dictSdsHash(const void *key);
-uint64_t dictSdsCaseHash(const void *key);
-uint64_t dictCStrHash(const void *key);
-uint64_t dictCStrCaseHash(const void *key);
-uint64_t dictEncObjHash(const void *key);
-int dictSdsKeyCompare(const void *key1, const void *key2);
-int dictSdsKeyCaseCompare(const void *key1, const void *key2);
-int dictCStrKeyCompare(const void *key1, const void *key2);
-int dictCStrKeyCaseCompare(const void *key1, const void *key2);
-int dictEncObjKeyCompare(const void *key1, const void *key2);
+/* Entry destructor functions for dict types */
 void dictSdsDestructor(void *val);
 void dictListDestructor(void *val);
 void dictEntryDestructorSdsKey(void *entry);

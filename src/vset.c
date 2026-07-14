@@ -1063,7 +1063,7 @@ static uint64_t hash_pointer(const void *ptr) {
 }
 
 hashtableType pointerHashtableType = {
-    .hashFunction = hash_pointer,
+    .hashKey = hash_pointer,
 };
 
 static inline vsetBucket *findBucket(rax *expiry_buckets, long long expiry, unsigned char *key, size_t *key_len, long long *pbucket_ts, raxNode **node) {

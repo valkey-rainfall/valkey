@@ -73,8 +73,14 @@ static uint64_t hashfunc(const void *key) {
     return hashtableGenHashFunction((const char *)key, strlen((const char *)key));
 }
 
-static int keycmp(const void *key1, const void *key2) {
-    return strcmp((const char *)key1, (const char *)key2) == 0;
+static uint64_t hashentry(const void *entry) {
+    const keyval *e = (const keyval *)entry;
+    return hashfunc(e->data);
+}
+
+static bool keycmp(const void *entry, const void *key) {
+    const keyval *e = (const keyval *)entry;
+    return strcmp((const char *)e->data, (const char *)key) == 0;
 }
 
 static void freekeyval(void *keyval) {
@@ -112,8 +118,8 @@ class HashtableTest : public ::testing::Test {
         monotonicInit();
 
         memset(&keyval_type, 0, sizeof(keyval_type));
-        keyval_type.entryGetKey = getkey;
-        keyval_type.hashFunction = hashfunc;
+        keyval_type.hashKey = hashfunc;
+        keyval_type.hashEntry = hashentry;
         keyval_type.keyCompare = keycmp;
         keyval_type.entryDestructor = freekeyval;
         keyval_type.trackMemUsage = trackmemusage;
@@ -914,7 +920,7 @@ TEST_F(HashtableTest, random_entry_with_long_chain) {
     const size_t num_samples = (size_t)n + 1;
 
     hashtableType type = {};
-    type.hashFunction = mock_hash_entry_get_hash;
+    type.hashEntry = mock_hash_entry_get_hash;
     type.entryDestructor = freekeyval;
 
     hashtable *ht = hashtableCreate(&type);

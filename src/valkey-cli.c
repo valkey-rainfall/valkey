@@ -190,10 +190,6 @@ int spectrum_palette_size;
 static int orig_termios_saved = 0;
 static struct termios orig_termios; /* To restore terminal at exit.*/
 
-/* Dict Helpers */
-static uint64_t dictSdsHash(const void *key);
-static int dictSdsKeyCompare(const void *key1, const void *key2);
-
 /* Cluster Manager Command Info */
 typedef struct clusterManagerCommand {
     char *name;
@@ -379,17 +375,6 @@ static sds getDotfilePath(char *envoverride, char *envoverride_old, char *dotfil
     return dotPath;
 }
 
-static uint64_t dictSdsHash(const void *key) {
-    return dictGenHashFunction(key, sdslen(key));
-}
-
-static int dictSdsKeyCompare(const void *key1, const void *key2) {
-    int l1, l2;
-    l1 = sdslen((sds)key1);
-    l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
-    return memcmp(key1, key2, l1) == 0;
-}
 
 static void dictEntryDestructorSdsKeyNoVal(void *entry) {
     dictEntry *de = entry;
@@ -902,9 +887,7 @@ static void cliLegacyInitHelp(dict *groups) {
 static void cliInitHelp(void) {
     /* Dict type for a set of strings, used to collect names of command groups. */
     dictType groupsdt = {
-        .entryGetKey = dictEntryGetKey,
-        .hashFunction = dictSdsHash,
-        .keyCompare = dictSdsKeyCompare,
+        DICT_TYPE_SDS,
         .entryDestructor = dictEntryDestructorSdsKeyNoVal,
     };
     valkeyReply *commandTable;
@@ -3687,16 +3670,12 @@ typedef struct clusterManagerLink {
 } clusterManagerLink;
 
 static dictType clusterManagerDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsVal,
 };
 
 static dictType clusterManagerLinkDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKeyListVal,
 };
 
@@ -9244,9 +9223,7 @@ static void dictEntryDestructorTypeinfoVal(void *entry) {
 }
 
 static dictType typeinfoDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorTypeinfoVal,
 };
 

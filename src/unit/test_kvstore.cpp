@@ -19,7 +19,7 @@ uint64_t hashConflictTestCallback(const void *key) {
     return 0;
 }
 
-int cmpTestCallback(const void *k1, const void *k2) {
+bool cmpTestCallback(const void *k1, const void *k2) {
     return strcmp((const char *)k1, (const char *)k2) == 0;
 }
 
@@ -49,7 +49,7 @@ class KvstoreTest : public ::testing::Test {
         /* Initialize KvstoreHashtableTestType explicitly by field name to avoid
          * dependency on field order (designated initializers require C++20). */
         memset(&KvstoreHashtableTestType, 0, sizeof(KvstoreHashtableTestType));
-        KvstoreHashtableTestType.hashFunction = hashTestCallback;
+        KvstoreHashtableTestType.hashKey = hashTestCallback;
         KvstoreHashtableTestType.keyCompare = cmpTestCallback;
         KvstoreHashtableTestType.entryDestructor = freeTestCallback;
         KvstoreHashtableTestType.rehashingStarted = kvstoreHashtableRehashingStarted;
@@ -59,7 +59,7 @@ class KvstoreTest : public ::testing::Test {
 
         /* Initialize KvstoreConflictHashtableTestType */
         memset(&KvstoreConflictHashtableTestType, 0, sizeof(KvstoreConflictHashtableTestType));
-        KvstoreConflictHashtableTestType.hashFunction = hashConflictTestCallback;
+        KvstoreConflictHashtableTestType.hashKey = hashConflictTestCallback;
         KvstoreConflictHashtableTestType.keyCompare = cmpTestCallback;
         KvstoreConflictHashtableTestType.entryDestructor = freeTestCallback;
         KvstoreConflictHashtableTestType.rehashingStarted = kvstoreHashtableRehashingStarted;

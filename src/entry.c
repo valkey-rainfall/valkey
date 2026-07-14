@@ -1,4 +1,5 @@
 #include "server.h"
+#include "stringref.h"
 #include "serverassert.h"
 #include "entry.h"
 

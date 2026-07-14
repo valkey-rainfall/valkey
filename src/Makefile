@@ -507,6 +507,7 @@ ENGINE_SERVER_OBJ = \
     geo.o \
     geohash.o \
     geohash_helper.o \
+    hashfunctions.o \
     hashtable.o \
     hyperloglog.o \
     intset.o \
@@ -558,6 +559,7 @@ ENGINE_SERVER_OBJ = \
     socket.o \
     sort.o \
     sparkline.o \
+    stringref.o \
     strl.o \
     syncio.o \
     syscheck.o \
@@ -594,6 +596,7 @@ ENGINE_CLI_OBJ = \
     crc64.o \
     crccombine.o \
     crcspeed.o \
+    hashfunctions.o \
     hashtable.o \
     monotonic.o \
     mt19937-64.o \
@@ -602,6 +605,7 @@ ENGINE_CLI_OBJ = \
     serverassert.o \
     sha256.o \
     siphash.o \
+    stringref.o \
     strl.o \
     util.o \
     valkey-cli.o \
@@ -620,6 +624,7 @@ ENGINE_BENCHMARK_OBJ = \
     crcspeed.o \
     fuzzer_client.o \
     fuzzer_command_generator.o \
+    hashfunctions.o \
     hashtable.o \
     monotonic.o \
     mt19937-64.o \
@@ -628,6 +633,7 @@ ENGINE_BENCHMARK_OBJ = \
     serverassert.o \
     sha256.o \
     siphash.o \
+    stringref.o \
     strl.o \
     util.o \
     valkey-benchmark.o \

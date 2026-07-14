@@ -70,9 +70,7 @@ typedef struct functionsLibMetaData {
 } functionsLibMetaData;
 
 dictType functionDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
@@ -84,9 +82,7 @@ static void dictEntryDestructorSdsKeyEngineStatsValue(void *entry) {
 }
 
 dictType engineStatsDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyEngineStatsValue,
 };
 
@@ -102,9 +98,7 @@ static void dictEntryDestructorSdsKeyEngineFunctionValue(void *entry) {
  * and "AAA") are stored as distinct entries here but collapse to one entry in
  * the global dict, which later trips an assertion in libraryUnlink. */
 dictType libraryFunctionDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyEngineFunctionValue,
 };
 
@@ -116,9 +110,7 @@ static void dictEntryDestructorSdsKeyEngineLibraryValue(void *entry) {
 }
 
 dictType librariesDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKeyEngineLibraryValue,
 };
 

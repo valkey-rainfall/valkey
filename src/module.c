@@ -56,6 +56,7 @@
  * function names. For details, see the script src/modules/gendoc.rb.
  * -------------------------------------------------------------------------- */
 #include "server.h"
+#include "stringref.h"
 #include "cluster.h"
 #include "commandlog.h"
 #include "rdb.h"
@@ -1554,7 +1555,7 @@ int VM_CreateSubcommand(ValkeyModuleCommand *parent,
 
     /* Check if the command name is busy within the parent command. */
     sds declared_name = sdsnew(name);
-    if (parent_cmd->subcommands_ht && lookupSubcommand(parent_cmd, declared_name) != NULL) {
+    if (parent_cmd->subcommands_ht && lookupSubcommand(parent_cmd, name, strlen(name)) != NULL) {
         sdsfree(declared_name);
         return VALKEYMODULE_ERR;
     }
@@ -13011,9 +13012,7 @@ size_t moduleGetMemUsage(robj *key, robj *val, size_t sample_size, int dbid) {
  * this gets queries from modules. */
 
 dictType moduleAPIDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictCStrHash,
-    .keyCompare = dictCStrKeyCompare,
+    DICT_TYPE_CSTR,
     .entryDestructor = zfree,
 };
 
@@ -13038,9 +13037,7 @@ void moduleInitModulesSystemLast(void) {
 }
 
 dictType sdsKeyValueHashDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
-    .keyCompare = dictSdsKeyCaseCompare,
+    DICT_TYPE_SDS_CASE,
     .entryDestructor = dictEntryDestructorSdsKeyValue,
 };
 
@@ -13259,7 +13256,7 @@ int moduleFreeCommand(struct ValkeyModule *module, struct serverCommand *cmd) {
             struct serverCommand *sub = next;
             if (moduleFreeCommand(module, sub) != C_OK) continue;
 
-            serverAssert(hashtableDelete(cmd->subcommands_ht, sub->declared_name));
+            serverAssert(hashtableDelete(cmd->subcommands_ht, &(stringRef){sub->declared_name, sdslen((sds)sub->declared_name)}));
             sdsfree((sds)sub->declared_name);
             sdsfree(sub->fullname);
             zfree(sub);
@@ -13282,8 +13279,8 @@ void moduleUnregisterCommands(struct ValkeyModule *module) {
         struct serverCommand *cmd = next;
         if (moduleFreeCommand(module, cmd) != C_OK) continue;
 
-        serverAssert(hashtableDelete(server.commands, cmd->fullname));
-        serverAssert(hashtableDelete(server.orig_commands, cmd->fullname));
+        serverAssert(hashtableDelete(server.commands, &(stringRef){cmd->fullname, sdslen(cmd->fullname)}));
+        serverAssert(hashtableDelete(server.orig_commands, &(stringRef){cmd->fullname, sdslen(cmd->fullname)}));
         sdsfree((sds)cmd->declared_name);
         sdsfree(cmd->fullname);
         zfree(cmd);

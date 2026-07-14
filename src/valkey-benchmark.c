@@ -264,10 +264,6 @@ static long long showThroughput(struct aeEventLoop *eventLoop, long long id, voi
 int runFuzzerClients(const char *host, int port, int max_commands, int parallel_clients, int cluster_mode, int num_keys, cliSSLconfig *ssl_config, const char *log_level, int fuzz_flags);
 static int parseCommandTemplate(int argc, char **argv);
 
-/* Dict callbacks */
-static uint64_t dictSdsHash(const void *key);
-static int dictSdsKeyCompare(const void *key1, const void *key2);
-
 /* Implementation */
 static long long ustime(void) {
     struct timeval tv;
@@ -304,22 +300,9 @@ static bool isBenchmarkFinished(int request_count) {
     return false;
 }
 
-static uint64_t dictSdsHash(const void *key) {
-    return dictGenHashFunction(key, sdslen(key));
-}
-
-static int dictSdsKeyCompare(const void *key1, const void *key2) {
-    int l1, l2;
-    l1 = sdslen((sds)key1);
-    l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
-    return memcmp(key1, key2, l1) == 0;
-}
 
 static dictType dtype = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsHash,
-    .keyCompare = dictSdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = zfree,
 };
 

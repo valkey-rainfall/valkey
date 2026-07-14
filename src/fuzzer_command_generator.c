@@ -287,19 +287,6 @@ void configDictValDestructor(void *val) {
     sdsfree(entry->value);
     zfree(entry);
 }
-
-static int sdsKeyCompare(const void *key1, const void *key2) {
-    int l1, l2;
-    l1 = sdslen((sds)key1);
-    l2 = sdslen((sds)key2);
-    if (l1 != l2) return 0;
-    return memcmp(key1, key2, l1) == 0;
-}
-
-static uint64_t sdsHash(const void *key) {
-    return dictGenHashFunction(key, sdslen(key));
-}
-
 static void dictEntryDestructorSdsKeyConfigVal(void *entry) {
     dictEntry *de = entry;
     sdsfree(dictGetKey(de));
@@ -309,9 +296,7 @@ static void dictEntryDestructorSdsKeyConfigVal(void *entry) {
 
 /* Dictionary type for config entries */
 static dictType configDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = sdsHash,
-    .keyCompare = sdsKeyCompare,
+    DICT_TYPE_SDS,
     .entryDestructor = dictEntryDestructorSdsKeyConfigVal,
 };
 
@@ -962,7 +947,6 @@ static void freeCommandEntry(CommandEntry *command) {
     zfree(command->argv);
     command->argv = NULL;
 }
-
 
 /* Check if a command should be filtered out from the command registry as they may make the server untestable */
 static int shouldFilterCommand(const sds cmdName, int fuzz_flags) {
