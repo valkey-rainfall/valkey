@@ -52,6 +52,7 @@ set ::baseport 21111; # initial port for spawned servers
 set ::portcount 8000; # we don't wanna use more than 10000 to avoid collision with cluster bus ports
 set ::traceleaks 0
 set ::valgrind 0
+set ::slowenv 0
 set ::durable 0
 set ::tls 0
 set ::io_threads 0
@@ -737,6 +738,9 @@ proc print_help_screen {} {
         "                   runtest-moduleapi which will build the test module."
         "--skip-leaks       Disable macOS leaks verification."
         "--valgrind         Run the test over valgrind."
+        "--slow-env         Relax timing assumptions for slow execution environments"
+        "                   (e.g. instrumented builds such as code coverage). Extends"
+        "                   condition-wait budgets without slowing down passing tests."
         "--durable          suppress test crashes and keep running"
         "--stack-logging    Enable macOS leaks/malloc stack logging."
         "--accurate         Run slow randomized tests for more iterations."
@@ -842,6 +846,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::leaks 0
     } elseif {$opt eq {--valgrind}} {
         set ::valgrind 1
+    } elseif {$opt eq {--slow-env}} {
+        set ::slowenv 1
     } elseif {$opt eq {--stack-logging}} {
         if {[string match {*Darwin*} [exec uname -a]]} {
             set ::leaks 1

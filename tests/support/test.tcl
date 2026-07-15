@@ -131,6 +131,13 @@ proc assert_refcount_morethan {key ref} {
 # executed. If 'debugscript' is provided, it is executed after failure of
 # the confition (before the retry delay).
 proc wait_for_condition {maxtries delay e _else_ elsescript {_debug_ ""} {debugscript ""}} {
+    # In an explicitly flagged slow environment (e.g. gcov-instrumented
+    # coverage builds, see --slow-env) everything runs slower, so give
+    # conditions more time to become true. This doesn't slow down passing
+    # tests since we break out as soon as the condition is met.
+    if {$::slowenv} {
+        set maxtries [expr {$maxtries * 3}]
+    }
     while {[incr maxtries -1] >= 0} {
         set errcode [catch {uplevel 1 [list expr $e]} result]
         if {$errcode == 0} {

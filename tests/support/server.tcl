@@ -107,7 +107,7 @@ proc kill_server config {
     catch {exec kill $pid}
     # Node might have been stopped in the test
     catch {exec kill -SIGCONT $pid}
-    if {$::valgrind} {
+    if {[slow_env]} {
         set max_wait 120000
     } else {
         set max_wait 10000
@@ -695,7 +695,7 @@ proc start_server {options {code undefined}} {
             continue; # Try again
         }
 
-        if {$::valgrind} {set retrynum 1000} else {set retrynum 100}
+        if {[slow_env]} {set retrynum 1000} else {set retrynum 100}
         if {$code ne "undefined" && $wait_ready} {
             set serverisup [server_is_up $::host $port $retrynum]
         } else {

@@ -1,3 +1,11 @@
+# Return true when the tests run in an environment that is known to be
+# significantly slower than a plain build (valgrind, or an environment
+# explicitly flagged as slow with --slow-env, e.g. gcov-instrumented
+# coverage builds). Used to relax timing assumptions.
+proc slow_env {} {
+    return [expr {$::valgrind || $::slowenv}]
+}
+
 proc randstring {min max {type binary}} {
     set len [expr {$min+int(rand()*($max-$min+1))}]
     set output {}

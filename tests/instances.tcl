@@ -16,6 +16,7 @@ source ../support/test.tcl
 
 set ::verbose 0
 set ::valgrind 0
+set ::slowenv 0
 set ::tls 0
 set ::tls_module 0
 set ::io_threads 0
