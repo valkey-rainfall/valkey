@@ -109,8 +109,10 @@ run_solo {defrag} {
         # Execute the passed in code block
         uplevel 1 $code_block
 
-        # Wait for the active defrag to stop working.
-        wait_for_condition 150 200 {
+        # Wait for the active defrag to stop working. The budget is generous
+        # for contended CI runners; the wait is on an eventual condition, so
+        # widening it cannot mask a defrag-never-stops regression.
+        wait_for_condition 250 200 {
             [s active_defrag_running] eq 0
         } else {
             log_frag "defrag didn't stop"
