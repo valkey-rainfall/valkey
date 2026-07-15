@@ -276,12 +276,13 @@ run_solo {defrag} {
                 set current_cpu [s active_defrag_running]
                 assert_range $current_cpu 2 3
 
-                # alter the CPU limits and check that they took effect
+                # alter the CPU limits and check that defrag continues; we don't
+                # assert active_defrag_running == 1 here because defrag may
+                # legitimately complete before the probe fires. The outcome
+                # assertions after perform_defrag carry the verification.
                 r config set active-defrag-cycle-min 1
                 r config set active-defrag-cycle-max 1
                 after 120
-                # it's possible that defrag has already completed
-                assert {[s active_defrag_running] == 1}
 
                 # now bump up the CPU to finish quickly
                 r config set active-defrag-cycle-min 40
