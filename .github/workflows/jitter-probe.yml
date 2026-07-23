@@ -4,6 +4,8 @@ name: runner-jitter-probe
 # No Valkey code involved — results are engine-independent.
 
 on:
+  push:
+    branches: [runner-jitter-probe]
   workflow_dispatch:
     inputs:
       reps:
@@ -47,8 +49,10 @@ jobs:
 
       - name: Run probe sweep
         run: |
+          REPS="${{ inputs.reps }}"
+          LOADS="${{ inputs.loads }}"
           ./run_probe.sh "gh-${{ matrix.os }}-r${{ github.run_id }}" results \
-            "${{ inputs.reps }}" ${{ inputs.loads }}
+            "${REPS:-5}" ${LOADS:-0 4 16 32}
 
       - name: Upload results
         uses: actions/upload-artifact@v4
