@@ -26,6 +26,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -274,6 +275,34 @@ static uint64_t min_clock_step_ns(size_t samples) {
     return minstep == UINT64_MAX ? 0 : minstep;
 }
 
+/* Phase 4: exec-spawn latency — fork + execvp(argv) with stdout/stderr on
+ * /dev/null + waitpid. Models test-harness server spawn (fork, exec, dynamic
+ * linking, brief child work). Returns number of samples recorded; 0 if the
+ * target binary is unavailable (probe spawn exits 127). */
+static size_t measure_exec_spawn(char *const argv[], uint64_t *out,
+                                 size_t iters) {
+    for (size_t i = 0; i < iters; i++) {
+        uint64_t t0 = now_ns(CLOCK_MONOTONIC);
+        pid_t pid = fork();
+        if (pid == 0) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+            }
+            execvp(argv[0], argv);
+            _exit(127);
+        }
+        int st = 0;
+        if (pid > 0) waitpid(pid, &st, 0);
+        uint64_t t1 = now_ns(CLOCK_MONOTONIC);
+        if (i == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 127)
+            return 0; /* target missing; skip this distribution */
+        out[i] = t1 - t0;
+    }
+    return iters;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
@@ -296,6 +325,7 @@ int main(int argc, char **argv) {
     double busy_secs = 5.0;
     size_t fork_iters = 200;
     size_t fork_heap_mb = 64;
+    size_t spawn_iters = 200;
     int load = 0;
     const char *label = "";
 
@@ -310,6 +340,8 @@ int main(int argc, char **argv) {
             fork_iters = (size_t)atol(argv[++i]);
         else if (!strcmp(argv[i], "--fork-heap-mb") && i + 1 < argc)
             fork_heap_mb = (size_t)atol(argv[++i]);
+        else if (!strcmp(argv[i], "--spawn-iters") && i + 1 < argc)
+            spawn_iters = (size_t)atol(argv[++i]);
         else if (!strcmp(argv[i], "--load") && i + 1 < argc)
             load = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--label") && i + 1 < argc)
@@ -318,7 +350,7 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "usage: %s [--sleep-iters N] [--sleep-us US] "
                     "[--busy-secs S] [--fork-iters N] [--fork-heap-mb MB] "
-                    "[--load NWORKERS] [--label STR]\n",
+                    "[--spawn-iters N] [--load NWORKERS] [--label STR]\n",
                     argv[0]);
             return 2;
         }
@@ -366,7 +398,10 @@ int main(int argc, char **argv) {
     uint64_t *gaps = calloc(gaps_cap, sizeof(uint64_t));
     uint64_t *fork_lat = calloc(fork_iters, sizeof(uint64_t));
     uint64_t *fork_total = calloc(fork_iters, sizeof(uint64_t));
-    if (!sleep_ov || !gaps || !fork_lat || !fork_total) {
+    uint64_t *spawn_true = calloc(spawn_iters, sizeof(uint64_t));
+    uint64_t *spawn_dl = calloc(spawn_iters, sizeof(uint64_t));
+    if (!sleep_ov || !gaps || !fork_lat || !fork_total || !spawn_true ||
+        !spawn_dl) {
         fprintf(stderr, "alloc failure\n");
         return 1;
     }
@@ -388,6 +423,13 @@ int main(int argc, char **argv) {
                                      &busy_iters, &busy_max, &busy_lost);
 
     measure_fork(fork_lat, fork_total, fork_iters, fork_heap_mb);
+
+    /* exec-spawn: /bin/true = pure fork+exec; openssl version = adds the
+     * dynamic-linking work a TLS-enabled server binary pays at startup. */
+    char *argv_true[] = {(char *)"/bin/true", NULL};
+    char *argv_dl[] = {(char *)"openssl", (char *)"version", NULL};
+    size_t n_spawn_true = measure_exec_spawn(argv_true, spawn_true, spawn_iters);
+    size_t n_spawn_dl = measure_exec_spawn(argv_dl, spawn_dl, spawn_iters);
 
     uint64_t mono1 = now_ns(CLOCK_MONOTONIC);
     uint64_t real1 = now_ns(CLOCK_REALTIME);
@@ -440,9 +482,10 @@ int main(int argc, char **argv) {
     printf("  },\n");
     printf("  \"config\": {\"sleep_iters\": %zu, \"sleep_us\": %lu, "
            "\"busy_secs\": %.1f, \"fork_iters\": %zu, \"fork_heap_mb\": %zu, "
+           "\"spawn_iters\": %zu, "
            "\"load_workers\": %d, \"gap_threshold_us\": %.1f},\n",
            sleep_iters, (unsigned long)sleep_us, busy_secs, fork_iters,
-           fork_heap_mb, load, (double)gap_thresh_ns / 1000.0);
+           fork_heap_mb, spawn_iters, load, (double)gap_thresh_ns / 1000.0);
     printf("  \"results\": {\n");
     emit_dist("sleep_overshoot_us", sleep_ov, nsleep);
     printf(",\n");
@@ -457,6 +500,10 @@ int main(int argc, char **argv) {
     emit_dist("fork_call_us", fork_lat, fork_iters);
     printf(",\n");
     emit_dist("fork_total_us", fork_total, fork_iters);
+    printf(",\n");
+    emit_dist("spawn_true_us", spawn_true, n_spawn_true);
+    printf(",\n");
+    emit_dist("spawn_dl_us", spawn_dl, n_spawn_dl);
     printf(",\n");
     printf("    \"clock\": {\"mono_res_ns\": %ld, \"min_step_ns\": %lu, "
            "\"realtime_vs_mono_ppm\": %.3f, \"raw_vs_mono_ppm\": %.3f, "
@@ -480,5 +527,7 @@ int main(int argc, char **argv) {
     free(gaps);
     free(fork_lat);
     free(fork_total);
+    free(spawn_true);
+    free(spawn_dl);
     return 0;
 }

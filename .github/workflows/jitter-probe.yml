@@ -14,7 +14,7 @@ on:
         required: false
       loads:
         description: "Space-separated busy-worker counts"
-        default: "0 4 16 32"
+        default: "0 2 4 8 16"
         required: false
 
 # Unique group per run: probe runs must never cancel each other
@@ -52,7 +52,7 @@ jobs:
           REPS="${{ inputs.reps }}"
           LOADS="${{ inputs.loads }}"
           ./run_probe.sh "gh-${{ matrix.os }}-r${{ github.run_id }}" results \
-            "${REPS:-5}" ${LOADS:-0 4 16 32}
+            "${REPS:-5}" ${LOADS:-0 2 4 8 16}
 
       - name: Upload results
         uses: actions/upload-artifact@v4
