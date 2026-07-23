@@ -1,0 +1,58 @@
+name: runner-jitter-probe
+
+# Characterizes the scheduling/clock behavior of the runner environment.
+# No Valkey code involved — results are engine-independent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "Repetitions per load level"
+        default: "5"
+        required: false
+      loads:
+        description: "Space-separated busy-worker counts"
+        default: "0 4 16 32"
+        required: false
+
+# Unique group per run: probe runs must never cancel each other
+# (unlike the daily workflow whose group is keyed on use_git_ref).
+concurrency:
+  group: jitter-probe-${{ github.run_id }}
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build probe
+        run: gcc -O2 -Wall -Wextra -Werror -o jitter_probe jitter_probe.c
+
+      - name: Runner environment snapshot
+        run: |
+          echo "nproc=$(nproc)"
+          uname -a
+          cat /sys/devices/system/clocksource/clocksource0/current_clocksource || true
+          cat /proc/loadavg
+          grep -m1 'model name' /proc/cpuinfo || true
+
+      - name: Run probe sweep
+        run: |
+          ./run_probe.sh "gh-${{ matrix.os }}-r${{ github.run_id }}" results \
+            "${{ inputs.reps }}" ${{ inputs.loads }}
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: jitter-${{ matrix.os }}-${{ github.run_id }}
+          path: results/*.json
+          retention-days: 30
