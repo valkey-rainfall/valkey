@@ -693,7 +693,11 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->refcount > 1) return C_ERR;
 
-    if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
+    /* Only string objects are freed by IO threads. Any string encoding is
+     * safe: RAW frees the sds and the robj, while EMBSTR and INT are a single
+     * allocation freed with one zfree (embedded key/expire included). Objects
+     * with refcount > 1 (including shared objects) are never offloaded. */
+    if (obj->type != OBJ_STRING) return C_ERR;
 
     void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
     if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
