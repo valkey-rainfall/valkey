@@ -1183,3 +1183,53 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 } ; # if jemalloc
 
 }
+
+start_server {tags {"string"} overrides {enable-debug-assert yes}} {
+    test {SET overwrite with cached entry ref is safe under active rehash} {
+        # setGenericCommand caches the entry's hash table location at lookup
+        # and reuses it in the store step. enable-debug-assert makes
+        # setKeyWithRef verify on every overwrite that the cached reference
+        # still points at the right entry. Interleave inserts (which grow the
+        # table and keep incremental rehash active) with overwrites so the
+        # assert is exercised while entries are being moved between tables.
+        r flushall
+        for {set i 0} {$i < 20000} {incr i} {
+            r set refkey:$i v$i
+            if {$i % 2 == 0} {
+                r set refkey:[expr {$i / 2}] overwritten$i
+            }
+        }
+        assert_equal "overwritten19998" [r get refkey:9999]
+        assert_equal 20000 [r dbsize]
+    }
+
+    test {SET variants consume the cached entry ref correctly} {
+        r flushall
+        r set k v1
+        # Plain overwrite
+        assert_equal {OK} [r set k v2]
+        assert_equal "v2" [r get k]
+        # XX on existing / NX on existing
+        assert_equal {OK} [r set k v3 XX]
+        assert_equal {} [r set k v4 NX]
+        assert_equal "v3" [r get k]
+        # GET variant returns old value while overwriting via the cached ref
+        assert_equal "v3" [r set k v5 GET]
+        assert_equal "v5" [r get k]
+        # Overwrite of a key with TTL: EX path and KEEPTTL path
+        r set tk tv1 EX 100
+        assert_equal {OK} [r set tk tv2 KEEPTTL]
+        assert_range [r ttl tk] 90 100
+        assert_equal {OK} [r set tk tv3]
+        assert_equal -1 [r ttl tk]
+        # IFEQ match and mismatch
+        r set ck cv1
+        assert_equal {OK} [r set ck cv2 IFEQ cv1]
+        assert_equal {} [r set ck cv3 IFEQ wrong]
+        assert_equal "cv2" [r get ck]
+        # NX insert (no ref path) still works
+        r del nk
+        assert_equal {OK} [r set nk nv NX]
+        assert_equal "nv" [r get nk]
+    }
+}
