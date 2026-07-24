@@ -139,69 +139,51 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
     }
 }
 
-start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5 enable-debug-assert yes}} {
-    test {Prebuilt SET entries: pipelined overwrite churn preserves values and encodings} {
-        # Plain SETs parsed on IO threads carry a speculatively built entry.
-        # Heavy pipelining exercises both the current-command and queued-command
-        # prebuild paths; enable-debug-assert verifies key/value match at consume.
-        r config set io-threads-always-active yes
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    test {DB entry frees are offloaded to IO threads for all string encodings} {
+        # Overwriting a key frees the old entry (dbSetValue). These frees
+        # should be offloaded to IO threads for every string encoding:
+        # RAW, EMBSTR (small values, single-allocation entry) and INT.
+        assert_equal {OK} [r config set io-threads-always-active yes]
+        activate_io_threads_and_wait
         r flushall
-        set rd [valkey_deferring_client]
-        for {set i 0} {$i < 2000} {incr i} {
-            $rd set pk[expr {$i % 20}] "prebuilt-value-$i"
+
+        # EMBSTR: small values produce embedded key+value entries.
+        set embstr_before [s io_threaded_freed_objects]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set embkey[expr {$i % 10}] "embstr-value-$i"
         }
-        $rd flush
-        for {set i 0} {$i < 2000} {incr i} { $rd read }
-        for {set k 0} {$k < 20} {incr k} {
-            assert_equal "prebuilt-value-[expr {1980 + $k}]" [r get pk$k]
+        set embstr_freed [expr {[s io_threaded_freed_objects] - $embstr_before}]
+        # 990 overwrites free an embstr entry each. Allow headroom for
+        # occasional queue-full fallbacks to a main-thread free.
+        assert_morethan $embstr_freed 500
+
+        # INT: integer-encoded values, entry free is a single zfree.
+        set int_before [s io_threaded_freed_objects]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set intkey[expr {$i % 10}] [expr {100000 + $i}]
         }
-        assert_encoding embstr pk0
-        # The consume path must actually engage: 2000 SETs, 1980 overwrites,
-        # each eligible (embstr, no TTL). Allow headroom for early inserts.
-        assert_morethan [s prebuilt_entries_used] 1000
-        $rd close
-        # Integer values must keep INT encoding (prebuild refuses them).
-        r set intk 1234567
-        assert_encoding int intk
-        # Large values must keep RAW encoding.
-        r set rawk [string repeat x 200]
-        assert_encoding raw rawk
-        assert_equal 22 [r dbsize]
+        set int_freed [expr {[s io_threaded_freed_objects] - $int_before}]
+        assert_morethan $int_freed 500
+
+        # Correctness: latest values are intact after the overwrite churn.
+        for {set k 0} {$k < 10} {incr k} {
+            assert_equal "embstr-value-[expr {990 + $k}]" [r get embkey$k]
+            assert_equal [expr {100000 + 990 + $k}] [r get intkey$k]
+        }
+        assert_equal 20 [r dbsize]
+
+        # Let the async frees drain before the server shuts down.
+        wait_for_io_threads_to_go_idle
     }
 
-    test {Prebuilt SET entries: TTL carry falls back to the normal path} {
-        # Overwriting a key that has a TTL cannot consume the prebuilt entry
-        # (it is built without an expire field). KEEPTTL must preserve the TTL.
-        r set ttlk v1 EX 100
-        r set ttlk v2 KEEPTTL
-        assert_range [r ttl ttlk] 90 100
-        assert_equal "v2" [r get ttlk]
-        # Plain SET clears the TTL, whichever path built the entry.
-        r set ttlk v3
-        assert_equal -1 [r ttl ttlk]
-        assert_equal "v3" [r get ttlk]
-    }
-
-    test {Prebuilt SET entries: unconsumed entries leak nothing} {
-        # A plain SET queued inside MULTI parses (and prebuilds) on the IO
-        # thread, but the command is queued rather than executed, so the
-        # prebuilt entry must be released by resetClient. A leak of ~64B x
-        # 10000 iterations (~640KB) would be visible in used_memory.
-        r set mk original
-        set mem_before [s used_memory]
-        for {set i 0} {$i < 10000} {incr i} {
-            r multi
-            r set mk "multi-value-$i"
-            r exec
+    test {DB entry frees are not offloaded with a single IO thread} {
+        assert_equal {OK} [r config set io-threads 1]
+        set before [s io_threaded_freed_objects]
+        for {set i 0} {$i < 100} {incr i} {
+            r set singlekey "embstr-value-$i"
         }
-        assert_equal "multi-value-9999" [r get mk]
-        set mem_after [s used_memory]
-        assert {[expr {$mem_after - $mem_before}] < 300000}
-        # Wrong-type overwrite consumes the prebuilt entry correctly.
-        r del listk
-        r rpush listk a
-        r set listk plainstring
-        assert_equal "plainstring" [r get listk]
-        assert_encoding embstr listk
+        assert_equal $before [s io_threaded_freed_objects]
+        assert_equal "embstr-value-99" [r get singlekey]
     }
 }
