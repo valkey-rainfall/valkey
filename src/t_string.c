@@ -95,7 +95,12 @@ void setGenericCommand(client *c,
         if (getGenericCommand(c) == C_ERR) goto cleanup;
     }
 
-    robj *existing_value = lookupKeyWrite(c->db, key);
+    /* Capture the entry's location in the keys table so the overwrite below
+     * can skip a second lookup. The reference stays valid because no operation
+     * that can move entries runs on db->keys between here and setKeyWithRef()
+     * (the checkAlreadyExpired path deletes the key but aborts the SET). */
+    void **oldref = NULL;
+    robj *existing_value = lookupKeyWriteWithRef(c->db, key, &oldref);
     found = existing_value != NULL;
 
     /* Handle the IFEQ conditional check */
@@ -143,7 +148,7 @@ void setGenericCommand(client *c,
          * object is not released when adding it to the database. */
         incrRefCount(val);
     }
-    setKey(c, c->db, key, &val, setkey_flags);
+    setKeyWithRef(c, c->db, key, &val, setkey_flags, found ? oldref : NULL);
     if (expire) val = setExpire(c, c->db, key, milliseconds);
 
     /* By setting the reallocated value back into argv, we can avoid duplicating
