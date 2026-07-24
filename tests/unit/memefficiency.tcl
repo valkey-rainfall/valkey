@@ -89,7 +89,7 @@ run_solo {defrag} {
     # Start defrag and wait for it to stop
     # The optional code block is executed after defrag has started
     proc perform_defrag {{code_block {}}} {
-        r config set latency-monitor-threshold 5
+        r config set latency-monitor-threshold 1 ;# LATDIST: was 5; capture all events >=1ms for distribution
         r latency reset
 
         set old_defrag_time [s total_active_defrag_time]
@@ -126,6 +126,8 @@ run_solo {defrag} {
     }
 
     # Checks for any significant latency events
+    # LATDIST instrumentation: log full latency data instead of asserting, so
+    # every pass completes all test units and yields distribution samples.
     proc validate_latency {limit_ms} {
         if {!$::no_latency} {
             set max_latency 0
@@ -135,15 +137,12 @@ run_solo {defrag} {
                     set max_latency $max
                 }
             }
-            if {$::verbose} {
-                puts "Validating max latency ($max_latency) is LT $limit_ms"
-                if {$max_latency > 0} {
-                    puts [r latency latest]
-                    puts [r latency history active-defrag-cycle]
-                    puts [r latency history while-blocked-cron]
-                }
-            }
-            assert {$max_latency <= $limit_ms}
+            set breach [expr {$max_latency > $limit_ms ? 1 : 0}]
+            puts "LATDIST_DATA limit_ms=$limit_ms max_latency=$max_latency breach=$breach ts=[clock milliseconds]"
+            puts "LATDIST_HIST_DEFRAG [r latency history active-defrag-cycle]"
+            puts "LATDIST_HIST_CRON [r latency history while-blocked-cron]"
+            # LATDIST: original assertion disabled for distribution gathering:
+            # assert {$max_latency <= $limit_ms}
         }
     }
 
@@ -233,6 +232,7 @@ run_solo {defrag} {
 
         log_frag "after defragging"
         validate_frag_ratio < 1.1
+        puts "LATDIST_TEST $name" ;# LATDIST: name marker for the data line that follows
         validate_latency $opts(latency)
 
         # verify the data isn't corrupted or changed
