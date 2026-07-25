@@ -291,6 +291,22 @@ static robj *createStringObjectWithKeyAndExpire(const char *ptr, size_t len, con
     }
 }
 
+/* Speculatively build the database entry for a plain SET, so the store step
+ * does not have to allocate and copy it. Safe to call from IO threads: it
+ * touches no shared state beyond the (thread-safe) allocator.
+ *
+ * Returns NULL when the entry cannot be predicted at parse time:
+ * - values that parse as integers get OBJ_ENCODING_INT via tryObjectEncoding
+ * - values too large to embed take the RAW path (and may reuse the old entry
+ *   allocation via the swap fast path in dbSetValue). */
+robj *tryPrebuildStringEntry(const_sds key, const_sds val) {
+    long long ll;
+    size_t len = sdslen(val);
+    if (len <= 20 && string2ll(val, len, &ll)) return NULL;
+    if (!shouldEmbedStringObject(len, key, EXPIRY_NONE)) return NULL;
+    return createEmbeddedStringObjectWithKeyAndExpire(val, len, key, EXPIRY_NONE);
+}
+
 void *objectGetVal(const robj *o) {
     if (o->hasembval) {
         unsigned char *data = objectEmbeddedData(o);

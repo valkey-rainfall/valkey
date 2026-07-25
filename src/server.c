@@ -2826,6 +2826,7 @@ void resetServerStats(void) {
     server.stat_total_reads_processed = 0;
     server.stat_io_writes_processed = 0;
     server.stat_io_freed_objects = 0;
+    server.stat_prebuilt_entries_used = 0;
     server.stat_io_accept_offloaded = 0;
     server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
@@ -4274,14 +4275,31 @@ void prepareCommand(client *c) {
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
+/* Speculatively build the DB entry for a parsed plain SET (exactly
+ * "SET key value") so the main thread can link it in without allocating.
+ * Only called from IO threads — on the main-thread parse path the prebuild
+ * would be the same work the store step does anyway. */
+static robj *tryPrebuildEntryForCommand(struct serverCommand *cmd, robj **argv, int argc, int read_flags) {
+    if (cmd == NULL || cmd->proc != setCommand || argc != 3) return NULL;
+    if (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)) return NULL;
+    return tryPrebuildStringEntry(objectGetVal(argv[1]), objectGetVal(argv[2]));
+}
+
 void prepareCommandQueue(client *c) {
     /* First AKA current command (c->argv). */
     prepareCommand(c);
+
+    int prebuild = !inMainThread();
+    if (prebuild) {
+        serverAssert(c->prebuilt_entry == NULL);
+        c->prebuilt_entry = tryPrebuildEntryForCommand(c->parsed_cmd, c->argv, c->argc, c->read_flags);
+    }
 
     /* Commands in client's command queue. */
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
+        if (prebuild) p->prebuilt_entry = tryPrebuildEntryForCommand(p->cmd, p->argv, p->argc, p->read_flags);
     }
 }
 
@@ -6543,6 +6561,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_reads_processed:%lld\r\n", server.stat_io_reads_processed,
                 "io_threaded_writes_processed:%lld\r\n", server.stat_io_writes_processed,
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
+                "prebuilt_entries_used:%lld\r\n", server.stat_prebuilt_entries_used,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,

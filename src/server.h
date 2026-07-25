@@ -1275,6 +1275,7 @@ typedef struct parsedCommand {
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    robj *prebuilt_entry; /* Speculatively built DB entry (plain SET only), or NULL. */
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1316,6 +1317,8 @@ typedef struct client {
     long bulklen;        /* Length of bulk argument in multi bulk request. */
     long long woff;      /* Last write global replication offset. */
     cmdQueue cmd_queue;  /* Parsed commands queue */
+    robj *prebuilt_entry; /* Speculatively built DB entry for the current command
+                           * (plain SET only, built during IO-thread parsing), or NULL. */
     /* Command execution state and command information */
     struct serverCommand *cmd;        /* Current command. */
     struct serverCommand *lastcmd;    /* Last command executed. */
@@ -1928,6 +1931,7 @@ struct valkeyServer {
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
+    long long stat_prebuilt_entries_used;              /* SET store steps that consumed an IO-thread-prebuilt entry */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
@@ -3754,6 +3758,7 @@ int checkAlreadyExpired(mstime_t when);
 robj *lookupKeyRead(serverDb *db, robj *key);
 robj *lookupKeyWrite(serverDb *db, robj *key);
 robj *lookupKeyWriteWithRef(serverDb *db, robj *key, void ***ref);
+robj *tryPrebuildStringEntry(const_sds key, const_sds val);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyReadWithFlags(serverDb *db, robj *key, int flags);
@@ -3780,7 +3785,7 @@ void dbReplaceValue(serverDb *db, robj *key, robj **valref);
 #define SETKEY_DOESNT_EXIST 8
 #define SETKEY_ADD_OR_UPDATE 16 /* Key most likely doesn't exists */
 void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags);
-void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags, void **oldref);
+void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags, void **oldref, robj *prebuilt);
 robj *dbRandomKey(serverDb *db);
 int dbGenericDelete(serverDb *db, robj *key, int async, int flags);
 int dbSyncDelete(serverDb *db, robj *key);
