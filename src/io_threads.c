@@ -318,6 +318,9 @@ static void *IOThreadMain(void *myid) {
                 case JOB_REQ_FREE_ARGV:
                     ioThreadFreeArgv((robj **)data);
                     break;
+                case JOB_REQ_FREE_OBJ:
+                    decrRefCount(data);
+                    break;
                 case JOB_REQ_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
@@ -693,10 +696,29 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->refcount > 1) return C_ERR;
 
-    if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
+    /* Only string objects are freed by IO threads. Any string encoding is
+     * safe: RAW frees the sds and the robj, while EMBSTR and INT are a single
+     * allocation freed with one zfree (embedded key/expire included). Objects
+     * with refcount > 1 (including shared objects) are never offloaded. */
+    if (obj->type != OBJ_STRING) return C_ERR;
 
     void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
-    if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
+
+    /* Prefer the private inbox of the IO thread serving the current client
+     * (same routing as argv frees): the enqueue is batched and committed once
+     * per event loop cycle, and that thread touches this client's data anyway.
+     * Fall back to the shared queue when there is no client context. */
+    client *c = server.current_client;
+    if (c != NULL) {
+        int target_id = c->cur_tid;
+        if (target_id < 1 || target_id >= server.active_io_threads_num) {
+            target_id = (c->id % (server.active_io_threads_num - 1)) + 1;
+        }
+        if (spscIsFull(&io_private_inbox[target_id])) return C_ERR;
+        spscEnqueue(&io_private_inbox[target_id], job, false);
+    } else {
+        if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
+    }
     io_jobs_submitted++;
     server.stat_io_freed_objects++;
     return C_OK;

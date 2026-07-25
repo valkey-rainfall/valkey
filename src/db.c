@@ -47,7 +47,7 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
 static keyStatus expireIfNeeded(serverDb *db, robj *key, robj *val, int flags);
 static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, robj *prebuilt);
 static robj *lookupKeyWithRef(serverDb *db, robj *key, int flags, void ***ref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
@@ -226,7 +226,7 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     if (update_if_existing) {
         oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
         if (oldref != NULL) {
-            dbSetValue(db, key, valref, 1, oldref);
+            dbSetValue(db, key, valref, 1, oldref, NULL);
             return;
         }
     } else {
@@ -337,7 +337,7 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * value should be stored.
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, robj *prebuilt) {
     robj *val = *valref;
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexForKey(objectGetVal(key));
@@ -380,9 +380,23 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         old = val;
     } else {
         /* Replace the old value at its location in the key space. */
-        objectSetLRU(val, objectGetLRU(old));
         long long expire = objectGetExpire(old);
-        new = objectSetKeyAndExpire(val, objectGetVal(key), expire);
+        if (prebuilt != NULL && expire < 0) {
+            /* Use the entry speculatively built during IO-thread parsing:
+             * it already embeds this key and value with no expire. */
+            debugServerAssertWithInfo(NULL, key,
+                                      sdscmp(objectGetKey(prebuilt), objectGetVal(key)) == 0 &&
+                                          val->encoding == OBJ_ENCODING_EMBSTR &&
+                                          sdscmp(objectGetVal(prebuilt), objectGetVal(val)) == 0);
+            new = prebuilt;
+            prebuilt = NULL;
+            server.stat_prebuilt_entries_used++;
+            objectSetLRU(new, objectGetLRU(old));
+            decrRefCount(val); /* Release the parsed value object. */
+        } else {
+            objectSetLRU(val, objectGetLRU(old));
+            new = objectSetKeyAndExpire(val, objectGetVal(key), expire);
+        }
         *oldref = new;
         /* Replace the old value at its location in the expire space. */
         if (expire >= 0) {
@@ -403,6 +417,9 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
+    /* Release an unconsumed prebuilt entry (swap fast path or expire carry). */
+    if (prebuilt != NULL) decrRefCount(prebuilt);
+
     /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
     if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
         /* OK */
@@ -417,7 +434,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
 void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
-    dbSetValue(db, key, valref, 0, NULL);
+    dbSetValue(db, key, valref, 0, NULL, NULL);
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -436,7 +453,7 @@ void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
 void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
-    setKeyWithRef(c, db, key, valref, flags, NULL);
+    setKeyWithRef(c, db, key, valref, flags, NULL, NULL);
 }
 
 /* Like setKey(), but accepts an optional reference to the existing entry's
@@ -445,7 +462,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
  * only used when the key is known to exist, and it MUST still be valid: no
  * operation that can move entries (insert, delete, rehash step) may have run
  * on db->keys since the reference was obtained. */
-void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags, void **oldref) {
+void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags, void **oldref, robj *prebuilt) {
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
@@ -456,8 +473,10 @@ void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags,
         keyfound = (lookupKeyWrite(db, key) != NULL);
 
     if (!keyfound) {
+        if (prebuilt) decrRefCount(prebuilt);
         dbAdd(db, key, valref);
     } else if (keyfound < 0) {
+        if (prebuilt) decrRefCount(prebuilt);
         dbAddInternal(db, key, valref, 1);
     } else {
         /* When the caller supplied a reference, verify (in debug builds) that
@@ -467,7 +486,7 @@ void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags,
         debugServerAssertWithInfo(c, key,
                                   oldref == NULL || (*oldref != NULL && sdscmp(objectGetKey((robj *)*oldref),
                                                                                objectGetVal(key)) == 0));
-        dbSetValue(db, key, valref, 1, oldref);
+        dbSetValue(db, key, valref, 1, oldref, prebuilt);
     }
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);

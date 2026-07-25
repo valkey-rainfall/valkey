@@ -148,7 +148,12 @@ void setGenericCommand(client *c,
          * object is not released when adding it to the database. */
         incrRefCount(val);
     }
-    setKeyWithRef(c, c->db, key, &val, setkey_flags, found ? oldref : NULL);
+    /* Take ownership of the entry speculatively built during IO-thread
+     * parsing (plain SET only; NULL otherwise). setKeyWithRef consumes it on
+     * the overwrite path or releases it. */
+    robj *prebuilt = c->prebuilt_entry;
+    c->prebuilt_entry = NULL;
+    setKeyWithRef(c, c->db, key, &val, setkey_flags, found ? oldref : NULL, prebuilt);
     if (expire) val = setExpire(c, c->db, key, milliseconds);
 
     /* By setting the reallocated value back into argv, we can avoid duplicating

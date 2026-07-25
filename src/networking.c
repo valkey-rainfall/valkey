@@ -327,6 +327,7 @@ client *createClient(connection *conn) {
     c->argv = NULL;
     c->argv_len = 0;
     c->argv_len_sum = 0;
+    c->prebuilt_entry = NULL;
     c->original_argc = 0;
     c->original_argv = NULL;
     c->redact_arg_bitmap = 0;
@@ -2210,6 +2211,10 @@ int freeClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    if (c->prebuilt_entry) {
+        decrRefCount(c->prebuilt_entry);
+        c->prebuilt_entry = NULL;
+    }
     discardCommandQueue(c);
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
@@ -3374,6 +3379,12 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    /* Release a speculatively built entry the command did not consume
+     * (command aborted, wrong type, key had a TTL, ...). */
+    if (c->prebuilt_entry) {
+        decrRefCount(c->prebuilt_entry);
+        c->prebuilt_entry = NULL;
+    }
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4086,6 +4097,10 @@ static bool consumeCommandQueue(client *c) {
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
     c->qb_applied += p->input_bytes;
+    /* Take ownership of the speculatively built entry, if any. */
+    serverAssert(c->prebuilt_entry == NULL);
+    c->prebuilt_entry = p->prebuilt_entry;
+    p->prebuilt_entry = NULL;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
          * I/O threads, we want to free it in I/O threads too, to avoid
@@ -4099,6 +4114,7 @@ void discardCommandQueue(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     while (queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off++];
+        if (p->prebuilt_entry) decrRefCount(p->prebuilt_entry);
         for (int j = 0; j < p->argc; j++) {
             decrRefCount(p->argv[j]);
         }

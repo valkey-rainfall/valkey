@@ -138,3 +138,52 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         }
     }
 }
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    test {DB entry frees are offloaded to IO threads for all string encodings} {
+        # Overwriting a key frees the old entry (dbSetValue). These frees
+        # should be offloaded to IO threads for every string encoding:
+        # RAW, EMBSTR (small values, single-allocation entry) and INT.
+        assert_equal {OK} [r config set io-threads-always-active yes]
+        activate_io_threads_and_wait
+        r flushall
+
+        # EMBSTR: small values produce embedded key+value entries.
+        set embstr_before [s io_threaded_freed_objects]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set embkey[expr {$i % 10}] "embstr-value-$i"
+        }
+        set embstr_freed [expr {[s io_threaded_freed_objects] - $embstr_before}]
+        # 990 overwrites free an embstr entry each. Allow headroom for
+        # occasional queue-full fallbacks to a main-thread free.
+        assert_morethan $embstr_freed 500
+
+        # INT: integer-encoded values, entry free is a single zfree.
+        set int_before [s io_threaded_freed_objects]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set intkey[expr {$i % 10}] [expr {100000 + $i}]
+        }
+        set int_freed [expr {[s io_threaded_freed_objects] - $int_before}]
+        assert_morethan $int_freed 500
+
+        # Correctness: latest values are intact after the overwrite churn.
+        for {set k 0} {$k < 10} {incr k} {
+            assert_equal "embstr-value-[expr {990 + $k}]" [r get embkey$k]
+            assert_equal [expr {100000 + 990 + $k}] [r get intkey$k]
+        }
+        assert_equal 20 [r dbsize]
+
+        # Let the async frees drain before the server shuts down.
+        wait_for_io_threads_to_go_idle
+    }
+
+    test {DB entry frees are not offloaded with a single IO thread} {
+        assert_equal {OK} [r config set io-threads 1]
+        set before [s io_threaded_freed_objects]
+        for {set i 0} {$i < 100} {incr i} {
+            r set singlekey "embstr-value-$i"
+        }
+        assert_equal $before [s io_threaded_freed_objects]
+        assert_equal "embstr-value-99" [r get singlekey]
+    }
+}
