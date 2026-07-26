@@ -108,11 +108,13 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             server.current_client && server.current_client->flag.no_touch &&
             server.executing_client && server.executing_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
+        /* EXPERIMENT: skip LRU/LFU touch for GET bottleneck cost measurement */
+#if 0
         if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)) {
-            /* Shared objects can't be stored in the database. */
             serverAssert(val->refcount != OBJ_SHARED_REFCOUNT);
             val->lru = lrulfu_touch(val->lru);
         }
+#endif
 
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
         /* TODO: Use separate hits stats for WRITE */
