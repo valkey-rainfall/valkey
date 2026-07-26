@@ -4103,10 +4103,13 @@ void call(client *c, int flags) {
         server.stat_numcommands++;
     }
 
+    /* EXPERIMENT: skip zmalloc peak memory check for GET bottleneck cost measurement */
+#if 0
     /* Record peak memory after each command and before the eviction that runs
      * before the next command. */
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+#endif
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);
