@@ -4108,8 +4108,16 @@ void call(client *c, int flags) {
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
 
+    /* EXPERIMENT: skip afterCommand for GET bottleneck cost measurement.
+     * afterCommand calls: postExecutionUnitOperations (firePostExecutionUnitJobs +
+     * propagatePendingCommands + modulePostExecutionUnitOperations),
+     * trackingHandlePendingKeyInvalidations, clusterSlotStatsAddNetworkBytesOutForUserClient,
+     * and pending_push_messages join. For read-only GET with no modules/tracking/cluster,
+     * all of these are early-return no-ops, but the out-of-line calls + icache cost remain. */
+#if 0
     /* Do some maintenance job and cleanup */
     afterCommand(c);
+#endif
 
     /* Remember the replication offset of the client, right after its last
      * command that resulted in propagation. */
