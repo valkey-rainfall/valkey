@@ -3986,8 +3986,11 @@ void call(client *c, int flags) {
         command_failed = 1;
     }
 
+    /* EXPERIMENT: skip module event + minor telemetry for GET bottleneck cost measurement */
+#if 0
     /* Fire command result event for subscribed modules. */
     moduleFireCommandResultEvent(c, real_cmd, command_failed, duration, dirty);
+#endif
 
     /* After executing command, we will close the client after writing entire
      * reply if it is set 'CLIENT_CLOSE_AFTER_COMMAND' flag. */
@@ -4011,7 +4014,10 @@ void call(client *c, int flags) {
         } else {
             latencyTraceIfNeeded(server, command, duration);
         }
+        /* EXPERIMENT: skip durationAddSample */
+#if 0
         if (server.execution_nesting == 0) durationAddSample(EL_DURATION_TYPE_CMD, duration);
+#endif
     }
 
     /* Log the command into the commandlog if needed.
@@ -4032,10 +4038,13 @@ void call(client *c, int flags) {
      * respectively. If the client is blocked we will handle latency stats and duration when it is unblocked. */
     if (update_command_stats && !c->flag.blocked) {
         real_cmd->calls++;
+        /* EXPERIMENT: skip microseconds, histogram, cluster slot stats */
+#if 0
         real_cmd->microseconds += c->duration;
         if (server.latency_tracking_enabled && !c->flag.blocked)
             updateCommandLatencyHistogram(&(real_cmd->latency_histogram), c->duration * 1000);
         clusterSlotStatsAddCpuDuration(c, c->duration);
+#endif
     }
 
     /* The duration needs to be reset after each call except for a blocked command,
