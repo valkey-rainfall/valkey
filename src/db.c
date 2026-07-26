@@ -114,11 +114,17 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             val->lru = lrulfu_touch(val->lru);
         }
 
+        /* EXPERIMENT: skip keyspace hit/miss stats for GET bottleneck cost measurement */
+#if 0
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
+#endif
         /* TODO: Use separate hits stats for WRITE */
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
+        /* EXPERIMENT: skip keyspace miss stats */
+#if 0
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
+#endif
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
