@@ -639,6 +639,12 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
         return C_ERR;
     }
 
+    /* EXPERIMENT: skip offload for small argv (GET/SET/INCR) to avoid
+     * cross-core cache snoops for refcount reads on IO-thread-allocated robjs. */
+    if (argc <= 3) {
+        return C_ERR;
+    }
+
     int target_id = c->cur_tid;
     if (target_id < 1 || target_id >= server.active_io_threads_num) {
         target_id = (c->id % (server.active_io_threads_num - 1)) + 1;
