@@ -1,9 +1,15 @@
 name: latdist-probe
 
-# Defrag latency-distribution probe: runs the instrumented memefficiency suite
-# (validate_latency logs full latency data instead of asserting) as single
-# passes with --clients 1, preserving run_solo semantics. Logs are uploaded
-# as artifacts for distribution analysis.
+# Defrag latency probe with contention witness. validate_latency logs
+# latency-monitor data (stdout + LATDIST_FILE) instead of asserting;
+# witness.py samples system CPU activity at 1Hz so breach events can be
+# joined to whoever was running in the same window.
+#
+# Mode is selected by tokens in the head commit message:
+#   [mode:solo]  N passes of memefficiency only, --clients 1 (default, N=20)
+#   [mode:ci]    N passes of the FULL suite, 16 clients, run_solo active (N=3)
+#   [mode:loop]  full suite, 16 clients, --loops 1 (run_solo disabled)
+#   [passes:N]   override pass count
 on:
   push:
     branches: [latdist-probe]
@@ -22,24 +28,49 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+      - name: Determine mode
+        id: cfg
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          MODE=solo
+          echo "$MSG" | grep -q '\[mode:ci\]' && MODE=ci
+          echo "$MSG" | grep -q '\[mode:loop\]' && MODE=loop
+          P=$(echo "$MSG" | grep -oP '\[passes:\K[0-9]+' | head -1 || true)
+          if [ -z "$P" ]; then
+            case "$MODE" in solo) P=20 ;; ci) P=3 ;; loop) P=1 ;; esac
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "passes=$P" >> "$GITHUB_OUTPUT"
+          echo "Selected mode=$MODE passes=$P"
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y tcl8.6 tclx
       - name: Build (jemalloc)
         run: make -j"$(nproc)"
-      - name: Run solo passes
+      - name: Run passes with witness
+        env:
+          MODE: ${{ steps.cfg.outputs.mode }}
+          PASSES: ${{ steps.cfg.outputs.passes }}
         run: |
           mkdir -p latdist-logs
-          for i in $(seq 1 "${PASSES:-20}"); do
+          export LATDIST_FILE="$PWD/latdist-logs/latdist-events.log"
+          python3 latdist/witness.py "$PWD/latdist-logs/witness.jsonl" &
+          WPID=$!
+          for i in $(seq 1 "$PASSES"); do
             tag=$(printf "pass-%03d" "$i")
-            la0=$(cut -d' ' -f1 /proc/loadavg)
+            echo "LATDIST_PASS_START $tag $(date +%s%3N)" >> "$LATDIST_FILE"
             t0=$(date +%s)
-            ./runtest --single unit/memefficiency --clients 1 > "latdist-logs/$tag.log" 2>&1 || true
+            case "$MODE" in
+              solo) ./runtest --single unit/memefficiency --clients 1 > "latdist-logs/$tag.log" 2>&1 || true ;;
+              ci)   ./runtest --clients 16 > "latdist-logs/$tag.log" 2>&1 || true ;;
+              loop) ./runtest --clients 16 --loops 1 > "latdist-logs/$tag.log" 2>&1 || true ;;
+            esac
             t1=$(date +%s)
-            la1=$(cut -d' ' -f1 /proc/loadavg)
-            echo -e "$tag\t$t0\t$t1\t$((t1-t0))\t$la0\t$la1" >> latdist-logs/manifest.tsv
+            echo -e "$tag\t$t0\t$t1\t$((t1-t0))" >> latdist-logs/manifest.tsv
           done
+          kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null || true
+          gzip latdist-logs/witness.jsonl
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: latdist-${{ matrix.os }}
+          name: latdist-${{ steps.cfg.outputs.mode }}-${{ matrix.os }}
           path: latdist-logs/

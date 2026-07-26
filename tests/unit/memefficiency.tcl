@@ -128,6 +128,16 @@ run_solo {defrag} {
     # Checks for any significant latency events
     # LATDIST instrumentation: log full latency data instead of asserting, so
     # every pass completes all test units and yields distribution samples.
+    # Lines go to stdout and, when LATDIST_FILE is set, are appended there too
+    # (client stdout is not reliably captured in parallel runs).
+    proc latdist_emit {line} {
+        puts $line
+        if {[info exists ::env(LATDIST_FILE)]} {
+            set fh [open $::env(LATDIST_FILE) a]
+            puts $fh $line
+            close $fh
+        }
+    }
     proc validate_latency {limit_ms} {
         if {!$::no_latency} {
             set max_latency 0
@@ -138,9 +148,9 @@ run_solo {defrag} {
                 }
             }
             set breach [expr {$max_latency > $limit_ms ? 1 : 0}]
-            puts "LATDIST_DATA limit_ms=$limit_ms max_latency=$max_latency breach=$breach ts=[clock milliseconds]"
-            puts "LATDIST_HIST_DEFRAG [r latency history active-defrag-cycle]"
-            puts "LATDIST_HIST_CRON [r latency history while-blocked-cron]"
+            latdist_emit "LATDIST_DATA limit_ms=$limit_ms max_latency=$max_latency breach=$breach ts=[clock milliseconds]"
+            latdist_emit "LATDIST_HIST_DEFRAG [r latency history active-defrag-cycle]"
+            latdist_emit "LATDIST_HIST_CRON [r latency history while-blocked-cron]"
             # LATDIST: original assertion disabled for distribution gathering:
             # assert {$max_latency <= $limit_ms}
         }
@@ -232,7 +242,7 @@ run_solo {defrag} {
 
         log_frag "after defragging"
         validate_frag_ratio < 1.1
-        puts "LATDIST_TEST $name" ;# LATDIST: name marker for the data line that follows
+        latdist_emit "LATDIST_TEST $name" ;# LATDIST: name marker for the data lines that follow
         validate_latency $opts(latency)
 
         # verify the data isn't corrupted or changed
