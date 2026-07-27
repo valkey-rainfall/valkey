@@ -2829,6 +2829,11 @@ void resetServerStats(void) {
     server.stat_io_accept_offloaded = 0;
     server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    server.io_lookup_hits = 0;
+    server.io_lookup_fallbacks = 0;
+    server.io_lookup_attempts = 0;
+#endif
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
@@ -6628,6 +6633,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                "io_lookup_attempts:%lld\r\n", server.io_lookup_attempts,
+                "io_lookup_hits:%lld\r\n", server.io_lookup_hits,
+                "io_lookup_fallbacks:%lld\r\n", server.io_lookup_fallbacks,
+#endif
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,

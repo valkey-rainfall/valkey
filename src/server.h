@@ -1275,6 +1275,9 @@ typedef struct parsedCommand {
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    /* IO-thread optimistic lookup offload (per-command, v2). */
+    void *io_lookup_entry;       /* Pre-resolved hashtable entry (NULL = miss or not attempted) */
+    uint64_t io_lookup_version;  /* Hashtable version snapshot before lookup */
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1939,6 +1942,11 @@ struct valkeyServer {
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
     long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
     long long stat_total_prefetch_batches;             /* Total number of prefetched batches */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    long long io_lookup_hits;                          /* IO lookup offload: version-valid hits */
+    long long io_lookup_fallbacks;                     /* IO lookup offload: version-stale fallbacks */
+    long long io_lookup_attempts;                      /* IO lookup offload: total attempts (IO thread) */
+#endif
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */
     struct {
