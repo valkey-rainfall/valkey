@@ -9,7 +9,9 @@ name: latdist-probe
 #   [mode:solo]  N passes of memefficiency only, --clients 1 (default, N=20)
 #   [mode:ci]    N passes of the FULL suite, 16 clients, run_solo active (N=3)
 #   [mode:loop]  full suite, 16 clients, --loops 1 (run_solo disabled)
-#   [passes:N]   override pass count
+#   [mode:hunt]  full suite, 16 clients, run_solo active, sharded across 6
+#                jobs/arch (N passes PER shard, default 50 => 300/arch)
+#   [passes:N]   override pass count (per shard in hunt mode)
 on:
   push:
     branches: [latdist-probe]
@@ -24,8 +26,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 350
+    timeout-minutes: 1200
     steps:
       - uses: actions/checkout@v4
       - name: Determine mode
@@ -35,18 +38,26 @@ jobs:
           MODE=solo
           echo "$MSG" | grep -q '\[mode:ci\]' && MODE=ci
           echo "$MSG" | grep -q '\[mode:loop\]' && MODE=loop
+          echo "$MSG" | grep -q '\[mode:hunt\]' && MODE=hunt
           P=$(echo "$MSG" | grep -oP '\[passes:\K[0-9]+' | head -1 || true)
           if [ -z "$P" ]; then
-            case "$MODE" in solo) P=20 ;; ci) P=3 ;; loop) P=1 ;; esac
+            case "$MODE" in solo) P=20 ;; ci) P=3 ;; loop) P=1 ;; hunt) P=50 ;; esac
           fi
+          # Non-sharded modes: only shard 1 does work; shards 2-6 no-op.
+          RUN=yes
+          if [ "$MODE" != "hunt" ] && [ "${{ matrix.shard }}" != "1" ]; then RUN=no; fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "passes=$P" >> "$GITHUB_OUTPUT"
-          echo "Selected mode=$MODE passes=$P"
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "Selected mode=$MODE passes=$P shard=${{ matrix.shard }} run=$RUN"
       - name: Install test dependencies
+        if: steps.cfg.outputs.run == 'yes'
         run: sudo apt-get update && sudo apt-get install -y tcl8.6 tclx
       - name: Build (jemalloc)
+        if: steps.cfg.outputs.run == 'yes'
         run: make -j"$(nproc)"
       - name: Run passes with witness
+        if: steps.cfg.outputs.run == 'yes'
         env:
           MODE: ${{ steps.cfg.outputs.mode }}
           PASSES: ${{ steps.cfg.outputs.passes }}
@@ -61,7 +72,7 @@ jobs:
             t0=$(date +%s)
             case "$MODE" in
               solo) ./runtest --single unit/memefficiency --clients 1 > "latdist-logs/$tag.log" 2>&1 || true ;;
-              ci)   ./runtest --clients 16 > "latdist-logs/$tag.log" 2>&1 || true ;;
+              ci|hunt) ./runtest --clients 16 > "latdist-logs/$tag.log" 2>&1 || true ;;
               loop) ./runtest --clients 16 --loops 1 > "latdist-logs/$tag.log" 2>&1 || true ;;
             esac
             t1=$(date +%s)
@@ -70,7 +81,7 @@ jobs:
           kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null || true
           gzip latdist-logs/witness.jsonl
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.cfg.outputs.run == 'yes'
         with:
-          name: latdist-${{ steps.cfg.outputs.mode }}-${{ matrix.os }}
+          name: latdist-${{ steps.cfg.outputs.mode }}-${{ matrix.os }}-shard${{ matrix.shard }}
           path: latdist-logs/
