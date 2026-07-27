@@ -1378,6 +1378,9 @@ typedef struct client {
     int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
+    /* IO-thread optimistic lookup offload state (experiment). */
+    void *io_lookup_result;                       /* Pre-resolved entry pointer from IO-thread speculative lookup (NULL=miss or not attempted) */
+    uint64_t io_lookup_version;                   /* Hashtable version snapshot taken BEFORE the IO-thread lookup */
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -2902,6 +2905,7 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_CROSSSLOT (1 << 20)
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
+#define READ_FLAGS_IO_LOOKUP_DONE (1 << 23) /* IO thread completed speculative lookup offload */
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)

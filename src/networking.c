@@ -6644,6 +6644,22 @@ void ioThreadReadQueryFromClient(client *c) {
     trimCommandQueue(c);
     prepareCommandQueue(c);
 
+    /* IO-thread optimistic lookup offload: for single-key CMD_READONLY|CMD_FAST
+     * commands (GET shape), speculatively perform the hash-table lookup here.
+     * The main thread validates via version comparison before using the result. */
+    if ((c->read_flags & READ_FLAGS_PARSING_COMPLETED) && c->argc == 2 &&
+        c->parsed_cmd != NULL &&
+        (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST) &&
+        !server.cluster_enabled) {
+        /* Non-cluster mode: kvstore index is always 0 */
+        uint64_t v1 = kvstoreHashtableGetVersion(c->db->keys, 0);
+        void *entry = NULL;
+        kvstoreHashtableFindReadOnly(c->db->keys, 0, objectGetVal(c->argv[1]), &entry);
+        c->io_lookup_result = entry;  /* NULL means key-not-found (valid result) */
+        c->io_lookup_version = v1;
+        c->read_flags |= READ_FLAGS_IO_LOOKUP_DONE;
+    }
+
     /* Parsing was not completed - let the main-thread handle it. */
     if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
         goto done;

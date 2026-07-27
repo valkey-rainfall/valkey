@@ -80,7 +80,31 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * in the replication link. */
 robj *lookupKey(serverDb *db, robj *key, int flags) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+    robj *val = NULL;
+
+    /* IO-thread optimistic lookup offload: if the IO thread pre-resolved this
+     * key and the hashtable version hasn't changed, use the cached result directly
+     * (skipping the expensive hash-table walk). */
+    client *c = server.current_client;
+    if (c && (c->read_flags & READ_FLAGS_IO_LOOKUP_DONE)) {
+        uint64_t cur_version = kvstoreHashtableGetVersion(db->keys, dict_index);
+        if (cur_version == c->io_lookup_version) {
+            val = c->io_lookup_result;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            server.io_lookup_hits++;
+#endif
+        } else {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            server.io_lookup_fallbacks++;
+#endif
+            val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+        }
+        /* Clear the pre-resolved state -- single use per command. */
+        c->read_flags &= ~READ_FLAGS_IO_LOOKUP_DONE;
+    } else {
+        val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+    }
+
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the primary. We forbid it on readonly replicas, but

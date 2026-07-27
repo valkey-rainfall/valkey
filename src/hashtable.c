@@ -53,6 +53,7 @@
 #include "util.h"
 
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,6 +312,11 @@ struct hashtable {
     int8_t bucket_exp[2];      /* Exponent for num buckets (num = 1 << exp). */
     int16_t pause_rehash;      /* Non-zero = rehashing is paused */
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
+    _Atomic(uint64_t) version; /* Monotonic mutation version for optimistic lookup offload.
+                                * Incremented on every operation that can move or invalidate
+                                * entry pointers: insert, delete, rehash step, resize/table swap,
+                                * replace-reallocated. IO threads read this with relaxed ordering
+                                * to validate speculative lookups. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
     void *metadata[];
@@ -345,6 +351,14 @@ typedef struct {
 
 static_assert(sizeof(hashtablePosition) >= sizeof(position),
               "Opaque iterator size");
+
+/* Bump the mutation version. Must be called on every operation that invalidates
+ * entry pointers: insert, delete, rehash step (moves entries between tables),
+ * resize/table swap, replace-reallocated-entry. Uses relaxed store since the
+ * main thread is the sole writer; IO threads read with relaxed load (optimistic). */
+static inline void bumpVersion(hashtable *ht) {
+    atomic_store_explicit(&ht->version, atomic_load_explicit(&ht->version, memory_order_relaxed) + 1, memory_order_relaxed);
+}
 
 /* State for incremental find. */
 typedef struct {
@@ -716,9 +730,11 @@ static void rehashStep(hashtable *ht) {
     assert(hashtableIsRehashing(ht));
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
+        bumpVersion(ht);
         return;
     }
     rehashStepExpand(ht);
+    bumpVersion(ht);
 }
 
 /* Called internally on lookup and other reads to the table. */
@@ -807,6 +823,7 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
             rehashStep(ht);
         }
     }
+    bumpVersion(ht);
     return true;
 }
 
@@ -1100,6 +1117,7 @@ static void insert(hashtable *ht, uint64_t hash, void *entry) {
     b->presence |= (1 << pos_in_bucket);
     b->hashes[pos_in_bucket] = highBits(hash);
     ht->used[table_index]++;
+    bumpVersion(ht);
 }
 
 /* A 64-bit fingerprint of some of the state of the hash table. */
@@ -1268,6 +1286,7 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->rehash_idx = -1;
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
+    atomic_store_explicit(&ht->version, 0, memory_order_relaxed);
     ht->safe_iterators = NULL;
     resetTable(ht, 0);
     resetTable(ht, 1);
@@ -1628,6 +1647,53 @@ void **hashtableFindRef(hashtable *ht, const void *key) {
     return b ? &b->entries[pos_in_bucket] : NULL;
 }
 
+/* Read-only find variant: performs the same bucket walk as hashtableFind but
+ * does NOT call rehashStepOnReadIfNeeded. This is safe to call from IO threads
+ * concurrently with main-thread mutations (the caller must validate the result
+ * using the version protocol). */
+bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found) {
+    if (hashtableSize(ht) == 0) return false;
+    uint64_t hash = hashKey(ht, key);
+    uint8_t h2 = highBits(hash);
+    int pos_in_bucket = 0;
+
+    /* NO rehashStepOnReadIfNeeded -- this is the key difference. */
+
+    for (int table = 0; table <= 1; table++) {
+        if (ht->used[table] == 0) continue;
+        size_t mask = expToMask(ht->bucket_exp[table]);
+        size_t bucket_idx = hash & mask;
+        /* Skip already rehashed buckets. */
+        if (table == 0 && ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx) {
+            continue;
+        }
+        bucket *b = &ht->tables[table][bucket_idx];
+        do {
+            for (int pos = 0; pos < numBucketPositions(b); pos++) {
+                if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
+                    void *entry = b->entries[pos];
+                    const void *elem_key = entryGetKey(ht, entry);
+                    if (compareKeys(ht, key, elem_key)) {
+                        if (ht->type->validateEntry && !ht->type->validateEntry(ht, entry)) {
+                            return false;
+                        }
+                        if (found) *found = entry;
+                        return true;
+                    }
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+    }
+    return false;
+}
+
+/* Returns the current mutation version (relaxed load). IO threads use this
+ * to snapshot the version before/after a speculative lookup. */
+uint64_t hashtableGetVersion(hashtable *ht) {
+    return atomic_load_explicit(&ht->version, memory_order_relaxed);
+}
+
 /* Adds an entry. Returns true on success. Returns false if there was already an entry
  * with the same key. */
 bool hashtableAdd(hashtable *ht, void *entry) {
@@ -1719,6 +1785,7 @@ void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *po
     b->presence |= (1 << pos_in_bucket);
     b->entries[pos_in_bucket] = entry;
     ht->used[table_index]++;
+    bumpVersion(ht);
     /* Hash bits are already set by hashtableFindPositionForInsert. */
 }
 
@@ -1741,6 +1808,7 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
              * iterator code instead. */
             fillBucketHole(ht, b, pos_in_bucket, table_index);
         }
+        bumpVersion(ht);
         hashtableShrinkIfNeeded(ht);
         return true;
     }
@@ -1781,6 +1849,7 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2 && b->entries[pos] == old_entry) {
                     /* It's a match. */
                     b->entries[pos] = new_entry;
+                    bumpVersion(ht);
                     return true;
                 }
             }
@@ -1861,6 +1930,7 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
     assert(isPositionFilled(b, pos_in_bucket));
     b->presence &= ~(1 << pos_in_bucket);
     ht->used[table_index]--;
+    bumpVersion(ht);
     /* When we resume rehashing, it may cause the bucket to be deleted due to
      * auto shrink. */
     hashtablePauseAutoShrink(ht);

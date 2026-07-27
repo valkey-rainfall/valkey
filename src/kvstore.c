@@ -879,6 +879,18 @@ bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found) {
     return hashtableFind(ht, key, found);
 }
 
+bool kvstoreHashtableFindReadOnly(kvstore *kvs, int didx, void *key, void **found) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return false;
+    return hashtableFindReadOnly(ht, key, found);
+}
+
+uint64_t kvstoreHashtableGetVersion(kvstore *kvs, int didx) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return 0;
+    return hashtableGetVersion(ht);
+}
+
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     if (!ht) return NULL;
