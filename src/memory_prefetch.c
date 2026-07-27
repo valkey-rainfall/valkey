@@ -217,6 +217,34 @@ static void prefetchCommands(void) {
 void processClientsCommandsBatch(void) {
     if (!batch || batch->client_count == 0) return;
 
+    /* v4 PUBLISH-BEFORE-CONSUME BARRIER:
+     * Flush any pending hashtable mutations to the shared version field BEFORE
+     * we consume any IO-thread pre-resolved entries. This dominates all consumption
+     * paths because both the io_threads.c handleReadJobs() call and the recursive
+     * call from processClientIOReadsDone converge here.
+     *
+     * Correctness argument: IO threads snapshot the shared version (acquire) before
+     * performing lookups. The main thread may have mutated entries since that snapshot.
+     * By publishing pending mutations with release semantics HERE, the subsequent
+     * validation in lookupKey (comparing io_lookup_version against the now-updated
+     * shared version) correctly detects staleness. Without this barrier, we'd
+     * validate against a stale shared version and accept dangling pointers.
+     *
+     * Read-only traffic: if no mutations occurred (pending == last_published),
+     * this is a single branch (no atomic store, no cache-line write). */
+    if (batch->executed_commands == 0) {
+        /* Only publish on first entry (not recursive calls mid-batch) */
+        for (int i = 0; i < server.dbnum; i++) {
+            if (server.db[i] && server.db[i]->keys) {
+                uint64_t published = kvstoreHashtablePublishVersion(server.db[i]->keys, 0);
+                (void)published;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                if (published) server.io_lookup_publishes++;
+#endif
+            }
+        }
+    }
+
     /* If executed_commands is not 0,
      * it means that we are in the middle of processing a batch and this is a recursive call */
     if (batch->executed_commands == 0) {

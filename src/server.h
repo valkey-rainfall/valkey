@@ -1946,6 +1946,8 @@ struct valkeyServer {
     long long io_lookup_hits;                          /* IO lookup offload: version-valid hits */
     long long io_lookup_fallbacks;                     /* IO lookup offload: version-stale fallbacks */
     long long io_lookup_attempts;                      /* IO lookup offload: total attempts (IO thread) */
+    long long io_lookup_intrabatch_fallbacks;          /* IO lookup offload: intra-batch mutation invalidations */
+    long long io_lookup_publishes;                     /* IO lookup offload: lazy version publishes to shared line */
 #endif
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */

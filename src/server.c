@@ -2833,6 +2833,8 @@ void resetServerStats(void) {
     server.io_lookup_hits = 0;
     server.io_lookup_fallbacks = 0;
     server.io_lookup_attempts = 0;
+    server.io_lookup_intrabatch_fallbacks = 0;
+    server.io_lookup_publishes = 0;
 #endif
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
@@ -6637,6 +6639,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_lookup_attempts:%lld\r\n", server.io_lookup_attempts,
                 "io_lookup_hits:%lld\r\n", server.io_lookup_hits,
                 "io_lookup_fallbacks:%lld\r\n", server.io_lookup_fallbacks,
+                "io_lookup_intrabatch_fallbacks:%lld\r\n", server.io_lookup_intrabatch_fallbacks,
+                "io_lookup_publishes:%lld\r\n", server.io_lookup_publishes,
 #endif
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,

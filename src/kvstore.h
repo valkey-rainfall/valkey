@@ -86,6 +86,8 @@ unsigned long kvstoreHashtableDefragTables(kvstore *kvs, unsigned long cursor, v
 bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found);
 bool kvstoreHashtableFindReadOnly(kvstore *kvs, int didx, void *key, void **found);
 uint64_t kvstoreHashtableGetVersion(kvstore *kvs, int didx);
+uint64_t kvstoreHashtablePublishVersion(kvstore *kvs, int didx);
+uint64_t kvstoreHashtableGetPendingVersion(kvstore *kvs, int didx);
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key);
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry);
 

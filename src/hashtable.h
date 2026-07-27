@@ -147,6 +147,8 @@ bool hashtableFind(hashtable *ht, const void *key, void **found);
 void **hashtableFindRef(hashtable *ht, const void *key);
 bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
 uint64_t hashtableGetVersion(hashtable *ht);
+uint64_t hashtablePublishVersion(hashtable *ht);
+uint64_t hashtableGetPendingVersion(hashtable *ht);
 bool hashtableAdd(hashtable *ht, void *entry);
 bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing);
 bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition *position, void **existing);

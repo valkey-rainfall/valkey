@@ -891,6 +891,18 @@ uint64_t kvstoreHashtableGetVersion(kvstore *kvs, int didx) {
     return hashtableGetVersion(ht);
 }
 
+uint64_t kvstoreHashtablePublishVersion(kvstore *kvs, int didx) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return 0;
+    return hashtablePublishVersion(ht);
+}
+
+uint64_t kvstoreHashtableGetPendingVersion(kvstore *kvs, int didx) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return 0;
+    return hashtableGetPendingVersion(ht);
+}
+
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     if (!ht) return NULL;

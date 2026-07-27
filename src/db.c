@@ -83,11 +83,19 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
     robj *val = NULL;
 
     /* IO-thread optimistic lookup offload: if the IO thread pre-resolved this
-     * key and the hashtable version hasn't changed, use the cached result directly
-     * (skipping the expensive hash-table walk). */
+     * key and no mutations have occurred since, use the cached result directly
+     * (skipping the expensive hash-table walk).
+     *
+     * v4 lazy-publish: validate against the main-thread-private pending_version
+     * rather than the shared atomic. This provides BOTH guards in one check:
+     *  - Cross-batch: IO thread snapshot (taken from shared version after publish)
+     *    != pending means mutations happened between batches.
+     *  - Intra-batch: a same-batch earlier command (e.g. SET) bumped pending,
+     *    so later commands' pre-resolved entries are correctly invalidated.
+     * Bonus: no atomic load on the hot path (pending_version is a plain uint64). */
     client *c = server.current_client;
     if (c && (c->read_flags & READ_FLAGS_IO_LOOKUP_DONE)) {
-        uint64_t cur_version = kvstoreHashtableGetVersion(db->keys, dict_index);
+        uint64_t cur_version = kvstoreHashtableGetPendingVersion(db->keys, dict_index);
         if (cur_version == c->io_lookup_version) {
             val = c->io_lookup_result;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -95,7 +103,13 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
 #endif
         } else {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            server.io_lookup_fallbacks++;
+            if (cur_version > c->io_lookup_version + 1) {
+                /* Cross-batch or multi-mutation fallback */
+                server.io_lookup_fallbacks++;
+            } else {
+                /* Intra-batch: exactly one mutation since publish (same-batch SET) */
+                server.io_lookup_intrabatch_fallbacks++;
+            }
 #endif
             val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
         }

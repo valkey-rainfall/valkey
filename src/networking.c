@@ -6563,6 +6563,11 @@ void processClientIOReadsDone(client *c) {
     int ret = addCommandToBatchAndProcessIfFull(c);
     /* If the command was not added to the commands batch, process it immediately */
     if (ret == C_ERR) {
+        /* v4: publish pending version before direct consumption (same barrier as
+         * processClientsCommandsBatch but for the non-batched path). */
+        if (c->read_flags & READ_FLAGS_IO_LOOKUP_DONE) {
+            kvstoreHashtablePublishVersion(c->db->keys, 0);
+        }
         if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
     }
 }

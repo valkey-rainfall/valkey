@@ -317,11 +317,18 @@ struct hashtable {
     /* --- Cache line 1: cold fields (main thread only, infrequent access) --- */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
-    /* --- Cache line 2: write-hot version (isolated to avoid false sharing) ---
-     * IO threads read this with relaxed ordering to validate speculative lookups.
-     * Main thread increments on every operation that can move or invalidate entry
-     * pointers: insert, delete, rehash step, resize/table swap, replace-reallocated.
-     * Isolated so SET's bumpVersion write does NOT invalidate the read-heavy line 0. */
+    /* v4 lazy-publish: main-thread-private mutation state.
+     * pending_version: plain counter incremented by bumpVersion (no atomic, no coherency).
+     * last_published: tracks what was last written to the shared 'version' field.
+     * The difference (pending - last_published) represents un-published mutations.
+     * These are on cache line 1 (main-thread-only cold line) -- zero cross-core traffic. */
+    uint64_t pending_version;
+    uint64_t last_published;
+    /* --- Cache line 2: shared published version (isolated to avoid false sharing) ---
+     * IO threads read this with acquire ordering to validate speculative lookups.
+     * Main thread publishes lazily (only before consuming IO-parsed batches) using
+     * release semantics, so read-only traffic produces ZERO writes to this line.
+     * Isolated so even the lazy publish does NOT invalidate the read-heavy line 0. */
     alignas(64) _Atomic(uint64_t) version;
     void *metadata[];
 };
@@ -363,12 +370,15 @@ typedef struct {
 static_assert(sizeof(hashtablePosition) >= sizeof(position),
               "Opaque iterator size");
 
-/* Bump the mutation version. Must be called on every operation that invalidates
- * entry pointers: insert, delete, rehash step (moves entries between tables),
- * resize/table swap, replace-reallocated-entry. Uses relaxed store since the
- * main thread is the sole writer; IO threads read with relaxed load (optimistic). */
+/* Bump the mutation version. v4 lazy-publish: only increments the main-thread-private
+ * pending counter. The shared 'version' field is NOT written here; it is published
+ * lazily (with release semantics) only before the main thread consumes IO-parsed
+ * batches. This means read-only traffic (GET-only) produces ZERO writes to the
+ * shared cache line, eliminating the RFO that cost v3 ~1.4% on SET-heavy workloads.
+ * Must be called on every operation that invalidates entry pointers: insert, delete,
+ * rehash step, resize/table swap, replace-reallocated-entry. */
 static inline void bumpVersion(hashtable *ht) {
-    atomic_store_explicit(&ht->version, atomic_load_explicit(&ht->version, memory_order_relaxed) + 1, memory_order_relaxed);
+    ht->pending_version++;
 }
 
 /* State for incremental find. */
@@ -1298,6 +1308,8 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
     atomic_store_explicit(&ht->version, 0, memory_order_relaxed);
+    ht->pending_version = 0;
+    ht->last_published = 0;
     ht->safe_iterators = NULL;
     resetTable(ht, 0);
     resetTable(ht, 1);
@@ -1699,10 +1711,33 @@ bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found) {
     return false;
 }
 
-/* Returns the current mutation version (relaxed load). IO threads use this
- * to snapshot the version before/after a speculative lookup. */
+/* Returns the current published mutation version (acquire load). IO threads use
+ * this to snapshot the version before speculative lookups. The acquire pairs with
+ * the release store in hashtablePublishVersion, ensuring the IO thread sees all
+ * entry pointer moves that preceded the version bump. */
 uint64_t hashtableGetVersion(hashtable *ht) {
-    return atomic_load_explicit(&ht->version, memory_order_relaxed);
+    return atomic_load_explicit(&ht->version, memory_order_acquire);
+}
+
+/* v4 lazy-publish: flush pending mutations to the shared version field.
+ * Called on the main thread BEFORE consuming any IO-parsed command batch.
+ * Uses release semantics so IO threads (using acquire loads) see all preceding
+ * memory stores (entry pointer moves) before the version bump they'll observe.
+ * Returns the number of mutations published (0 = no-op, expected for GET-only). */
+uint64_t hashtablePublishVersion(hashtable *ht) {
+    uint64_t pending = ht->pending_version;
+    uint64_t last = ht->last_published;
+    if (pending == last) return 0;
+    atomic_store_explicit(&ht->version, pending, memory_order_release);
+    ht->last_published = pending;
+    return pending - last;
+}
+
+/* v4: return the main-thread-private pending version counter.
+ * Used for intra-batch guards (snapshot at batch start, check before each
+ * pre-resolved entry consumption -- a same-batch mutation invalidates remaining). */
+uint64_t hashtableGetPendingVersion(hashtable *ht) {
+    return ht->pending_version;
 }
 
 /* Adds an entry. Returns true on success. Returns false if there was already an entry
