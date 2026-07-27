@@ -53,6 +53,7 @@
 #include "util.h"
 
 #include <limits.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -305,6 +306,7 @@ static_assert(sizeof(bucket) == HASHTABLE_BUCKET_SIZE, "Bucket size mismatch");
 typedef struct iter iter;
 
 struct hashtable {
+    /* --- Cache line 0: hot read-only fields (IO threads + main thread lookups) --- */
     hashtableType *type;
     ssize_t rehash_idx;        /* -1 = rehashing not in progress. */
     bucket *tables[2];         /* 0 = main table, 1 = rehashing target.  */
@@ -312,15 +314,24 @@ struct hashtable {
     int8_t bucket_exp[2];      /* Exponent for num buckets (num = 1 << exp). */
     int16_t pause_rehash;      /* Non-zero = rehashing is paused */
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
-    _Atomic(uint64_t) version; /* Monotonic mutation version for optimistic lookup offload.
-                                * Incremented on every operation that can move or invalidate
-                                * entry pointers: insert, delete, rehash step, resize/table swap,
-                                * replace-reallocated. IO threads read this with relaxed ordering
-                                * to validate speculative lookups. */
+    /* --- Cache line 1: cold fields (main thread only, infrequent access) --- */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
+    /* --- Cache line 2: write-hot version (isolated to avoid false sharing) ---
+     * IO threads read this with relaxed ordering to validate speculative lookups.
+     * Main thread increments on every operation that can move or invalidate entry
+     * pointers: insert, delete, rehash step, resize/table swap, replace-reallocated.
+     * Isolated so SET's bumpVersion write does NOT invalidate the read-heavy line 0. */
+    alignas(64) _Atomic(uint64_t) version;
     void *metadata[];
 };
+
+/* Verify version field is on a dedicated cache line (offset 128 = line 2),
+ * isolated from the hot read fields on line 0 (tables/used/bucket_exp). */
+static_assert(offsetof(struct hashtable, version) % 64 == 0,
+              "version must be cache-line aligned");
+static_assert(offsetof(struct hashtable, version) >= 128,
+              "version must be on line 2+, away from hot read fields on line 0");
 
 struct iter {
     hashtable *hashtable;

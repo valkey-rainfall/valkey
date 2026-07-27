@@ -6655,14 +6655,20 @@ void ioThreadReadQueryFromClient(client *c) {
      * the hash-table lookup for each eligible one. At P=10, this covers
      * ~10 commands per IO read instead of v1's single command. */
     if ((c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !server.cluster_enabled) {
+        /* v3: Read version ONCE per parsed batch (before any lookups).
+         * A single snapshot is strictly more conservative -- any mutation after
+         * this point invalidates ALL lookups in the batch, which is the safe
+         * direction. This also reduces cross-core cache-line reads of the
+         * version field from N (per-command) to 1 (per-batch). */
+        uint64_t batch_version = kvstoreHashtableGetVersion(c->db->keys, 0);
+
         /* First command (c->argv / c->parsed_cmd) */
         if (c->argc == 2 && c->parsed_cmd != NULL &&
             (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
-            uint64_t v1 = kvstoreHashtableGetVersion(c->db->keys, 0);
             void *entry = NULL;
             kvstoreHashtableFindReadOnly(c->db->keys, 0, objectGetVal(c->argv[1]), &entry);
             c->io_lookup_result = entry;
-            c->io_lookup_version = v1;
+            c->io_lookup_version = batch_version;
             c->read_flags |= READ_FLAGS_IO_LOOKUP_DONE;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             atomic_fetch_add_explicit(&server.io_lookup_attempts, 1, memory_order_relaxed);
@@ -6675,11 +6681,10 @@ void ioThreadReadQueryFromClient(client *c) {
             parsedCommand *p = &queue->cmds[i];
             if (p->argc == 2 && p->cmd != NULL &&
                 (p->cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
-                uint64_t v1 = kvstoreHashtableGetVersion(c->db->keys, 0);
                 void *entry = NULL;
                 kvstoreHashtableFindReadOnly(c->db->keys, 0, objectGetVal(p->argv[1]), &entry);
                 p->io_lookup_entry = entry;
-                p->io_lookup_version = v1;
+                p->io_lookup_version = batch_version;
                 p->read_flags |= READ_FLAGS_IO_LOOKUP_DONE;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
                 atomic_fetch_add_explicit(&server.io_lookup_attempts, 1, memory_order_relaxed);
