@@ -3973,56 +3973,9 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.pending_command) {
         c->flag.pending_command = 0;
-        /* D+ Read-Side: If this command was speculatively executed on the IO
-         * thread, its reply is already in c->buf. Skip main-thread execution
-         * and just do the bookkeeping (commandProcessed equivalent). */
-        if (c->read_flags & READ_FLAGS_DPLUS_SPECULATED) {
-            c->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
-            /* Update stats for the speculated command. */
-            server.stat_numcommands++;
-            c->commands_processed++;
-            /* Reset client argv/argc so the next parse cycle starts clean.
-             * This mirrors what commandProcessed()->resetClient() does. */
-            freeClientArgv(c);
-            c->slot = -1;
-            /* The cmd_queue entries with DPLUS_SPECULATED are also skipped. */
-            goto skip_queue;
-        }
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
-    }
-
-skip_queue:
-    /* D+ Read-Side: Skip any queue entries that were speculatively completed. */
-    while (c->cmd_queue.off < c->cmd_queue.len) {
-        parsedCommand *p = &c->cmd_queue.cmds[c->cmd_queue.off];
-        if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
-        /* Advance past this speculated command — reply already written. */
-        c->cmd_queue.off++;
-        server.stat_numcommands++;
-        c->commands_processed++;
-        /* Free argv for the consumed command. */
-        for (int j = 0; j < p->argc; j++) {
-            decrRefCount(p->argv[j]);
-        }
-        zfree(p->argv);
-        p->argv = NULL;
-        p->argc = 0;
-        if (c->cmd_queue.off == c->cmd_queue.len) {
-            c->cmd_queue.off = c->cmd_queue.len = 0;
-        }
-    }
-
-    /* D+ Read-Side: speculative replies are written into c->buf by the IO
-     * thread WITHOUT going through addReply()/prepareClientToWrite(). If the
-     * whole batch was speculated, no main-thread execution ever schedules
-     * this client for output — the replies would be stranded in the buffer.
-     * Queue the client for write directly. putClientInPendingWriteQueue()
-     * self-guards via c->flag.pending_write, and prepareClientToWrite() would
-     * NOT work here: it only queues when the buffer was previously empty. */
-    if (c->bufpos > 0 || clientHasPendingReplies(c)) {
-        putClientInPendingWriteQueue(c);
     }
 
     /* Now process client if it has more commands queued and/or more data in
