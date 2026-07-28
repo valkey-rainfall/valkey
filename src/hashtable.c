@@ -324,6 +324,10 @@ struct hashtable {
     void *metadata[];
 };
 
+/* Forward declarations for dplus version bump helpers (defined below). */
+static inline void dplusBumpShard(hashtable *ht, uint64_t hash);
+static inline void dplusBumpAllShards(hashtable *ht);
+
 struct iter {
     hashtable *hashtable;
     bucket *bucket;

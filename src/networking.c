@@ -37,6 +37,7 @@
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
 #include "io_threads.h"
+#include "dplus.h"
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
@@ -3972,8 +3973,40 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.pending_command) {
         c->flag.pending_command = 0;
+        /* D+ Read-Side: If this command was speculatively executed on the IO
+         * thread, its reply is already in c->buf. Skip main-thread execution
+         * and just do the bookkeeping (commandProcessed equivalent). */
+        if (c->read_flags & READ_FLAGS_DPLUS_SPECULATED) {
+            c->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+            /* Update stats for the speculated command. */
+            server.stat_numcommands++;
+            c->commands_processed++;
+            /* The cmd_queue entries with DPLUS_SPECULATED are also skipped. */
+            goto skip_queue;
+        }
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
+        }
+    }
+
+skip_queue:
+    /* D+ Read-Side: Skip any queue entries that were speculatively completed. */
+    while (c->cmd_queue.off < c->cmd_queue.len) {
+        parsedCommand *p = &c->cmd_queue.cmds[c->cmd_queue.off];
+        if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
+        /* Advance past this speculated command — reply already written. */
+        c->cmd_queue.off++;
+        server.stat_numcommands++;
+        c->commands_processed++;
+        /* Free argv for the consumed command. */
+        for (int j = 0; j < p->argc; j++) {
+            decrRefCount(p->argv[j]);
+        }
+        zfree(p->argv);
+        p->argv = NULL;
+        p->argc = 0;
+        if (c->cmd_queue.off == c->cmd_queue.len) {
+            c->cmd_queue.off = c->cmd_queue.len = 0;
         }
     }
 
@@ -6653,6 +6686,11 @@ void ioThreadReadQueryFromClient(client *c) {
     if (c->argc == 0) {
         goto done;
     }
+
+    /* D+ Read-Side: Attempt speculative GET execution on this IO thread.
+     * Iterates a contiguous prefix of GET commands, writing replies directly
+     * into c->buf. Punted commands flow to main thread as usual. */
+    dplusSpeculateBatch(c, getCurTid());
 
 done:
     /* Only trim query buffer for non-primary clients

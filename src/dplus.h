@@ -7,27 +7,21 @@
  * non-GET-shaped punt to the main thread via today's parsed-command queue.
  *
  * REPLY-BUFFER ORDERING GUARANTEE:
- * The spec flags reply-buffer ordering as the likeliest subtle bug. Here's
- * how it's preserved:
- *
- * Current model: commands within a client's pipeline are appended to the reply
- * buffer (c->buf / c->reply list) in strict command order because the main
- * thread processes them sequentially via processInputBuffer → processCommandAndResetClient.
- *
- * D+ model: the IO thread writes speculative replies for a CONTIGUOUS PREFIX
- * of GET commands in the batch. As soon as a non-speculative command is
- * encountered (write, non-GET, validation fail, exclusive mode), ALL remaining
- * commands in that client's batch are punted to main-thread processing.
+ * The "contiguous prefix" rule is the key invariant. The IO thread writes
+ * speculative replies for a contiguous prefix of GET commands in the batch.
+ * As soon as a non-speculative command is encountered (write, non-GET,
+ * validation fail, exclusive mode), ALL remaining commands in that client's
+ * batch are punted to main-thread processing.
  * Since:
  *   (a) speculative replies are written first (IO thread, before main-thread
  *       processClientIOReadsDone dispatches), and
  *   (b) punted commands are processed strictly after the IO-thread read
  *       completes (main thread calls processPendingCommandAndInputBuffer),
  * the reply buffer naturally accumulates in command order:
- *   [spec_reply_0][spec_reply_1]...[spec_reply_k][main_reply_k+1][main_reply_k+2]...
+ *   [spec_reply_0][spec_reply_1]...[spec_reply_k][main_reply_k+1]...
  *
- * The "contiguous prefix" rule is the key invariant: we NEVER speculate a
- * command that has an un-speculated predecessor in the same batch.
+ * We NEVER speculate a command that has an un-speculated predecessor in the
+ * same batch.
  */
 
 #ifndef DPLUS_H
@@ -39,8 +33,7 @@
 
 /* --- Component 1: Sharded version array --- */
 
-/* Number of version shards. 256 = 4 cache lines of 8 counters each if padded
- * one-per-line, or 32 lines if packed 8/line. Start with 8/line (2KB total). */
+/* Number of version shards. 256 = 32 cache lines × 8 counters per line = 2KB. */
 #define DPLUS_VERSION_SHARDS 256
 
 /* Cache line size for alignment. */
@@ -51,16 +44,16 @@
 
 /* Version array: 256 counters, grouped 8 per cache line (32 lines total = 2KB).
  * Stored at the tail of struct hashtable via tail allocation. */
-typedef struct {
-    alignas(64) _Atomic(uint64_t) v[8]; /* 8 counters per line */
+typedef struct dplusVersionLine {
+    _Atomic(uint64_t) v[8] __attribute__((aligned(64))); /* 8 counters per line */
 } dplusVersionLine;
 
 /* Full sharded version array: 32 lines × 8 counters = 256 shards. */
 #define DPLUS_VERSION_LINES (DPLUS_VERSION_SHARDS / 8)
 
-typedef struct {
+struct dplusVersionArray {
     dplusVersionLine lines[DPLUS_VERSION_LINES];
-} dplusVersionArray;
+};
 
 /* --- Component 4: Exclusive mode --- */
 
@@ -113,9 +106,18 @@ static inline void dplusVersionBumpAll(dplusVersionArray *va) {
     atomic_thread_fence(memory_order_release);
 }
 
-/* Component 2: Speculative find (implemented in hashtable.c) */
+/* Component 2: Read-only find (implemented in hashtable.c) */
+bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
+
+/* Component 2: Speculative find with pre-computed hash (implemented in hashtable.c) */
 bool hashtableFindSpeculative(void *ht, const void *key, void **found, uint64_t hash,
                               unsigned shard, uint64_t *ver_out);
+
+/* Component 2: Hash key accessor (implemented in hashtable.c) */
+uint64_t hashtableHashKey(hashtable *ht, const void *key);
+
+/* Component 2: Version array accessor (implemented in hashtable.c) */
+dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 
 /* Component 4: Exclusive mode helpers (implemented in dplus.c) */
 void dplusExclusiveEnter(void);  /* Main thread: set exclusive + spin-wait */
@@ -125,7 +127,17 @@ void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
 struct client;
 int dplusSpeculativeGet(struct client *c, void *key_sds, int resp);
 
+/* Component 2/5: IO-thread batch speculation (implemented in dplus.c).
+ * Called from ioThreadReadQueryFromClient. Returns count of commands
+ * speculatively completed. tid = IO thread index (1..N-1). */
+int dplusSpeculateBatch(struct client *c, int tid);
+
 /* Maximum embedded value size for speculative copy. Larger values punt. */
 #define DPLUS_MAX_SPECULATIVE_VALUE_LEN 64
+
+/* Component 6: INFO section (dplus.c, only if -DIO_LOOKUP_OFFLOAD_STATS) */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+sds dplusInfoString(sds info);
+#endif
 
 #endif /* DPLUS_H */

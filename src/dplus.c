@@ -1,8 +1,8 @@
 /* D+ Read-Side Prototype — Speculative GET execution on IO threads.
  * See dplus.h for architecture overview and reply-ordering guarantee. */
 
-#include "dplus.h"
 #include "server.h"
+#include "dplus.h"
 
 #include <string.h>
 #include <stdatomic.h>
@@ -34,16 +34,14 @@ void dplusExclusiveLeave(void) {
     atomic_store_explicit(&dplus_exclusive_mode, 0, memory_order_seq_cst);
 }
 
-/* --- Component 2: Speculative GET on IO thread --- */
+/* --- Component 2: Speculative GET — reply helpers --- */
 
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
  * Returns bytes written, or 0 if insufficient space (punt to main). */
 static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
-    /* RESP2 bulk: $<len>\r\n<data>\r\n
-     * RESP3 bulk: same format for simple strings. */
     char hdr[32];
     int hdrlen = snprintf(hdr, sizeof(hdr), "$%zu\r\n", vallen);
-    size_t total = hdrlen + vallen + 2; /* +2 for trailing \r\n */
+    size_t total = hdrlen + vallen + 2; /* trailing \r\n */
     size_t available = c->buf_usable_size - c->bufpos;
     if (total > available) return 0; /* Won't fit — punt */
 
@@ -76,13 +74,7 @@ static int dplusWriteNilReply(client *c, int resp) {
     return (int)nil_len;
 }
 
-/* Format a RESP integer reply for OBJ_ENCODING_INT robj. */
-static int dplusWriteIntAsBulk(client *c, long long intval) {
-    /* Convert int to string, then emit as bulk string. */
-    char buf[21]; /* max int64 string length */
-    int len = ll2string(buf, sizeof(buf), intval);
-    return dplusWriteBulkReply(c, buf, len);
-}
+/* --- Component 2: Core speculative GET execution --- */
 
 /* Execute a speculative GET for the given key on the IO thread.
  *
@@ -95,7 +87,7 @@ static int dplusWriteIntAsBulk(client *c, long long intval) {
  */
 int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     serverDb *db = c->db;
-    int dict_index = 0; /* Non-cluster: always 0. */
+    int dict_index = 0; /* Non-cluster: always slot 0. */
 
     /* Get the hashtable for the keys kvstore. */
     hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
@@ -105,7 +97,7 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     }
 
     /* Compute hash, determine shard. */
-    uint64_t hash = kvstoreHashForKey(db->keys, dict_index, key_sds);
+    uint64_t hash = hashtableHashKey(ht, key_sds);
     unsigned shard = DPLUS_SHARD_INDEX(hash);
 
     /* Get the version array from the hashtable. */
@@ -138,32 +130,25 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     /* Found an entry. It's an robj*. */
     robj *o = (robj *)entry;
 
-    /* Type check: must be OBJ_STRING. Non-string → punt (error reply too complex). */
+    /* Type check: must be OBJ_STRING. Non-string → punt. */
     if (objectGetType(o) != OBJ_STRING) return 0;
 
-    /* Expiry check: if the key has an expire, check logically.
+    /* Expiry check: read embedded expiry from the robj (no separate lookup).
      * We do NOT call expireIfNeeded (that mutates) — just check timestamp. */
     if (o->hasexpire) {
-        /* Look up expiry from the expires kvstore — read-only. */
-        void *expire_entry = NULL;
-        hashtable *expire_ht = kvstoreGetHashtable(db->expires, dict_index);
-        if (expire_ht && hashtableFindReadOnly(expire_ht, key_sds, &expire_entry)) {
-            long long when = objectGetExpire((robj *)expire_entry);
-            mstime_t now = mstime();
-            if (when >= 0 && now >= when) {
-                /* Logically expired — reply nil, enqueue lazy-delete to main.
-                 * For the prototype, just punt to main (it handles TTL cleanly). */
+        mstime_t when = objectGetExpire(o);
+        if (when >= 0 && mstime() >= when) {
+            /* Logically expired — punt to main for lazy-delete + notifications. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-                atomic_fetch_add_explicit(&dplus_stats.expired_replies, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&dplus_stats.expired_replies, 1, memory_order_relaxed);
 #endif
-                return 0; /* Punt — main handles expiry + notifications */
-            }
+            return 0;
         }
     }
 
     /* Value extraction: copy value bytes BEFORE validation re-read.
      * Only handle embstr and int encodings (small values).
-     * RAW encoding (heap-allocated SDS) with len > threshold → punt. */
+     * RAW encoding with len > threshold → punt. */
     char valbuf[DPLUS_MAX_SPECULATIVE_VALUE_LEN + 21]; /* extra for int formatting */
     size_t vallen;
     int encoding = objectGetEncoding(o);
@@ -195,13 +180,7 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     }
 
     /* Version valid — write reply. */
-    int written;
-    if (encoding == OBJ_ENCODING_INT) {
-        written = dplusWriteBulkReply(c, valbuf, vallen);
-    } else {
-        written = dplusWriteBulkReply(c, valbuf, vallen);
-    }
-
+    int written = dplusWriteBulkReply(c, valbuf, vallen);
     if (written <= 0) return 0; /* Buffer full — punt */
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -209,3 +188,112 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
 #endif
     return 1; /* Success — reply in buffer, skip main-thread execution */
 }
+
+/* --- Component 2/5: IO-thread batch speculation --- */
+
+/* Called from ioThreadReadQueryFromClient after parsing is complete.
+ * Iterates the parsed command queue attempting speculative GETs on a
+ * contiguous prefix. As soon as a command can't be speculated (non-GET,
+ * write, validation fail, exclusive mode), we stop — remaining commands
+ * punt to main-thread execution via the normal path.
+ *
+ * REPLY ORDERING: The contiguous-prefix invariant guarantees that all
+ * speculative replies are written into c->buf BEFORE the main thread
+ * processes any punted commands (which append their replies after).
+ * This preserves pipeline reply ordering without any reordering logic.
+ *
+ * Returns the number of commands speculatively completed.
+ */
+int dplusSpeculateBatch(client *c, int tid) {
+    int speculated = 0;
+
+    /* Early exit: speculation disabled (single-threaded or cluster mode). */
+    if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
+
+    /* Set per-thread flag (seq_cst handshake with exclusive mode). */
+    atomic_store_explicit(&dplus_in_speculative_read[tid], 1, memory_order_seq_cst);
+
+    /* Check exclusive mode AFTER setting flag (barrier handshake). */
+    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_seq_cst)) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.exclusive_punts, 1, memory_order_relaxed);
+#endif
+        goto out;
+    }
+
+    /* --- First command (c->argv / c->parsed_cmd) --- */
+    if (c->argc == 2 && c->parsed_cmd != NULL &&
+        c->parsed_cmd == lookupCommandByCString("get") &&
+        (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
+
+        void *key_sds = objectGetVal(c->argv[1]);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
+#endif
+        if (dplusSpeculativeGet(c, key_sds, c->resp)) {
+            c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+            speculated++;
+        } else {
+            /* First command failed — stop (contiguous-prefix rule). */
+            goto out;
+        }
+    } else {
+        /* First command not eligible — nothing to speculate. */
+        goto out;
+    }
+
+    /* --- Command queue (pipelined commands) --- */
+    cmdQueue *queue = &c->cmd_queue;
+    for (int i = queue->off; i < queue->len; i++) {
+        parsedCommand *p = &queue->cmds[i];
+
+        /* Intra-batch write guard: if any prior command was a write,
+         * stop speculating (read-your-writes correctness). */
+        if (p->cmd == NULL) break;
+        if (!(p->cmd->flags & CMD_READONLY)) break;
+
+        /* Must be GET (argc==2, CMD_FAST, explicit cmd check). */
+        if (p->argc != 2 || !(p->cmd->flags & CMD_FAST)) break;
+        if (p->cmd != lookupCommandByCString("get")) break;
+
+        void *key_sds = objectGetVal(p->argv[1]);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
+#endif
+        if (dplusSpeculativeGet(c, key_sds, c->resp)) {
+            p->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+            speculated++;
+        } else {
+            /* Validation fail or punt — stop. */
+            break;
+        }
+    }
+
+out:
+    /* Clear per-thread flag. */
+    atomic_store_explicit(&dplus_in_speculative_read[tid], 0, memory_order_seq_cst);
+    return speculated;
+}
+
+/* --- Component 6: INFO section --- */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+sds dplusInfoString(sds info) {
+    info = sdscatprintf(info,
+        "# Dplus\r\n"
+        "dplus_speculative_attempts:%llu\r\n"
+        "dplus_speculative_hits:%llu\r\n"
+        "dplus_validation_misses:%llu\r\n"
+        "dplus_exclusive_punts:%llu\r\n"
+        "dplus_large_value_punts:%llu\r\n"
+        "dplus_expired_replies:%llu\r\n"
+        "dplus_intra_batch_write_punts:%llu\r\n",
+        (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed));
+    return info;
+}
+#endif

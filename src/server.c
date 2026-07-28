@@ -46,6 +46,7 @@
 #include "syscheck.h"
 #include "threads_mngr.h"
 #include "fmtargs.h"
+#include "dplus.h"
 #include "io_threads.h"
 #include "tls.h"
 #include "sds.h"
@@ -3930,7 +3931,33 @@ void call(client *c, int flags) {
         }
     }
 
+    /* D+ Read-Side: Exclusive mode for commands that require full atomicity.
+     * Normal writes (SET/DEL/EXPIRE) are safe — the sharded version bump
+     * invalidates concurrent speculative reads. Exclusive mode is only for
+     * multi-key atomic operations (EVAL/EXEC/KEYS/FLUSH/DEBUG) where a
+     * partial read mid-operation could observe inconsistent cross-key state.
+     *
+     * We check nesting depth (server.execution_nesting) to avoid redundant
+     * enter/leave for commands called from within EVAL/EXEC (they're already
+     * under exclusive mode from the outer command). */
+    int dplus_exclusive = 0;
+    if (server.io_threads_num > 1 && server.execution_nesting == 0) {
+        /* Check if this is an exclusive-mode command by proc pointer. */
+        serverCommandProc *proc = c->cmd->proc;
+        if (proc == evalCommand || proc == evalShaCommand ||
+            proc == fcallCommand || proc == execCommand ||
+            proc == keysCommand || proc == flushdbCommand ||
+            proc == flushallCommand || proc == debugCommand) {
+            dplusExclusiveEnter();
+            dplus_exclusive = 1;
+        }
+    }
+
     c->cmd->proc(c);
+
+    if (dplus_exclusive) {
+        dplusExclusiveLeave();
+    }
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
@@ -6804,6 +6831,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             }
         }
     }
+
+    /* D+ Read-Side stats (only when compiled with -DIO_LOOKUP_OFFLOAD_STATS). */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = dplusInfoString(info);
+    }
+#endif
 
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
