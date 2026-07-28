@@ -3981,6 +3981,10 @@ int processPendingCommandAndInputBuffer(client *c) {
             /* Update stats for the speculated command. */
             server.stat_numcommands++;
             c->commands_processed++;
+            /* Reset client argv/argc so the next parse cycle starts clean.
+             * This mirrors what commandProcessed()->resetClient() does. */
+            freeClientArgv(c);
+            c->slot = -1;
             /* The cmd_queue entries with DPLUS_SPECULATED are also skipped. */
             goto skip_queue;
         }
