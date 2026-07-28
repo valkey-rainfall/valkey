@@ -3941,7 +3941,12 @@ void call(client *c, int flags) {
      * enter/leave for commands called from within EVAL/EXEC (they're already
      * under exclusive mode from the outer command). */
     int dplus_exclusive = 0;
-    if (server.io_threads_num > 1 && server.execution_nesting == 0) {
+    if (server.io_threads_num > 1 && server.execution_nesting == 1) {
+        /* NOTE: call() has already run enterExecutionUnit() above, so the
+         * top-level command sees execution_nesting == 1 here (NOT 0 — that
+         * was a dead-gate bug caught by the atomicity gauntlet). Commands
+         * invoked from within EVAL/EXEC see >= 2 and skip (already covered
+         * by the outer command's exclusive window). */
         /* Check if this is an exclusive-mode command by proc pointer. */
         serverCommandProc *proc = c->cmd->proc;
         if (proc == evalCommand || proc == evalShaCommand ||
