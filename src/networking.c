@@ -4014,6 +4014,17 @@ skip_queue:
         }
     }
 
+    /* D+ Read-Side: speculative replies are written into c->buf by the IO
+     * thread WITHOUT going through addReply()/prepareClientToWrite(). If the
+     * whole batch was speculated, no main-thread execution ever schedules
+     * this client for output — the replies would be stranded in the buffer.
+     * Queue the client for write directly. putClientInPendingWriteQueue()
+     * self-guards via c->flag.pending_write, and prepareClientToWrite() would
+     * NOT work here: it only queues when the buffer was previously empty. */
+    if (c->bufpos > 0 || clientHasPendingReplies(c)) {
+        putClientInPendingWriteQueue(c);
+    }
+
     /* Now process client if it has more commands queued and/or more data in
      * it's buffer.
      *
