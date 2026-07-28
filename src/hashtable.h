@@ -145,6 +145,7 @@ void hashtableSetCanAbortShrink(bool can_abort);
 /* Entries */
 bool hashtableFind(hashtable *ht, const void *key, void **found);
 void **hashtableFindRef(hashtable *ht, const void *key);
+bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
 bool hashtableAdd(hashtable *ht, void *entry);
 bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing);
 bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition *position, void **existing);
@@ -157,6 +158,12 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key);
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
+
+/* D+ speculative read support */
+struct dplusVersionArray;
+typedef struct dplusVersionArray dplusVersionArray;
+dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
+uint64_t hashtableHashKey(hashtable *ht, const void *key);
 
 /* Iteration & scan */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);

@@ -51,8 +51,11 @@
 #include "monotonic.h"
 #include "config.h"
 #include "util.h"
+#include "dplus.h"
 
 #include <limits.h>
+#include <stdalign.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -313,6 +316,11 @@ struct hashtable {
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
+    /* D+ sharded version array: 256 shards, 8 per cache line = 2KB.
+     * Isolated from the read-hot header fields above (offsetof >= 128).
+     * IO threads read with acquire; main thread bumps with relaxed stores.
+     * Structural mutations (rehash/resize) bump ALL shards + release fence. */
+    alignas(64) dplusVersionArray versions;
     void *metadata[];
 };
 
@@ -716,9 +724,11 @@ static void rehashStep(hashtable *ht) {
     assert(hashtableIsRehashing(ht));
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
+        dplusBumpAllShards(ht);
         return;
     }
     rehashStepExpand(ht);
+    dplusBumpAllShards(ht);
 }
 
 /* Called internally on lookup and other reads to the table. */
@@ -807,6 +817,7 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
             rehashStep(ht);
         }
     }
+    dplusBumpAllShards(ht);
     return true;
 }
 
@@ -1100,6 +1111,7 @@ static void insert(hashtable *ht, uint64_t hash, void *entry) {
     b->presence |= (1 << pos_in_bucket);
     b->hashes[pos_in_bucket] = highBits(hash);
     ht->used[table_index]++;
+    dplusBumpShard(ht, hash);
 }
 
 /* A 64-bit fingerprint of some of the state of the hash table. */
@@ -1254,6 +1266,109 @@ static void invalidateAllSafeIterators(hashtable *ht) {
     while (ht->safe_iterators) untrackSafeIterator(ht->safe_iterators);
 }
 
+/* --- D+ sharded version functions --- */
+
+void dplusVersionArrayInit(dplusVersionArray *va) {
+    memset(va, 0, sizeof(*va));
+}
+
+/* Bump a single shard version (entry-specific mutation). */
+static inline void dplusBumpShard(hashtable *ht, uint64_t hash) {
+    unsigned shard = DPLUS_SHARD_INDEX(hash);
+    dplusVersionBumpShard(&ht->versions, shard);
+}
+
+/* Bump all shards (structural mutation: rehash/resize). */
+static inline void dplusBumpAllShards(hashtable *ht) {
+    dplusVersionBumpAll(&ht->versions);
+}
+
+/* Public accessor for the version array pointer. */
+dplusVersionArray *hashtableGetVersionArray(hashtable *ht) {
+    return &ht->versions;
+}
+
+/* Read-only find: same bucket walk as hashtableFind but does NOT call
+ * rehashStepOnReadIfNeeded. Safe for IO-thread concurrent speculation. */
+bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found) {
+    if (hashtableSize(ht) == 0) return false;
+    uint64_t hash = hashKey(ht, key);
+    uint8_t h2 = highBits(hash);
+
+    /* NO rehashStepOnReadIfNeeded — the key difference from hashtableFind. */
+
+    for (int table = 0; table <= 1; table++) {
+        if (ht->used[table] == 0) continue;
+        size_t mask = expToMask(ht->bucket_exp[table]);
+        size_t bucket_idx = hash & mask;
+        /* Skip already rehashed buckets. */
+        if (table == 0 && ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx) {
+            continue;
+        }
+        bucket *b = &ht->tables[table][bucket_idx];
+        do {
+            for (int pos = 0; pos < numBucketPositions(b); pos++) {
+                if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
+                    void *entry = b->entries[pos];
+                    const void *elem_key = entryGetKey(ht, entry);
+                    if (compareKeys(ht, key, elem_key)) {
+                        if (ht->type->validateEntry && !ht->type->validateEntry(ht, entry)) {
+                            return false;
+                        }
+                        if (found) *found = entry;
+                        return true;
+                    }
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+    }
+    return false;
+}
+
+/* Speculative find with hash pre-computed and shard version output.
+ * For the D+ IO-thread path that already has the hash from key lookup. */
+bool hashtableFindSpeculative(void *ht_ptr, const void *key, void **found,
+                              uint64_t hash, unsigned shard, uint64_t *ver_out) {
+    hashtable *ht = (hashtable *)ht_ptr;
+    (void)shard; /* Shard used by caller for version check */
+    if (hashtableSize(ht) == 0) return false;
+    uint8_t h2 = highBits(hash);
+
+    for (int table = 0; table <= 1; table++) {
+        if (ht->used[table] == 0) continue;
+        size_t mask = expToMask(ht->bucket_exp[table]);
+        size_t bucket_idx = hash & mask;
+        if (table == 0 && ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx) {
+            continue;
+        }
+        bucket *b = &ht->tables[table][bucket_idx];
+        do {
+            for (int pos = 0; pos < numBucketPositions(b); pos++) {
+                if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
+                    void *entry = b->entries[pos];
+                    const void *elem_key = entryGetKey(ht, entry);
+                    if (compareKeys(ht, key, elem_key)) {
+                        if (ht->type->validateEntry && !ht->type->validateEntry(ht, entry)) {
+                            return false;
+                        }
+                        if (found) *found = entry;
+                        if (ver_out) *ver_out = 0; /* unused currently */
+                        return true;
+                    }
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+    }
+    return false;
+}
+
+/* Returns hash of a key using the hashtable's hash function. */
+uint64_t hashtableHashKey(hashtable *ht, const void *key) {
+    return hashKey(ht, key);
+}
+
 /* --- API functions --- */
 
 /* Allocates and initializes a new hashtable specified by the given type. */
@@ -1269,6 +1384,7 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
     ht->safe_iterators = NULL;
+    dplusVersionArrayInit(&ht->versions);
     resetTable(ht, 0);
     resetTable(ht, 1);
     if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size);
@@ -1720,6 +1836,9 @@ void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *po
     b->entries[pos_in_bucket] = entry;
     ht->used[table_index]++;
     /* Hash bits are already set by hashtableFindPositionForInsert. */
+    /* D+ version bump: compute hash from entry key for per-shard bump. */
+    const void *key = entryGetKey(ht, entry);
+    dplusBumpShard(ht, hashKey(ht, key));
 }
 
 /* Removes the entry with the matching key and returns it. The entry
@@ -1741,6 +1860,7 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
              * iterator code instead. */
             fillBucketHole(ht, b, pos_in_bucket, table_index);
         }
+        dplusBumpShard(ht, hash);
         hashtableShrinkIfNeeded(ht);
         return true;
     }
@@ -1781,6 +1901,7 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2 && b->entries[pos] == old_entry) {
                     /* It's a match. */
                     b->entries[pos] = new_entry;
+                    dplusBumpShard(ht, hash);
                     return true;
                 }
             }
@@ -1859,6 +1980,9 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
 
     /* Delete the entry and resume rehashing. */
     assert(isPositionFilled(b, pos_in_bucket));
+    /* D+ version bump: we don't have the hash readily available in the position struct,
+     * so bump all shards. This is a rare operation (two-phase delete). */
+    dplusBumpAllShards(ht);
     b->presence &= ~(1 << pos_in_bucket);
     ht->used[table_index]--;
     /* When we resume rehashing, it may cause the bucket to be deleted due to
