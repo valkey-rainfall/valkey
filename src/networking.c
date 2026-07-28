@@ -6705,7 +6705,15 @@ void ioThreadReadQueryFromClient(client *c) {
     /* D+ Read-Side: Attempt speculative GET execution on this IO thread.
      * Iterates a contiguous prefix of GET commands, writing replies directly
      * into c->buf. Punted commands flow to main thread as usual. */
-    dplusSpeculateBatch(c, getCurTid());
+    int dplus_count = dplusSpeculateBatch(c, getCurTid());
+
+    /* D+ Phase-1 no-enqueue: consume speculated commands HERE on the IO thread.
+     * After this, c->argc==0 and cmd_queue has no speculated entries, so the
+     * main thread sees nothing to execute. Per-thread stats are accumulated;
+     * aggregated into stat_numcommands by main in beforeSleep. */
+    if (dplus_count > 0) {
+        dplusConsumeSpeculated(c, dplus_count, getCurTid());
+    }
 
 done:
     /* Only trim query buffer for non-primary clients

@@ -67,6 +67,20 @@ extern _Atomic(int) dplus_exclusive_mode;
 #define DPLUS_MAX_IO_THREADS 256
 extern _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS];
 
+/* --- Per-IO-thread command counters (no-enqueue Phase-1) ---
+ *
+ * When IO threads consume speculated commands locally, they must NOT write
+ * to shared stat_numcommands (cache-line bouncing per command kills throughput).
+ * Instead, each IO thread accumulates into its own cache-line-aligned counter.
+ * The main thread aggregates (add-and-zero) once per event-loop iteration in
+ * beforeSleep — a per-LOOP touch, not per-command. */
+typedef struct dplusThreadStats {
+    long long commands_processed; /* speculated commands consumed on this thread */
+    char _pad[DPLUS_CACHELINE - sizeof(long long)]; /* pad to full cache line */
+} __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
+
+extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
+
 /* --- Component 6: Stats (behind -DIO_LOOKUP_OFFLOAD_STATS) --- */
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -131,6 +145,17 @@ int dplusSpeculativeGet(struct client *c, void *key_sds, int resp);
  * Called from ioThreadReadQueryFromClient. Returns count of commands
  * speculatively completed. tid = IO thread index (1..N-1). */
 int dplusSpeculateBatch(struct client *c, int tid);
+
+/* Component 5: IO-thread consumption (implemented in dplus.c).
+ * Called from ioThreadReadQueryFromClient AFTER dplusSpeculateBatch succeeds.
+ * Consumes the N speculated commands at the IO thread: frees argv, advances
+ * cmd_queue, increments per-thread stats. The main thread never sees these
+ * commands. Returns count of commands consumed. */
+void dplusConsumeSpeculated(struct client *c, int count, int tid);
+
+/* Aggregate per-IO-thread command counters into server.stat_numcommands.
+ * Called once per event-loop iteration from beforeSleep. O(num_io_threads). */
+void dplusAggregateStats(void);
 
 /* Maximum embedded value size for speculative copy. Larger values punt. */
 #define DPLUS_MAX_SPECULATIVE_VALUE_LEN 64

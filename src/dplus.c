@@ -11,6 +11,9 @@
 _Atomic(int) dplus_exclusive_mode = 0;
 _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS] = {0};
 
+/* --- Per-IO-thread command counters (no-enqueue Phase-1) --- */
+dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
+
 /* --- Component 6: Stats --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 dplusStats dplus_stats = {0};
@@ -273,6 +276,79 @@ out:
     /* Clear per-thread flag. */
     atomic_store_explicit(&dplus_in_speculative_read[tid], 0, memory_order_seq_cst);
     return speculated;
+}
+
+/* --- Phase-1 no-enqueue: IO-thread command consumption --- */
+
+/* Consume speculated commands at the IO thread so they never reach main.
+ *
+ * After dplusSpeculateBatch writes replies into c->buf and marks commands
+ * with READ_FLAGS_DPLUS_SPECULATED, this function:
+ * 1. Frees the first command's argv (c->argv) and clears pending_command state.
+ * 2. Advances cmd_queue past all DPLUS_SPECULATED entries, freeing their argv.
+ * 3. Increments per-IO-thread command counter (NOT shared stat_numcommands).
+ * 4. Increments c->commands_processed directly — safe because the IO thread
+ *    owns the client exclusively during the read phase (io_read_state ==
+ *    CLIENT_PENDING_IO; main thread will not touch the client until we
+ *    set CLIENT_COMPLETED_IO and send to main).
+ *
+ * After this, c->argc == 0, pending_command is clear, and cmd_queue has no
+ * speculated entries. Main-thread processClientIOReadsDone sees nothing to
+ * execute. */
+void dplusConsumeSpeculated(client *c, int count, int tid) {
+    int consumed = 0;
+
+    /* --- First command (c->argv / c->parsed_cmd case) --- */
+    if (count > 0 && (c->read_flags & READ_FLAGS_DPLUS_SPECULATED)) {
+        c->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+        freeClientArgv(c);  /* Frees argv[0..argc-1], sets argc=0 */
+        c->slot = -1;
+        c->commands_processed++;
+        consumed++;
+    }
+
+    /* --- Command queue entries --- */
+    cmdQueue *queue = &c->cmd_queue;
+    while (consumed < count && queue->off < queue->len) {
+        parsedCommand *p = &queue->cmds[queue->off];
+        if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
+        p->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+        queue->off++;
+        /* Free argv for the consumed command. */
+        for (int j = 0; j < p->argc; j++) {
+            decrRefCount(p->argv[j]);
+        }
+        zfree(p->argv);
+        p->argv = NULL;
+        p->argc = 0;
+        c->commands_processed++;
+        consumed++;
+    }
+
+    /* Compact queue if fully consumed. */
+    if (queue->off == queue->len) {
+        queue->off = queue->len = 0;
+    }
+
+    /* Accumulate into per-IO-thread counter (no shared-line write). */
+    dplus_thread_stats[tid].commands_processed += consumed;
+}
+
+/* Aggregate per-IO-thread command counters into server.stat_numcommands.
+ * Called from beforeSleep once per event-loop iteration. The main thread
+ * is the sole writer of stat_numcommands, so this is a plain add-and-zero
+ * with no atomics needed on the server side. The IO threads only increment
+ * their own counter (single-writer per slot), so a plain read + zero is
+ * safe: worst case we miss a few commands this iteration and catch them
+ * next time (bounded lag of one event-loop cycle, ~1ms). */
+void dplusAggregateStats(void) {
+    for (int i = 0; i < server.io_threads_num; i++) {
+        long long n = dplus_thread_stats[i].commands_processed;
+        if (n > 0) {
+            server.stat_numcommands += n;
+            dplus_thread_stats[i].commands_processed = 0;
+        }
+    }
 }
 
 /* --- Component 6: INFO section --- */

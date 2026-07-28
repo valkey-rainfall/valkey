@@ -1875,6 +1875,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
+    /* D+ Phase-1: aggregate per-IO-thread command counters into
+     * stat_numcommands before processing responses (which read it for
+     * instantaneous metrics). One shared-line touch per event-loop, not
+     * per-command. */
+    dplusAggregateStats();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
