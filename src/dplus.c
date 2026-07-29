@@ -198,13 +198,109 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     return 1; /* Success — reply in buffer, skip main-thread execution */
 }
 
-/* --- Component 2/5: IO-thread batch speculation --- */
+/* --- Component 2/5: IO-thread batch speculation with batched prefetch --- */
+
+/* Maximum batch depth for prefetch overlap. Matches server.prefetch_batch_max_size default. */
+#define DPLUS_BATCH_DEPTH 16
+
+/* Per-key state for the batched prefetch + validate pipeline. */
+typedef struct dplusBatchEntry {
+    void *key_sds;                           /* SDS key string */
+    uint64_t hash;                           /* Pre-computed hash */
+    unsigned shard;                          /* Version shard index */
+    uint64_t v_before;                       /* Version read before find */
+    hashtableIncrementalFindState find_state; /* Incremental find state */
+    int is_first_cmd;                        /* 1 if this is c->argv, 0 if queue */
+    int queue_idx;                           /* Index in cmd_queue (if !is_first_cmd) */
+} dplusBatchEntry;
+
+/* Execute the validate+copy+reply phase for a single prefetched entry.
+ * Returns 1 on success (reply written), 0 on punt. */
+static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, int resp) {
+    dplusVersionArray *va = hashtableGetVersionArray(ht);
+
+    /* Get the find result — entry is now in cache from prefetch. */
+    void *entry = NULL;
+    bool found = hashtableIncrementalFindGetResult(&e->find_state, &entry);
+
+    if (!found) {
+        /* Key not found. Validate version. */
+        uint64_t v_after = dplusVersionRead(va, e->shard);
+        if (e->v_before != v_after) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+#endif
+            return 0;
+        }
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
+#endif
+        return dplusWriteNilReply(c, resp) > 0 ? 1 : 0;
+    }
+
+    /* Found an entry. It's an robj*. */
+    robj *o = (robj *)entry;
+
+    /* Type check: must be OBJ_STRING. */
+    if (objectGetType(o) != OBJ_STRING) return 0;
+
+    /* Expiry check. */
+    if (o->hasexpire) {
+        mstime_t when = objectGetExpire(o);
+        if (when >= 0 && mstime() >= when) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.expired_replies, 1, memory_order_relaxed);
+#endif
+            return 0;
+        }
+    }
+
+    /* Value extraction: copy BEFORE validation re-read. */
+    char valbuf[DPLUS_MAX_SPECULATIVE_VALUE_LEN + 21];
+    size_t vallen;
+    int encoding = objectGetEncoding(o);
+
+    if (encoding == OBJ_ENCODING_INT) {
+        long long intval = (long long)(long)objectGetVal(o);
+        vallen = ll2string(valbuf, sizeof(valbuf), intval);
+    } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
+        sds s = objectGetVal(o);
+        vallen = sdslen(s);
+        if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.large_value_punts, 1, memory_order_relaxed);
+#endif
+            return 0;
+        }
+        memcpy(valbuf, s, vallen);
+    } else {
+        return 0;
+    }
+
+    /* VALIDATION RE-READ: check shard version after value copy. */
+    uint64_t v_after = dplusVersionRead(va, e->shard);
+    if (e->v_before != v_after) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+#endif
+        return 0;
+    }
+
+    /* Version valid — write reply. */
+    int written = dplusWriteBulkReply(c, valbuf, vallen);
+    if (written <= 0) return 0;
+
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
+#endif
+    return 1;
+}
 
 /* Called from ioThreadReadQueryFromClient after parsing is complete.
  * Iterates the parsed command queue attempting speculative GETs on a
- * contiguous prefix. As soon as a command can't be speculated (non-GET,
- * write, validation fail, exclusive mode), we stop — remaining commands
- * punt to main-thread execution via the normal path.
+ * contiguous prefix. Uses batched incremental-find to overlap memory
+ * prefetches across multiple keys before executing the serial
+ * validate+copy+reply phase with warm caches.
  *
  * REPLY ORDERING: The contiguous-prefix invariant guarantees that all
  * speculative replies are written into c->buf BEFORE the main thread
@@ -235,50 +331,91 @@ int dplusSpeculateBatch(client *c, int tid) {
         goto out;
     }
 
-    /* --- First command (c->argv / c->parsed_cmd) --- */
+    /* --- Phase 1: Collect eligible prefix keys into batch --- */
+    serverDb *db = c->db;
+    int dict_index = 0;
+    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+    if (!ht) goto out;
+
+    dplusVersionArray *va = hashtableGetVersionArray(ht);
+    if (!va) goto out;
+
+    dplusBatchEntry batch[DPLUS_BATCH_DEPTH];
+    int batch_count = 0;
+
+    /* First command (c->argv / c->parsed_cmd). */
     if (c->argc == 2 && c->parsed_cmd != NULL &&
         c->parsed_cmd == dplus_get_cmd &&
         (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
 
-        void *key_sds = objectGetVal(c->argv[1]);
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
-#endif
-        if (dplusSpeculativeGet(c, key_sds, c->resp)) {
-            c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
-            speculated++;
-        } else {
-            /* First command failed — stop (contiguous-prefix rule). */
-            goto out;
-        }
+        dplusBatchEntry *e = &batch[batch_count];
+        e->key_sds = objectGetVal(c->argv[1]);
+        e->hash = hashtableHashKey(ht, e->key_sds);
+        e->shard = DPLUS_SHARD_INDEX(e->hash);
+        e->v_before = dplusVersionRead(va, e->shard);
+        e->is_first_cmd = 1;
+        e->queue_idx = -1;
+        batch_count++;
     } else {
         /* First command not eligible — nothing to speculate. */
         goto out;
     }
 
-    /* --- Command queue (pipelined commands) --- */
+    /* Command queue (pipelined commands). */
     cmdQueue *queue = &c->cmd_queue;
-    for (int i = queue->off; i < queue->len; i++) {
+    for (int i = queue->off; i < queue->len && batch_count < DPLUS_BATCH_DEPTH; i++) {
         parsedCommand *p = &queue->cmds[i];
-
-        /* Intra-batch write guard: if any prior command was a write,
-         * stop speculating (read-your-writes correctness). */
         if (p->cmd == NULL) break;
         if (!(p->cmd->flags & CMD_READONLY)) break;
-
-        /* Must be GET (argc==2, CMD_FAST, explicit cmd check). */
         if (p->argc != 2 || !(p->cmd->flags & CMD_FAST)) break;
         if (p->cmd != dplus_get_cmd) break;
 
-        void *key_sds = objectGetVal(p->argv[1]);
+        dplusBatchEntry *e = &batch[batch_count];
+        e->key_sds = objectGetVal(p->argv[1]);
+        e->hash = hashtableHashKey(ht, e->key_sds);
+        e->shard = DPLUS_SHARD_INDEX(e->hash);
+        e->v_before = dplusVersionRead(va, e->shard);
+        e->is_first_cmd = 0;
+        e->queue_idx = i;
+        batch_count++;
+    }
+
+    if (batch_count == 0) goto out;
+
+    /* --- Phase 2: Batched incremental find (prefetch overlap) --- */
+    /* Initialize all find states. */
+    for (int i = 0; i < batch_count; i++) {
+        hashtableIncrementalFindInit(&batch[i].find_state, ht, batch[i].key_sds);
+    }
+
+    /* Interleave find steps across all keys until all complete.
+     * Each step issues a prefetch for the next memory access in that key's
+     * lookup chain, then yields to the next key. This overlaps prefetch
+     * latency across keys. */
+    int not_done;
+    do {
+        not_done = 0;
+        for (int i = 0; i < batch_count; i++) {
+            not_done += hashtableIncrementalFindStep(&batch[i].find_state);
+        }
+    } while (not_done > 0);
+
+    /* --- Phase 3: Serial validate + copy + reply (caches warm) --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, batch_count, memory_order_relaxed);
 #endif
-        if (dplusSpeculativeGet(c, key_sds, c->resp)) {
-            p->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+
+    for (int i = 0; i < batch_count; i++) {
+        if (dplusValidateAndReply(c, &batch[i], ht, c->resp)) {
+            /* Mark command as speculated. */
+            if (batch[i].is_first_cmd) {
+                c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+            } else {
+                queue->cmds[batch[i].queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+            }
             speculated++;
         } else {
-            /* Validation fail or punt — stop. */
+            /* Contiguous-prefix rule: stop at first failure. */
             break;
         }
     }
