@@ -306,7 +306,21 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
          * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
          * (the removed main-side skip path used to clear this flag). */
         c->flag.pending_command = 0;
-        freeClientArgv(c);  /* Frees argv[0..argc-1], sets argc=0 */
+        /* Free argv INLINE — do NOT call freeClientArgv() which routes through
+         * tryOffloadFreeArgvToIOThreads(). That function increments the non-atomic
+         * io_jobs_submitted from the IO thread (data race with main) and enqueues
+         * to a SPSC queue potentially owned by this same thread (invariant
+         * violation: SPSC is single-producer = main thread only). The race causes
+         * lost increments -> submitted < finished -> infinite spin in
+         * drainIOThreadsQueue on shutdown. */
+        for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+        zfree(c->argv);
+        c->argv = NULL;
+        c->argc = 0;
+        c->cmd = NULL;
+        c->parsed_cmd = NULL;
+        c->argv_len_sum = 0;
+        c->argv_len = 0;
         c->slot = -1;
         c->commands_processed++;
         consumed++;
