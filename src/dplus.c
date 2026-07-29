@@ -301,6 +301,11 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     /* --- First command (c->argv / c->parsed_cmd case) --- */
     if (count > 0 && (c->read_flags & READ_FLAGS_DPLUS_SPECULATED)) {
         c->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+        /* CRITICAL: clear pending_command — the parse path set it, and without
+         * clearing it here the main thread's processPendingCommandAndInputBuffer
+         * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
+         * (the removed main-side skip path used to clear this flag). */
+        c->flag.pending_command = 0;
         freeClientArgv(c);  /* Frees argv[0..argc-1], sets argc=0 */
         c->slot = -1;
         c->commands_processed++;
