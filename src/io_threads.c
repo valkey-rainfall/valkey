@@ -82,6 +82,15 @@ static int getPendingIOResponsesCount(void) {
 void drainIOThreadsQueue(void) {
     serverAssert(inMainThread());
     commitIOJobs();
+    /* Under io-threads-always-active, IOThreadsBeforeSleep may have deactivated
+     * threads (locked their mutexes) in this same event-loop iteration. If there
+     * are pending jobs, threads must be reactivated to process them. */
+    if (getPendingIOThreadsJobs() > 0 && server.io_threads_always_active && server.active_io_threads_num == 1) {
+        for (int i = 1; i < server.io_threads_num; i++) {
+            pthread_mutex_unlock(&io_threads_mutex[i]);
+        }
+        server.active_io_threads_num = server.io_threads_num;
+    }
     while (getPendingIOThreadsJobs()) {
         atomic_thread_fence(memory_order_acquire);
     }
