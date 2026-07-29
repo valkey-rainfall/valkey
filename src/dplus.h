@@ -81,6 +81,26 @@ typedef struct dplusThreadStats {
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
 
+/* --- Write-tax gate (r100 heuristic) ---
+ *
+ * Per-IO-thread rolling window tracking the ratio of "punted to main because
+ * non-GET/write" batches vs "speculated" batches. When recent traffic is
+ * write-heavy, speculation is pure overhead (version misses / wasted prefetches).
+ * Skip dplusSpeculateBatch entirely when writes dominate.
+ *
+ * Implementation: per-thread shift register (64-bit) — each bit represents one
+ * batch: 1 = had eligible speculation, 0 = punted (first cmd was non-GET/write).
+ * If popcount < threshold, skip. Updated per-batch in dplusSpeculateBatch.
+ * No shared-line reads (each thread owns its own counter). */
+#define DPLUS_WRITE_TAX_WINDOW 64
+#define DPLUS_WRITE_TAX_THRESHOLD 8  /* Skip if < 8/64 recent batches speculated */
+
+typedef struct dplusWriteTaxGate {
+    uint64_t history;  /* Shift register: bit=1 means batch was speculated */
+} __attribute__((aligned(DPLUS_CACHELINE))) dplusWriteTaxGate;
+
+extern dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS];
+
 /* --- Component 6: Stats (behind -DIO_LOOKUP_OFFLOAD_STATS) --- */
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS

@@ -14,6 +14,9 @@ _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS] = {0};
 /* --- Per-IO-thread command counters (no-enqueue Phase-1) --- */
 dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
 
+/* --- Write-tax gate (per-IO-thread) --- */
+dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS] = {{.history = ~(uint64_t)0}}; /* Start optimistic (all-ones = all speculated) */
+
 /* --- Component 6: Stats --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 dplusStats dplus_stats = {0};
@@ -315,6 +318,12 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* Early exit: speculation disabled (single-threaded or cluster mode). */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
+    /* Write-tax gate pointer — declared early so the out: label can update it.
+     * The actual gate CHECK happens below, after first-command eligibility is
+     * determined (to avoid a dead-state where the gate blocks all speculation
+     * including the GET traffic that would recover it). */
+    dplusWriteTaxGate *gate = &dplus_write_tax[tid];
+
     /* Lazily cache the GET command pointer — eliminates repeated case-insensitive
      * siphash lookups (7% of worker profile per the per-TID decomposition). */
     static struct serverCommand *dplus_get_cmd = NULL;
@@ -347,6 +356,21 @@ int dplusSpeculateBatch(client *c, int tid) {
     if (c->argc == 2 && c->parsed_cmd != NULL &&
         c->parsed_cmd == dplus_get_cmd &&
         (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
+
+        /* Write-tax gate: first command IS eligible (GET), so we know the
+         * workload can speculate. Check the gate to decide whether recent
+         * traffic justifies the prefetch investment. If traffic has been
+         * write-heavy, speculation attempts mostly hit validation misses,
+         * wasting prefetch cycles. Skip the batch but shift in a 1 so the
+         * gate recovers once GETs resume. */
+        if (__builtin_popcountll(gate->history) < DPLUS_WRITE_TAX_THRESHOLD) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.intra_batch_write_punts, 1, memory_order_relaxed);
+#endif
+            /* Shift in 1 (eligible batch seen) to allow recovery. */
+            gate->history = (gate->history << 1) | 1;
+            goto out;
+        }
 
         dplusBatchEntry *e = &batch[batch_count];
         e->key_sds = objectGetVal(c->argv[1]);
@@ -421,6 +445,9 @@ int dplusSpeculateBatch(client *c, int tid) {
     }
 
 out:
+    /* Update write-tax gate: shift in 1 if any speculation succeeded, 0 if punted. */
+    gate->history = (gate->history << 1) | (speculated > 0 ? 1 : 0);
+
     /* Clear per-thread flag. */
     atomic_store_explicit(&dplus_in_speculative_read[tid], 0, memory_order_seq_cst);
     return speculated;
