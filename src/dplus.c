@@ -318,6 +318,16 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* Early exit: speculation disabled (single-threaded or cluster mode). */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
+    /* ZERO-COST WRITE-BATCH EXIT: if the first command isn't even a GET,
+     * return before touching any atomics or gate state. Eliminates the r100
+     * write-tax (2 seq_cst ops + gate history shift cost on pure-write batches).
+     * Uses a lazily-cached command pointer (static, idempotent init). */
+    {
+        static struct serverCommand *dplus_get_cmd_fast = NULL;
+        if (!dplus_get_cmd_fast) dplus_get_cmd_fast = lookupCommandByCString("get");
+        if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd_fast) return 0;
+    }
+
     /* Write-tax gate pointer — declared early so the out: label can update it.
      * The actual gate CHECK happens below, after first-command eligibility is
      * determined (to avoid a dead-state where the gate blocks all speculation
