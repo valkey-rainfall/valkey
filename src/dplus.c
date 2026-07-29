@@ -213,6 +213,11 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* Early exit: speculation disabled (single-threaded or cluster mode). */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
+    /* Lazily cache the GET command pointer — eliminates repeated case-insensitive
+     * siphash lookups (7% of worker profile per the per-TID decomposition). */
+    static struct serverCommand *dplus_get_cmd = NULL;
+    if (!dplus_get_cmd) dplus_get_cmd = lookupCommandByCString("get");
+
     /* Set per-thread flag (seq_cst handshake with exclusive mode). */
     atomic_store_explicit(&dplus_in_speculative_read[tid], 1, memory_order_seq_cst);
 
@@ -226,7 +231,7 @@ int dplusSpeculateBatch(client *c, int tid) {
 
     /* --- First command (c->argv / c->parsed_cmd) --- */
     if (c->argc == 2 && c->parsed_cmd != NULL &&
-        c->parsed_cmd == lookupCommandByCString("get") &&
+        c->parsed_cmd == dplus_get_cmd &&
         (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
 
         void *key_sds = objectGetVal(c->argv[1]);
@@ -257,7 +262,7 @@ int dplusSpeculateBatch(client *c, int tid) {
 
         /* Must be GET (argc==2, CMD_FAST, explicit cmd check). */
         if (p->argc != 2 || !(p->cmd->flags & CMD_FAST)) break;
-        if (p->cmd != lookupCommandByCString("get")) break;
+        if (p->cmd != dplus_get_cmd) break;
 
         void *key_sds = objectGetVal(p->argv[1]);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
