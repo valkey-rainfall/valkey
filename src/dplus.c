@@ -42,8 +42,14 @@ void dplusExclusiveLeave(void) {
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
  * Returns bytes written, or 0 if insufficient space (punt to main). */
 static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
+    /* Fast bulk-header formatting: "$<len>\r\n" using ll2string instead of
+     * snprintf (eliminates 2.6% __vfprintf_internal from worker profile). */
     char hdr[32];
-    int hdrlen = snprintf(hdr, sizeof(hdr), "$%zu\r\n", vallen);
+    hdr[0] = '$';
+    int numlen = ll2string(hdr + 1, sizeof(hdr) - 3, (long long)vallen);
+    hdr[numlen + 1] = '\r';
+    hdr[numlen + 2] = '\n';
+    int hdrlen = numlen + 3;
     size_t total = hdrlen + vallen + 2; /* trailing \r\n */
     size_t available = c->buf_usable_size - c->bufpos;
     if (total > available) return 0; /* Won't fit — punt */
