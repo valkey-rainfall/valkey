@@ -2353,6 +2353,15 @@ void beforeNextClient(client *c) {
      * So whenever we change the code here we need to consider if we need this change on module
      * blocked client as well */
 
+    /* Door-2 ownership: main is done touching this client — release it back
+     * to its owning worker. Must be a release store so the worker's acquire
+     * of io_read_state observes all of main's writes to the client structs.
+     * (Counterpart of the deferred release in processClientIOReadsDone.) */
+    if (c->owner_tid != 0 && c->io_read_state == CLIENT_COMPLETED_IO) {
+        atomic_thread_fence(memory_order_release);
+        c->io_read_state = CLIENT_IDLE;
+    }
+
     /* Trim the query buffer to the current position. */
     if (isReplicatedClient(c)) {
         /* If the client is replicated, trim the querybuf to repl_applied,
@@ -4372,7 +4381,16 @@ void readQueryFromClient(connection *conn) {
          * with io_read_state == CLIENT_IDLE (not PENDING_IO, since we didn't
          * go through trySendReadToIOThreads). Set it to pending, process,
          * then hand off to main. */
-        if (c->io_read_state != CLIENT_IDLE || c->io_write_state == CLIENT_PENDING_IO) return;
+        if (c->io_read_state != CLIENT_IDLE || c->io_write_state == CLIENT_PENDING_IO) {
+            serverLog(LL_DEBUG, "Door-2 SKIP read: client id=%llu owner=%d "
+                "io_read=%d io_write=%d tid=%d",
+                (unsigned long long)c->id, c->owner_tid,
+                c->io_read_state, c->io_write_state, getCurTid());
+            return;
+        }
+        serverLog(LL_DEBUG, "Door-2 ENTER read: client id=%llu owner=%d tid=%d "
+            "conn_state=%d", (unsigned long long)c->id, c->owner_tid,
+            getCurTid(), connGetState(c->conn));
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
         c->io_read_state = CLIENT_PENDING_IO;
@@ -6566,7 +6584,15 @@ void processClientIOReadsDone(client *c) {
     }
 
     c->flag.pending_read = 0;
-    c->io_read_state = CLIENT_IDLE;
+    /* Door-2 ownership: do NOT release the client back to its owning worker
+     * yet. The worker's event loop can fire readable the instant
+     * io_read_state == CLIENT_IDLE, and this client's parsed commands may
+     * execute LATER (deferred into the prefetch batch). Releasing here lets
+     * the worker read+parse into the same client structs while main executes
+     * the previous batch — a data race (design-doc §D bug pattern). Owned
+     * clients are released in beforeNextClient() after execution completes.
+     * Legacy (owner_tid == 0) clients keep the original early release. */
+    if (c->owner_tid == 0) c->io_read_state = CLIENT_IDLE;
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) return;
