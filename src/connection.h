@@ -168,7 +168,12 @@ struct connection {
     ConnectionCallbackFunc conn_handler;
     ConnectionCallbackFunc write_handler;
     ConnectionCallbackFunc read_handler;
+    struct aeEventLoop *el; /* Owning event loop, NULL = server.el (default). */
 };
+
+/* conn->el usage: if conn->el is non-NULL, use it as the event loop for this
+ * connection's fd registration. Otherwise fall back to server.el.
+ * Pattern in .c files: aeEventLoop *el = conn->el ? conn->el : server.el; */
 
 #define CONFIG_BINDADDR_MAX 16
 
