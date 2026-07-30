@@ -39,5 +39,6 @@ int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
+struct aeEventLoop *ioGetWorkerEventLoop(int tid);
 
 #endif /* IO_THREADS_H */

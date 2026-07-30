@@ -168,6 +168,8 @@ void IOThreadsBeforeSleep(long long current_time) {
         if (server.active_io_threads_num > 1 && getPendingIOThreadsJobs() == 0 &&
             getPendingIOResponsesCount() == 0) {
             for (int i = 1; i < server.active_io_threads_num; i++) {
+                /* Door-2: don't lock (deactivate) workers that have owned fds */
+                if (worker_el[i] && worker_el[i]->maxfd != -1) continue;
                 pthread_mutex_lock(&io_threads_mutex[i]);
             }
             server.active_io_threads_num = 1;
@@ -270,6 +272,8 @@ void IOThreadsAfterSleep(int numevents) {
         if (!spscIsEmpty(&io_private_inbox[tid])) return;
         /* ...or if we are dropping to 1 thread but the global queue still has work */
         if (target == 1 && !spmcIsEmpty(&io_shared_inbox)) return;
+        /* Door-2: don't deactivate workers with owned fds. */
+        if (worker_el[tid] && worker_el[tid]->maxfd != -1) return;
 
         pthread_mutex_lock(&io_threads_mutex[tid]);
         server.active_io_threads_num--;
@@ -412,13 +416,19 @@ static void *IOThreadMain(void *myid) {
          * any registered fds. With no fds (this slice), this is a no-op —
          * the maxfd == -1 check short-circuits before any syscall. */
         if (worker_el[id]->maxfd != -1) {
-            aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
+            int ev_processed = aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
+            processed += ev_processed;
         }
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
                 flushPendingIOResponses(0);
+            } else if (worker_el[id]->maxfd != -1) {
+                /* Door-2 ownership: worker has client fds — can't block on
+                 * mutex or we'd miss socket events. Yield 1ms then re-poll.
+                 * Under load this branch never fires (processed > 0). */
+                usleep(1000);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
@@ -450,6 +460,13 @@ static void createIOThread(int id) {
         serverLog(LL_WARNING, "Fatal: Can't create event loop for IO thread %d", id);
         exit(1);
     }
+    /* Enable poll protection so aeCreateFileEvent/aeDeleteFileEvent from main
+     * thread serialize against the worker's aeProcessEvents via poll_mutex.
+     * This is belt-and-suspenders: for NEW fd registration from main, the fd
+     * can't fire until after epoll_ctl completes (kernel barrier), so there's
+     * no actual race for accept-time registration. But we set it to be safe
+     * for future fd modifications (handler changes, deletions). */
+    aeSetPollProtect(worker_el[id], 1);
     serverLog(LL_NOTICE, "IO thread %d: created per-worker event loop (setsize=%d)", id, setsize);
 
     pthread_t tid;
@@ -495,6 +512,13 @@ void killIOThreads(void) {
     for (int j = 1; j < server.io_threads_num; j++) { /* We don't kill thread 0, which is the main thread. */
         shutdownIOThread(j);
     }
+}
+
+/* Return the per-worker event loop for the given thread ID.
+ * tid must be in [1, io_threads_num-1]. Returns NULL if tid is invalid. */
+aeEventLoop *ioGetWorkerEventLoop(int tid) {
+    if (tid < 1 || tid >= server.io_threads_num) return NULL;
+    return worker_el[tid];
 }
 
 int updateIOThreads(const char **err) {
@@ -571,6 +595,9 @@ void initIOThreads(int prev_threads_num) {
 
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* Door-2: owned clients handle reads on their worker's event loop.
+     * Return C_OK so main won't try to handle them either. */
+    if (c->owner_tid != 0) return C_OK;
     /* If IO thread is already reading, return C_OK to make sure the main thread will not handle it. */
     if (c->io_read_state != CLIENT_IDLE) return C_OK;
     if (c->io_write_state == CLIENT_PENDING_IO) return C_OK;
@@ -904,13 +931,17 @@ int trySendAcceptToIOThreads(connection *conn) {
 
 /* Function to handle read jobs */
 static void handleReadJobs(client **read_jobs, int read_count) {
-    server.stat_io_reads_pending -= read_count;
-    serverAssert(server.stat_io_reads_pending >= 0);
+    int legacy_count = 0;
     /* process each client */
     for (int i = 0; i < read_count; i++) {
         client *c = read_jobs[i];
+        if (c->owner_tid == 0) legacy_count++;
         processClientIOReadsDone(c);
     }
+    /* Only decrement for legacy (non-owned) clients — owned clients bypass
+     * stat_io_reads_pending on the submit side. */
+    server.stat_io_reads_pending -= legacy_count;
+    serverAssert(server.stat_io_reads_pending >= 0);
 
     /* Process commands in batch if we processed any reads */
     if (read_count) {
@@ -935,8 +966,16 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 int processIOThreadsResponses(void) {
     /* We don't check for threads number  since some threads may return jobs then deactivate/shut-down */
 
-    /* Quick check if any pending operations exist */
-    if (getPendingIOResponsesCount() == 0) return 0;
+    /* Quick check if any pending operations exist.
+     * Note: owned-client reads bypass io_jobs_submitted/finished accounting,
+     * so also peek at the MPSC outbox directly for their responses. */
+    if (getPendingIOResponsesCount() == 0) {
+        /* Door-2: owned clients push to MPSC without incrementing io_jobs_submitted.
+         * Check if the MPSC has data by comparing head vs tail. */
+        size_t head = atomic_load_explicit(&io_shared_outbox.head, memory_order_relaxed);
+        size_t tail = atomic_load_explicit(&io_shared_outbox.tail, memory_order_acquire);
+        if (head == tail) return 0;
+    }
 
     int total_processed = 0;
     void *jobs[JOB_BATCH_SIZE];

@@ -1226,6 +1226,10 @@ static void clientsCron(int clients_this_cycle) {
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
+        /* Door-2: skip worker-owned clients — their timeout/resize logic
+         * will be handled by the worker in a future slice. For now, they
+         * are immune to clientsCron eviction to prevent races. */
+        if (c->owner_tid != 0) continue;
 
         /* The following functions do different service checks on the client.
          * The protocol is that they return non-zero if the client was

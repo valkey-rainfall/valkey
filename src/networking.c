@@ -367,6 +367,7 @@ client *createClient(connection *conn) {
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
+    c->owner_tid = 0;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -1902,11 +1903,25 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
     }
 
     /* Create connection and client */
+    /* Door-2 ownership: assign connection to a worker event loop BEFORE
+     * createClient so that connSetReadHandler registers the fd on the
+     * worker's epoll, not server.el. Round-robin across active workers. */
+    int ownership_target = 0;
+    if (server.io_threads_ownership && server.io_threads_num > 1) {
+        static _Atomic int rr_counter = 0;
+        int num_workers = server.io_threads_num - 1; /* workers are [1, io_threads_num-1] */
+        ownership_target = (atomic_fetch_add(&rr_counter, 1) % num_workers) + 1;
+        conn->el = ioGetWorkerEventLoop(ownership_target);
+    }
     if ((c = createClient(conn)) == NULL) {
         serverLog(LL_WARNING, "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
                   connGetLastError(conn), addr, laddr);
         connClose(conn); /* May be already closed, just ignore errors */
         return;
+    }
+    /* Set stable owner_tid for door-2 ownership tracking. */
+    if (ownership_target > 0) {
+        c->owner_tid = (uint8_t)ownership_target;
     }
 
     /* Last chance to keep flags */
@@ -4347,6 +4362,33 @@ static bool readToQueryBuf(client *c) {
 #define REPL_MAX_READS_PER_IO_EVENT 25
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
+
+    /* Door-2 ownership: if this client is owned by a worker and we're firing
+     * on that worker's event loop, run the IO-thread read path directly
+     * (read + parse + dplus speculate) then hand to main via MPSC.
+     * This replaces the SPMC dispatch path for owned clients. */
+    if (c->owner_tid != 0 && !inMainThread()) {
+        /* Mirror ioThreadReadQueryFromClient logic, but the client arrives
+         * with io_read_state == CLIENT_IDLE (not PENDING_IO, since we didn't
+         * go through trySendReadToIOThreads). Set it to pending, process,
+         * then hand off to main. */
+        if (c->io_read_state != CLIENT_IDLE || c->io_write_state == CLIENT_PENDING_IO) return;
+        c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+        c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+        c->io_read_state = CLIENT_PENDING_IO;
+        c->flag.pending_read = 1;
+        connSetPostponeUpdateState(c->conn, 1);
+
+        /* Execute the same path as ioThreadReadQueryFromClient. */
+        ioThreadReadQueryFromClient(c);
+        /* NOTE: ioThreadReadQueryFromClient sets io_read_state = COMPLETED_IO
+         * and calls sendToMainThread(c, JOB_RES_READ_CLIENT).
+         * The io_jobs_submitted counter is NOT incremented here because the
+         * client didn't go through the SPMC queue — the main-thread response
+         * handler will see the COMPLETED_IO state directly from the MPSC. */
+        return;
+    }
+
     /* Check if we can send the client to be handled by the IO-thread */
     if (postponeClientRead(c)) return;
 
@@ -6509,6 +6551,13 @@ int postponeClientRead(client *c) {
 
 void processClientIOReadsDone(client *c) {
     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
+    if (c->conn == NULL) {
+        serverLog(LL_WARNING, "Door-2 BUG: processClientIOReadsDone c=%p conn=NULL owner_tid=%d "
+                  "io_read_state=%d io_write_state=%d close_asap=%d id=%llu",
+                  (void*)c, c->owner_tid, c->io_read_state, c->io_write_state,
+                  c->flag.close_asap, (unsigned long long)c->id);
+        serverPanic("Door-2: processClientIOReadsDone with NULL conn");
+    }
 
     if (ProcessingEventsWhileBlocked) {
         /* When ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
