@@ -31,6 +31,12 @@ static _Atomic(size_t) io_jobs_finished;
 static int io_threads_initialized = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
+/* Per-worker event loops for door-2 ownership model. Each IO worker gets
+ * its own aeEventLoop with a private epoll fd. When conn->el is set to
+ * worker_el[tid], that connection's fd lives on the worker's epoll instead
+ * of server.el. Currently allocated but empty (no fds registered). */
+static aeEventLoop *worker_el[IO_THREADS_MAX_NUM] = {0};
+
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
  * Requires data pointers to be 8-byte aligned (standard for zmalloc/ptrs). */
@@ -402,6 +408,13 @@ static void *IOThreadMain(void *myid) {
             atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
         }
 
+        /* Door-2 infrastructure: pump the per-worker event loop if it has
+         * any registered fds. With no fds (this slice), this is a no-op —
+         * the maxfd == -1 check short-circuits before any syscall. */
+        if (worker_el[id]->maxfd != -1) {
+            aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
+        }
+
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
@@ -427,6 +440,17 @@ static void createIOThread(int id) {
 
     /* Initialize the private SPSC queue for this thread */
     spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
+
+    /* Create per-worker event loop (same setsize as server.el).
+     * Currently no fds are registered — this is infrastructure for
+     * the door-2 ownership model where client fds will migrate here. */
+    int setsize = server.maxclients + CONFIG_FDSET_INCR;
+    worker_el[id] = aeCreateEventLoop(setsize);
+    if (!worker_el[id]) {
+        serverLog(LL_WARNING, "Fatal: Can't create event loop for IO thread %d", id);
+        exit(1);
+    }
+    serverLog(LL_NOTICE, "IO thread %d: created per-worker event loop (setsize=%d)", id, setsize);
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
@@ -459,6 +483,12 @@ static void shutdownIOThread(int id) {
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);
     spscFree(&io_private_inbox[id]);
+
+    /* Free the per-worker event loop. */
+    if (worker_el[id]) {
+        aeDeleteEventLoop(worker_el[id]);
+        worker_el[id] = NULL;
+    }
 }
 
 void killIOThreads(void) {
