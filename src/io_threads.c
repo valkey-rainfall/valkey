@@ -142,7 +142,17 @@ void IOThreadsBeforeSleep(long long current_time) {
     if (server.io_threads_always_active) {
         /* active_all_io_threads state is for debug purposes: deactivate all threads before sleep if no pending jobs,
          * and reactivate all after sleep. We can't leave it active all the time as it will consume much CPU that will interfere with tests */
-        if (server.active_io_threads_num > 1 && getPendingIOThreadsJobs() == 0) {
+        /* BUGFIX: also check getPendingIOResponsesCount(). On ARM (weak memory
+         * model), the MPSC outbox consumer may see an advanced tail but a stale
+         * NULL buffer slot because the producer's relaxed fetch_add on tail can
+         * propagate before the release store to the buffer. If we deactivate
+         * threads in this window and no new events arrive (numevents==0 keeps
+         * threads locked), the response is stranded until the next timer cycle
+         * re-dequeues — but by then afterSleep won't unlock (numevents==0).
+         * Checking getPendingIOResponsesCount()>0 prevents deactivation while
+         * main still expects responses, making the stall self-healing. */
+        if (server.active_io_threads_num > 1 && getPendingIOThreadsJobs() == 0 &&
+            getPendingIOResponsesCount() == 0) {
             for (int i = 1; i < server.active_io_threads_num; i++) {
                 pthread_mutex_lock(&io_threads_mutex[i]);
             }
