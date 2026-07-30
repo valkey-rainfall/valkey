@@ -120,13 +120,21 @@ void waitForClientIO(client *c) {
     if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE) return;
 
     /* Wait for read operation to complete if pending. */
-    while (c->io_read_state == CLIENT_PENDING_IO) {
-        atomic_thread_fence(memory_order_acquire);
+    {
+        monotime _w = getMonotonicUs();
+        while (c->io_read_state == CLIENT_PENDING_IO) {
+            atomic_thread_fence(memory_order_acquire);
+            if (getMonotonicUs() - _w > 5000000) serverPanic("waitForClientIO READ spin timeout");
+        }
     }
 
     /* Wait for write operation to complete if pending. */
-    while (c->io_write_state == CLIENT_PENDING_IO) {
-        atomic_thread_fence(memory_order_acquire);
+    {
+        monotime _w2 = getMonotonicUs();
+        while (c->io_write_state == CLIENT_PENDING_IO) {
+            atomic_thread_fence(memory_order_acquire);
+            if (getMonotonicUs() - _w2 > 5000000) serverPanic("waitForClientIO WRITE spin timeout");
+        }
     }
 
     /* Final memory barrier to ensure all changes are visible */

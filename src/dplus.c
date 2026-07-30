@@ -30,8 +30,10 @@ void dplusExclusiveEnter(void) {
     /* Spin until no IO thread is in a speculative read. Bounded by one GET
      * execution time (sub-microsecond). */
     for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        monotime _w = getMonotonicUs();
         while (atomic_load_explicit(&dplus_in_speculative_read[i], memory_order_seq_cst)) {
             /* Spin — bounded by single GET latency. */
+            if (getMonotonicUs() - _w > 5000000) serverPanic("dplusExclusiveEnter spin timeout on slot %d", i);
         }
     }
 }
