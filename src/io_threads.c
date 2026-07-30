@@ -91,8 +91,21 @@ void drainIOThreadsQueue(void) {
         }
         server.active_io_threads_num = server.io_threads_num;
     }
+    /* Spin until all submitted jobs are completed by IO threads.
+     * Safety: panic after ~5 seconds (calibrated at ~2.5GHz = ~12.5B cycles)
+     * to convert silent hangs into diagnosable crashes. Under normal operation
+     * the drain completes in microseconds. */
+    monotime drain_start = getMonotonicUs();
     while (getPendingIOThreadsJobs()) {
         atomic_thread_fence(memory_order_acquire);
+        if ((getMonotonicUs() - drain_start) > 5000000) { /* 5 seconds */
+            serverPanic("drainIOThreadsQueue: timeout after 5s. "
+                "submitted=%zu finished=%zu pending=%zu active_threads=%d",
+                io_jobs_submitted,
+                (size_t)atomic_load_explicit(&io_jobs_finished, memory_order_acquire),
+                getPendingIOThreadsJobs(),
+                server.active_io_threads_num);
+        }
     }
 }
 
