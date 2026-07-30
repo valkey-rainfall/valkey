@@ -166,7 +166,7 @@ void IOThreadsBeforeSleep(long long current_time) {
          * Checking getPendingIOResponsesCount()>0 prevents deactivation while
          * main still expects responses, making the stall self-healing. */
         if (server.active_io_threads_num > 1 && getPendingIOThreadsJobs() == 0 &&
-            getPendingIOResponsesCount() == 0) {
+            getPendingIOResponsesCount() == 0 && !server.io_threads_ownership) {
             for (int i = 1; i < server.active_io_threads_num; i++) {
                 /* Door-2: don't lock (deactivate) workers that have owned fds */
                 if (worker_el[i] && worker_el[i]->maxfd != -1) continue;
@@ -198,6 +198,10 @@ void IOThreadsBeforeSleep(long long current_time) {
 void IOThreadsAfterSleep(int numevents) {
     if (server.io_threads_num == 1) return;
     serverAssert(inMainThread());
+    /* Door-2 ownership: all workers are permanently active (set at init);
+     * ignition/scaling would only ever try to park a worker, which loses
+     * wakeups for owned fds assigned after the park check. */
+    if (server.io_threads_ownership) return;
     /* Always Active Policy */
     if (server.io_threads_always_active) {
         if (numevents > 0 && server.active_io_threads_num < server.io_threads_num) {
@@ -424,9 +428,11 @@ static void *IOThreadMain(void *myid) {
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
                 flushPendingIOResponses(0);
-            } else if (worker_el[id]->maxfd != -1) {
-                /* Door-2 ownership: worker has client fds — can't block on
-                 * mutex or we'd miss socket events. Yield 1ms then re-poll.
+            } else if (server.io_threads_ownership || worker_el[id]->maxfd != -1) {
+                /* Door-2 ownership: worker may hold client fds — or be assigned
+                 * one by main at ANY moment (accept-time assignment). Blocking on
+                 * the mutex here loses that wakeup: we checked maxfd before the
+                 * fd arrived and would never re-check. Yield 1ms then re-poll.
                  * Under load this branch never fires (processed > 0). */
                 usleep(1000);
             } else {
@@ -590,6 +596,19 @@ void initIOThreads(int prev_threads_num) {
     /* Spawn and initialize the I/O threads. */
     for (int i = prev_threads_num; i < server.io_threads_num; i++) {
         createIOThread(i);
+    }
+
+    /* Door-2 ownership: workers must be permanently active. A parked worker
+     * checked maxfd == -1 BEFORE main assigned it a client fd and would never
+     * re-check (lost wakeup: accepted clients register on the worker's epoll
+     * but their reads never fire). Unlock all parked workers now; the
+     * deactivation paths are all skipped under ownership mode. */
+    if (server.io_threads_ownership) {
+        for (int i = server.active_io_threads_num; i < server.io_threads_num; i++) {
+            pthread_mutex_unlock(&io_threads_mutex[i]);
+        }
+        server.active_io_threads_num = server.io_threads_num;
+        serverLog(LL_NOTICE, "Door-2 ownership: all %d IO threads permanently active", server.io_threads_num - 1);
     }
 }
 
@@ -1005,6 +1024,14 @@ int processIOThreadsResponses(void) {
                 untagJob(jobs[i], &data, &job_type);
                 client *c = (client *)data;
                 if (job_type == JOB_RES_READ_CLIENT) {
+                    if (c->io_read_state != CLIENT_COMPLETED_IO) {
+                        serverLog(LL_WARNING,
+                            "Door-2 DEQUEUE BUG: client id=%llu owner_tid=%d "
+                            "io_read_state=%d io_write_state=%d flags=0x%llx",
+                            (unsigned long long)c->id, c->owner_tid,
+                            c->io_read_state, c->io_write_state,
+                            (unsigned long long)c->raw_flag1);
+                    }
                     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
                     read_jobs[read_count++] = c;
                 } else if (job_type == JOB_RES_WRITE_CLIENT) {
