@@ -1,0 +1,51 @@
+name: Door-2 ownership matrix
+
+# V2 of the door-2 verification track: the config combination no upstream CI
+# runs — io-threads 4 with the ownership gate both off and on, across the
+# full tcl suite and moduleapi. Catches config-combination rot between the
+# heavyweight local gate batteries.
+#
+# eventloop moduleapi unit is skipped under io-threads: its in-module
+# beforeSleep/afterSleep pairing assert is incompatible with offloaded
+# execution in BOTH modes (pre-existing upstream issue, not door-2).
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 10:00 UTC (03:00 Pacific)
+    - cron: "0 10 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ownership-matrix:
+    runs-on: ubuntu-latest
+    if: github.repository == 'valkey-rainfall/valkey'
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [runtest, moduleapi]
+        ownership: ["yes", "no"]
+    name: ${{ matrix.suite }} io4 ownership=${{ matrix.ownership }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: make
+        run: make -j"$(nproc)" SERVER_CFLAGS='-Werror'
+      - name: test (full suite)
+        if: matrix.suite == 'runtest'
+        run: |
+          ./runtest --durable --io-threads \
+            --config io-threads 4 \
+            --config io-threads-ownership ${{ matrix.ownership }} \
+            --verbose --dump-logs --tags -illegal-teardown
+      - name: test (moduleapi)
+        if: matrix.suite == 'moduleapi'
+        run: |
+          ./runtest-moduleapi --durable --io-threads \
+            --config io-threads 4 \
+            --config io-threads-ownership ${{ matrix.ownership }} \
+            --skipunit unit/moduleapi/eventloop \
+            --verbose --dump-logs
