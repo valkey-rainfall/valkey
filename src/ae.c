@@ -496,8 +496,15 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
              * fe->mask recheck below runs under the lock, so an event the
              * teardown deleted can no longer fire. Per-fd granularity keeps
              * the other thread's wait bounded by ONE callback, not a whole
-             * sweep. No-op (flag unset) for main's loop. */
-            AE_LOCK(eventLoop);
+             * sweep. No-op (flag unset) for main's loop.
+             *
+             * PAIRING: remember whether WE locked. The naive form re-reads
+             * eventLoop->flags at unlock time — if AE_PROTECT_POLL flips
+             * during the callback, that unlocks a mutex we never locked
+             * (EPERM assert, seen in the gate battery on server.el). Lock
+             * decisions must never be re-derived from mutable state. */
+            int dispatch_locked = (eventLoop->flags & AE_PROTECT_POLL) != 0;
+            if (dispatch_locked) assert(pthread_mutex_lock(&eventLoop->poll_mutex) == 0);
             aeFileEvent *fe = &eventLoop->events[fd];
             int mask = eventLoop->fired[j].mask;
             int fired = 0; /* Number of events fired for current fd. */
@@ -544,7 +551,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
                     fired++;
                 }
             }
-            AE_UNLOCK(eventLoop);
+            if (dispatch_locked) assert(pthread_mutex_unlock(&eventLoop->poll_mutex) == 0);
 
             processed++;
         }
