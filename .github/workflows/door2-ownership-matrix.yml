@@ -30,7 +30,7 @@ jobs:
   ownership-matrix:
     runs-on: ubuntu-latest
     if: github.repository == 'valkey-rainfall/valkey'
-    timeout-minutes: 180
+    timeout-minutes: 300 # full io4 runtest exceeds 180m on 2-core runners
     strategy:
       fail-fast: false
       matrix:
