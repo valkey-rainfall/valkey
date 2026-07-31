@@ -118,6 +118,54 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         }
     }
 
+    test {OWNERSHIP: WATCH aborts EXEC when watched key changes (speculated reads active)} {
+        # Design-doc risk 5 ('believed clean; verify in gauntlet'): watch
+        # lists are writer-side state; speculated GETs must neither trip nor
+        # miss dirty-CAS. A watching client's GET may take the speculated
+        # path; the subsequent modification by ANOTHER client must still
+        # abort EXEC.
+        r set wkey v0
+        set rd [valkey_deferring_client]
+        $rd watch wkey
+        assert_equal "OK" [$rd read]
+        # Speculated read on the watching client — must not clear/damage
+        # the watch.
+        $rd get wkey
+        assert_equal "v0" [$rd read]
+        # Another client modifies the watched key.
+        r set wkey v1
+        $rd multi
+        assert_equal "OK" [$rd read]
+        $rd get wkey
+        assert_equal "QUEUED" [$rd read]
+        $rd exec
+        assert_equal {} [$rd read] ; # nil multi-bulk = aborted
+        $rd close
+    }
+
+    test {OWNERSHIP: WATCH allows EXEC when watched key untouched (reads are not dirtying)} {
+        # The inverse property: heavy speculated READS of the watched key by
+        # other clients must NOT dirty the CAS — only writes do.
+        r set wkey2 stable
+        set rd [valkey_deferring_client]
+        $rd watch wkey2
+        assert_equal "OK" [$rd read]
+        # Other clients hammer speculated reads on the watched key.
+        for {set i 0} {$i < 3} {incr i} {
+            set rr [valkey_deferring_client]
+            for {set j 0} {$j < 50} {incr j} { $rr get wkey2 }
+            for {set j 0} {$j < 50} {incr j} { assert_equal "stable" [$rr read] }
+            $rr close
+        }
+        $rd multi
+        assert_equal "OK" [$rd read]
+        $rd get wkey2
+        assert_equal "QUEUED" [$rd read]
+        $rd exec
+        assert_equal {stable} [$rd read] ; # committed
+        $rd close
+    }
+
     test {OWNERSHIP: pipeline integrity under mixed read-write} {
         # Slice-3 reply-ordering guarantee: consumed GET replies precede the
         # main-executed remainder, per batch, in order.
