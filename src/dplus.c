@@ -353,6 +353,11 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* Set per-thread flag (seq_cst handshake with exclusive mode). */
     atomic_store_explicit(&dplus_in_speculative_read[tid], 1, memory_order_seq_cst);
 
+    /* Time the batch for commandstats parity: speculated GETs bypass call(),
+     * so their duration must be accumulated per-thread and folded into the
+     * GET command's microseconds by dplusAggregateStats (as with calls). */
+    monotime spec_start = getMonotonicUs();
+
     /* Check exclusive mode AFTER setting flag (barrier handshake). */
     if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_seq_cst)) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -469,6 +474,10 @@ out:
     /* Update write-tax gate: shift in 1 if any speculation succeeded, 0 if punted. */
     gate->history = (gate->history << 1) | (speculated > 0 ? 1 : 0);
 
+    /* Commandstats parity: fold execution time into the per-thread counter
+     * (calls are accumulated in dplusConsumeSpeculated). */
+    if (speculated > 0) dplus_thread_stats[tid].usec += (long long)(getMonotonicUs() - spec_start);
+
     /* Clear per-thread flag. */
     atomic_store_explicit(&dplus_in_speculative_read[tid], 0, memory_order_seq_cst);
     return speculated;
@@ -557,11 +566,24 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
  * safe: worst case we miss a few commands this iteration and catch them
  * next time (bounded lag of one event-loop cycle, ~1ms). */
 void dplusAggregateStats(void) {
+    /* Commandstats parity: speculated GETs bypass call(), which is where
+     * cmd->calls / cmd->microseconds are normally incremented. Fold the
+     * per-thread counters into the GET command here so INFO COMMANDSTATS
+     * (and everything downstream: LATENCY, tests, dashboards) sees them.
+     * Only GET is ever speculated, so a single target command suffices. */
+    static struct serverCommand *get_cmd = NULL;
+    if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
         long long n = dplus_thread_stats[i].commands_processed;
         if (n > 0) {
             server.stat_numcommands += n;
+            if (get_cmd) get_cmd->calls += n;
             dplus_thread_stats[i].commands_processed = 0;
+        }
+        long long us = dplus_thread_stats[i].usec;
+        if (us > 0) {
+            if (get_cmd) get_cmd->microseconds += us;
+            dplus_thread_stats[i].usec = 0;
         }
     }
 }

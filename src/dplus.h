@@ -76,7 +76,8 @@ extern _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS];
  * beforeSleep — a per-LOOP touch, not per-command. */
 typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
-    char _pad[DPLUS_CACHELINE - sizeof(long long)]; /* pad to full cache line */
+    long long usec;               /* wall time spent executing them (for commandstats) */
+    char _pad[DPLUS_CACHELINE - 2 * sizeof(long long)]; /* pad to full cache line */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
