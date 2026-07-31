@@ -11,8 +11,15 @@ name: Door-2 ownership matrix
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "exp/door2-*"
+    paths-ignore:
+      - "**/*.md"
   schedule:
     # Weekly, Monday 10:00 UTC (03:00 Pacific)
+    # NOTE: schedule + workflow_dispatch only fire once this file reaches the
+    # fork's default branch; until then the push trigger above does the work.
     - cron: "0 10 * * 1"
 
 concurrency:
