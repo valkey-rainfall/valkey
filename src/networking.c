@@ -2415,6 +2415,13 @@ void beforeNextClient(client *c) {
         if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
             c->flag.monitor || c->flag.replica || c->flag.primary ||
             c->flag.tracking || c->flag.close_after_reply ||
+            c->slot_migration_job != NULL || /* import jobs are REPLICATED
+                            * (isReplicatedClient) yet arrive as accepted —
+                            * hence owned — connections; the owned read path
+                            * breaks their reploff/qb_applied bookkeeping
+                            * (networking.c:4004 assert in migrateslots).
+                            * Export jobs have special write coordination
+                            * too — punt all slot-migration clients. */
             c->pubsub_data != NULL) { /* lazily allocated on first pubsub/tracking use */
             disownClient(c);
         }
