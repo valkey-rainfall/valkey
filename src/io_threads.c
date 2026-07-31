@@ -892,6 +892,17 @@ void sendToMainThread(void *data, int type) {
         }
         listAddNodeTail(pending_io_responses, job);
     }
+    /* Door-2 ownership: main owns NO client fds, so its event loop sleeps in
+     * epoll for up to a full server-hz tick (~100ms) with our response queued.
+     * Wake it the way module threads do — one byte down the module pipe
+     * (O_NONBLOCK: if the pipe is full a wakeup is already pending and the
+     * failed write is free). Without this, every handoff and every cleanup
+     * response waits for the timer, collapsing throughput to ~clients*hz. */
+    if (server.io_threads_ownership) {
+        if (write(server.module_pipe[1], "A", 1) != 1) {
+            /* Pipe full or transient error — a wakeup is already pending. */
+        }
+    }
 }
 
 static void ioThreadAccept(client *c) {
@@ -971,7 +982,15 @@ static void handleReadJobs(client **read_jobs, int read_count) {
 
 /* Function to handle write jobs */
 static void handleWriteJobs(client **write_jobs, int write_count) {
-    server.stat_io_writes_pending -= write_count;
+    /* Door-2: worker-local completions (owning worker wrote its own client's
+     * reply and sent JOB_RES_WRITE_CLIENT for cleanup only) never passed
+     * through trySendWriteToIOThreads, so they never incremented
+     * stat_io_writes_pending — don't decrement for them. */
+    int offloaded = 0;
+    for (int i = 0; i < write_count; i++) {
+        if (!(write_jobs[i]->write_flags & WRITE_FLAGS_OWNED_LOCAL)) offloaded++;
+    }
+    server.stat_io_writes_pending -= offloaded;
     serverAssert(server.stat_io_writes_pending >= 0);
 
     for (int i = 0; i < write_count; i++) {

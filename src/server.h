@@ -2909,6 +2909,10 @@ void dictVanillaFree(void *val);
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
 #define WRITE_FLAGS_IS_REPLICA (1 << 1)
+#define WRITE_FLAGS_OWNED_LOCAL (1 << 2) /* Door-2: write initiated by the owning \
+                                          * worker itself (worker-local completion), \
+                                          * not offloaded by main — no pending-write \
+                                          * accounting to unwind. */
 
 client *createClient(connection *conn);
 int freeClient(client *c);

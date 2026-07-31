@@ -1860,6 +1860,32 @@ void clientAcceptHandler(connection *conn) {
 
     server.stat_numconnections++;
     moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
+
+    /* Door-2 ownership: migrate the client to a worker event loop as the
+     * LAST step of accept — client struct fully built, accept-time module
+     * events fired, nothing on main still expects to touch this conn.
+     *
+     * ORDER IS LOAD-BEARING (crash class: accept-ordering race). An earlier
+     * version set conn->el BEFORE createClient so the read handler registered
+     * directly on the worker's epoll — but createClient registers the handler
+     * as its FIRST action and initializes c->conn/fields AFTER, so the worker
+     * could fire readQueryFromClient on a half-built client (owner_tid still
+     * 0 → fell into main-only dispatch from a worker; c->conn NULL → SIGSEGV
+     * in trySendReadToIOThreads). Now: set owner_tid, delete the read event
+     * from main's loop, switch conn->el, re-register on the worker's loop.
+     * aeCreateFileEvent on the worker's loop takes its AE_LOCK, giving the
+     * release/acquire edge that publishes all prior main-thread writes to
+     * c/conn before any event can fire there. TLS stays on main (handshake
+     * handlers are main-only) until a later slice. */
+    if (server.io_threads_ownership && server.io_threads_num > 1 && !connIsTLS(conn)) {
+        static _Atomic int rr_counter = 0;
+        int num_workers = server.io_threads_num - 1; /* workers are [1, io_threads_num-1] */
+        int ownership_target = (atomic_fetch_add(&rr_counter, 1) % num_workers) + 1;
+        c->owner_tid = (uint8_t)ownership_target;
+        connSetReadHandler(conn, NULL);
+        conn->el = ioGetWorkerEventLoop(ownership_target);
+        connSetReadHandler(conn, readQueryFromClient);
+    }
 }
 
 void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
@@ -1903,26 +1929,15 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
     }
 
     /* Create connection and client */
-    /* Door-2 ownership: assign connection to a worker event loop BEFORE
-     * createClient so that connSetReadHandler registers the fd on the
-     * worker's epoll, not server.el. Round-robin across active workers. */
-    int ownership_target = 0;
-    if (server.io_threads_ownership && server.io_threads_num > 1) {
-        static _Atomic int rr_counter = 0;
-        int num_workers = server.io_threads_num - 1; /* workers are [1, io_threads_num-1] */
-        ownership_target = (atomic_fetch_add(&rr_counter, 1) % num_workers) + 1;
-        conn->el = ioGetWorkerEventLoop(ownership_target);
-    }
     if ((c = createClient(conn)) == NULL) {
         serverLog(LL_WARNING, "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
                   connGetLastError(conn), addr, laddr);
         connClose(conn); /* May be already closed, just ignore errors */
         return;
     }
-    /* Set stable owner_tid for door-2 ownership tracking. */
-    if (ownership_target > 0) {
-        c->owner_tid = (uint8_t)ownership_target;
-    }
+    /* Door-2 ownership migration happens at the END of clientAcceptHandler —
+     * after the client is fully constructed and accept has fully completed.
+     * See the comment there for the ordering rationale. */
 
     /* Last chance to keep flags */
     if (flags.unix_socket) c->flag.unix_socket = 1;
@@ -4380,8 +4395,15 @@ void readQueryFromClient(connection *conn) {
         /* Mirror ioThreadReadQueryFromClient logic, but the client arrives
          * with io_read_state == CLIENT_IDLE (not PENDING_IO, since we didn't
          * go through trySendReadToIOThreads). Set it to pending, process,
-         * then hand off to main. */
-        if (c->io_read_state != CLIENT_IDLE || c->io_write_state == CLIENT_PENDING_IO) {
+         * then hand off to main. Defer (skip) while main holds ANY write
+         * state on this client — an in-flight offloaded write, a completed
+         * write awaiting main's done-handler, or membership in the
+         * pending-write queue. dplusSpeculateBatch writes into c->buf, and
+         * main's flush of previous replies reads/resets the same buffer:
+         * touching it concurrently is a data race. Level-triggered epoll
+         * re-fires this event, so deferring loses nothing. */
+        if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE ||
+            c->flag.pending_write) {
             serverLog(LL_DEBUG, "Door-2 SKIP read: client id=%llu owner=%d "
                 "io_read=%d io_write=%d tid=%d",
                 (unsigned long long)c->id, c->owner_tid,
@@ -4399,11 +4421,13 @@ void readQueryFromClient(connection *conn) {
 
         /* Execute the same path as ioThreadReadQueryFromClient. */
         ioThreadReadQueryFromClient(c);
-        /* NOTE: ioThreadReadQueryFromClient sets io_read_state = COMPLETED_IO
-         * and calls sendToMainThread(c, JOB_RES_READ_CLIENT).
-         * The io_jobs_submitted counter is NOT incremented here because the
-         * client didn't go through the SPMC queue — the main-thread response
-         * handler will see the COMPLETED_IO state directly from the MPSC. */
+        /* NOTE: for a fully-consumed pure-read batch, ioThreadReadQueryFromClient
+         * completes WORKER-LOCALLY (slice 3): reply written to the socket here,
+         * read state released, main only gets JOB_RES_WRITE_CLIENT for cleanup.
+         * Otherwise it sets io_read_state = COMPLETED_IO and hands off via
+         * JOB_RES_READ_CLIENT as before. The io_jobs_submitted counter is NOT
+         * incremented on this path because the client didn't go through the
+         * SPMC queue. */
         return;
     }
 
@@ -6741,6 +6765,46 @@ void ioThreadReadQueryFromClient(client *c) {
      * aggregated into stat_numcommands by main in beforeSleep. */
     if (dplus_count > 0) {
         dplusConsumeSpeculated(c, dplus_count, getCurTid());
+
+        /* Door-2 slice 3: WORKER-LOCAL COMPLETION. If this is an owned client
+         * on its owning worker and the batch was FULLY consumed (pure reads:
+         * no first-command remainder, no queued remainder), the replies are
+         * already sitting in c->buf — write the socket right here and release
+         * the read state, skipping the main-thread round trip on the client-
+         * visible path entirely. Main receives only a JOB_RES_WRITE_CLIENT
+         * for post-write cleanup (stats, memory buckets, error handling),
+         * which reuses the established offloaded-write done-protocol.
+         * Guards: plain buffer replies only (no reply list, not encoded),
+         * normal client type, not replicated — anything else falls through
+         * to the battle-tested main handoff below. */
+        if (c->owner_tid != 0 && c->owner_tid == getCurTid() &&
+            c->argc == 0 && !c->flag.pending_command &&
+            c->cmd_queue.off >= c->cmd_queue.len &&
+            c->bufpos > 0 && listLength(c->reply) == 0 && !c->flag.buf_encoded &&
+            !(c->read_flags & READ_FLAGS_REPLICATED) &&
+            getClientType(c) == CLIENT_TYPE_NORMAL &&
+            !c->flag.close_asap && !c->flag.close_after_reply) {
+            trimClientQueryBuffer(c);
+            /* Release read state — main never learns about this read. We are
+             * the only thread touching this client until sendToMainThread
+             * below publishes it. */
+            c->flag.pending_read = 0;
+            c->io_read_state = CLIENT_IDLE;
+            /* Snapshot write state exactly as trySendWriteToIOThreads does
+             * (we ARE the IO thread, so the io_last_* snapshot is trivially
+             * coherent), then run the standard IO-thread write path:
+             * _writeToClient + COMPLETED_IO + JOB_RES_WRITE_CLIENT. Main's
+             * processClientIOWriteDone handles cleanup, partial writes and
+             * write errors through the existing machinery. The postpone-
+             * update-state set at entry is cleared there too, mirroring the
+             * offloaded-write flow. */
+            c->io_last_reply_block = NULL;
+            c->io_last_bufpos = (size_t)c->bufpos;
+            c->write_flags = WRITE_FLAGS_OWNED_LOCAL;
+            c->io_write_state = CLIENT_PENDING_IO;
+            ioThreadWriteToClient(c);
+            return;
+        }
     }
 
 done:
