@@ -142,6 +142,7 @@ void aeSetPollProtect(aeEventLoop *eventLoop, int protect);
 void aeAcquireLock(aeEventLoop *eventLoop);
 void aeReleaseLock(aeEventLoop *eventLoop);
 int aeProcessEventsProtected(aeEventLoop *eventLoop, int flags);
+int aePollDirect(aeEventLoop *eventLoop, struct timeval *tvp);
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);
 int aeGetSetSize(aeEventLoop *eventLoop);
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);

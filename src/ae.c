@@ -399,6 +399,28 @@ int aePoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     return ret;
 }
 
+/* Door-2 ownership: bounded blocking poll WITHOUT taking poll_mutex.
+ * Used by idle worker pumps to sleep IN the epoll (instant wake on owned-fd
+ * activity, near-zero idle CPU) instead of usleep-polling — 30 idle
+ * ownership servers measured 84% aggregate CPU with the usleep pump vs 5%
+ * for parked legacy workers; this restores parity.
+ *
+ * Why not holding the lock is safe here (and why holding it would be wrong):
+ * holding poll_mutex across a blocking wait would stall main's
+ * aeCreateFileEvent (accept migration) and aeAcquireLock (disown/freeClient
+ * teardown) for the full timeout. Unlocked is safe because:
+ *   - epoll_ctl (main, under lock) concurrent with epoll_wait (here) is a
+ *     kernel-supported pattern; newly added fds become pollable immediately.
+ *   - el->fired/numevents are only written by this loop's owner thread.
+ *   - A fired entry for an fd main just deleted is neutralized by the
+ *     fe->mask recheck that runs under the per-fd DISPATCH lock (which this
+ *     function does not replace — dispatch locking is unchanged).
+ * The caller must dispatch via aeProcessEvents afterwards (level-triggered
+ * epoll re-reports anything this poll consumed into fired[]). */
+int aePollDirect(aeEventLoop *eventLoop, struct timeval *tvp) {
+    return aeApiPoll(eventLoop, tvp);
+}
+
 /* Door-2 ownership: quiesce/resume a protected event loop from another
  * thread. While held, the loop's owner cannot be inside poll OR dispatch
  * (aeProcessEventsProtected holds the same mutex across its whole

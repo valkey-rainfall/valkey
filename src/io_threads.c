@@ -352,7 +352,6 @@ static void *IOThreadMain(void *myid) {
     thread_id = (int)id;
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
-    int worker_saw_fires = 0; /* Door-2: last sweep saw (possibly useless) fires */
     monotime work_start_time = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
@@ -437,7 +436,6 @@ static void *IOThreadMain(void *myid) {
         if (worker_el[id]->maxfd != -1) {
             io_worker_useless_fires = 0;
             int ev_processed = aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
-            worker_saw_fires = (ev_processed > 0);
             if (ev_processed > io_worker_useless_fires) processed += ev_processed - io_worker_useless_fires;
         }
 
@@ -448,13 +446,16 @@ static void *IOThreadMain(void *myid) {
             } else if (server.io_threads_ownership || worker_el[id]->maxfd != -1) {
                 /* Door-2 ownership: worker may hold client fds — or be assigned
                  * one by main at ANY moment (accept-time assignment). Blocking on
-                 * the mutex here loses that wakeup: we checked maxfd before the
-                 * fd arrived and would never re-check. GRADUATED yield: if the
-                 * sweep saw fires that were merely waiting on main (handoff in
-                 * flight), sleep short — main's turnaround is tens of µs and a
-                 * 1ms sleep would quantize every owned round-trip. Only when
-                 * the loop is truly quiet, sleep the full 1ms. */
-                usleep(worker_saw_fires ? 100 : 1000);
+                 * the mutex here loses that wakeup. And usleep-polling burns CPU
+                 * at density: 30 idle ownership servers measured 84% aggregate
+                 * CPU (vs 5% parked legacy) — enough to starve replies machine-
+                 * wide under the test harness (the "reconnect race"). Instead,
+                 * sleep IN the worker's epoll: instant wake on owned-fd activity,
+                 * ~zero idle cost. Bounded at 2ms so cross-thread queue jobs and
+                 * newly-migrated fds (registered by main via epoll_ctl — visible
+                 * to an in-progress epoll_wait) are picked up promptly. */
+                struct timeval tv = {0, 2000};
+                aePollDirect(worker_el[id], &tv);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
@@ -989,11 +990,16 @@ static void handleReadJobs(client **read_jobs, int read_count) {
     /* process each client */
     for (int i = 0; i < read_count; i++) {
         client *c = read_jobs[i];
-        if (c->owner_tid == 0) legacy_count++;
+        /* Discriminate by the STABLE per-read flag set at the submit/entry
+         * site, NOT by owner_tid: freeClient's detach and disownClient zero
+         * owner_tid while an owned handoff can still be queued here, which
+         * made this decrement fire for reads that never incremented the
+         * counter (underflow assert under accept/kill churn). */
+        if (!(c->read_flags & READ_FLAGS_OWNED_HANDOFF)) legacy_count++;
         processClientIOReadsDone(c);
     }
-    /* Only decrement for legacy (non-owned) clients — owned clients bypass
-     * stat_io_reads_pending on the submit side. */
+    /* Only decrement for legacy (offloaded) reads — owned-path handoffs
+     * bypass stat_io_reads_pending on the submit side. */
     server.stat_io_reads_pending -= legacy_count;
     serverAssert(server.stat_io_reads_pending >= 0);
 

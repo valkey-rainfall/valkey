@@ -2501,8 +2501,15 @@ int freeClientsInAsyncFreeQueue(void) {
         if (c->flag.protected || clientHasPendingIO(c)) continue;
 
         c->flag.close_asap = 0;
-        freeClient(c);
+        /* Door-2 ownership: remove the node BEFORE freeClient. An owned
+         * client's worker can re-arm pending IO between our check above and
+         * freeClient's own re-check (EOF'd fds are level-triggered and the
+         * worker reacts in microseconds) — freeClient then defers via
+         * freeClientAsync, which re-queues cleanly only if this stale node
+         * is already gone (otherwise: close_asap==0 + node listed = the
+         * double-add debug assert). */
         listDelNode(server.clients_to_close, ln);
+        freeClient(c);
         freed++;
     }
     return freed;
@@ -4463,6 +4470,12 @@ void readQueryFromClient(connection *conn) {
          * of a replicated client without repl_applied coordination →
          * networking.c qb_applied assert (found by hooks.tcl cluster leg). */
         c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+        /* Stable marker for the accounting on main's side: this read never
+         * incremented stat_io_reads_pending. owner_tid is NOT a safe
+         * discriminator there — freeClient's detach and disownClient zero it
+         * while this handoff can still be queued in the MPSC (found as a
+         * reads_pending underflow assert under accept/kill churn). */
+        c->read_flags |= READ_FLAGS_OWNED_HANDOFF;
         c->io_read_state = CLIENT_PENDING_IO;
         c->flag.pending_read = 1;
         connSetPostponeUpdateState(c->conn, 1);
@@ -6747,7 +6760,13 @@ void processClientIOReadsDone(client *c) {
     if (handleReadResult(c) == C_ERR) {
         /* EOF/read error: handleReadResult scheduled the free. Release the
          * owned read state so clientHasPendingIO clears and freeClient can
-         * actually run (otherwise: zombie client, no DISCONNECTED hook). */
+         * actually run (otherwise: zombie client, no DISCONNECTED hook).
+         * ALSO drop the read handler: an EOF'd fd is level-triggered
+         * perpetually readable, so the owner worker would re-fire and
+         * re-handoff this dying client in a tight loop until the async free
+         * lands (aeDeleteFileEvent takes the worker loop's AE_LOCK — safe
+         * from main). */
+        if (c->owner_tid != 0 && c->conn) connSetReadHandler(c->conn, NULL);
         DOOR2_RELEASE_OWNED_READ(c);
         return;
     }
