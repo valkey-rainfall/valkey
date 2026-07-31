@@ -2799,6 +2799,10 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+    /* D+ boundary: settle pending per-thread speculated-command counters
+     * into the stats we are about to clear — otherwise they survive the
+     * reset and fold in later (calls=101-vs-100 class of test failures). */
+    dplusAggregateStats();
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -6770,6 +6774,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "commandstats") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
+        /* D+ boundary: fold pending per-thread speculated counts in before
+         * rendering, so INFO sees commands whose replies were already sent
+         * (calls=10000-vs-10010 class of test failures). */
+        dplusAggregateStats();
         info = genValkeyInfoStringCommandStats(info, server.commands);
     }
 
