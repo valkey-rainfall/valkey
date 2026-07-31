@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "dplus.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -382,13 +383,33 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
-    if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
-        /* OK */
-    } else if (server.lazyfree_lazy_server_del) {
-        freeObjAsync(key, old, db->id);
-    } else {
-        decrRefCount(old);
+    /* D+ entry-lifetime: bump the shard version for ref-based replacement.
+     * Both branches above mutate the entry WITHOUT touching buckets, so
+     * hashtable.c's bump sites never fire — a concurrent speculative read
+     * of this key must fail validation (the in-place branch additionally
+     * tears type/encoding/ptr across three stores). */
+    {
+        int dict_index = getKVStoreIndexForKey(objectGetVal(key));
+        hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+        if (ht) {
+            dplusVersionArray *va = hashtableGetVersionArray(ht);
+            if (va) dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(hashtableSdsHash(objectGetVal(key))));
+        }
+    }
+
+    /* D+ entry-lifetime: defer the old object's free past walk quiescence
+     * (see entry-lifetime-design.md); routing recorded at defer time. */
+    int limbo_route = DPLUS_LIMBO_OFFLOAD_PREF;
+    if (server.lazyfree_lazy_server_del && lazyfreeShouldBeAsync(key, old, db->id)) limbo_route = DPLUS_LIMBO_ASYNC;
+    if (!dplusDeferFree(old, limbo_route)) {
+        /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
+        if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
+            /* OK */
+        } else if (server.lazyfree_lazy_server_del) {
+            freeObjAsync(key, old, db->id);
+        } else {
+            decrRefCount(old);
+        }
     }
     *valref = new;
 }
@@ -504,10 +525,16 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
+        /* D+ entry-lifetime: the unlinked object may still be read by an
+         * in-flight speculative walk — defer the free to the quiescence
+         * flush, recording the routing decision now (the effort heuristic
+         * needs the key). Falls back to immediate free when no walkers can
+         * exist. See entry-lifetime-design.md. */
         if (async) {
-            freeObjAsync(key, val, db->id);
+            int route = lazyfreeShouldBeAsync(key, val, db->id) ? DPLUS_LIMBO_ASYNC : DPLUS_LIMBO_SYNC;
+            if (!dplusDeferFree(val, route)) freeObjAsync(key, val, db->id);
         } else {
-            decrRefCount(val);
+            if (!dplusDeferFree(val, DPLUS_LIMBO_SYNC)) decrRefCount(val);
         }
 
         return 1;

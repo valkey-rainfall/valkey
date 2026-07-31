@@ -165,6 +165,16 @@ int dplusSpeculativeGet(struct client *c, void *key_sds, int resp);
 /* Component 2/5: IO-thread batch speculation (implemented in dplus.c).
  * Called from ioThreadReadQueryFromClient. Returns count of commands
  * speculatively completed. tid = IO thread index (1..N-1). */
+/* Quiescence-deferred reclamation (entry-lifetime-design.md). */
+#define DPLUS_LIMBO_SYNC 0
+#define DPLUS_LIMBO_ASYNC 1
+#define DPLUS_LIMBO_OFFLOAD_PREF 2
+#define DPLUS_LIMBO_RAW 3 /* zfree() at flush — bucket arrays etc. */
+int dplusDeferFree(struct serverObject *o, int route);
+int dplusDeferFreeRaw(void *ptr);
+void dplusFlushLimbo(void);
+size_t dplusLimboPeak(void);
+
 int dplusSpeculateBatch(struct client *c, int tid);
 
 /* Component 5: IO-thread consumption (implemented in dplus.c).

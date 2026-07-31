@@ -623,11 +623,13 @@ static void dismissRehashedBucketsIfNeeded(hashtable *ht) {
  * handle the cleanup of old buckets, such as clearing presence bits. */
 static void rehashStepFinalize(hashtable *ht) {
     size_t idx = ht->rehash_idx;
-    /* Free child bucket. */
+    /* Free child bucket. D+ entry-lifetime: defer past walk quiescence —
+     * incremental rehash steps run while walks are in flight (part-1's
+     * drain only covers rehash COMPLETION). */
     bucket *b = getChildBucket(ht->tables[0] + idx);
     while (b != NULL) {
         bucket *next = getChildBucket(b);
-        zfree(b);
+        if (!dplusDeferFreeRaw(b)) zfree(b);
         if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
         ht->child_buckets[0]--;
         b = next;
@@ -1021,7 +1023,10 @@ static void pruneLastBucket(hashtable *ht, bucket *before_last, bucket *last, in
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(before_last, ENTRIES_PER_BUCKET - 1, last, pos_in_last);
     }
-    zfree(last);
+    /* D+ entry-lifetime: a speculative walk may hold this chain bucket —
+     * defer the free past walk quiescence (falls back to zfree when no
+     * walkers can exist). See entry-lifetime-design.md. */
+    if (!dplusDeferFreeRaw(last)) zfree(last);
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
     ht->child_buckets[table_index]--;
 }

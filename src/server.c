@@ -1884,6 +1884,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * instantaneous metrics). One shared-line touch per event-loop, not
      * per-command. */
     dplusAggregateStats();
+    /* D+ entry-lifetime: free objects deferred past speculative-walk
+     * quiescence (one bounded drain, only when the limbo is non-empty). */
+    dplusFlushLimbo();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
