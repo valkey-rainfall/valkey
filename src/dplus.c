@@ -340,8 +340,18 @@ int dplusSpeculateBatch(client *c, int tid) {
      * were safe only because MULTI heads the batch; a GET arriving in a
      * LATER read while flag.multi is set would be speculated). Blocked /
      * just-unblocked clients must have replies ordered after the unblock
-     * reply. Cheap plain-byte tests, ordered before any atomics. */
-    if (c->flag.multi || c->flag.blocked || c->flag.unblocked) return 0;
+     * reply. Cheap plain-byte tests, ordered before any atomics.
+     *
+     * BUFFER-STATE GUARD: dplusWriteBulkReply appends RAW RESP to c->buf.
+     * If the buffer is in copy-avoidance ENCODED mode (header-framed
+     * payloads), raw bytes corrupt the framing — trackBufReferences walks
+     * off the payload chain ('ptr == buf + bufpos' assert; found by the
+     * fork's dataset tests mixing KEYS/HSET-encoded replies with speculated
+     * GETs). A non-empty reply list is equally disqualifying: new reply
+     * data belongs at the list tail, not in buf, or replies reorder. */
+    if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
+        c->flag.buf_encoded || listLength(c->reply) != 0)
+        return 0;
 
     /* ZERO-COST WRITE-BATCH EXIT: if the first command isn't even a GET,
      * return before touching any atomics or gate state. Eliminates the r100
@@ -578,26 +588,45 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
  * with no atomics needed on the server side. The IO threads only increment
  * their own counter (single-writer per slot), so a plain read + zero is
  * safe: worst case we miss a few commands this iteration and catch them
- * next time (bounded lag of one event-loop cycle, ~1ms). */
+ * next time (bounded lag of one event-loop cycle, ~1ms).
+ *
+ * BOUNDARY CALLERS (beyond beforeSleep): CONFIG RESETSTAT and INFO
+ * commandstats must call this too — otherwise pending per-thread counts
+ * survive a reset (stale +N folds in later) or are missing from a read
+ * (found by valkey-benchmark.tcl: calls=101 vs 100, calls=10000 vs 10010).
+ * For RESETSTAT the settle happens BEFORE the zeroing, absorbing pending
+ * counts into the stats about to be cleared. */
 void dplusAggregateStats(void) {
     /* Commandstats parity: speculated GETs bypass call(), which is where
      * cmd->calls / cmd->microseconds are normally incremented. Fold the
      * per-thread counters into the GET command here so INFO COMMANDSTATS
-     * (and everything downstream: LATENCY, tests, dashboards) sees them.
-     * Only GET is ever speculated, so a single target command suffices. */
+     * (and everything downstream) sees them. Only GET is ever speculated,
+     * so a single target command suffices.
+     *
+     * MONOTONIC-DELTA scheme (NOT add-and-zero): workers increment their
+     * slots concurrently with this fold; zeroing a slot from main races the
+     * worker's read-modify-write and PERMANENTLY loses counts (observed as
+     * calls=99-vs-100 once INFO/RESETSTAT-time folds made folding frequent).
+     * Workers' counters only ever grow; main folds the delta since its own
+     * last_seen snapshot. A racy read can only UNDER-read (missing the very
+     * latest increment), which the next fold picks up — never loses. */
+    static long long seen_calls[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_usec[DPLUS_MAX_IO_THREADS] = {0};
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
         long long n = dplus_thread_stats[i].commands_processed;
-        if (n > 0) {
-            server.stat_numcommands += n;
-            if (get_cmd) get_cmd->calls += n;
-            dplus_thread_stats[i].commands_processed = 0;
+        if (n > seen_calls[i]) {
+            long long delta = n - seen_calls[i];
+            seen_calls[i] = n;
+            server.stat_numcommands += delta;
+            if (get_cmd) get_cmd->calls += delta;
         }
         long long us = dplus_thread_stats[i].usec;
-        if (us > 0) {
-            if (get_cmd) get_cmd->microseconds += us;
-            dplus_thread_stats[i].usec = 0;
+        if (us > seen_usec[i]) {
+            long long delta = us - seen_usec[i];
+            seen_usec[i] = us;
+            if (get_cmd) get_cmd->microseconds += delta;
         }
     }
 }
