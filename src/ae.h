@@ -139,6 +139,9 @@ void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep);
 void aeSetCustomPollProc(aeEventLoop *eventLoop, aeCustomPollProc *custompoll);
 void aeSetPollProtect(aeEventLoop *eventLoop, int protect);
+void aeAcquireLock(aeEventLoop *eventLoop);
+void aeReleaseLock(aeEventLoop *eventLoop);
+int aeProcessEventsProtected(aeEventLoop *eventLoop, int flags);
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);
 int aeGetSetSize(aeEventLoop *eventLoop);
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);

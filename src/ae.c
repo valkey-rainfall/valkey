@@ -92,10 +92,16 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->aftersleep = NULL;
     eventLoop->custompoll = NULL;
     eventLoop->flags = 0;
-    /* Initialize the eventloop mutex with PTHREAD_MUTEX_ERRORCHECK type */
+    /* Initialize the eventloop mutex with PTHREAD_MUTEX_RECURSIVE type.
+     * Door-2 ownership: worker loops hold this lock across their whole
+     * poll+dispatch iteration (aeProcessEventsProtected) so that another
+     * thread can QUIESCE the loop (aeAcquireLock) before tearing down a
+     * client the dispatch might be touching. Recursive because callbacks
+     * running under the pump's lock legitimately re-enter ae (create/delete
+     * file events on their own loop). */
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     if (pthread_mutex_init(&eventLoop->poll_mutex, &attr) != 0) goto err;
 
     if (aeApiCreate(eventLoop) == -1) goto err;
@@ -393,6 +399,30 @@ int aePoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     return ret;
 }
 
+/* Door-2 ownership: quiesce/resume a protected event loop from another
+ * thread. While held, the loop's owner cannot be inside poll OR dispatch
+ * (aeProcessEventsProtected holds the same mutex across its whole
+ * iteration), so the caller may safely tear down clients whose callbacks
+ * run on this loop. No-ops for unprotected loops. */
+void aeAcquireLock(aeEventLoop *eventLoop) {
+    AE_LOCK(eventLoop);
+}
+
+void aeReleaseLock(aeEventLoop *eventLoop) {
+    AE_UNLOCK(eventLoop);
+}
+
+/* Lock-covered variant of aeProcessEvents for worker loops: the poll_mutex
+ * is held across poll AND event dispatch, so aeAcquireLock from another
+ * thread synchronizes with in-flight callbacks (not just registration).
+ * The pump uses AE_DONT_WAIT so the lock is never held while sleeping. */
+int aeProcessEventsProtected(aeEventLoop *eventLoop, int flags) {
+    AE_LOCK(eventLoop);
+    int ret = aeProcessEvents(eventLoop, flags);
+    AE_UNLOCK(eventLoop);
+    return ret;
+}
+
 /* Process every pending file event, then every pending time event
  * (that may be registered by file event callbacks just processed).
  * Without special flags the function sleeps until some file event
@@ -459,6 +489,15 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
 
         for (j = 0; j < numevents; j++) {
             int fd = eventLoop->fired[j].fd;
+            /* Protected loops (door-2 worker pumps): hold the lock across
+             * this fd's callback dispatch. Another thread tearing down a
+             * client (freeClient/disown) acquires the same lock, so after
+             * aeAcquireLock returns no callback is in flight — and the
+             * fe->mask recheck below runs under the lock, so an event the
+             * teardown deleted can no longer fire. Per-fd granularity keeps
+             * the other thread's wait bounded by ONE callback, not a whole
+             * sweep. No-op (flag unset) for main's loop. */
+            AE_LOCK(eventLoop);
             aeFileEvent *fe = &eventLoop->events[fd];
             int mask = eventLoop->fired[j].mask;
             int fired = 0; /* Number of events fired for current fd. */
@@ -505,6 +544,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
                     fired++;
                 }
             }
+            AE_UNLOCK(eventLoop);
 
             processed++;
         }

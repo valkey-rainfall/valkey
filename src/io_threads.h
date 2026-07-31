@@ -40,5 +40,6 @@ int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
 struct aeEventLoop *ioGetWorkerEventLoop(int tid);
+void ioWorkerCountUselessFire(void);
 
 #endif /* IO_THREADS_H */

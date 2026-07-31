@@ -15,6 +15,10 @@
 
 static _Thread_local int thread_id = 0;
 static _Thread_local mpscTicket io_thread_ticket = {0};
+/* Door-2: count of event-loop fires that did no useful work this pump
+ * iteration (owned client still waiting on main). Pump reads+resets to
+ * decide backoff. Thread-local: each worker counts only its own fires. */
+static _Thread_local int io_worker_useless_fires = 0;
 /* Backlog of responses when io_shared_outbox is full. Should be rare. */
 static _Thread_local list *pending_io_responses = NULL;
 static pthread_t io_threads[IO_THREADS_MAX_NUM] = {0};
@@ -348,6 +352,7 @@ static void *IOThreadMain(void *myid) {
     thread_id = (int)id;
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
+    int worker_saw_fires = 0; /* Door-2: last sweep saw (possibly useless) fires */
     monotime work_start_time = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
@@ -417,11 +422,23 @@ static void *IOThreadMain(void *myid) {
         }
 
         /* Door-2 infrastructure: pump the per-worker event loop if it has
-         * any registered fds. With no fds (this slice), this is a no-op —
-         * the maxfd == -1 check short-circuits before any syscall. */
+         * any registered fds. With no fds, the maxfd == -1 check
+         * short-circuits before any syscall. Teardown safety comes from
+         * PER-FD dispatch locking inside aeProcessEvents (AE_PROTECT_POLL):
+         * main's aeAcquireLock waits at most one callback, and events
+         * deleted by a teardown can't fire afterwards (fe->mask recheck
+         * runs under the lock).
+         *
+         * BACKOFF: a fire whose client is still waiting on main (handoff in
+         * flight) does no work — level-triggered epoll re-fires it every
+         * sweep until main finishes. Counting those as "processed" makes
+         * this loop spin hot. Only count fires that did real work; an
+         * all-useless sweep falls through to the idle usleep below. */
         if (worker_el[id]->maxfd != -1) {
+            io_worker_useless_fires = 0;
             int ev_processed = aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
-            processed += ev_processed;
+            worker_saw_fires = (ev_processed > 0);
+            if (ev_processed > io_worker_useless_fires) processed += ev_processed - io_worker_useless_fires;
         }
 
         /* If both queues were empty (no processing done), wait for signal. */
@@ -432,9 +449,12 @@ static void *IOThreadMain(void *myid) {
                 /* Door-2 ownership: worker may hold client fds — or be assigned
                  * one by main at ANY moment (accept-time assignment). Blocking on
                  * the mutex here loses that wakeup: we checked maxfd before the
-                 * fd arrived and would never re-check. Yield 1ms then re-poll.
-                 * Under load this branch never fires (processed > 0). */
-                usleep(1000);
+                 * fd arrived and would never re-check. GRADUATED yield: if the
+                 * sweep saw fires that were merely waiting on main (handoff in
+                 * flight), sleep short — main's turnaround is tens of µs and a
+                 * 1ms sleep would quantize every owned round-trip. Only when
+                 * the loop is truly quiet, sleep the full 1ms. */
+                usleep(worker_saw_fires ? 100 : 1000);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
@@ -518,6 +538,10 @@ void killIOThreads(void) {
     for (int j = 1; j < server.io_threads_num; j++) { /* We don't kill thread 0, which is the main thread. */
         shutdownIOThread(j);
     }
+}
+
+void ioWorkerCountUselessFire(void) {
+    io_worker_useless_fires++;
 }
 
 /* Return the per-worker event loop for the given thread ID.

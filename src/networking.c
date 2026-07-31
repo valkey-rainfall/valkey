@@ -391,6 +391,12 @@ client *createClient(connection *conn) {
 
 void installClientWriteHandler(client *c) {
     int ae_barrier = 0;
+    /* Door-2 ownership: the write handler (sendReplyToClient → writeToClient)
+     * runs main-only reply machinery. For an owned client, conn->el is the
+     * worker's loop — the handler would fire ON THE WORKER. Disown first
+     * (partial writes / slow clients are rare; such a client degrades to the
+     * legacy path permanently, which handles retry natively). */
+    if (c->owner_tid != 0 && inMainThread()) disownClient(c);
     /* For the fsync=always policy, we want that a given FD is never
      * served for reading and writing in the same event loop iteration,
      * so that in the middle of receiving the query, and serving it
@@ -2153,6 +2159,30 @@ void clearClientConnectionState(client *c) {
 int freeClient(client *c) {
     listNode *ln;
 
+    /* Door-2 ownership: detach an owned client from its worker's event loop
+     * FIRST — under the loop lock (synchronizes with the worker's pump, which
+     * holds it across poll+dispatch), delete the read event so the worker can
+     * never fire for this client again. Without this, the worker could start
+     * a fresh read between our pending-IO check below and the conn teardown
+     * (state was IDLE at fire time) — a use-after-free. In-flight work
+     * (PENDING/COMPLETED states, queued MPSC responses) is handled by the
+     * existing deferral below: clientHasPendingIO → freeClientAsync retries
+     * after IO settles. */
+    if (c->owner_tid != 0 && inMainThread()) {
+        aeEventLoop *worker_loop = ioGetWorkerEventLoop(c->owner_tid);
+        if (worker_loop) {
+            aeAcquireLock(worker_loop);
+            if (c->conn) {
+                connSetReadHandler(c->conn, NULL); /* deletes from worker loop via conn->el */
+                c->conn->el = NULL;
+            }
+            c->owner_tid = 0;
+            aeReleaseLock(worker_loop);
+        } else {
+            c->owner_tid = 0;
+        }
+    }
+
     /* If a client is protected, yet we need to free it right now, make sure
      * to at least use asynchronous freeing. */
     if (c->flag.protected || c->flag.protected_rdb_channel || clientHasPendingIO(c)) {
@@ -2371,8 +2401,23 @@ void beforeNextClient(client *c) {
     /* Door-2 ownership: main is done touching this client — release it back
      * to its owning worker. Must be a release store so the worker's acquire
      * of io_read_state observes all of main's writes to the client structs.
-     * (Counterpart of the deferred release in processClientIOReadsDone.) */
+     * (Counterpart of the deferred release in processClientIOReadsDone.)
+     *
+     * PUNT-ALL POLICY: if command execution moved the client into a complex
+     * state — MULTI (subsequent commands must reply +QUEUED, but the worker
+     * would speculate GETs), blocked (replies must be ordered after the
+     * unblock reply), pubsub/tracking/monitor/replica (main asynchronously
+     * writes into the client's buffers, racing the worker's speculation and
+     * local-write path) — DISOWN it first: permanently migrate it back to
+     * main's loop as a legacy client. Simple request/response clients (the
+     * hot path) stay owned. */
     if (c->owner_tid != 0 && c->io_read_state == CLIENT_COMPLETED_IO) {
+        if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
+            c->flag.monitor || c->flag.replica || c->flag.primary ||
+            c->flag.tracking || c->flag.close_after_reply ||
+            c->pubsub_data != NULL) { /* lazily allocated on first pubsub/tracking use */
+            disownClient(c);
+        }
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
     }
@@ -4404,15 +4449,13 @@ void readQueryFromClient(connection *conn) {
          * re-fires this event, so deferring loses nothing. */
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE ||
             c->flag.pending_write) {
-            serverLog(LL_DEBUG, "Door-2 SKIP read: client id=%llu owner=%d "
-                "io_read=%d io_write=%d tid=%d",
-                (unsigned long long)c->id, c->owner_tid,
-                c->io_read_state, c->io_write_state, getCurTid());
+            /* Level-triggered epoll will re-fire while we wait for main —
+             * count the useless fire so the pump can back off (release its
+             * lock + usleep) instead of spinning a hot sweep loop that
+             * starves main of AE_LOCK on this loop. */
+            ioWorkerCountUselessFire();
             return;
         }
-        serverLog(LL_DEBUG, "Door-2 ENTER read: client id=%llu owner=%d tid=%d "
-            "conn_state=%d", (unsigned long long)c->id, c->owner_tid,
-            getCurTid(), connGetState(c->conn));
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
         c->io_read_state = CLIENT_PENDING_IO;
@@ -6589,6 +6632,45 @@ int postponeClientRead(client *c) {
     if (ProcessingEventsWhileBlocked) return 0;
 
     return (trySendReadToIOThreads(c) == C_OK);
+}
+
+/* Door-2 ownership: DISOWN a worker-owned client — migrate it back to main's
+ * event loop and clear owner_tid. The inverse of the accept-time migration.
+ * MUST be called from the main thread.
+ *
+ * Used when a client leaves the simple request/response world (blocked,
+ * pubsub, MONITOR, becomes a replica, MULTI, tracking) — states where main
+ * asynchronously writes into the client's buffers, which would race with the
+ * owning worker's speculation/local-write path. Once disowned, the client is
+ * a plain legacy client (owner_tid == 0) forever: reads dispatch via the
+ * SPMC offload like any other client. This is the "punt-all" policy from the
+ * design doc, implemented as permanent ownership transfer rather than a
+ * per-command punt protocol.
+ *
+ * Safety: aeAcquireLock on the worker's loop synchronizes with its pump,
+ * which holds the same mutex across poll+dispatch — after acquiring, the
+ * worker cannot be inside any callback for this (or any) client on that
+ * loop. The worker may still hold the client via a QUEUED cross-thread job
+ * (io_read_state/io_write_state PENDING_IO) — callers must have waited for
+ * IDLE/COMPLETED first (we assert). */
+void disownClient(client *c) {
+    if (c->owner_tid == 0) return;
+    serverAssert(inMainThread());
+    serverAssert(c->io_read_state != CLIENT_PENDING_IO && c->io_write_state != CLIENT_PENDING_IO);
+
+    aeEventLoop *worker_loop = ioGetWorkerEventLoop(c->owner_tid);
+    serverAssert(worker_loop != NULL);
+    aeAcquireLock(worker_loop);
+    /* Under the lock: the worker is not dispatching. Move the fd. */
+    if (c->conn && connHasReadHandler(c->conn)) {
+        connSetReadHandler(c->conn, NULL); /* deletes from worker_loop (conn->el) */
+        c->conn->el = NULL;                /* NULL = server.el default */
+        connSetReadHandler(c->conn, readQueryFromClient); /* registers on main's loop */
+    } else if (c->conn) {
+        c->conn->el = NULL;
+    }
+    c->owner_tid = 0;
+    aeReleaseLock(worker_loop);
 }
 
 void processClientIOReadsDone(client *c) {
