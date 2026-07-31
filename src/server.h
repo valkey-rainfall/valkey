@@ -3821,6 +3821,7 @@ size_t lazyfreeGetPendingObjectsCount(void);
 size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
+uint64_t hashtableSdsHash(const void *key); /* defined in server.c; used by db.c dplus bump */
 void lazyfreeObjPrejudged(robj *obj);
 int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
