@@ -505,10 +505,26 @@ static void swapTables(hashtable *ht) {
 static void rehashingCompleted(hashtable *ht) {
     if (ht->type->rehashingCompleted) ht->type->rehashingCompleted(ht);
     if (ht->tables[0]) {
+        /* D+ EXPIRY-RACE FIX: a worker-side speculative walk
+         * (dplusSpeculateBatch → hashtableIncrementalFindInit/Step) may hold
+         * pointers into this bucket array RIGHT NOW — the seqlock versions
+         * validate results, not the walk's memory safety. Drain in-flight
+         * speculation and punt new attempts until the free+swap completes.
+         * Sub-µs when no walk is in flight; bounded by one GET otherwise.
+         * Rehash completion is rare relative to ops — perf-neutral.
+         * Found by the PX 5-10 expiry gauntlet leg: SIGSEGV in
+         * hashtableIncrementalFindStep under mass expiry, BOTH ownership
+         * modes (pre-existing D+ lineage bug). */
+        dplusExclusiveEnter();
         zfree(ht->tables[0]);
         if (ht->type->trackMemUsage) {
             ht->type->trackMemUsage(ht, -sizeof(bucket) * numBuckets(ht->bucket_exp[0]));
         }
+        swapTables(ht);
+        resetTable(ht, 1);
+        ht->rehash_idx = -1;
+        dplusExclusiveLeave();
+        return;
     }
 
     swapTables(ht);
@@ -1398,6 +1414,12 @@ hashtable *hashtableCreate(hashtableType *type) {
 /* Deletes all the entries. If a callback is provided, it is called from time
  * to time to indicate progress. */
 void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
+    /* D+ EXPIRY-RACE FIX (same class as rehashingCompleted): this frees both
+     * bucket arrays; a worker speculative walk may hold pointers into them.
+     * Exclusive mode is COUNTER-based, so this nests safely inside
+     * FLUSHALL's existing exclusive window and is safe from the BIO
+     * lazyfree thread concurrently with main. */
+    dplusExclusiveEnter();
     if (hashtableIsRehashing(ht)) {
         /* Pretend rehashing completed. */
         if (ht->type->rehashingCompleted) ht->type->rehashingCompleted(ht);
@@ -1440,6 +1462,7 @@ void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
         }
         resetTable(ht, table_index);
     }
+    dplusExclusiveLeave();
 }
 
 /* Deletes all the entries and frees the table. */

@@ -24,12 +24,26 @@ dplusStats dplus_stats = {0};
 
 /* --- Component 4: Exclusive mode implementation --- */
 
+/* Exclusive mode is a COUNTER, not a flag (changed for the expiry-race fix):
+ * hashtable teardown paths (rehashingCompleted / hashtableEmpty) now enter
+ * exclusive mode, and they can run NESTED inside an existing exclusive
+ * window (FLUSHALL's proc is already wrapped) or from a BIO lazyfree thread
+ * CONCURRENTLY with main. fetch_add/fetch_sub keeps every window intact;
+ * workers punt while the counter is nonzero (their existing nonzero-true
+ * load needs no change). Every enterer spin-drains — trivially fast when a
+ * nested/concurrent enterer already drained (flags stay 0 while count>0). */
 void dplusExclusiveEnter(void) {
-    /* Set exclusive mode with seq_cst to ensure visibility to all IO threads. */
-    atomic_store_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
+    atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
+    /* No IO threads => no speculation to drain. Also makes this BOOT-SAFE:
+     * hashtable teardown paths call here during earliest init (command-table
+     * dict rehash), before the monotonic clock is initialized — the fast
+     * paths below must not touch getMonotonicUs() unless a walk flag is
+     * actually set (impossible before workers exist). */
+    if (server.io_threads_num <= 1) return;
     /* Spin until no IO thread is in a speculative read. Bounded by one GET
      * execution time (sub-microsecond). */
     for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        if (!atomic_load_explicit(&dplus_in_speculative_read[i], memory_order_seq_cst)) continue;
         monotime _w = getMonotonicUs();
         while (atomic_load_explicit(&dplus_in_speculative_read[i], memory_order_seq_cst)) {
             /* Spin — bounded by single GET latency. */
@@ -39,7 +53,7 @@ void dplusExclusiveEnter(void) {
 }
 
 void dplusExclusiveLeave(void) {
-    atomic_store_explicit(&dplus_exclusive_mode, 0, memory_order_seq_cst);
+    atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 }
 
 /* --- Component 2: Speculative GET — reply helpers --- */
