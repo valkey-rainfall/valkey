@@ -320,6 +320,15 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* Early exit: speculation disabled (single-threaded or cluster mode). */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
+    /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
+     * execute only at EXEC — speculating a GET here would execute it early
+     * and strand it from the transaction (real bug: pipelined MULTI batches
+     * were safe only because MULTI heads the batch; a GET arriving in a
+     * LATER read while flag.multi is set would be speculated). Blocked /
+     * just-unblocked clients must have replies ordered after the unblock
+     * reply. Cheap plain-byte tests, ordered before any atomics. */
+    if (c->flag.multi || c->flag.blocked || c->flag.unblocked) return 0;
+
     /* ZERO-COST WRITE-BATCH EXIT: if the first command isn't even a GET,
      * return before touching any atomics or gate state. Eliminates the r100
      * write-tax (2 seq_cst ops + gate history shift cost on pure-write batches).
