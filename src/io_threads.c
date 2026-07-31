@@ -678,6 +678,14 @@ int trySendReadToIOThreads(client *c) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* Door-2 ownership: owned clients must NEVER enter the SPSC write-offload
+     * path. Their writes happen either worker-locally (WRITE_FLAGS_OWNED_LOCAL
+     * in the owned read path) or synchronously on main under the owner
+     * worker's loop lock (handleClientsWithPendingWrites). Routing them here
+     * would create a third concurrent writer on an arbitrary IO thread that
+     * neither protocol synchronizes with: double JOB_RES_WRITE_CLIENT events
+     * (networking.c:3392 assert) and racing socket writes. */
+    if (c->owner_tid != 0) return C_ERR;
     /* The I/O thread is already writing for this client. */
     if (c->io_write_state != CLIENT_IDLE) return C_OK;
     if (c->io_read_state == CLIENT_PENDING_IO) return C_ERR;

@@ -3390,24 +3390,54 @@ parseResult handleParseResults(client *c) {
 void processClientIOWriteDone(client *c) {
     if (c->io_write_state == CLIENT_IDLE) return; /* Already handled */
     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
-    c->io_write_state = CLIENT_IDLE;
+    /* Door-2 ownership: IDLE is the worker's green light — its dispatch
+     * deferral guard reads io_write_state and starts the next owned-local
+     * write the moment it sees IDLE. Publishing IDLE at the top (legacy
+     * order) lets the worker's write #2 race the postWriteToClient
+     * consumption of write #1's fields (nwritten, io_last_bufpos) below.
+     * For owned clients, consume first, publish IDLE last; when replies
+     * remain, queue BEFORE the green light (the worker defers on
+     * pending_write || !IDLE). Legacy clients keep the original order —
+     * their next write is main-initiated, no concurrent observer.
+     * KNOWN REMAINING (V3 catalog): these are plain stores observed by the
+     * worker's plain loads — needs C11 atomic accessors on the owned
+     * handshake fields for ARM-sound publication ordering. A lock here was
+     * tried and rejected: it serialized main's done-batch against worker
+     * dispatch and produced multi-minute reply-tail stalls under TSan. */
+    int owned = (c->owner_tid != 0);
+    if (!owned) c->io_write_state = CLIENT_IDLE;
 
     /* Don't post-process-writes to clients that are going to be closed anyway. */
-    if (c->flag.close_asap) return;
+    if (c->flag.close_asap) {
+        if (owned) c->io_write_state = CLIENT_IDLE;
+        return;
+    }
 
 
     connSetPostponeUpdateState(c->conn, 0);
     connUpdateState(c->conn);
     if (postWriteToClient(c) == C_ERR) {
+        if (owned) c->io_write_state = CLIENT_IDLE;
         return;
     }
 
-    if (!clientHasPendingReplies(c)) return;
+    if (!clientHasPendingReplies(c)) {
+        if (owned) c->io_write_state = CLIENT_IDLE;
+        return;
+    }
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
          * able to write everything in one go. */
+        if (owned) c->io_write_state = CLIENT_IDLE;
         installClientWriteHandler(c);
+    } else if (owned) {
+        /* Owned client with replies still pending: queue it BEFORE publishing
+         * IDLE — the worker defers on (pending_write || !IDLE), so the flag
+         * must be visible before the green light or it can start an
+         * owned-local write of a buffer main still intends to flush. */
+        putClientInPendingWriteQueue(c);
+        c->io_write_state = CLIENT_IDLE;
     } else {
         /* If we can send the client to the I/O thread, let it handle the write. */
         if (trySendWriteToIOThreads(c) == C_OK) return;
@@ -3441,27 +3471,56 @@ int handleClientsWithPendingWrites(void) {
 
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
 
+        /* Door-2 ownership: main flushing an owned client's replies races the
+         * owner worker's dispatch (speculation writes into c->buf; the worker's
+         * deferral guard reads pending_write + io_write_state as two separate
+         * non-atomic flags — the clear-then-write window below is exactly the
+         * gap it can slip through). Take the owner worker's loop lock for the
+         * whole flush: the worker's per-fd dispatch takes the same lock, so
+         * the read-vs-flush interleaving becomes impossible rather than
+         * merely improbable. Uncontended cost is one atomic pair; contended
+         * cost is bounded by one dispatch callback (the slice-4 argument). */
+        aeEventLoop *owner_loop = NULL;
+        if (c->owner_tid != 0) {
+            owner_loop = ioGetWorkerEventLoop(c->owner_tid);
+            if (owner_loop) aeAcquireLock(owner_loop);
+        }
+
         c->flag.pending_write = 0;
         listUnlinkNode(server.clients_pending_write, ln);
 
-        if (!clientHasPendingReplies(c)) continue;
+        if (!clientHasPendingReplies(c)) {
+            if (owner_loop) aeReleaseLock(owner_loop);
+            continue;
+        }
 
-        /* If we can send the client to the I/O thread, let it handle the write. */
-        if (trySendWriteToIOThreads(c) == C_OK) continue;
+        /* If we can send the client to the I/O thread, let it handle the write.
+         * (Owned clients never take this path — guarded in the callee.) */
+        if (trySendWriteToIOThreads(c) == C_OK) {
+            if (owner_loop) aeReleaseLock(owner_loop);
+            continue;
+        }
 
         /* We can't write to the client while IO operation is in progress. */
-        if (c->io_write_state != CLIENT_IDLE) continue;
+        if (c->io_write_state != CLIENT_IDLE) {
+            if (owner_loop) aeReleaseLock(owner_loop);
+            continue;
+        }
 
         processed++;
 
         /* Try to write buffers to the client socket. */
-        if (writeToClient(c) == C_ERR) continue;
+        if (writeToClient(c) == C_ERR) {
+            if (owner_loop) aeReleaseLock(owner_loop);
+            continue;
+        }
 
         /* If after the synchronous writes above we still have data to
          * output to the client, we need to install the writable handler. */
         if (clientHasPendingReplies(c)) {
             installClientWriteHandler(c);
         }
+        if (owner_loop) aeReleaseLock(owner_loop);
     }
     return processed;
 }
