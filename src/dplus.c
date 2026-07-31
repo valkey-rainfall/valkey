@@ -353,6 +353,12 @@ int dplusSpeculateBatch(client *c, int tid) {
         c->flag.buf_encoded || listLength(c->reply) != 0)
         return 0;
 
+    /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
+     * the originals outside the limbo hooks — reads racing a move are the
+     * same UAF class. Punt speculation while defrag is running (rare,
+     * default-off feature; costs nothing otherwise). */
+    if (server.active_defrag_cpu_percent > 0) return 0;
+
     /* ZERO-COST WRITE-BATCH EXIT: if the first command isn't even a GET,
      * return before touching any atomics or gate state. Eliminates the r100
      * write-tax (2 seq_cst ops + gate history shift cost on pure-write batches).
@@ -629,6 +635,115 @@ void dplusAggregateStats(void) {
             if (get_cmd) get_cmd->microseconds += delta;
         }
     }
+}
+
+/* --- Component 7: Quiescence-deferred reclamation (entry lifetime) ---
+ *
+ * See entry-lifetime-design.md. Worker speculation reads hashtable entry
+ * memory (key compare in the walk, value copy, robj field reads) that main
+ * frees on delete/expiry/overwrite. Copy-then-validate discards stale
+ * RESULTS but still LOADS from freed memory — UB that was benign only while
+ * jemalloc kept pages mapped (mass expiry unmapped one: SIGSEGV in
+ * dictSdsKeyCompare, both ownership modes).
+ *
+ * Scheme: db->keys mutation paths defer robj frees onto this main-thread
+ * limbo list instead of freeing. beforeSleep flushes: one bounded
+ * exclusive-mode drain (workers' walks are sub-µs and announced via
+ * dplus_in_speculative_read), then the swapped-out list is freed OUTSIDE
+ * the window — preserving the original sync/lazyfree routing per object.
+ * A pointer reachable by any walk is thus never freed until every walk
+ * that could have observed it has completed. */
+
+typedef struct dplusLimboEntry {
+    robj *o;
+    uint8_t route; /* DPLUS_LIMBO_SYNC / _ASYNC / _OFFLOAD_PREF */
+} dplusLimboEntry;
+
+static dplusLimboEntry *dplus_limbo = NULL;
+static size_t dplus_limbo_len = 0;
+static size_t dplus_limbo_cap = 0;
+static size_t dplus_limbo_peak = 0; /* high-water for INFO/tests */
+
+/* Defer an robj free until the next quiescence flush. Returns 1 if deferred,
+ * 0 if the caller should free immediately (no walkers can exist). Callers
+ * pass the object AFTER unlinking it from the table, so no NEW walk can
+ * reach it; only in-flight walks might hold it.
+ *
+ * route preserves the caller's free-path choice, DECIDED AT DEFER TIME
+ * (lazyfree's effort heuristic needs the key, which is gone by flush time):
+ *   DPLUS_LIMBO_SYNC          decrRefCount at flush
+ *   DPLUS_LIMBO_ASYNC         hand to BIO lazyfree at flush (pre-judged)
+ *   DPLUS_LIMBO_OFFLOAD_PREF  prefer IO-thread free offload, else sync */
+int dplusDeferFree(robj *o, int route) {
+    /* No IO threads => no speculative walkers => immediate free is safe.
+     * (Also keeps single-threaded perf and boot paths untouched.) */
+    if (server.io_threads_num <= 1) return 0;
+    if (dplus_limbo_len == dplus_limbo_cap) {
+        dplus_limbo_cap = dplus_limbo_cap ? dplus_limbo_cap * 2 : 128;
+        dplus_limbo = zrealloc(dplus_limbo, dplus_limbo_cap * sizeof(dplusLimboEntry));
+    }
+    dplus_limbo[dplus_limbo_len].o = o;
+    dplus_limbo[dplus_limbo_len].route = (uint8_t)route;
+    dplus_limbo_len++;
+    if (dplus_limbo_len > dplus_limbo_peak) dplus_limbo_peak = dplus_limbo_len;
+    return 1;
+}
+
+/* Raw-pointer variant: zfree at flush. For non-robj memory a walk can hold —
+ * child BUCKETS freed by delete-path chain compaction (pruneLastBucket) and
+ * per-step rehash cleanup (rehashStepFinalize). Part 1 only drained
+ * whole-table frees; these incremental frees were the residual escape
+ * (OFF-mode expiry-leg crash: walker held a chain bucket while main's
+ * expiry delete compacted it away). */
+int dplusDeferFreeRaw(void *ptr) {
+    if (server.io_threads_num <= 1) return 0;
+    if (dplus_limbo_len == dplus_limbo_cap) {
+        dplus_limbo_cap = dplus_limbo_cap ? dplus_limbo_cap * 2 : 128;
+        dplus_limbo = zrealloc(dplus_limbo, dplus_limbo_cap * sizeof(dplusLimboEntry));
+    }
+    dplus_limbo[dplus_limbo_len].o = (robj *)ptr;
+    dplus_limbo[dplus_limbo_len].route = DPLUS_LIMBO_RAW;
+    dplus_limbo_len++;
+    if (dplus_limbo_len > dplus_limbo_peak) dplus_limbo_peak = dplus_limbo_len;
+    return 1;
+}
+
+/* Flush the limbo list. Called from beforeSleep (main). The drain is bounded
+ * by one in-flight speculation batch (sub-µs); the frees happen outside the
+ * exclusive window and follow each object's recorded route, so lazyfree/BIO
+ * and IO-thread offload behave exactly as an immediate free would have. */
+void dplusFlushLimbo(void) {
+    if (dplus_limbo_len == 0) return;
+    dplusLimboEntry *batch = dplus_limbo;
+    size_t n = dplus_limbo_len;
+    /* Detach so any re-entrant defer starts a fresh list rather than
+     * mutating the one being flushed. */
+    dplus_limbo = NULL;
+    dplus_limbo_len = 0;
+    dplus_limbo_cap = 0;
+
+    dplusExclusiveEnter();
+    /* All in-flight walks have completed; new speculation punts until Leave.
+     * Nothing to do inside the window — the objects are already unlinked;
+     * the drain itself is the synchronization. */
+    dplusExclusiveLeave();
+
+    for (size_t i = 0; i < n; i++) {
+        robj *o = batch[i].o;
+        switch (batch[i].route) {
+        case DPLUS_LIMBO_OFFLOAD_PREF:
+            if (tryOffloadFreeObjToIOThreads(o) == C_OK) break;
+            /* fall through to sync */
+        case DPLUS_LIMBO_SYNC: decrRefCount(o); break;
+        case DPLUS_LIMBO_ASYNC: lazyfreeObjPrejudged(o); break;
+        case DPLUS_LIMBO_RAW: zfree(o); break;
+        }
+    }
+    zfree(batch);
+}
+
+size_t dplusLimboPeak(void) {
+    return dplus_limbo_peak;
 }
 
 /* --- Component 6: INFO section --- */

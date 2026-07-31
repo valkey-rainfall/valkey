@@ -3810,6 +3810,8 @@ size_t lazyfreeGetPendingObjectsCount(void);
 size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
+void lazyfreeObjPrejudged(robj *obj);
+int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
 void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
 void dbUntrackKeyWithVolatileItems(serverDb *db, robj *o);
