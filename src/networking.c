@@ -4458,6 +4458,11 @@ void readQueryFromClient(connection *conn) {
         }
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+        /* FLAG PARITY with trySendReadToIOThreads: without the REPLICATED
+         * flag, ioThreadReadQueryFromClient's done-path trims the querybuf
+         * of a replicated client without repl_applied coordination →
+         * networking.c qb_applied assert (found by hooks.tcl cluster leg). */
+        c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
         c->io_read_state = CLIENT_PENDING_IO;
         c->flag.pending_read = 1;
         connSetPostponeUpdateState(c->conn, 1);
@@ -6697,15 +6702,35 @@ void processClientIOReadsDone(client *c) {
      * the worker read+parse into the same client structs while main executes
      * the previous batch — a data race (design-doc §D bug pattern). Owned
      * clients are released in beforeNextClient() after execution completes.
-     * Legacy (owner_tid == 0) clients keep the original early release. */
+     * Legacy (owner_tid == 0) clients keep the original early release.
+     *
+     * ZOMBIE HAZARD: every early `return` below that skips command execution
+     * ALSO skips beforeNextClient — an owned client stuck at COMPLETED_IO
+     * makes clientHasPendingIO() true forever, so freeClientAsync re-defers
+     * infinitely: no DISCONNECTED module hook, phantom connected_clients
+     * (found by moduleapi hooks.tcl in the gate battery). Each early stop
+     * must release via DOOR2_RELEASE_OWNED_READ first. */
+#define DOOR2_RELEASE_OWNED_READ(cl)                                        \
+    do {                                                                    \
+        if ((cl)->owner_tid != 0 && (cl)->io_read_state == CLIENT_COMPLETED_IO) { \
+            atomic_thread_fence(memory_order_release);                      \
+            (cl)->io_read_state = CLIENT_IDLE;                              \
+        }                                                                   \
+    } while (0)
     if (c->owner_tid == 0) c->io_read_state = CLIENT_IDLE;
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
-    if (c->flag.close_asap) return;
+    if (c->flag.close_asap) {
+        DOOR2_RELEASE_OWNED_READ(c);
+        return;
+    }
 
     /* If a client is protected, don't do anything,
      * that may trigger read/write error or recreate handler. */
-    if (c->flag.protected) return;
+    if (c->flag.protected) {
+        DOOR2_RELEASE_OWNED_READ(c);
+        return;
+    }
 
     /* Save the current conn state, as connUpdateState may modify it */
     int in_accept_state = (connGetState(c->conn) == CONN_STATE_ACCEPTING);
@@ -6713,10 +6738,17 @@ void processClientIOReadsDone(client *c) {
     connUpdateState(c->conn);
 
     /* In accept state, no client's data was read - stop here. */
-    if (in_accept_state) return;
+    if (in_accept_state) {
+        DOOR2_RELEASE_OWNED_READ(c);
+        return;
+    }
 
     /* On read error - stop here. */
     if (handleReadResult(c) == C_ERR) {
+        /* EOF/read error: handleReadResult scheduled the free. Release the
+         * owned read state so clientHasPendingIO clears and freeClient can
+         * actually run (otherwise: zombie client, no DISCONNECTED hook). */
+        DOOR2_RELEASE_OWNED_READ(c);
         return;
     }
 
@@ -6724,12 +6756,14 @@ void processClientIOReadsDone(client *c) {
         parseResult res = handleParseResults(c);
         /* On parse error - stop here. */
         if (res == PARSE_ERR) {
+            DOOR2_RELEASE_OWNED_READ(c);
             return;
         } else if (res == PARSE_NEEDMORE) {
             beforeNextClient(c);
             return;
         }
     }
+#undef DOOR2_RELEASE_OWNED_READ
 
     if (c->argc > 0) {
         c->flag.pending_command = 1;
