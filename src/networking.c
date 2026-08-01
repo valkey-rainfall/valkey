@@ -2470,7 +2470,17 @@ void beforeNextClient(client *c) {
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
-        trySendWriteToIOThreads(c);
+        if (trySendWriteToIOThreads(c) == C_ERR && c->owner_tid != 0 && clientHasPendingReplies(c) &&
+            !c->flag.pending_write) {
+            /* Owned client (guarded out of the SPSC offload) whose replies
+             * were produced on the SPECULATED path — that path fills c->buf
+             * without prepareClientToWrite, so the queue-on-first-reply edge
+             * never fired on main and nothing else will flush this buffer:
+             * pre-guard, this trySend call was the flush; found by the V4
+             * differential fuzzer as a permanent 0%-CPU reply wedge. Queue it
+             * for the beforeSleep flush (which takes the owner-worker lock). */
+            putClientInPendingWriteQueue(c);
+        }
     }
 }
 
