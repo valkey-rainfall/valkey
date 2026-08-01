@@ -3390,6 +3390,16 @@ parseResult handleParseResults(client *c) {
 void processClientIOWriteDone(client *c) {
     if (c->io_write_state == CLIENT_IDLE) return; /* Already handled */
     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
+/* Release-publish IDLE (the owner worker's green light): the fence pairs
+ * with the acquire in the worker's dispatch guard, ordering all of main's
+ * prior writes to this client (postWriteToClient consumption, buffer
+ * resets, pending-write queue linkage) before the flag the worker polls.
+ * Mirrors DOOR2_RELEASE_OWNED_READ. */
+#define DOOR2_RELEASE_OWNED_WRITE(cl)                       \
+    do {                                                    \
+        atomic_thread_fence(memory_order_release);          \
+        (cl)->io_write_state = CLIENT_IDLE;                 \
+    } while (0)
     /* Door-2 ownership: IDLE is the worker's green light — its dispatch
      * deferral guard reads io_write_state and starts the next owned-local
      * write the moment it sees IDLE. Publishing IDLE at the top (legacy
@@ -3409,7 +3419,7 @@ void processClientIOWriteDone(client *c) {
 
     /* Don't post-process-writes to clients that are going to be closed anyway. */
     if (c->flag.close_asap) {
-        if (owned) c->io_write_state = CLIENT_IDLE;
+        if (owned) DOOR2_RELEASE_OWNED_WRITE(c);
         return;
     }
 
@@ -3417,19 +3427,19 @@ void processClientIOWriteDone(client *c) {
     connSetPostponeUpdateState(c->conn, 0);
     connUpdateState(c->conn);
     if (postWriteToClient(c) == C_ERR) {
-        if (owned) c->io_write_state = CLIENT_IDLE;
+        if (owned) DOOR2_RELEASE_OWNED_WRITE(c);
         return;
     }
 
     if (!clientHasPendingReplies(c)) {
-        if (owned) c->io_write_state = CLIENT_IDLE;
+        if (owned) DOOR2_RELEASE_OWNED_WRITE(c);
         return;
     }
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
          * able to write everything in one go. */
-        if (owned) c->io_write_state = CLIENT_IDLE;
+        if (owned) DOOR2_RELEASE_OWNED_WRITE(c);
         installClientWriteHandler(c);
     } else if (owned) {
         /* Owned client with replies still pending: queue it BEFORE publishing
@@ -3437,7 +3447,7 @@ void processClientIOWriteDone(client *c) {
          * must be visible before the green light or it can start an
          * owned-local write of a buffer main still intends to flush. */
         putClientInPendingWriteQueue(c);
-        c->io_write_state = CLIENT_IDLE;
+        DOOR2_RELEASE_OWNED_WRITE(c);
     } else {
         /* If we can send the client to the I/O thread, let it handle the write. */
         if (trySendWriteToIOThreads(c) == C_OK) return;
@@ -4529,6 +4539,13 @@ void readQueryFromClient(connection *conn) {
             ioWorkerCountUselessFire();
             return;
         }
+        /* Pairs with main's release fences before its owned IDLE
+         * publications (DOOR2_RELEASE_OWNED_READ / _WRITE): everything main
+         * wrote to this client before green-lighting us (buffer resets,
+         * pending-write unlink, reply consumption) must be visible before we
+         * touch c->buf below. volatile alone orders the compiler, not the
+         * ARM memory system. */
+        atomic_thread_fence(memory_order_acquire);
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
         /* FLAG PARITY with trySendReadToIOThreads: without the REPLICATED
