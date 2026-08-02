@@ -1335,8 +1335,11 @@ bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found) {
             for (int pos = 0; pos < numBucketPositions(b); pos++) {
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
                     void *entry = b->entries[pos];
-                    const void *elem_key = entryGetKey(ht, entry);
-                    if (compareKeys(ht, key, elem_key)) {
+                    /* Concurrent-walk hardening (Bug #13): skip transient
+                     * NULLs from mid-mutation slots; seqlock validation
+                     * catches the mutation. */
+                    const void *elem_key = entry ? entryGetKey(ht, entry) : NULL;
+                    if (elem_key && compareKeys(ht, key, elem_key)) {
                         if (ht->type->validateEntry && !ht->type->validateEntry(ht, entry)) {
                             return false;
                         }
@@ -1372,8 +1375,11 @@ bool hashtableFindSpeculative(void *ht_ptr, const void *key, void **found,
             for (int pos = 0; pos < numBucketPositions(b); pos++) {
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
                     void *entry = b->entries[pos];
-                    const void *elem_key = entryGetKey(ht, entry);
-                    if (compareKeys(ht, key, elem_key)) {
+                    /* Concurrent-walk hardening (Bug #13): skip transient
+                     * NULLs from mid-mutation slots; seqlock validation
+                     * catches the mutation. */
+                    const void *elem_key = entry ? entryGetKey(ht, entry) : NULL;
+                    if (elem_key && compareKeys(ht, key, elem_key)) {
                         if (ht->type->validateEntry && !ht->type->validateEntry(ht, entry)) {
                             return false;
                         }
@@ -2063,8 +2069,17 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
         {
             hashtable *ht = data->hashtable;
             void *entry = data->bucket->entries[data->pos];
-            const void *elem_key = entryGetKey(ht, entry);
-            if (compareKeys(ht, data->key, elem_key)) {
+            /* Concurrent-walk hardening (Bug #13): a speculative walker can
+             * observe a slot mid-mutation — presence set but the entry (or
+             * its key) transiently NULL. Dereferencing it faults
+             * (sdslen(NULL) reads NULL[-1]). Treat it as a non-match and
+             * move on: any mutation that produces this state bumps the
+             * shard version, so the seqlock validation re-read fails the
+             * whole speculation and the command punts to main. On the main
+             * thread the invariant (filled => non-NULL) holds and these
+             * branches never fire. */
+            const void *elem_key = entry ? entryGetKey(ht, entry) : NULL;
+            if (elem_key && compareKeys(ht, data->key, elem_key)) {
                 /* It's a match. */
                 data->state = HASHTABLE_FOUND;
                 return false;
