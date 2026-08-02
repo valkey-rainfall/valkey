@@ -441,81 +441,93 @@ int dplusSpeculateBatch(client *c, int tid) {
         goto out;
     }
 
-    /* Command queue (pipelined commands): process the ENTIRE eligible prefix
-     * in chunks of DPLUS_BATCH_DEPTH. The chunk size preserves the
-     * cache-friendly interleaved-prefetch overlap (phase 2 walks ≤16 lookup
-     * chains concurrently); the outer loop extends coverage to any pipeline
-     * depth. Pre-chunking, P>16 pipelines overflowed the window and the
-     * remainder executed on main — the flamegraph-confirmed P50 collapse
-     * (main executing overflow + flush ping-pong, −29..45%% vs OFF).
+    /* Command queue (pipelined commands): STREAMING SLOT-REFILL (fix #1b).
+     * The chunked design processed the prefix in phase-bounded windows of
+     * DPLUS_BATCH_DEPTH: fill 16, step all finds to completion, validate all
+     * 16, repeat. Every chunk boundary was a pipeline bubble — the next
+     * chunk's finds started cold with zero overlap.
+     *
+     * Streaming replaces the phases with a ring of DPLUS_BATCH_DEPTH slots
+     * holding IN-FLIGHT finds. Each sweep steps every pending find once
+     * (one prefetch issued per slot per sweep — the same interleave cadence
+     * that made the chunked design cache-friendly). Replies must be emitted
+     * in command order, so validation+reply happens only at the HEAD slot:
+     * the moment the head's find completes it is validated and replied
+     * (cache-warm), the slot is freed, and the fill loop tops the window
+     * back up from the queue. Prefetch depth stays constant across the
+     * entire eligible prefix — no bubbles. Out-of-order completions simply
+     * wait as completed find states until they become the head; the seqlock
+     * validation at reply time covers the (unchanged) racy window.
      * The contiguous-prefix rule holds globally: a validation failure or
      * ineligible command ends speculation for the whole read. */
     cmdQueue *queue = &c->cmd_queue;
     int queue_pos = queue->off;
     int prefix_open = 1;
 
-    while (1) {
-        /* Fill the current chunk from the queue. */
-        for (; queue_pos < queue->len && batch_count < DPLUS_BATCH_DEPTH; queue_pos++) {
+    /* Ring state: batch[] reused as the slot array. head..tail are monotonic;
+     * slot index = seq % DPLUS_BATCH_DEPTH. done[] marks completed finds so
+     * they are not re-stepped. batch_count==1 from the first-command block
+     * above: seed the ring with it. */
+    unsigned head = 0, tail = 0;
+    uint8_t done[DPLUS_BATCH_DEPTH];
+    hashtableIncrementalFindInit(&batch[0].find_state, ht, batch[0].key_sds);
+    done[0] = 0;
+    tail = 1;
+    (void)batch_count;
+
+    while (head < tail || prefix_open) {
+        /* Fill: top the window up from the queue. */
+        while (prefix_open && tail - head < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
             if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
                 !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
-
-            dplusBatchEntry *e = &batch[batch_count];
+            dplusBatchEntry *e = &batch[tail % DPLUS_BATCH_DEPTH];
             e->key_sds = objectGetVal(p->argv[1]);
             e->hash = hashtableHashKey(ht, e->key_sds);
             e->shard = DPLUS_SHARD_INDEX(e->hash);
             e->v_before = dplusVersionRead(va, e->shard);
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
-            batch_count++;
+            hashtableIncrementalFindInit(&e->find_state, ht, e->key_sds);
+            done[tail % DPLUS_BATCH_DEPTH] = 0;
+            tail++;
+            queue_pos++;
+        }
+        if (queue_pos >= queue->len) prefix_open = 0; /* queue exhausted — drain */
+        if (head == tail) break; /* nothing in flight and nothing to fill */
+
+        /* Sweep: one find step per pending slot (one prefetch each). */
+        for (unsigned s = head; s < tail; s++) {
+            unsigned i = s % DPLUS_BATCH_DEPTH;
+            if (!done[i]) done[i] = !hashtableIncrementalFindStep(&batch[i].find_state);
         }
 
-        if (batch_count == 0) break;
-
-        /* --- Phase 2: Batched incremental find (prefetch overlap) --- */
-        for (int i = 0; i < batch_count; i++) {
-            hashtableIncrementalFindInit(&batch[i].find_state, ht, batch[i].key_sds);
-        }
-
-        /* Interleave find steps across all keys until all complete.
-         * Each step issues a prefetch for the next memory access in that key's
-         * lookup chain, then yields to the next key. This overlaps prefetch
-         * latency across keys. */
-        int not_done;
-        do {
-            not_done = 0;
-            for (int i = 0; i < batch_count; i++) {
-                not_done += hashtableIncrementalFindStep(&batch[i].find_state);
-            }
-        } while (not_done > 0);
-
-        /* --- Phase 3: Serial validate + copy + reply (caches warm) --- */
+        /* Drain: validate + reply completed HEADS in command order. */
+        while (head < tail && done[head % DPLUS_BATCH_DEPTH]) {
+            dplusBatchEntry *e = &batch[head % DPLUS_BATCH_DEPTH];
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, batch_count, memory_order_relaxed);
+            atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
 #endif
-
-        for (int i = 0; i < batch_count; i++) {
-            if (dplusValidateAndReply(c, &batch[i], ht, c->resp)) {
-                /* Mark command as speculated. */
-                if (batch[i].is_first_cmd) {
+            if (dplusValidateAndReply(c, e, ht, c->resp)) {
+                if (e->is_first_cmd) {
                     c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
                 } else {
-                    queue->cmds[batch[i].queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                    queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
                 }
                 speculated++;
+                head++;
             } else {
-                /* Contiguous-prefix rule: stop at first failure — globally. */
+                /* Contiguous-prefix rule: first failure ends speculation
+                 * globally. In-flight slots behind it are abandoned (their
+                 * commands fall through to main execution). */
                 prefix_open = 0;
+                head = tail; /* discard remaining in-flight slots */
                 break;
             }
         }
-
-        if (!prefix_open) break;
-        batch_count = 0; /* next chunk */
     }
 
 out:
