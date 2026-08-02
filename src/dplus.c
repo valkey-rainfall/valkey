@@ -441,63 +441,81 @@ int dplusSpeculateBatch(client *c, int tid) {
         goto out;
     }
 
-    /* Command queue (pipelined commands). */
+    /* Command queue (pipelined commands): process the ENTIRE eligible prefix
+     * in chunks of DPLUS_BATCH_DEPTH. The chunk size preserves the
+     * cache-friendly interleaved-prefetch overlap (phase 2 walks ≤16 lookup
+     * chains concurrently); the outer loop extends coverage to any pipeline
+     * depth. Pre-chunking, P>16 pipelines overflowed the window and the
+     * remainder executed on main — the flamegraph-confirmed P50 collapse
+     * (main executing overflow + flush ping-pong, −29..45%% vs OFF).
+     * The contiguous-prefix rule holds globally: a validation failure or
+     * ineligible command ends speculation for the whole read. */
     cmdQueue *queue = &c->cmd_queue;
-    for (int i = queue->off; i < queue->len && batch_count < DPLUS_BATCH_DEPTH; i++) {
-        parsedCommand *p = &queue->cmds[i];
-        if (p->cmd == NULL) break;
-        if (!(p->cmd->flags & CMD_READONLY)) break;
-        if (p->argc != 2 || !(p->cmd->flags & CMD_FAST)) break;
-        if (p->cmd != dplus_get_cmd) break;
+    int queue_pos = queue->off;
+    int prefix_open = 1;
 
-        dplusBatchEntry *e = &batch[batch_count];
-        e->key_sds = objectGetVal(p->argv[1]);
-        e->hash = hashtableHashKey(ht, e->key_sds);
-        e->shard = DPLUS_SHARD_INDEX(e->hash);
-        e->v_before = dplusVersionRead(va, e->shard);
-        e->is_first_cmd = 0;
-        e->queue_idx = i;
-        batch_count++;
-    }
+    while (1) {
+        /* Fill the current chunk from the queue. */
+        for (; queue_pos < queue->len && batch_count < DPLUS_BATCH_DEPTH; queue_pos++) {
+            parsedCommand *p = &queue->cmds[queue_pos];
+            if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
+                !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
+                prefix_open = 0; /* ineligible command ends the global prefix */
+                break;
+            }
 
-    if (batch_count == 0) goto out;
-
-    /* --- Phase 2: Batched incremental find (prefetch overlap) --- */
-    /* Initialize all find states. */
-    for (int i = 0; i < batch_count; i++) {
-        hashtableIncrementalFindInit(&batch[i].find_state, ht, batch[i].key_sds);
-    }
-
-    /* Interleave find steps across all keys until all complete.
-     * Each step issues a prefetch for the next memory access in that key's
-     * lookup chain, then yields to the next key. This overlaps prefetch
-     * latency across keys. */
-    int not_done;
-    do {
-        not_done = 0;
-        for (int i = 0; i < batch_count; i++) {
-            not_done += hashtableIncrementalFindStep(&batch[i].find_state);
+            dplusBatchEntry *e = &batch[batch_count];
+            e->key_sds = objectGetVal(p->argv[1]);
+            e->hash = hashtableHashKey(ht, e->key_sds);
+            e->shard = DPLUS_SHARD_INDEX(e->hash);
+            e->v_before = dplusVersionRead(va, e->shard);
+            e->is_first_cmd = 0;
+            e->queue_idx = queue_pos;
+            batch_count++;
         }
-    } while (not_done > 0);
 
-    /* --- Phase 3: Serial validate + copy + reply (caches warm) --- */
+        if (batch_count == 0) break;
+
+        /* --- Phase 2: Batched incremental find (prefetch overlap) --- */
+        for (int i = 0; i < batch_count; i++) {
+            hashtableIncrementalFindInit(&batch[i].find_state, ht, batch[i].key_sds);
+        }
+
+        /* Interleave find steps across all keys until all complete.
+         * Each step issues a prefetch for the next memory access in that key's
+         * lookup chain, then yields to the next key. This overlaps prefetch
+         * latency across keys. */
+        int not_done;
+        do {
+            not_done = 0;
+            for (int i = 0; i < batch_count; i++) {
+                not_done += hashtableIncrementalFindStep(&batch[i].find_state);
+            }
+        } while (not_done > 0);
+
+        /* --- Phase 3: Serial validate + copy + reply (caches warm) --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-    atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, batch_count, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, batch_count, memory_order_relaxed);
 #endif
 
-    for (int i = 0; i < batch_count; i++) {
-        if (dplusValidateAndReply(c, &batch[i], ht, c->resp)) {
-            /* Mark command as speculated. */
-            if (batch[i].is_first_cmd) {
-                c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+        for (int i = 0; i < batch_count; i++) {
+            if (dplusValidateAndReply(c, &batch[i], ht, c->resp)) {
+                /* Mark command as speculated. */
+                if (batch[i].is_first_cmd) {
+                    c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                } else {
+                    queue->cmds[batch[i].queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                }
+                speculated++;
             } else {
-                queue->cmds[batch[i].queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                /* Contiguous-prefix rule: stop at first failure — globally. */
+                prefix_open = 0;
+                break;
             }
-            speculated++;
-        } else {
-            /* Contiguous-prefix rule: stop at first failure. */
-            break;
         }
+
+        if (!prefix_open) break;
+        batch_count = 0; /* next chunk */
     }
 
 out:
