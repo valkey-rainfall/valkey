@@ -7056,6 +7056,62 @@ void ioThreadWriteToClient(client *c) {
         _writeToClient(c);
     }
 
+    /* Fix #2 (main-free completion, design: fix2-mainfree-completion-design.md,
+     * approved Aug 2): for a CLEAN owned-local write — fully drained, no error —
+     * the owner worker completes the write itself and publishes IDLE directly.
+     * Main receives NOTHING for these batches: no JOB_RES, no pipe wakeup, no
+     * done-handler — removing the per-batch main round-trip that the flame/
+     * counter analysis identified as ownership's throughput pacer.
+     *
+     * postWriteToClient transitive-closure decomposition on this path:
+     * - global stats -> per-worker monotonic counters, folded by
+     *   dplusAggregateStats (the proven commandstats pattern);
+     * - buffer/bookmark resets -> client-local; the worker owns the client
+     *   exclusively until IDLE is published (same argument as OWNED_LOCAL);
+     * - reply-list / encoded-buffer handling -> unreachable here (OWNED_LOCAL
+     *   entry guards: plain buf only, empty reply list, not encoded);
+     * - updateClientMemUsageAndBucket -> MAIN-ONLY: amortized by punting every
+     *   64th completion through the legacy handoff below, which runs the full
+     *   done-handler including the bucket refresh (bounds bucket staleness);
+     * - error / partial-write / close paths -> fall through to the legacy
+     *   handoff (rare paths keep the battle-tested protocol). */
+    if ((c->write_flags & WRITE_FLAGS_OWNED_LOCAL) && c->nwritten > 0 &&
+        !(c->write_flags & WRITE_FLAGS_WRITE_ERROR) &&
+        (size_t)c->nwritten == c->io_last_bufpos && c->bufpos == (int)c->io_last_bufpos) {
+        int tid = getCurTid();
+        dplus_thread_stats[tid].owned_writes++;
+        dplus_thread_stats[tid].owned_net_bytes += c->nwritten;
+        if ((dplus_thread_stats[tid].owned_writes & 63) != 0) {
+            c->net_output_bytes += c->nwritten;
+            c->last_interaction = server.unixtime; /* racy global read: established pattern */
+            /* The owned dispatch set postpone-update-state at entry; the main
+             * done-handler used to clear it. Skipping that handler without
+             * clearing here would defer conn state transitions FOREVER (the
+             * audit's predicted Bug #13). The conn belongs to this worker's
+             * event loop, so updating it here is the natural home. */
+            connSetPostponeUpdateState(c->conn, 0);
+            connUpdateState(c->conn);
+            /* Buffer + bookmark resets (the client-local subset of
+             * postWriteToClient for a fully-written plain buffer). */
+            c->bufpos = 0;
+            c->last_header = NULL;
+            resetLastWrittenBuf(c);
+            c->io_last_reply_block = NULL;
+            c->io_last_bufpos = 0;
+            c->nwritten = 0;
+            /* Green light: release-publish IDLE. The next dispatch for this
+             * client runs on THIS thread (no fence needed for ourselves), but
+             * main also reads io_write_state (free/kill deferral paths) —
+             * keep the release pairing with its acquire-side observations. */
+            atomic_thread_fence(memory_order_release);
+            c->io_write_state = CLIENT_IDLE;
+            return;
+        }
+        /* Every 64th completion: fall through to the main handoff so the full
+         * done-handler runs (incl. updateClientMemUsageAndBucket), bounding
+         * client memory-bucket staleness. */
+    }
+
     c->io_write_state = CLIENT_COMPLETED_IO;
     sendToMainThread(c, JOB_RES_WRITE_CLIENT);
 }

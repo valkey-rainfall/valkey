@@ -636,6 +636,8 @@ void dplusAggregateStats(void) {
      * latest increment), which the next fold picks up — never loses. */
     static long long seen_calls[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_usec[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_writes[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_net_bytes[DPLUS_MAX_IO_THREADS] = {0};
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
@@ -651,6 +653,18 @@ void dplusAggregateStats(void) {
             long long delta = us - seen_usec[i];
             seen_usec[i] = us;
             if (get_cmd) get_cmd->microseconds += delta;
+        }
+        /* Fix #2 (main-free completion): fold worker-side write completions
+         * into the global write stats. Same monotonic-delta scheme. */
+        long long w = dplus_thread_stats[i].owned_writes;
+        if (w > seen_writes[i]) {
+            server.stat_total_writes_processed += w - seen_writes[i];
+            seen_writes[i] = w;
+        }
+        long long b = dplus_thread_stats[i].owned_net_bytes;
+        if (b > seen_net_bytes[i]) {
+            server.stat_net_output_bytes += b - seen_net_bytes[i];
+            seen_net_bytes[i] = b;
         }
     }
 }

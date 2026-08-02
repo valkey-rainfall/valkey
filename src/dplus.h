@@ -77,7 +77,9 @@ extern _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS];
 typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
     long long usec;               /* wall time spent executing them (for commandstats) */
-    char _pad[DPLUS_CACHELINE - 2 * sizeof(long long)]; /* pad to full cache line */
+    long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
+    long long owned_net_bytes;    /* bytes written by those completions */
+    char _pad[DPLUS_CACHELINE - 4 * sizeof(long long)]; /* pad to full cache line */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
