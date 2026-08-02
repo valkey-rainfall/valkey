@@ -706,10 +706,41 @@ static size_t dplus_limbo_peak = 0; /* high-water for INFO/tests */
  *   DPLUS_LIMBO_SYNC          decrRefCount at flush
  *   DPLUS_LIMBO_ASYNC         hand to BIO lazyfree at flush (pre-judged)
  *   DPLUS_LIMBO_OFFLOAD_PREF  prefer IO-thread free offload, else sync */
+/* True if any IO thread is mid-speculative-walk right now (seq_cst snapshot).
+ * Used by the defer fast path; early-exits on the first set flag.
+ *
+ * The leading fence completes a Dekker pair with the walker: the caller's
+ * table unlink is a PLAIN store, and without the fence it could sit in the
+ * store buffer while our flag loads complete — letting a walker we did not
+ * see start a walk against the pre-unlink table (StoreLoad hazard). Walker
+ * side: flag store (seq_cst) then exclusive-mode load (seq_cst) before any
+ * table read. With our fence: if we miss the walker's flag, the walker is
+ * guaranteed to see our unlink — either way the object is unreachable. */
+static inline int dplusAnyWalkerActive(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        if (atomic_load_explicit(&dplus_in_speculative_read[i], memory_order_seq_cst)) return 1;
+    }
+    return 0;
+}
+
 int dplusDeferFree(robj *o, int route) {
     /* No IO threads => no speculative walkers => immediate free is safe.
      * (Also keeps single-threaded perf and boot paths untouched.) */
     if (server.io_threads_num <= 1) return 0;
+    /* Drain-free fast path (r100 write-tax remediation): the caller has
+     * ALREADY unlinked the object from the table (function contract above),
+     * so no NEW walk can reach it. If no walker flag is set right now
+     * (seq_cst), no IN-FLIGHT walk exists either — free immediately.
+     * Ordering argument (same Dekker as dplusExclusiveEnter): in the seq_cst
+     * total order, a racing walker's flag-set either precedes this check
+     * (we see it and defer) or follows it — and its table reads follow its
+     * flag-set, which follows our caller's unlink, so it cannot observe the
+     * object. Under write-heavy loads speculation rarely runs, so nearly
+     * every free takes this path and the deferral tax drops to ~0; under
+     * GET-heavy loads the first set flag short-circuits to deferral,
+     * keeping protection exactly when someone needs it. */
+    if (!dplusAnyWalkerActive()) return 0;
     if (dplus_limbo_len == dplus_limbo_cap) {
         dplus_limbo_cap = dplus_limbo_cap ? dplus_limbo_cap * 2 : 128;
         dplus_limbo = zrealloc(dplus_limbo, dplus_limbo_cap * sizeof(dplusLimboEntry));
@@ -729,6 +760,10 @@ int dplusDeferFree(robj *o, int route) {
  * expiry delete compacted it away). */
 int dplusDeferFreeRaw(void *ptr) {
     if (server.io_threads_num <= 1) return 0;
+    /* Drain-free fast path — same contract and ordering argument as
+     * dplusDeferFree: caller unlinked the bucket/memory from the structure
+     * before calling; no flag set => no walk can hold it => free now. */
+    if (!dplusAnyWalkerActive()) return 0;
     if (dplus_limbo_len == dplus_limbo_cap) {
         dplus_limbo_cap = dplus_limbo_cap ? dplus_limbo_cap * 2 : 128;
         dplus_limbo = zrealloc(dplus_limbo, dplus_limbo_cap * sizeof(dplusLimboEntry));
