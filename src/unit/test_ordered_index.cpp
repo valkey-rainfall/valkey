@@ -2025,12 +2025,15 @@ TEST_F(OrderedIndexTest, EstimateStructureMemoryTracksTreeShape) {
 }
 
 TEST_F(OrderedIndexTest, DismissMemoryWalksItems) {
-    /* Smoke test: dismissal must walk populated leaves and their separately
-     * allocated packed items without corrupting the index. */
-    populateSequential(200);
+    /* Dismissal hints memory to the OS for contents this process will not
+     * read again (fork child after serialization). At this layer the index
+     * is opaque, so the observable contract is coverage: at least one hint
+     * per item (plus the index's own nodes). */
+    enum { N = 200 };
+    populateSequential(N);
+    MockValkey mock;
+    EXPECT_CALL(mock, zmadvise_dontneed(_, _)).Times(AtLeast(N));
     orderedIndexDismissMemory(oi);
-    ASSERT_EQ(orderedIndexLength(oi), 200UL);
-    ASSERT_EQ(orderedIndexCountScoreRange(oi, NEG_INF, POS_INF, 0, 0), 200UL);
 }
 
 /* ========== Defrag tests (OrderedIndex layer) ========== */
@@ -2072,8 +2075,8 @@ static void oiDefragCountingCallback(OrderedIndexItem *old_item, OrderedIndexIte
     ((OIDefragRecord *)privdata)->count++;
 }
 
-/* Full two-phase defrag with everything relocating: the struct, inner nodes,
- * leaves, and items all move. The callback must fire once per item (the bridge
+/* Full defrag with everything relocating: the struct, inner nodes, leaves,
+ * and items all move. The callback must fire once per item (the bridge
  * defrag.c relies on), and the index must stay valid and fully readable  -- which
  * it can only be if every relocated pointer was patched through. */
 TEST_F(OrderedIndexTest, DefragRelocatesStructNodesLeavesAndItems) {
@@ -2085,12 +2088,13 @@ TEST_F(OrderedIndexTest, DefragRelocatesStructNodesLeavesAndItems) {
     }
     verifyOI();
 
-    /* Phase A: relocate the index struct + every inner node. Reassign because
-     * the struct pointer itself may move. */
+    /* Relocate the index's top-level struct. Reassign because the struct
+     * pointer itself may move. */
     oi = orderedIndexDefragInternals(oi, oiDefragForceRelocate);
     ASSERT_NE(oi, nullptr);
 
-    /* Phase B: sweep leaves + items, one leaf per call. */
+    /* Sweep: one leaf per call, with inner nodes relocated by the call that
+     * visits their leftmost descendant leaf. */
     OIDefragRecord rec = {0};
     unsigned long cursor = 0;
     do {

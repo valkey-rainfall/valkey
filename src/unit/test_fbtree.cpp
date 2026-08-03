@@ -4417,6 +4417,41 @@ static void *fbtreeDefragNoop(void *ptr) {
     return NULL;
 }
 
+/* Force-relocate variant that counts invocations, for exactly-once accounting
+ * across a full sweep. */
+static int g_fbtreeDefragRelocations = 0;
+static void *fbtreeDefragCountingForceRelocate(void *ptr) {
+    g_fbtreeDefragRelocations++;
+    return fbtreeDefragForceRelocate(ptr);
+}
+
+/* Count the inner nodes and leaves of a tree by structural walk, so tests can
+ * assert how many allocations a sweep must visit. */
+static void countTreeNodes(node *n, int *inner_count, int *leaf_count) {
+    if (n->is_leaf) {
+        (*leaf_count)++;
+        return;
+    }
+    (*inner_count)++;
+    innerNode *inner = (innerNode *)(void *)n;
+    for (int i = 0; i < inner->header.num_items; i++) {
+        countTreeNodes(inner->children[i], inner_count, leaf_count);
+    }
+}
+
+/* Count inner nodes whose shared prefix spilled to a separate heap block
+ * (prefix_len > EMBED_PREFIX_LEN); each is one extra allocation a sweep must
+ * relocate. */
+static int countSpilledPrefixNodes(node *n) {
+    if (n->is_leaf) return 0;
+    innerNode *inner = (innerNode *)(void *)n;
+    int count = (inner->prefix_len > EMBED_PREFIX_LEN) ? 1 : 0;
+    for (int i = 0; i < inner->header.num_items; i++) {
+        count += countSpilledPrefixNodes(inner->children[i]);
+    }
+    return count;
+}
+
 /* Verify forward iteration yields exactly n keys formatted "key_%08d" for i in
  * [0, n), each stored with its trailing NUL (as insert()/createString do). */
 static void verifyForwardKeys(fbtreeIndex *tree, int n) {
@@ -4517,12 +4552,14 @@ TEST_F(FbtreeTest, DefragScanRelocatesLeafStructs) {
     }
 }
 
-/* fbtreeDefragNodes must relocate every inner node and repoint parent child
+/* The scan must relocate every inner node and repoint parent child
  * links (and the root), across a single-leaf tree (no inner nodes: a no-op),
  * a two-level tree (inner root over leaves), and a three-level tree (inner
- * root over inner nodes). Force-relocate all inner nodes, then the tree must
- * validate and iterate identically. */
-TEST_F(FbtreeTest, DefragNodesRelocatesInnerNodes) {
+ * root over inner nodes). The scan relocates each inner node in the call that
+ * visits its leftmost descendant leaf, so a full force-relocate sweep must
+ * touch every allocation exactly once: every inner node, every leaf, and
+ * every item. The tree must then validate and iterate identically. */
+TEST_F(FbtreeTest, DefragScanRelocatesInnerNodes) {
     int shapes[] = {5, 100, 5000};
     for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
         int n = shapes[s];
@@ -4533,7 +4570,20 @@ TEST_F(FbtreeTest, DefragNodesRelocatesInnerNodes) {
             fbtreeInsert(tree, createString(buf));
         }
 
-        fbtreeDefragNodes(tree, fbtreeDefragForceRelocate);
+        int inner_count = 0, leaf_count = 0;
+        countTreeNodes(tree->root, &inner_count, &leaf_count);
+
+        g_fbtreeDefragRelocations = 0;
+        unsigned long cursor = 0;
+        int guard = 0;
+        do {
+            cursor = fbtreeDefragScan(tree, cursor, fbtreeDefragNoopItemCallback, NULL, fbtreeDefragCountingForceRelocate);
+            ASSERT_LT(++guard, n + 100) << "n=" << n << ": sweep did not terminate";
+        } while (cursor != 0);
+
+        EXPECT_EQ(g_fbtreeDefragRelocations, inner_count + leaf_count + n)
+            << "n=" << n << ": every inner node (" << inner_count << "), leaf ("
+            << leaf_count << "), and item should relocate exactly once";
 
         char err[256];
         ASSERT_TRUE(fbtreeDebugValidate(tree, false, err, sizeof(err))) << "n=" << n << ": " << err;
@@ -4541,6 +4591,55 @@ TEST_F(FbtreeTest, DefragNodesRelocatesInnerNodes) {
         verifyForwardKeys(tree, n);
 
         fbtreeFree(tree);
+    }
+}
+
+/* An inner node whose shared prefix exceeds the embedded capacity stores the
+ * prefix in a separate heap block. The sweep must relocate that block along
+ * with its owning node and re-store the pointer: with a force-relocate
+ * defragfn the old block is freed, so a stale pointer inside the node copy
+ * is a use-after-free on the next prefix-guided descent (ASAN verifies). */
+TEST_F(FbtreeTest, DefragScanRelocatesSpilledPrefixBlocks) {
+    const size_t prefix_len = EMBED_PREFIX_LEN + 46;
+    enum { N = 5000 };
+    char suffix[8];
+    for (int i = 0; i < N; i++) {
+        snprintf(suffix, sizeof(suffix), "s%05d", i);
+        fbtreeInsert(fbt, createPrefixString("P", prefix_len, suffix));
+    }
+
+    int inner_count = 0, leaf_count = 0;
+    countTreeNodes(fbt->root, &inner_count, &leaf_count);
+    int spilled = countSpilledPrefixNodes(fbt->root);
+    ASSERT_GT(spilled, 0) << "construction must produce spilled-prefix inner nodes";
+
+    g_fbtreeDefragRelocations = 0;
+    unsigned long cursor = 0;
+    int guard = 0;
+    do {
+        cursor = fbtreeDefragScan(fbt, cursor, fbtreeDefragNoopItemCallback, NULL, fbtreeDefragCountingForceRelocate);
+        ASSERT_LT(++guard, N + 100) << "sweep did not terminate";
+    } while (cursor != 0);
+
+    EXPECT_EQ(g_fbtreeDefragRelocations, inner_count + spilled + leaf_count + N)
+        << "every inner node, spilled prefix block, leaf, and item should relocate exactly once";
+
+    char err[256];
+    ASSERT_TRUE(fbtreeDebugValidate(fbt, false, err, sizeof(err))) << err;
+    ASSERT_EQ(fbtreeLength(fbt), (unsigned long)N);
+
+    /* Prefix-guided descents read the relocated prefix blocks: seek every
+     * 61st member by value and check its rank. */
+    for (int i = 0; i < N; i += 61) {
+        snprintf(suffix, sizeof(suffix), "s%05d", i);
+        sds probe = createPrefixString("P", prefix_len, suffix);
+        fbtreeIterator it;
+        fbtreeInitIterator(&it, fbt);
+        ASSERT_EQ(fbtreeSeekToValue(probe, &it), (long)i) << "seek for member " << i;
+        const_sds pos = fbtreeNext(&it);
+        ASSERT_NE(pos, nullptr);
+        ASSERT_EQ(memcmp(pos, probe, sdslen(probe)), 0) << "wrong member at rank " << i;
+        sdsfree(probe);
     }
 }
 
@@ -4637,10 +4736,10 @@ TEST_F(FbtreeTest, DefragScanRelocatesRootLeaf) {
     ASSERT_EQ(fbtreeNext(&it), nullptr);
 }
 
-/* End-to-end: run the structural node pass then a full leaf/item sweep, both
- * force-relocating everything, and confirm the tree validates and answers
- * forward, backward, and rank queries identically. */
-TEST_F(FbtreeTest, DefragNodesThenScanEndToEnd) {
+/* End-to-end: run a full sweep force-relocating everything — inner nodes,
+ * leaves, and items — and confirm the tree validates and answers forward,
+ * backward, and rank queries identically. */
+TEST_F(FbtreeTest, DefragScanFullSweepEndToEnd) {
     enum { N = 5000 };
     char buf[32];
     for (int i = 0; i < N; i++) {
@@ -4648,7 +4747,6 @@ TEST_F(FbtreeTest, DefragNodesThenScanEndToEnd) {
         insert(buf);
     }
 
-    fbtreeDefragNodes(fbt, fbtreeDefragForceRelocate);
     unsigned long cursor = 0;
     int guard = 0;
     do {
@@ -4674,19 +4772,47 @@ TEST_F(FbtreeTest, DefragNodesThenScanEndToEnd) {
     }
 }
 
-/* Dismiss walks every leaf and its separately-allocated items; the tree must
- * stay valid and iterate unchanged afterward. */
-TEST_F(FbtreeTest, DismissMemoryPreservesContent) {
+/* Dismissal hints memory to the OS (madvise DONTNEED) for contents this
+ * process will not read again -- the fork child after serializing a value.
+ * The observable unit contract is therefore not content preservation but
+ * coverage: every allocation the tree owns is hinted exactly once. The
+ * zmadvise_dontneed wrapper counts calls: one per item, per leaf struct,
+ * and per inner node. */
+TEST_F(FbtreeTest, DismissMemoryHintsEveryAllocationOnce) {
     enum { N = 3000 };
     char buf[32];
     for (int i = 0; i < N; i++) {
         snprintf(buf, sizeof(buf), "key_%08d", i);
         insert(buf);
     }
+    int inner_count = 0, leaf_count = 0;
+    countTreeNodes(fbt->root, &inner_count, &leaf_count);
+    ASSERT_EQ(countSpilledPrefixNodes(fbt->root), 0);
+
+    MockValkey mock;
+    EXPECT_CALL(mock, zmadvise_dontneed(_, _)).Times(N + leaf_count + inner_count);
     fbtreeDismissMemory(fbt);
-    char err[256];
-    ASSERT_TRUE(fbtreeDebugValidate(fbt, false, err, sizeof(err))) << err;
-    verifyForwardKeys(fbt, N);
+}
+
+/* Same coverage contract on a tree whose inner nodes carry spilled
+ * long-prefix heap blocks: each spilled block is one additional allocation
+ * the walk must hint. */
+TEST_F(FbtreeTest, DismissMemoryWalksInnerNodesAndSpilledPrefixes) {
+    const size_t prefix_len = EMBED_PREFIX_LEN + 46;
+    enum { N = 5000 };
+    char suffix[8];
+    for (int i = 0; i < N; i++) {
+        snprintf(suffix, sizeof(suffix), "s%05d", i);
+        fbtreeInsert(fbt, createPrefixString("P", prefix_len, suffix));
+    }
+    int inner_count = 0, leaf_count = 0;
+    countTreeNodes(fbt->root, &inner_count, &leaf_count);
+    int spilled = countSpilledPrefixNodes(fbt->root);
+    ASSERT_GT(spilled, 0) << "construction must produce spilled-prefix inner nodes";
+
+    MockValkey mock;
+    EXPECT_CALL(mock, zmadvise_dontneed(_, _)).Times(N + leaf_count + inner_count + spilled);
+    fbtreeDismissMemory(fbt);
 }
 
 /* ==========================================================================

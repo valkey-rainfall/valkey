@@ -208,8 +208,10 @@ void orderedIndexSeekToLexRange(OrderedIndexIterator *iter, const_sds min, const
  * ============================================================ */
 
 /* Hint to the OS that the index's memory pages can be reclaimed (madvise
- * DONTNEED). The index remains valid and usable  -- pages are faulted back in
- * on next access. Used during lazy-free to reduce RSS without blocking. */
+ * DONTNEED). Call only when the calling process will not read the index
+ * again -- e.g. in the fork child after the value has been serialized, to
+ * avoid needless copy-on-write. Reclaimed anonymous pages are zero-filled
+ * on any later access. */
 void orderedIndexDismissMemory(OrderedIndex *oi);
 
 /* Estimate the memory used by the index structure itself. Item payloads are
@@ -217,15 +219,16 @@ void orderedIndexDismissMemory(OrderedIndex *oi);
  * included; callers account for them by sampling the items they hold. */
 size_t orderedIndexEstimateStructureMemory(const OrderedIndex *oi);
 
-/* Defrag the index's own allocations: the index struct and every inner node.
- * Leaves and items are handled incrementally by orderedIndexScanDefrag. Returns
- * the index pointer, updated if the struct itself was relocated. */
+/* Defrag the index's own top-level struct. All node and item allocations are
+ * handled incrementally by orderedIndexScanDefrag. Returns the index pointer,
+ * updated if the struct was relocated. */
 OrderedIndex *orderedIndexDefragInternals(OrderedIndex *oi, void *(*defragfn)(void *));
 
 /* Incremental defrag scan over rank order, one leaf per call. Relocates the
  * leaf and its items via defragfn; when an item is relocated, callback is
- * invoked to update external refs. Inner nodes are handled separately by
- * orderedIndexDefragInternals. Returns the next cursor, or 0 when complete. */
+ * invoked to update external refs. Inner nodes are relocated by the call that
+ * visits their leftmost descendant leaf, bounding per-call work to at most
+ * tree-depth node relocations. Returns the next cursor, or 0 when complete. */
 unsigned long orderedIndexScanDefrag(OrderedIndex *oi, unsigned long cursor, OrderedIndexDefragCallback callback, void *privdata, void *(*defragfn)(void *));
 
 /* ============================================================
