@@ -49,6 +49,18 @@ typedef uint64_t hashtableIncrementalFindState[5];
  * optional. With all callbacks omitted, the hashtable is effectively a set of
  * pointer-sized integers. */
 typedef struct {
+    /* String-keyed mode. When set, the hashtable owns hashing and equality:
+     * entries are hashed by extracting their key bytes with this callback and
+     * compared by length and byte content. Lookups can be performed with raw
+     * bytes using the *Bytes functions (hashtableFindBytes etc.), avoiding
+     * any temporary key allocation. The key argument accepted by the
+     * non-Bytes lookup functions is entry-typed: it must be a value that
+     * this callback can extract key bytes from.
+     * When set, entryGetKey, hashFunction and keyCompare must be NULL. */
+    void (*entryGetKeyBytes)(const void *entry, const char **buf, size_t *len);
+    /* Hash function for key bytes in string-keyed mode. Optional; defaults
+     * to hashtableGenHashFunction (static seed). */
+    uint64_t (*hashBytes)(const char *buf, size_t len);
     /* If the type of an entry is not the same as the type of a key used for
      * lookup, this callback needs to return the key within an entry. */
     const void *(*entryGetKey)(const void *entry);
@@ -153,6 +165,15 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped);
 bool hashtableDelete(hashtable *ht, const void *key);
 void **hashtableTwoPhasePopFindRef(hashtable *ht, const void *key, hashtablePosition *position);
 void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *position);
+
+/* Raw-bytes lookups for string-keyed tables (type has entryGetKeyBytes set).
+ * These take the key as a (buf, len) pair, so no entry-typed key object needs
+ * to be allocated for the lookup. */
+bool hashtableFindBytes(hashtable *ht, const char *buf, size_t len, void **found);
+bool hashtableDeleteBytes(hashtable *ht, const char *buf, size_t len);
+bool hashtablePopBytes(hashtable *ht, const char *buf, size_t len, void **popped);
+bool hashtableFindPositionForInsertBytes(hashtable *ht, const char *buf, size_t len, hashtablePosition *position, void **existing);
+
 bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void *new_entry);
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key);
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);

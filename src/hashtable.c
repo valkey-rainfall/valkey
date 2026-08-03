@@ -418,12 +418,65 @@ static inline const void *entryGetKey(hashtable *ht, const void *entry) {
     }
 }
 
+/* --- String-keyed mode ---
+ *
+ * When the type has entryGetKeyBytes set, the hashtable owns hashing and
+ * equality: keys are byte strings extracted from entries. Internally, every
+ * lookup key is represented as a keyBytes struct and threaded through the
+ * generic 'const void *key' parameters. User-facing functions taking a
+ * generic key treat it as entry-typed and normalize it on entry (see
+ * normalizeKey). The *Bytes functions construct the representation directly
+ * from a (buf, len) pair. */
+typedef struct {
+    const char *buf;
+    size_t len;
+} keyBytes;
+
+static inline bool isStringKeyed(const hashtable *ht) {
+    return ht->type->entryGetKeyBytes != NULL;
+}
+
+static inline void entryKeyBytes(hashtable *ht, const void *entry, keyBytes *kb) {
+    ht->type->entryGetKeyBytes(entry, &kb->buf, &kb->len);
+}
+
+static inline uint64_t hashBytesInternal(hashtable *ht, const char *buf, size_t len) {
+    if (ht->type->hashBytes != NULL) return ht->type->hashBytes(buf, len);
+    return hashtableGenHashFunction(buf, len);
+}
+
+/* Normalizes a user-provided key to the internal lookup representation. In
+ * string-keyed mode the user key is entry-typed; its key bytes are extracted
+ * into *kb and a pointer to kb is returned. Otherwise the key is returned
+ * unchanged. The returned pointer is only valid while kb is in scope. */
+static inline const void *normalizeKey(hashtable *ht, const void *key, keyBytes *kb) {
+    if (!isStringKeyed(ht)) return key;
+    entryKeyBytes(ht, key, kb);
+    return kb;
+}
+
 static inline uint64_t hashKey(hashtable *ht, const void *key) {
+    if (isStringKeyed(ht)) {
+        const keyBytes *kb = key;
+        return hashBytesInternal(ht, kb->buf, kb->len);
+    }
     if (ht->type->hashFunction != NULL) {
         return ht->type->hashFunction(key);
     } else {
         return hashtableGenHashFunction((const char *)&key, sizeof(key));
     }
+}
+
+/* Hashes the key of an entry, given entryGetKey(entry). In string-keyed mode
+ * entryGetKey is the identity function, so the argument is the entry itself
+ * and its key bytes are extracted for hashing. */
+static inline uint64_t hashEntryKey(hashtable *ht, const void *entry_key) {
+    if (isStringKeyed(ht)) {
+        keyBytes kb;
+        entryKeyBytes(ht, entry_key, &kb);
+        return hashBytesInternal(ht, kb.buf, kb.len);
+    }
+    return hashKey(ht, entry_key);
 }
 
 /* For the hash bits stored in the bucket, we use the highest bits of the hash
@@ -656,7 +709,7 @@ static void rehashStepExpand(hashtable *ht) {
         }
 
         for (int i = 0; i < size; i++) {
-            uint64_t hash = hashKey(ht, key_buf[i]);
+            uint64_t hash = hashEntryKey(ht, key_buf[i]);
             rehashEntry(ht, entry_buf[i], hash, highBits(hash));
         }
     }
@@ -828,8 +881,18 @@ static bool expand(hashtable *ht, size_t size, int *malloc_failed) {
 static inline int checkCandidateInBucket(hashtable *ht, bucket *b, int pos, const void *key, int table, int *pos_in_bucket, int *table_index) {
     /* It's a candidate. */
     void *entry = b->entries[pos];
-    const void *elem_key = entryGetKey(ht, entry);
-    if (compareKeys(ht, key, elem_key)) {
+    int match;
+    if (isStringKeyed(ht)) {
+        /* key is the internal keyBytes representation. */
+        const keyBytes *kb = key;
+        keyBytes ekb;
+        entryKeyBytes(ht, entry, &ekb);
+        match = (ekb.len == kb->len && memcmp(ekb.buf, kb->buf, ekb.len) == 0);
+    } else {
+        const void *elem_key = entryGetKey(ht, entry);
+        match = compareKeys(ht, key, elem_key);
+    }
+    if (match) {
         /* It's a match. */
         assert(pos_in_bucket != NULL);
         if (!validateElementIfNeeded(ht, entry)) {
@@ -1605,6 +1668,8 @@ void dismissHashtable(hashtable *ht) {
  * if found is provided. Returns false if no matching entry was found. */
 bool hashtableFind(hashtable *ht, const void *key, void **found) {
     if (hashtableSize(ht) == 0) return false;
+    keyBytes kb;
+    key = normalizeKey(ht, key, &kb);
     uint64_t hash = hashKey(ht, key);
     int pos_in_bucket = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
@@ -1622,6 +1687,8 @@ bool hashtableFind(hashtable *ht, const void *key, void **found) {
  * accesses to the hash table due to incermental rehashing, so use with care. */
 void **hashtableFindRef(hashtable *ht, const void *key) {
     if (hashtableSize(ht) == 0) return NULL;
+    keyBytes kb;
+    key = normalizeKey(ht, key, &kb);
     uint64_t hash = hashKey(ht, key);
     int pos_in_bucket = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
@@ -1638,7 +1705,8 @@ bool hashtableAdd(hashtable *ht, void *entry) {
  * entry with the same key and, if an 'existing' pointer is provided, it is
  * pointed to the existing entry. */
 bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing) {
-    const void *key = entryGetKey(ht, entry);
+    keyBytes kb;
+    const void *key = normalizeKey(ht, entryGetKey(ht, entry), &kb);
     uint64_t hash = hashKey(ht, key);
     int pos_in_bucket = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
@@ -1679,9 +1747,8 @@ bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing) {
  *         doSomethingWithExistingEntry(existing);
  *     }
  */
-bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition *pos, void **existing) {
+static bool findPositionForInsertWithHash(hashtable *ht, const void *key, uint64_t hash, hashtablePosition *pos, void **existing) {
     position *p = positionFromOpaque(pos);
-    uint64_t hash = hashKey(ht, key);
     int pos_in_bucket, table_index;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
     if (b != NULL) {
@@ -1705,6 +1772,12 @@ bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition 
     return true;
 }
 
+bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition *pos, void **existing) {
+    keyBytes kb;
+    const void *lookup = normalizeKey(ht, key, &kb);
+    return findPositionForInsertWithHash(ht, lookup, hashKey(ht, lookup), pos, existing);
+}
+
 /* Inserts an entry at the position previously acquired using
  * hashtableFindPositionForInsert(). The entry must match the key provided when
  * finding the position. You must not access the hashtable in any way between
@@ -1725,9 +1798,7 @@ void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *po
 /* Removes the entry with the matching key and returns it. The entry
  * destructor is not called. Returns true and points 'popped' to the entry if a
  * matching entry was found. Returns false if no matching entry was found. */
-bool hashtablePop(hashtable *ht, const void *key, void **popped) {
-    if (hashtableSize(ht) == 0) return false;
-    uint64_t hash = hashKey(ht, key);
+static bool popWithHash(hashtable *ht, const void *key, uint64_t hash, void **popped) {
     int pos_in_bucket = 0;
     int table_index = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
@@ -1747,6 +1818,13 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
     return 0;
 }
 
+bool hashtablePop(hashtable *ht, const void *key, void **popped) {
+    if (hashtableSize(ht) == 0) return false;
+    keyBytes kb;
+    key = normalizeKey(ht, key, &kb);
+    return popWithHash(ht, key, hashKey(ht, key), popped);
+}
+
 /* Deletes the entry with the matching key. Returns true if an entry was
  * deleted, false if no matching entry was found. */
 bool hashtableDelete(hashtable *ht, const void *key) {
@@ -1758,13 +1836,57 @@ bool hashtableDelete(hashtable *ht, const void *key) {
     return false;
 }
 
+/* --- Raw-bytes lookup API for string-keyed tables --- */
+
+/* Like hashtableFind, but the key is given as raw bytes. Only valid for
+ * string-keyed tables (type has entryGetKeyBytes set). */
+bool hashtableFindBytes(hashtable *ht, const char *buf, size_t len, void **found) {
+    assert(isStringKeyed(ht));
+    if (hashtableSize(ht) == 0) return false;
+    keyBytes kb = {buf, len};
+    uint64_t hash = hashBytesInternal(ht, buf, len);
+    int pos_in_bucket = 0;
+    bucket *b = findBucket(ht, hash, &kb, &pos_in_bucket, NULL);
+    if (b) {
+        if (found) *found = b->entries[pos_in_bucket];
+        return true;
+    }
+    return false;
+}
+
+/* Like hashtablePop, but the key is given as raw bytes. */
+bool hashtablePopBytes(hashtable *ht, const char *buf, size_t len, void **popped) {
+    assert(isStringKeyed(ht));
+    if (hashtableSize(ht) == 0) return false;
+    keyBytes kb = {buf, len};
+    return popWithHash(ht, &kb, hashBytesInternal(ht, buf, len), popped);
+}
+
+/* Like hashtableDelete, but the key is given as raw bytes. */
+bool hashtableDeleteBytes(hashtable *ht, const char *buf, size_t len) {
+    void *entry;
+    if (hashtablePopBytes(ht, buf, len, &entry)) {
+        freeEntry(ht, entry);
+        return true;
+    }
+    return false;
+}
+
+/* Like hashtableFindPositionForInsert, but the key is given as raw bytes. */
+bool hashtableFindPositionForInsertBytes(hashtable *ht, const char *buf, size_t len, hashtablePosition *pos, void **existing) {
+    assert(isStringKeyed(ht));
+    keyBytes kb = {buf, len};
+    return findPositionForInsertWithHash(ht, &kb, hashBytesInternal(ht, buf, len), pos, existing);
+}
+
 /* When an entry has been reallocated, it can be replaced in a hash table
  * without dereferencing the old pointer which may no longer be valid. The new
  * entry with the same key and hash is used for finding the old entry and
  * replacing it with the new entry. Returns true if the entry was replaced and false if
  * the entry wasn't found. */
 bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void *new_entry) {
-    const void *key = entryGetKey(ht, new_entry);
+    keyBytes kb;
+    const void *key = normalizeKey(ht, entryGetKey(ht, new_entry), &kb);
     uint64_t hash = hashKey(ht, key);
     uint8_t h2 = highBits(hash);
     for (int table = 0; table <= 1; table++) {
@@ -1829,6 +1951,8 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
 void **hashtableTwoPhasePopFindRef(hashtable *ht, const void *key, hashtablePosition *pos) {
     position *p = positionFromOpaque(pos);
     if (hashtableSize(ht) == 0) return NULL;
+    keyBytes kb;
+    key = normalizeKey(ht, key, &kb);
     uint64_t hash = hashKey(ht, key);
     int pos_in_bucket = 0;
     int table_index = 0;
@@ -1892,7 +2016,7 @@ void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtabl
         data->bucket = NULL;
         data->hashtable = ht;
         data->key = key;
-        data->hash = hashKey(ht, key);
+        data->hash = hashEntryKey(ht, key);
     }
 }
 
@@ -1907,8 +2031,17 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
         {
             hashtable *ht = data->hashtable;
             void *entry = data->bucket->entries[data->pos];
-            const void *elem_key = entryGetKey(ht, entry);
-            if (compareKeys(ht, data->key, elem_key)) {
+            int match;
+            if (isStringKeyed(ht)) {
+                keyBytes kkb, ekb;
+                entryKeyBytes(ht, data->key, &kkb);
+                entryKeyBytes(ht, entry, &ekb);
+                match = (ekb.len == kkb.len && memcmp(ekb.buf, kkb.buf, ekb.len) == 0);
+            } else {
+                const void *elem_key = entryGetKey(ht, entry);
+                match = compareKeys(ht, data->key, elem_key);
+            }
+            if (match) {
                 /* It's a match. */
                 data->state = HASHTABLE_FOUND;
                 return false;
@@ -2055,6 +2188,8 @@ size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, voi
 bool hashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cursor) {
     if (cursor == 0) return false;
     size_t mask = expToMask(ht->bucket_exp[0]);
+    keyBytes kb;
+    key = normalizeKey(ht, key, &kb);
     uint64_t hash = hashKey(ht, key);
     size_t bucket_idx = hash & mask;
     size_t cursor_idx = cursor & mask;
