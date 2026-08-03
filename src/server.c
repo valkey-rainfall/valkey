@@ -631,16 +631,17 @@ hashtableType setHashtableType = {
     .hashBytes = genHashFunctionConfigurableSeed,
     .entryDestructor = dictSdsDestructor};
 
-const void *zsetHashtableGetKey(const void *element) {
-    const zskiplistNode *node = element;
-    return zslGetNodeElement(node);
+static void zsetEntryGetKeyBytes(const void *entry, const char **buf, size_t *len) {
+    sds ele = zslGetNodeElement((const zskiplistNode *)entry);
+    *buf = ele;
+    *len = sdslen(ele);
 }
 
-/* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
+/* Sorted sets hash (note: a skiplist is used in addition to the hash table).
+ * Entries are zskiplistNode pointers; the key is the node's element. */
 hashtableType zsetHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .entryGetKey = zsetHashtableGetKey,
-    .keyCompare = dictSdsKeyCompare,
+    .entryGetKeyBytes = zsetEntryGetKeyBytes,
+    .hashBytes = genHashFunctionConfigurableSeed,
 };
 
 uint64_t hashtableSdsHash(const void *key) {

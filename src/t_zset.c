@@ -512,8 +512,7 @@ static unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, ha
     while (x && zslValueLteMax(x->score, range)) {
         zskiplistNode *next = x->level[0].forward;
         zslDeleteNode(zsl, x, update);
-        sds ele = zslGetNodeElement(x);
-        hashtablePop(ht, ele, NULL);
+        hashtablePop(ht, x, NULL);
         zslFreeNode(x);
         removed++;
         x = next;
@@ -543,7 +542,7 @@ static unsigned long zslDeleteRangeByLex(zskiplist *zsl, zlexrangespec *range, h
     while (x && zslLexValueLteMax(zslGetNodeElement(x), range)) {
         zskiplistNode *next = x->level[0].forward;
         zslDeleteNode(zsl, x, update);
-        hashtableDelete(ht, zslGetNodeElement(x));
+        hashtableDelete(ht, x);
         zslFreeNode(x); /* Here is where x->ele is actually released. */
         removed++;
         x = next;
@@ -572,7 +571,7 @@ static unsigned long zslDeleteRangeByRank(zskiplist *zsl, unsigned int start, un
     while (x && traversed <= end) {
         zskiplistNode *next = x->level[0].forward;
         zslDeleteNode(zsl, x, update);
-        hashtableDelete(ht, zslGetNodeElement(x));
+        hashtableDelete(ht, x);
         zslFreeNode(x);
         removed++;
         traversed++;
@@ -1426,7 +1425,7 @@ int zsetScore(robj *zobj, sds member, double *score) {
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = objectGetVal(zobj);
         void *entry;
-        if (!hashtableFind(zs->ht, member, &entry)) return C_ERR;
+        if (!hashtableFindBytes(zs->ht, member, sdslen(member), &entry)) return C_ERR;
         zskiplistNode *setElement = entry;
         *score = setElement->score;
     } else {
@@ -1554,7 +1553,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
     if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = objectGetVal(zobj);
 
-        void **node_ref_in_hashtable = hashtableFindRef(zs->ht, ele);
+        void **node_ref_in_hashtable = hashtableFindRefBytes(zs->ht, ele, sdslen(ele));
         if (node_ref_in_hashtable != NULL) {
             /* NX? Return, same element already exists. */
             if (nx) {
@@ -1612,7 +1611,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
  * element was not there). */
 static int zsetRemoveFromSkiplist(zset *zs, sds ele) {
     void *entry;
-    if (!hashtablePop(zs->ht, ele, &entry)) return 0;
+    if (!hashtablePopBytes(zs->ht, ele, sdslen(ele), &entry)) return 0;
     zskiplistNode *node = entry;
 
     /* hashtable only contains pointers to skiplist nodes. Nothing to free. */
@@ -1690,7 +1689,7 @@ static long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
         zset *zs = objectGetVal(zobj);
 
         void *entry;
-        if (!hashtableFind(zs->ht, ele, &entry)) return -1;
+        if (!hashtableFindBytes(zs->ht, ele, sdslen(ele), &entry)) return -1;
         zskiplistNode *node = entry;
 
         rank = zslGetRank(zs->zsl, node);
@@ -2361,7 +2360,7 @@ static int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = objectGetVal(op->subject);
             void *entry;
-            if (hashtableFind(zs->ht, val->ele, &entry)) {
+            if (hashtableFindBytes(zs->ht, val->ele, sdslen(val->ele), &entry)) {
                 zskiplistNode *node = entry;
                 *score = node->score;
                 return 1;
@@ -2803,7 +2802,7 @@ static void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIn
                 hashtablePosition position;
                 /* If we don't have it, we need to create a new entry. */
                 void *existing;
-                if (hashtableFindPositionForInsert(dstzset->ht, sdsval, &position, &existing)) {
+                if (hashtableFindPositionForInsertBytes(dstzset->ht, sdsval, sdslen(sdsval), &position, &existing)) {
                     sds tmp_ele = zuiNewSdsFromValue(&zval);
                     zskiplistNode *new_node = zslCreateNode(zslRandomLevel(), score, tmp_ele);
                     sdsfree(tmp_ele);
@@ -4286,7 +4285,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         while (size > count) {
             void *element;
             hashtableFairRandomEntry(ht, &element);
-            hashtableDelete(ht, zslGetNodeElement((zskiplistNode *)element));
+            hashtableDelete(ht, element);
             size--;
         }
         hashtableCleanupIterator(&iter);
