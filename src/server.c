@@ -619,10 +619,16 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
-/* Set hashtable type. Items are SDS strings */
+/* Set hashtable type. Items are SDS strings. String-keyed: the hashtable
+ * handles hashing and equality via the key bytes. */
+static void setEntryGetKeyBytes(const void *entry, const char **buf, size_t *len) {
+    *buf = (const char *)entry;
+    *len = sdslen((sds)entry);
+}
+
 hashtableType setHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
+    .entryGetKeyBytes = setEntryGetKeyBytes,
+    .hashBytes = genHashFunctionConfigurableSeed,
     .entryDestructor = dictSdsDestructor};
 
 const void *zsetHashtableGetKey(const void *element) {

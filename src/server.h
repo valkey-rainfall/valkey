@@ -3551,11 +3551,11 @@ unsigned long long dbScan(serverDb *db, unsigned long long cursor, kvstoreScanFu
 /* Set data type */
 robj *setTypeCreate(sds value, size_t size_hint);
 int setTypeAdd(robj *subject, sds value);
-int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
+int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval);
 int setTypeRemove(robj *subject, sds value);
-int setTypeRemoveAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
+int setTypeRemoveAux(robj *set, char *str, size_t len, int64_t llval);
 int setTypeIsMember(robj *subject, sds value);
-int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
+int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval);
 setTypeIterator *setTypeInitIterator(robj *subject);
 void setTypeReleaseIterator(setTypeIterator *si);
 int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele);
