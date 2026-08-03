@@ -518,19 +518,22 @@ int hashtableResizeAllowed(size_t moreMem, double usedRatio) {
     return !overMaxmemoryAfterAlloc(moreMem);
 }
 
-const void *hashtableCommandGetCurrentName(const void *element) {
-    struct serverCommand *command = (struct serverCommand *)element;
-    return command->current_name;
+static void commandGetCurrentNameBytes(const void *element, const char **buf, size_t *len) {
+    const struct serverCommand *command = element;
+    *buf = command->current_name;
+    *len = sdslen(command->current_name);
 }
 
-const void *hashtableCommandGetOriginalName(const void *element) {
-    struct serverCommand *command = (struct serverCommand *)element;
-    return command->fullname;
+static void commandGetOriginalNameBytes(const void *element, const char **buf, size_t *len) {
+    const struct serverCommand *command = element;
+    *buf = command->fullname;
+    *len = sdslen(command->fullname);
 }
 
-const void *hashtableSubcommandGetKey(const void *element) {
-    struct serverCommand *command = (struct serverCommand *)element;
-    return command->declared_name;
+static void subcommandGetKeyBytes(const void *element, const char **buf, size_t *len) {
+    const struct serverCommand *command = element;
+    *buf = command->declared_name;
+    *len = strlen(command->declared_name);
 }
 
 /* Entry destructor that frees object key and the dictEntry itself */
@@ -695,21 +698,18 @@ hashtableType kvstoreExpiresHashtableType = {
 };
 
 /* Command set, hashed by current command name, stores serverCommand structs. */
-hashtableType commandSetType = {.entryGetKey = hashtableCommandGetCurrentName,
-                                .hashFunction = dictSdsCaseHash,
-                                .keyCompare = dictCStrKeyCaseCompare,
+hashtableType commandSetType = {.entryGetKeyBytes = commandGetCurrentNameBytes,
+                                .case_insensitive = 1,
                                 .instant_rehashing = 1};
 
 /* Command set, hashed by original command name, stores serverCommand structs. */
-hashtableType originalCommandSetType = {.entryGetKey = hashtableCommandGetOriginalName,
-                                        .hashFunction = dictSdsCaseHash,
-                                        .keyCompare = dictCStrKeyCaseCompare,
+hashtableType originalCommandSetType = {.entryGetKeyBytes = commandGetOriginalNameBytes,
+                                        .case_insensitive = 1,
                                         .instant_rehashing = 1};
 
 /* Sub-command set, hashed by char* string, stores serverCommand structs. */
-hashtableType subcommandSetType = {.entryGetKey = hashtableSubcommandGetKey,
-                                   .hashFunction = dictCStrCaseHash,
-                                   .keyCompare = dictCStrKeyCaseCompare,
+hashtableType subcommandSetType = {.entryGetKeyBytes = subcommandGetKeyBytes,
+                                   .case_insensitive = 1,
                                    .instant_rehashing = 1};
 
 /* Hash type hash table (note that small hashes are represented with listpacks) */
@@ -3481,14 +3481,14 @@ void serverOpArrayFree(serverOpArray *oa) {
 
 bool isContainerCommandBySds(sds s) {
     void *entry;
-    bool found_command = hashtableFind(server.commands, s, &entry);
+    bool found_command = hashtableFindBytes(server.commands, s, sdslen(s), &entry);
     struct serverCommand *base_cmd = entry;
     return found_command && base_cmd->subcommands_ht;
 }
 
 struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_name) {
     void *entry = NULL;
-    hashtableFind(container->subcommands_ht, sub_name, &entry);
+    hashtableFindBytes(container->subcommands_ht, sub_name, sdslen(sub_name), &entry);
     struct serverCommand *subcommand = entry;
     return subcommand;
 }
@@ -3503,7 +3503,8 @@ struct serverCommand *lookupSubcommand(struct serverCommand *container, sds sub_
  */
 struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int argc, int strict) {
     void *entry = NULL;
-    bool found_command = hashtableFind(commands, objectGetVal(argv[0]), &entry);
+    sds arg0 = objectGetVal(argv[0]);
+    bool found_command = hashtableFindBytes(commands, arg0, sdslen(arg0), &entry);
     struct serverCommand *base_cmd = entry;
     bool has_subcommands = found_command && base_cmd->subcommands_ht;
     if (argc == 1 || !has_subcommands) {
