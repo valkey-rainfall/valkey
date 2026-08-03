@@ -41,7 +41,7 @@ typedef struct hashtableStats hashtableStats;
 /* Can types that can be stack allocated. */
 typedef uint64_t hashtableIterator[6];
 typedef uint64_t hashtablePosition[2];
-typedef uint64_t hashtableIncrementalFindState[5];
+typedef uint64_t hashtableIncrementalFindState[7];
 
 /* --- Non-opaque types --- */
 
@@ -176,6 +176,7 @@ bool hashtableFindPositionForInsertBytes(hashtable *ht, const char *buf, size_t 
 
 bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void *new_entry);
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key);
+void hashtableIncrementalFindInitBytes(hashtableIncrementalFindState *state, hashtable *ht, const char *buf, size_t len);
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
 

@@ -347,6 +347,13 @@ static_assert(sizeof(hashtablePosition) >= sizeof(position),
               "Opaque iterator size");
 
 /* State for incremental find. */
+/* Internal representation of a lookup key in string-keyed mode (the type has
+ * entryGetKeyBytes set). See the string-keyed mode comment further below. */
+typedef struct {
+    const char *buf;
+    size_t len;
+} keyBytes;
+
 typedef struct {
     enum {
         HASHTABLE_CHECK_ENTRY,
@@ -360,6 +367,10 @@ typedef struct {
     hashtable *hashtable;
     bucket *bucket;
     const void *key;
+    /* String-keyed mode: the lookup key bytes, extracted or provided at init
+     * time so each compare step uses them without re-extraction. The buffer
+     * must remain valid for the duration of the incremental find. */
+    keyBytes kb;
     uint64_t hash;
 } incrementalFind;
 
@@ -427,10 +438,6 @@ static inline const void *entryGetKey(hashtable *ht, const void *entry) {
  * generic key treat it as entry-typed and normalize it on entry (see
  * normalizeKey). The *Bytes functions construct the representation directly
  * from a (buf, len) pair. */
-typedef struct {
-    const char *buf;
-    size_t len;
-} keyBytes;
 
 static inline bool isStringKeyed(const hashtable *ht) {
     return ht->type->entryGetKeyBytes != NULL;
@@ -2016,7 +2023,31 @@ void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtabl
         data->bucket = NULL;
         data->hashtable = ht;
         data->key = key;
-        data->hash = hashEntryKey(ht, key);
+        if (isStringKeyed(ht)) {
+            entryKeyBytes(ht, key, &data->kb);
+            data->hash = hashBytesInternal(ht, data->kb.buf, data->kb.len);
+        } else {
+            data->hash = hashKey(ht, key);
+        }
+    }
+}
+
+/* Like hashtableIncrementalFindInit, but the key is given as raw bytes. Only
+ * valid for string-keyed tables (type has entryGetKeyBytes set). The buffer
+ * must remain valid until the incremental find has completed. */
+void hashtableIncrementalFindInitBytes(hashtableIncrementalFindState *state, hashtable *ht, const char *buf, size_t len) {
+    incrementalFind *data = incrementalFindFromOpaque(state);
+    assert(isStringKeyed(ht));
+    if (hashtableSize(ht) == 0) {
+        data->state = HASHTABLE_NOT_FOUND;
+    } else {
+        data->state = HASHTABLE_NEXT_BUCKET;
+        data->bucket = NULL;
+        data->hashtable = ht;
+        data->key = NULL;
+        data->kb.buf = buf;
+        data->kb.len = len;
+        data->hash = hashBytesInternal(ht, buf, len);
     }
 }
 
@@ -2033,10 +2064,9 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
             void *entry = data->bucket->entries[data->pos];
             int match;
             if (isStringKeyed(ht)) {
-                keyBytes kkb, ekb;
-                entryKeyBytes(ht, data->key, &kkb);
+                keyBytes ekb;
                 entryKeyBytes(ht, entry, &ekb);
-                match = (ekb.len == kkb.len && memcmp(ekb.buf, kkb.buf, ekb.len) == 0);
+                match = (ekb.len == data->kb.len && memcmp(ekb.buf, data->kb.buf, ekb.len) == 0);
             } else {
                 const void *elem_key = entryGetKey(ht, entry);
                 match = compareKeys(ht, data->key, elem_key);
