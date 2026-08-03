@@ -59,7 +59,8 @@ typedef struct {
      * When set, entryGetKey, hashFunction and keyCompare must be NULL. */
     void (*entryGetKeyBytes)(const void *entry, const char **buf, size_t *len);
     /* Hash function for key bytes in string-keyed mode. Optional; defaults
-     * to hashtableGenHashFunction (static seed). */
+     * to hashtableGenHashFunction (static seed), or its case-insensitive
+     * variant when case_insensitive is set. */
     uint64_t (*hashBytes)(const char *buf, size_t len);
     /* If the type of an entry is not the same as the type of a key used for
      * lookup, this callback needs to return the key within an entry. */
@@ -92,6 +93,9 @@ typedef struct {
     size_t (*getMetadataSize)(void);
     /* Flag to disable incremental rehashing */
     unsigned instant_rehashing : 1;
+    /* String-keyed mode only: keys match case-insensitively. Affects both the
+     * default hash function and key equality. */
+    unsigned case_insensitive : 1;
 
 } hashtableType;
 
@@ -170,6 +174,7 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *position);
  * These take the key as a (buf, len) pair, so no entry-typed key object needs
  * to be allocated for the lookup. */
 bool hashtableFindBytes(hashtable *ht, const char *buf, size_t len, void **found);
+void **hashtableFindRefBytes(hashtable *ht, const char *buf, size_t len);
 bool hashtableDeleteBytes(hashtable *ht, const char *buf, size_t len);
 bool hashtablePopBytes(hashtable *ht, const char *buf, size_t len, void **popped);
 bool hashtableFindPositionForInsertBytes(hashtable *ht, const char *buf, size_t len, hashtablePosition *position, void **existing);

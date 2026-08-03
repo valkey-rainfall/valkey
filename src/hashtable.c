@@ -57,6 +57,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #if HAVE_X86_SIMD
 #include <immintrin.h>
@@ -449,7 +450,15 @@ static inline void entryKeyBytes(hashtable *ht, const void *entry, keyBytes *kb)
 
 static inline uint64_t hashBytesInternal(hashtable *ht, const char *buf, size_t len) {
     if (ht->type->hashBytes != NULL) return ht->type->hashBytes(buf, len);
+    if (ht->type->case_insensitive) return hashtableGenCaseHashFunction(buf, len);
     return hashtableGenHashFunction(buf, len);
+}
+
+/* Key equality in string-keyed mode. */
+static inline bool keyBytesMatch(hashtable *ht, const keyBytes *a, const keyBytes *b) {
+    if (a->len != b->len) return false;
+    if (ht->type->case_insensitive) return strncasecmp(a->buf, b->buf, a->len) == 0;
+    return memcmp(a->buf, b->buf, a->len) == 0;
 }
 
 /* Normalizes a user-provided key to the internal lookup representation. In
@@ -894,7 +903,7 @@ static inline int checkCandidateInBucket(hashtable *ht, bucket *b, int pos, cons
         const keyBytes *kb = key;
         keyBytes ekb;
         entryKeyBytes(ht, entry, &ekb);
-        match = (ekb.len == kb->len && memcmp(ekb.buf, kb->buf, ekb.len) == 0);
+        match = keyBytesMatch(ht, &ekb, kb);
     } else {
         const void *elem_key = entryGetKey(ht, entry);
         match = compareKeys(ht, key, elem_key);
@@ -1861,6 +1870,17 @@ bool hashtableFindBytes(hashtable *ht, const char *buf, size_t len, void **found
     return false;
 }
 
+/* Like hashtableFindRef, but the key is given as raw bytes. */
+void **hashtableFindRefBytes(hashtable *ht, const char *buf, size_t len) {
+    assert(isStringKeyed(ht));
+    if (hashtableSize(ht) == 0) return NULL;
+    keyBytes kb = {buf, len};
+    uint64_t hash = hashBytesInternal(ht, buf, len);
+    int pos_in_bucket = 0;
+    bucket *b = findBucket(ht, hash, &kb, &pos_in_bucket, NULL);
+    return b ? &b->entries[pos_in_bucket] : NULL;
+}
+
 /* Like hashtablePop, but the key is given as raw bytes. */
 bool hashtablePopBytes(hashtable *ht, const char *buf, size_t len, void **popped) {
     assert(isStringKeyed(ht));
@@ -2066,7 +2086,7 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
             if (isStringKeyed(ht)) {
                 keyBytes ekb;
                 entryKeyBytes(ht, entry, &ekb);
-                match = (ekb.len == data->kb.len && memcmp(ekb.buf, data->kb.buf, ekb.len) == 0);
+                match = keyBytesMatch(ht, &ekb, &data->kb);
             } else {
                 const void *elem_key = entryGetKey(ht, entry);
                 match = compareKeys(ht, data->key, elem_key);
