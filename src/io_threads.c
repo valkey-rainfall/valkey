@@ -7,6 +7,7 @@
 #include "io_threads.h"
 #include "cluster_migrateslots.h"
 #include "queues.h"
+#include "dplus.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -33,6 +34,19 @@ static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
 static size_t io_jobs_submitted;
 static _Atomic(size_t) io_jobs_finished;
 static int io_threads_initialized = 0;
+/* Door-2 wakeup coalescing: doorbell for the main-thread wakeup pipe.
+ * 0 = disarmed (main may be asleep; next response must ring), 1 = armed
+ * (a pipe byte is already in flight since main's last disarm; skip the
+ * syscall). Workers ring on the queue's empty->non-empty transition only;
+ * main disarms at the top of every processIOThreadsResponses() drain.
+ * Replaces one write(2) PER RESPONSE with one per main wakeup — the
+ * fix2flame profile showed modulePipeReadable at 23.3% of main plus
+ * ~5% worker-side anon_pipe_write at the P10 ceiling.
+ * Sharing note (drain-free lesson): main writes this line a few times per
+ * event-loop tick (per drain call), NOT per batch — workers' per-response
+ * relaxed loads mostly hit a shared cached copy, and each load replaces a
+ * ~microsecond syscall, so the coherence trade is the right direction. */
+static _Alignas(CACHE_LINE_SIZE) _Atomic(int) io_main_doorbell = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 /* Per-worker event loops for door-2 ownership model. Each IO worker gets
@@ -298,12 +312,15 @@ void ioThreadPoll(aeEventLoop *el) {
     atomic_store_explicit(&server.io_poll_state, AE_IO_STATE_DONE, memory_order_release);
 }
 
+static void ringMainDoorbell(void);
+
 static void flushPendingIOResponses(int blocking) {
     if (!pending_io_responses) return;
     listIter li;
     listNode *ln;
     listRewind(pending_io_responses, &li);
 
+    int flushed = 0;
     while ((ln = listNext(&li))) {
         void *job = listNodeValue(ln);
         int pushed = 0;
@@ -316,15 +333,23 @@ static void flushPendingIOResponses(int blocking) {
         } while (true);
 
         if (pushed) {
+            flushed++;
             listDelNode(pending_io_responses, ln);
         } else {
-            return;
+            goto out;
         }
     }
 
     /* List is fully drained */
     listRelease(pending_io_responses);
     pending_io_responses = NULL;
+out:
+    /* Coalesced wakeup: backlog jobs were pushed outside sendToMainThread's
+     * ring, so ring here. (Pre-coalescing this site had no pipe write and
+     * relied on the next response's unconditional write to wake main.) */
+    if (flushed > 0 && server.io_threads_ownership) {
+        ringMainDoorbell();
+    }
 }
 
 /* Define a cleanup function that will clean all thread resources */
@@ -913,6 +938,36 @@ void trySendPollJobToIOThreads(void) {
     io_jobs_submitted++;
 }
 
+/* Door-2 wakeup coalescing: ring main's wakeup pipe only if no ring is
+ * already in flight (doorbell disarmed). Called by workers after publishing
+ * a response into io_shared_outbox (or its backlog flush).
+ *
+ * Lost-wakeup proof (Dekker pairing with the disarm at the top of
+ * processIOThreadsResponses): our enqueue store and main's disarm store are
+ * both ordered before the respective subsequent loads via seq_cst fences.
+ * In the single total order, either main's queue peek observes our job, or
+ * our doorbell load observes main's disarm (and we ring). Either way the
+ * response is drained without waiting for the timer. */
+static void ringMainDoorbell(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&io_main_doorbell, memory_order_relaxed)) {
+        dplus_thread_stats[thread_id].doorbell_coalesced++;
+        return;
+    }
+    if (atomic_exchange_explicit(&io_main_doorbell, 1, memory_order_seq_cst)) {
+        dplus_thread_stats[thread_id].doorbell_coalesced++;
+        return;
+    }
+    dplus_thread_stats[thread_id].doorbell_rings++;
+    /* We won the arm race: exactly one byte per main sleep/drain cycle.
+     * EINTR: retry (the doorbell is armed; failing to write would defer the
+     * response to the timer). EAGAIN (pipe full): a wakeup is already
+     * pending in the pipe — free to skip. */
+    while (write(server.module_pipe[1], "A", 1) != 1) {
+        if (errno != EINTR) break;
+    }
+}
+
 void sendToMainThread(void *data, int type) {
     if (unlikely(pending_io_responses)) {
         flushPendingIOResponses(0);
@@ -927,14 +982,13 @@ void sendToMainThread(void *data, int type) {
     }
     /* Door-2 ownership: main owns NO client fds, so its event loop sleeps in
      * epoll for up to a full server-hz tick (~100ms) with our response queued.
-     * Wake it the way module threads do — one byte down the module pipe
-     * (O_NONBLOCK: if the pipe is full a wakeup is already pending and the
-     * failed write is free). Without this, every handoff and every cleanup
-     * response waits for the timer, collapsing throughput to ~clients*hz. */
+     * Wake it the way module threads do — one byte down the module pipe —
+     * but COALESCED: only the response that transitions main's view from
+     * empty to non-empty pays the syscall (fix2flame measured the
+     * per-response scheme at 23.3% of main in modulePipeReadable + ~5%
+     * worker-side pipe writes at the P10 ceiling). */
     if (server.io_threads_ownership) {
-        if (write(server.module_pipe[1], "A", 1) != 1) {
-            /* Pipe full or transient error — a wakeup is already pending. */
-        }
+        ringMainDoorbell();
     }
 }
 
@@ -1041,6 +1095,17 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 #define JOB_BATCH_SIZE (16)
 int processIOThreadsResponses(void) {
     /* We don't check for threads number  since some threads may return jobs then deactivate/shut-down */
+
+    /* Door-2 wakeup coalescing: disarm the doorbell BEFORE peeking the
+     * queue. Dekker pairing with ringMainDoorbell(): after this
+     * store+fence, any response enqueued before a worker's doorbell check
+     * is visible to the peek below, and any enqueued after it will find
+     * the doorbell disarmed and ring. Gated on ownership so OFF mode stays
+     * byte-identical (gate-off cost-free is a standing verdict). */
+    if (server.io_threads_ownership) {
+        atomic_store_explicit(&io_main_doorbell, 0, memory_order_seq_cst);
+        atomic_thread_fence(memory_order_seq_cst);
+    }
 
     /* Quick check if any pending operations exist.
      * Note: owned-client reads bypass io_jobs_submitted/finished accounting,

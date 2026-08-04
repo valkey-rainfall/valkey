@@ -79,7 +79,9 @@ typedef struct dplusThreadStats {
     long long usec;               /* wall time spent executing them (for commandstats) */
     long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
     long long owned_net_bytes;    /* bytes written by those completions */
-    char _pad[DPLUS_CACHELINE - 4 * sizeof(long long)]; /* pad to full cache line */
+    long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
+    long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
+    char _pad[DPLUS_CACHELINE - 6 * sizeof(long long)]; /* pad to full cache line */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -189,6 +191,9 @@ void dplusConsumeSpeculated(struct client *c, int count, int tid);
 /* Aggregate per-IO-thread command counters into server.stat_numcommands.
  * Called once per event-loop iteration from beforeSleep. O(num_io_threads). */
 void dplusAggregateStats(void);
+/* Door-2 wakeup-coalescing counters (prototype instrumentation). */
+long long dplusDoorbellRings(void);
+long long dplusDoorbellCoalesced(void);
 
 /* Maximum embedded value size for speculative copy. Larger values punt. */
 #define DPLUS_MAX_SPECULATIVE_VALUE_LEN 64

@@ -791,8 +791,31 @@ size_t dplusLimboPeak(void) {
 }
 
 /* --- Component 6: INFO section --- */
+/* Door-2 wakeup-coalescing counters (prototype): sums of per-worker plain
+ * fields written only by their owning worker — racy-by-design stats reads.
+ * Always compiled (not gated on IO_LOOKUP_OFFLOAD_STATS) so the coalescing
+ * A/B can read them from a default build's INFO stats. */
+long long dplusDoorbellRings(void) {
+    long long sum = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) sum += dplus_thread_stats[i].doorbell_rings;
+    return sum;
+}
+
+long long dplusDoorbellCoalesced(void) {
+    long long sum = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) sum += dplus_thread_stats[i].doorbell_coalesced;
+    return sum;
+}
+
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 sds dplusInfoString(sds info) {
+    /* Doorbell counters are per-thread plain fields written only by their
+     * owning worker; summing here is a racy-by-design stats read. */
+    long long doorbell_rings = 0, doorbell_coalesced = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        doorbell_rings += dplus_thread_stats[i].doorbell_rings;
+        doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
+    }
     info = sdscatprintf(info,
         "# Dplus\r\n"
         "dplus_speculative_attempts:%llu\r\n"
@@ -801,14 +824,18 @@ sds dplusInfoString(sds info) {
         "dplus_exclusive_punts:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
-        "dplus_intra_batch_write_punts:%llu\r\n",
+        "dplus_intra_batch_write_punts:%llu\r\n"
+        "dplus_doorbell_rings:%llu\r\n"
+        "dplus_doorbell_coalesced:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed));
+        (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
+        (unsigned long long)doorbell_rings,
+        (unsigned long long)doorbell_coalesced);
     return info;
 }
 #endif
