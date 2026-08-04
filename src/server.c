@@ -1477,8 +1477,11 @@ static void sumEngineUsedMemory(scriptingEngine *engine, void *context) {
 
 /* Called from serverCron and cronUpdateMemoryStats to update cached memory metrics. */
 void cronUpdateMemoryStats(void) {
-    /* Record the max memory used since the server was started. */
-    if (zmalloc_used_memory() > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used_memory();
+    /* Record the max memory used since the server was started.
+     * (Single walk: zmalloc_used_memory() sums per-thread cache lines —
+     * don't pay it twice for a compare-then-assign.) */
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
 
     run_with_period(100) {
         /* Sample the RSS and other metrics here since this is a relatively slow call.
@@ -1853,8 +1856,22 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
-    size_t zmalloc_used = zmalloc_used_memory();
-    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    /* Memstats decimation: zmalloc_used_memory() is not one atomic read — it
+     * walks used_memory_thread[], one cache line PER THREAD, each dirtied by
+     * its owner on every alloc/free. Sampling it every event-loop iteration
+     * makes main pull ~N remote-modified lines per wakeup (profiled at ~11%
+     * of main at high wakeup rates). used_memory_peak is an advisory INFO
+     * stat and already blind to spikes between iterations; sample it at most
+     * once per millisecond instead. server.mstime is refreshed every wakeup
+     * in afterSleep, so this adds no clock read. Eviction is unaffected:
+     * getMaxmemoryState() reads zmalloc_used_memory() fresh in the command
+     * path. */
+    static mstime_t peak_sample_last_ms = 0;
+    if (server.mstime != peak_sample_last_ms) {
+        peak_sample_last_ms = server.mstime;
+        size_t zmalloc_used = zmalloc_used_memory();
+        if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    }
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
