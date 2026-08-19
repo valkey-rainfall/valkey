@@ -196,7 +196,15 @@ long long dplusDoorbellRings(void);
 long long dplusDoorbellCoalesced(void);
 
 /* Maximum embedded value size for speculative copy. Larger values punt. */
-#define DPLUS_MAX_SPECULATIVE_VALUE_LEN 64
+/* W14 (Aug 19 2026): raised 64 -> 1024. Q2 cells proved the cliff: 64B GETs run
+ * at 10.600M (identical to 16B — in-threshold size is free) while 96B craters
+ * to 1.398M because every over-threshold GET punts to main (the ~2.6x punt
+ * tax; see [q2thresh:*] + proposal-skeleton §8). valbuf is stack-allocated
+ * (threshold + 21) at both speculation sites — ~1KB of stack per call is fine.
+ * Validation semantics unchanged: the wider copy only widens the snapshot
+ * window; a torn copy is rejected by the shard-version re-read as before.
+ * Watch metric: dplus_validation_misses under concurrent writes. */
+#define DPLUS_MAX_SPECULATIVE_VALUE_LEN 1024
 
 /* Component 6: INFO section (dplus.c, only if -DIO_LOOKUP_OFFLOAD_STATS) */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
