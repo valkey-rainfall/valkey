@@ -478,8 +478,18 @@ static void *IOThreadMain(void *myid) {
                  * sleep IN the worker's epoll: instant wake on owned-fd activity,
                  * ~zero idle cost. Bounded at 2ms so cross-thread queue jobs and
                  * newly-migrated fds (registered by main via epoll_ctl — visible
-                 * to an in-progress epoll_wait) are picked up promptly. */
-                struct timeval tv = {0, 2000};
+                 * to an in-progress epoll_wait) are picked up promptly.
+                 *
+                 * F5 DIAGNOSTIC (Aug 19, exp/door2-puntwake): punt completions
+                 * from main land in io_private_inbox with NO wakeup — a parked
+                 * worker notices them only on timeout expiry, quantizing every
+                 * punt round-trip at the park quantum (Q1/Q5 evidence: main 38%
+                 * / workers 18% utilized at r100-ON, ~15ms batch cycles). Shrink
+                 * the quantum 2ms -> 100us under ownership to PROVE the
+                 * mechanism; the real fix is a per-worker eventfd in worker_el
+                 * written by main on inbox enqueue (F5-proper). NOT for merge:
+                 * 100us re-inflates idle CPU (~1/20th of the old busy-poll). */
+                struct timeval tv = {0, server.io_threads_ownership ? 100 : 2000};
                 aePollDirect(worker_el[id], &tv);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
