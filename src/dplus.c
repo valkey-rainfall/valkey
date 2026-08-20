@@ -811,10 +811,11 @@ long long dplusDoorbellCoalesced(void) {
 sds dplusInfoString(sds info) {
     /* Doorbell counters are per-thread plain fields written only by their
      * owning worker; summing here is a racy-by-design stats read. */
-    long long doorbell_rings = 0, doorbell_coalesced = 0;
+    long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
     for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
+        punted_replies += dplus_thread_stats[i].punted_replies_written;
     }
     info = sdscatprintf(info,
         "# Dplus\r\n"
@@ -826,7 +827,8 @@ sds dplusInfoString(sds info) {
         "dplus_expired_replies:%llu\r\n"
         "dplus_intra_batch_write_punts:%llu\r\n"
         "dplus_doorbell_rings:%llu\r\n"
-        "dplus_doorbell_coalesced:%llu\r\n",
+        "dplus_doorbell_coalesced:%llu\r\n"
+        "dplus_punted_replies_written:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
@@ -835,7 +837,8 @@ sds dplusInfoString(sds info) {
         (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
         (unsigned long long)doorbell_rings,
-        (unsigned long long)doorbell_coalesced);
+        (unsigned long long)doorbell_coalesced,
+        (unsigned long long)punted_replies);
     return info;
 }
 #endif
