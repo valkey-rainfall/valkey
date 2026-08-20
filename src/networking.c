@@ -3480,6 +3480,9 @@ void processClientIOWriteDone(client *c) {
  * the designed degradation for slow clients). */
 static void f7OwnerWriteHandler(connection *conn) {
     client *c = connGetPrivateData(conn);
+    /* Self-delete during our own dispatch is safe: the dispatch lock is a
+     * recursive mutex held by THIS thread (ae.c:104), and the fe->mask
+     * recheck pattern tolerates events deleted mid-iteration. */
     connSetWriteHandler(conn, NULL);
     serverAssert(c->io_write_state == CLIENT_PENDING_IO);
     serverAssert(c->owner_tid == getCurTid());
@@ -3565,12 +3568,15 @@ int handleClientsWithPendingWrites(void) {
             c->io_last_bufpos = (size_t)c->bufpos;
             c->write_flags = WRITE_FLAGS_OWNED_LOCAL;
             c->io_write_state = CLIENT_PENDING_IO;
-            /* AE_LOCK is a plain (non-recursive) mutex and connSetWriteHandler
-             * -> aeCreateFileEvent takes it: RELEASE FIRST. The staging above
-             * is ordered before the release; anything the worker dispatches
-             * in the gap sees io_write_state == PENDING_IO and defers (the
-             * standard deferral guard). Registration then provides the
-             * publish edge for the handler itself. */
+            /* Lock discipline: poll_mutex is RECURSIVE (ae.c:104), so
+             * registering while holding the lock would not deadlock — we
+             * release first anyway to keep hold time minimal. Ordering is
+             * what matters: staging completes before the release (mutex
+             * release = the publish edge), and anything the worker
+             * dispatches in the gap sees io_write_state == PENDING_IO and
+             * defers (standard deferral guard), so no read can interleave
+             * before the handler fires. Free/kill paths defer on PENDING_IO
+             * likewise, so no disown window exists between stage and fire. */
             aeReleaseLock(owner_loop);
             if (connSetWriteHandler(c->conn, f7OwnerWriteHandler) == C_OK) {
                 continue;
