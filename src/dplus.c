@@ -839,21 +839,32 @@ sds dplusInfoString(sds info) {
     /* Q7 punt round-trip stage averages (fold per-thread accumulators). */
     {
         long long total_count = 0, total_d01 = 0, total_d12 = 0, total_d23 = 0;
+        long long total_sweeps = 0;
         for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
             total_count += dplus_thread_stats[i].punt_rt_count;
             total_d01 += dplus_thread_stats[i].sum_d01;
             total_d12 += dplus_thread_stats[i].sum_d12;
             total_d23 += dplus_thread_stats[i].sum_d23;
+            total_sweeps += dplus_thread_stats[i].sweeps;
         }
         long long avg_d01 = total_count ? total_d01 / total_count : 0;
         long long avg_d12 = total_count ? total_d12 / total_count : 0;
         long long avg_d23 = total_count ? total_d23 / total_count : 0;
+        /* Q7b: main-side drain cadence counters. */
+        long long drain_calls, drain_nonempty, drain_jobs;
+        dplusGetDrainCounters(&drain_calls, &drain_nonempty, &drain_jobs);
         info = sdscatprintf(info,
             "dplus_punt_rt_count:%lld\r\n"
             "dplus_punt_avg_d01_us:%lld\r\n"
             "dplus_punt_avg_d12_us:%lld\r\n"
-            "dplus_punt_avg_d23_us:%lld\r\n",
-            total_count, avg_d01, avg_d12, avg_d23);
+            "dplus_punt_avg_d23_us:%lld\r\n"
+            "dplus_drain_calls:%lld\r\n"
+            "dplus_drain_nonempty:%lld\r\n"
+            "dplus_drain_jobs:%lld\r\n"
+            "dplus_worker_sweeps_total:%lld\r\n",
+            total_count, avg_d01, avg_d12, avg_d23,
+            drain_calls, drain_nonempty, drain_jobs,
+            total_sweeps);
     }
     return info;
 }

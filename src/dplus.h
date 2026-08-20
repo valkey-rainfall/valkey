@@ -86,7 +86,9 @@ typedef struct dplusThreadStats {
     long long sum_d01;            /* cumulative T1-T0 (queue wait: worker->main) in µs */
     long long sum_d12;            /* cumulative T2-T1 (main execution time) in µs */
     long long sum_d23;            /* cumulative T3-T2 (return wait: main->worker) in µs */
-    char _pad[2 * DPLUS_CACHELINE - 10 * sizeof(long long)]; /* pad to 2 cache lines */
+    /* Q7b cadence counters. */
+    long long sweeps;             /* outer loop iterations (per-worker sweep rate) */
+    char _pad[2 * DPLUS_CACHELINE - 11 * sizeof(long long)]; /* pad to 2 cache lines */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -206,6 +208,8 @@ long long dplusDoorbellCoalesced(void);
 /* Component 6: INFO section (dplus.c, only if -DIO_LOOKUP_OFFLOAD_STATS) */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 sds dplusInfoString(sds info);
+/* Q7b cadence counters: main-side drain stats (defined in io_threads.c) */
+void dplusGetDrainCounters(long long *calls, long long *nonempty, long long *jobs);
 #endif
 
 #endif /* DPLUS_H */

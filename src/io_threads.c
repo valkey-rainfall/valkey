@@ -34,6 +34,12 @@ static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
 static size_t io_jobs_submitted;
 static _Atomic(size_t) io_jobs_finished;
 static int io_threads_initialized = 0;
+/* Q7b cadence counters: main-side drain stats (main-thread-only, plain). */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+static long long dplus_drain_calls = 0;
+static long long dplus_drain_nonempty = 0;
+static long long dplus_drain_jobs = 0;
+#endif
 /* Door-2 wakeup coalescing: doorbell for the main-thread wakeup pipe.
  * 0 = disarmed (main may be asleep; next response must ring), 1 = armed
  * (a pipe byte is already in flight since main's last disarm; skip the
@@ -381,6 +387,9 @@ static void *IOThreadMain(void *myid) {
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        dplus_thread_stats[id].sweeps++;
+#endif
         size_t batch_count = 0;
         monotime prev_work_start_time = work_start_time;
         work_start_time = getMonotonicUs();
@@ -1113,6 +1122,9 @@ int processIOThreadsResponses(void) {
     /* Quick check if any pending operations exist.
      * Note: owned-client reads bypass io_jobs_submitted/finished accounting,
      * so also peek at the MPSC outbox directly for their responses. */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    dplus_drain_calls++;
+#endif
     if (getPendingIOResponsesCount() == 0) {
         /* Door-2: owned clients push to MPSC without incrementing io_jobs_submitted.
          * Check if the MPSC has data by comparing head vs tail. */
@@ -1172,6 +1184,22 @@ int processIOThreadsResponses(void) {
         if (write_count) handleWriteJobs(write_jobs, write_count);
 
         /* If the queue was empty at the last try - don't try again */
-        if (dequeued_count == 0) return total_processed;
+        if (dequeued_count == 0) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            if (total_processed > 0) {
+                dplus_drain_nonempty++;
+                dplus_drain_jobs += total_processed;
+            }
+#endif
+            return total_processed;
+        }
     }
 }
+
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+void dplusGetDrainCounters(long long *calls, long long *nonempty, long long *jobs) {
+    *calls = dplus_drain_calls;
+    *nonempty = dplus_drain_nonempty;
+    *jobs = dplus_drain_jobs;
+}
+#endif
