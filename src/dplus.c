@@ -681,6 +681,9 @@ void dplusAggregateStats(void) {
     }
 }
 
+extern long long dplus_gauge_mpsc_sum, dplus_gauge_inflight_sum, dplus_gauge_samples;
+extern long long dplus_drain_busy_us;
+
 /* --- Component 7: Quiescence-deferred reclamation (entry lifetime) ---
  *
  * See entry-lifetime-design.md. Worker speculation reads hashtable entry
@@ -861,10 +864,16 @@ sds dplusInfoString(sds info) {
             "dplus_drain_calls:%lld\r\n"
             "dplus_drain_nonempty:%lld\r\n"
             "dplus_drain_jobs:%lld\r\n"
-            "dplus_worker_sweeps_total:%lld\r\n",
+            "dplus_worker_sweeps_total:%lld\r\n"
+            "dplus_gauge_avg_mpsc_depth:%lld\r\n"
+            "dplus_gauge_avg_inflight:%lld\r\n"
+            "dplus_drain_busy_us:%lld\r\n",
             total_count, avg_d01, avg_d12, avg_d23,
             drain_calls, drain_nonempty, drain_jobs,
-            total_sweeps);
+            total_sweeps,
+            dplus_gauge_samples ? dplus_gauge_mpsc_sum / dplus_gauge_samples : 0,
+            dplus_gauge_samples ? dplus_gauge_inflight_sum / dplus_gauge_samples : 0,
+            dplus_drain_busy_us);
     }
     return info;
 }
