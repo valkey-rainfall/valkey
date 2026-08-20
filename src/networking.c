@@ -3564,12 +3564,35 @@ int handleClientsWithPendingWrites(void) {
          * lock-take disappears with the pending-write queueing -- POC keeps
          * the queue for the non-clean shapes). Reply lists / encoded bufs /
          * non-normal types keep the legacy synchronous write below. */
-        if (c->owner_tid != 0 && c->bufpos > 0 && listLength(c->reply) == 0 &&
-            !c->flag.buf_encoded && getClientType(c) == CLIENT_TYPE_NORMAL &&
-            !c->flag.close_after_reply) {
-            c->io_last_reply_block = NULL;
-            c->io_last_bufpos = (size_t)c->bufpos;
-            c->write_flags = WRITE_FLAGS_OWNED_LOCAL;
+        if (c->owner_tid != 0 && getClientType(c) == CLIENT_TYPE_NORMAL &&
+            !c->flag.close_after_reply && !c->flag.lua_debug &&
+            (c->bufpos > 0 || listLength(c->reply) > 0)) {
+            /* Snapshot exactly as trySendWriteToIOThreads does for normal
+             * clients: last reply-list block + used position, else plain
+             * bufpos. Covers ENCODED buffers and reply lists — the shapes
+             * P>1 pipelining produces (the original plain-only condition
+             * never fired at P10: buf_encoded=1 on 100% of punted flushes).
+             * Tiering: plain non-encoded full drains earn fix #2 worker-side
+             * completion (OWNED_LOCAL); encoded/list shapes use write_flags=0
+             * so the worker WRITES but completion returns to main via
+             * JOB_RES_WRITE_CLIENT -> processClientIOWriteDone (battle-tested
+             * for encoded resets/partial writes). Main sheds the write phase
+             * in ALL staged cases — that is F7's actual claim. */
+            c->io_last_reply_block = listLast(c->reply);
+            if (c->io_last_reply_block) {
+                clientReplyBlock *f7blk = (clientReplyBlock *)listNodeValue(c->io_last_reply_block);
+                c->io_last_bufpos = f7blk->used;
+            } else {
+                c->io_last_bufpos = (size_t)c->bufpos;
+            }
+            connSetPostponeUpdateState(c->conn, 1);
+            c->write_flags = (!c->flag.buf_encoded && c->io_last_reply_block == NULL)
+                                 ? WRITE_FLAGS_OWNED_LOCAL : 0;
+            /* The offload tier (write_flags==0) completes via JOB_RES →
+             * handleWriteJobs, which decrements stat_io_writes_pending for
+             * non-OWNED_LOCAL jobs — balance it here (we are on main; these
+             * are genuinely pending offloaded writes now). */
+            if (c->write_flags == 0) server.stat_io_writes_pending++;
             c->io_write_state = CLIENT_PENDING_IO;
             /* Lock discipline: poll_mutex is RECURSIVE (ae.c:104), so
              * registering while holding the lock would not deadlock — we
@@ -3588,7 +3611,10 @@ int handleClientsWithPendingWrites(void) {
              * re-acquire, unstage, legacy synchronous write. */
             aeAcquireLock(owner_loop);
             c->io_write_state = CLIENT_IDLE;
+            if (c->write_flags == 0) server.stat_io_writes_pending--;
             c->write_flags = 0;
+            c->io_last_reply_block = NULL;
+            connSetPostponeUpdateState(c->conn, 0);
         }
 
         /* Try to write buffers to the client socket. */
