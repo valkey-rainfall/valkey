@@ -4629,6 +4629,7 @@ void readQueryFromClient(connection *conn) {
             dplus_thread_stats[tid].sum_d23 += (long long)(t3 - c->dplus_pt[2]);
             dplus_thread_stats[tid].punt_rt_count++;
             c->dplus_pt[0] = 0;
+            dplus_thread_stats[tid].handoffs_done++; /* Q7c */
         }
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
@@ -4645,6 +4646,7 @@ void readQueryFromClient(connection *conn) {
         c->read_flags |= READ_FLAGS_OWNED_HANDOFF;
         /* Q7 T0: worker stamps handoff start (punt begins). */
         c->dplus_pt[0] = getMonotonicUs();
+        dplus_thread_stats[getCurTid()].handoffs_started++; /* Q7c */
         c->io_read_state = CLIENT_PENDING_IO;
         c->flag.pending_read = 1;
         connSetPostponeUpdateState(c->conn, 1);

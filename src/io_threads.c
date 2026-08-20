@@ -37,6 +37,8 @@ static int io_threads_initialized = 0;
 /* Q7b cadence counters: main-side drain stats (main-thread-only, plain). */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 static long long dplus_drain_calls = 0;
+long long dplus_gauge_mpsc_sum = 0, dplus_gauge_inflight_sum = 0, dplus_gauge_samples = 0;
+long long dplus_drain_busy_us = 0;
 static long long dplus_drain_nonempty = 0;
 static long long dplus_drain_jobs = 0;
 #endif
@@ -1124,6 +1126,21 @@ int processIOThreadsResponses(void) {
      * so also peek at the MPSC outbox directly for their responses. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     dplus_drain_calls++;
+    /* Q7c: sample in-flight + queue depth at drain entry (per-drain rate,
+     * main-side — not per-event; coherence lesson respected). */
+    {
+        size_t qh = atomic_load_explicit(&io_shared_outbox.head, memory_order_relaxed);
+        size_t qt = atomic_load_explicit(&io_shared_outbox.tail, memory_order_acquire);
+        long long started = 0, done = 0;
+        for (int qi = 0; qi < DPLUS_MAX_IO_THREADS; qi++) {
+            started += dplus_thread_stats[qi].handoffs_started;
+            done += dplus_thread_stats[qi].handoffs_done;
+        }
+        dplus_gauge_mpsc_sum += (long long)(qt - qh);
+        dplus_gauge_inflight_sum += (started - done);
+        dplus_gauge_samples++;
+    }
+    long long dplus_drain_t0 = getMonotonicUs();
 #endif
     if (getPendingIOResponsesCount() == 0) {
         /* Door-2: owned clients push to MPSC without incrementing io_jobs_submitted.
@@ -1190,6 +1207,7 @@ int processIOThreadsResponses(void) {
                 dplus_drain_nonempty++;
                 dplus_drain_jobs += total_processed;
             }
+            dplus_drain_busy_us += getMonotonicUs() - dplus_drain_t0;
 #endif
             return total_processed;
         }

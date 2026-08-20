@@ -89,7 +89,9 @@ typedef struct dplusThreadStats {
     long long sum_d23;            /* cumulative T3-T2 (return wait: main->worker) in µs */
     /* Q7b cadence counters. */
     long long sweeps;             /* outer loop iterations (per-worker sweep rate) */
-    char _pad[2 * DPLUS_CACHELINE - 12 * sizeof(long long)]; /* pad to 2 cache lines */
+    long long handoffs_started;   /* Q7c: T0 count (per owner thread) */
+    long long handoffs_done;      /* Q7c: T3 count */
+    char _pad[2 * DPLUS_CACHELINE - 14 * sizeof(long long)]; /* pad to 2 cache lines */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
