@@ -82,7 +82,12 @@ typedef struct dplusThreadStats {
     long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
     long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
-    char _pad[DPLUS_CACHELINE - 7 * sizeof(long long)]; /* pad to full cache line */
+    /* Q7 punt round-trip stage instrumentation (per-thread, race-free). */
+    long long punt_rt_count;      /* number of complete punt round-trips measured */
+    long long sum_d01;            /* cumulative T1-T0 (queue wait: worker->main) in µs */
+    long long sum_d12;            /* cumulative T2-T1 (main execution time) in µs */
+    long long sum_d23;            /* cumulative T3-T2 (return wait: main->worker) in µs */
+    char _pad[2 * DPLUS_CACHELINE - 11 * sizeof(long long)]; /* pad to 2 cache lines */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];

@@ -839,6 +839,25 @@ sds dplusInfoString(sds info) {
         (unsigned long long)doorbell_rings,
         (unsigned long long)doorbell_coalesced,
         (unsigned long long)punted_replies);
+    /* Q7 punt round-trip stage averages (fold per-thread accumulators). */
+    {
+        long long total_count = 0, total_d01 = 0, total_d12 = 0, total_d23 = 0;
+        for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+            total_count += dplus_thread_stats[i].punt_rt_count;
+            total_d01 += dplus_thread_stats[i].sum_d01;
+            total_d12 += dplus_thread_stats[i].sum_d12;
+            total_d23 += dplus_thread_stats[i].sum_d23;
+        }
+        long long avg_d01 = total_count ? total_d01 / total_count : 0;
+        long long avg_d12 = total_count ? total_d12 / total_count : 0;
+        long long avg_d23 = total_count ? total_d23 / total_count : 0;
+        info = sdscatprintf(info,
+            "dplus_punt_rt_count:%lld\r\n"
+            "dplus_punt_avg_d01_us:%lld\r\n"
+            "dplus_punt_avg_d12_us:%lld\r\n"
+            "dplus_punt_avg_d23_us:%lld\r\n",
+            total_count, avg_d01, avg_d12, avg_d23);
+    }
     return info;
 }
 #endif

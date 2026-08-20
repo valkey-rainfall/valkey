@@ -1360,6 +1360,10 @@ typedef struct client {
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t owner_tid;                    /* Stable owner thread ID (door-2). 0 = legacy/writer-owned. */
+    /* Q7 punt round-trip instrumentation: 4 timestamps forming 3 deltas.
+     * T0 = worker handoff start, T1 = main pickup, T2 = main done,
+     * T3 = worker next-batch start (computed at T3 site). */
+    uint64_t dplus_pt[4];
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
