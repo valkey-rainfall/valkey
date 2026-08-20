@@ -81,7 +81,8 @@ typedef struct dplusThreadStats {
     long long owned_net_bytes;    /* bytes written by those completions */
     long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
     long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
-    char _pad[DPLUS_CACHELINE - 6 * sizeof(long long)]; /* pad to full cache line */
+    long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
+    char _pad[DPLUS_CACHELINE - 7 * sizeof(long long)]; /* pad to full cache line */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];

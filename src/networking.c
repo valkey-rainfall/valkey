@@ -3470,6 +3470,23 @@ void processClientIOWriteDone(client *c) {
  * we can just write the replies to the client output buffer without any
  * need to use a syscall in order to install the writable event handler,
  * get it called, and so forth. */
+/* F7 (owner reply writes): AE_WRITABLE handler on the OWNER worker's loop for
+ * a punted-command reply staged by main. Fires on the worker; self-deletes
+ * first (one-shot semantics on a level-triggered loop), then runs the
+ * standard IO-thread write path. Clean full drains complete worker-side via
+ * the fix #2 gate inside ioThreadWriteToClient's completion block; partial
+ * writes and errors flow through JOB_RES_WRITE_CLIENT to main's
+ * processClientIOWriteDone (which may disown via installClientWriteHandler --
+ * the designed degradation for slow clients). */
+static void f7OwnerWriteHandler(connection *conn) {
+    client *c = connGetPrivateData(conn);
+    connSetWriteHandler(conn, NULL);
+    serverAssert(c->io_write_state == CLIENT_PENDING_IO);
+    serverAssert(c->owner_tid == getCurTid());
+    dplus_thread_stats[getCurTid()].punted_replies_written++;
+    ioThreadWriteToClient(c);
+}
+
 int handleClientsWithPendingWrites(void) {
     int processed = 0;
     int pending_writes = listLength(server.clients_pending_write);
@@ -3528,6 +3545,42 @@ int handleClientsWithPendingWrites(void) {
         }
 
         processed++;
+
+        /* F7 (owner reply writes): for an owned client with the clean shape
+         * (plain buffer, not encoded, normal type), do NOT write here -- stage
+         * the write and hand it to the OWNER worker via a writable event on
+         * its loop. connSetWriteHandler -> aeCreateFileEvent takes the worker
+         * loop's AE_LOCK: same release/acquire publish edge as accept-time
+         * migration (see the accept-ordering comment), so the staged snapshot
+         * is visible before the handler can fire. We already hold the owner
+         * loop lock here, so no dispatch races the staging. Main sheds the
+         * write phase (and, once staged writes dominate, this whole
+         * lock-take disappears with the pending-write queueing -- POC keeps
+         * the queue for the non-clean shapes). Reply lists / encoded bufs /
+         * non-normal types keep the legacy synchronous write below. */
+        if (c->owner_tid != 0 && c->bufpos > 0 && listLength(c->reply) == 0 &&
+            !c->flag.buf_encoded && getClientType(c) == CLIENT_TYPE_NORMAL &&
+            !c->flag.close_after_reply) {
+            c->io_last_reply_block = NULL;
+            c->io_last_bufpos = (size_t)c->bufpos;
+            c->write_flags = WRITE_FLAGS_OWNED_LOCAL;
+            c->io_write_state = CLIENT_PENDING_IO;
+            /* AE_LOCK is a plain (non-recursive) mutex and connSetWriteHandler
+             * -> aeCreateFileEvent takes it: RELEASE FIRST. The staging above
+             * is ordered before the release; anything the worker dispatches
+             * in the gap sees io_write_state == PENDING_IO and defers (the
+             * standard deferral guard). Registration then provides the
+             * publish edge for the handler itself. */
+            aeReleaseLock(owner_loop);
+            if (connSetWriteHandler(c->conn, f7OwnerWriteHandler) == C_OK) {
+                continue;
+            }
+            /* Registration failed (ERANGE-class, effectively unreachable):
+             * re-acquire, unstage, legacy synchronous write. */
+            aeAcquireLock(owner_loop);
+            c->io_write_state = CLIENT_IDLE;
+            c->write_flags = 0;
+        }
 
         /* Try to write buffers to the client socket. */
         if (writeToClient(c) == C_ERR) {
