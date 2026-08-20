@@ -1138,6 +1138,19 @@ int processIOThreadsResponses(void) {
     client *read_jobs[JOB_BATCH_SIZE];
     client *write_jobs[JOB_BATCH_SIZE];
 
+    /* F6 DIAGNOSTIC (Q7b lockstep finding, Aug 19): under ownership at r100,
+     * this while(1) grinds the ENTIRE client population's punted batches in
+     * one call (~20ms for 1200 clients), and owned-client replies are only
+     * written back in handleClientsWithPendingWrites at iteration end — so
+     * the whole system moves in lockstep waves (measured: drains/s == wave
+     * rate == 30/s, jobs/drain == 1200 == population, d01+d23 ≈ wave period).
+     * Cap the jobs consumed per call so main RETURNS to its event loop,
+     * flushes the chunk's replies, and re-enters via the pending pipe byte —
+     * letting worker reply-emission overlap main's grind. Cap value is a
+     * probe knob, not tuned. */
+#define DPLUS_DRAIN_CAP 128
+    int drain_cap_used = 0;
+
     /* Loop until we consume all pending jobs */
     while (1) {
         int received_responses = 0;
@@ -1182,6 +1195,26 @@ int processIOThreadsResponses(void) {
 
         if (read_count) handleReadJobs(read_jobs, read_count);
         if (write_count) handleWriteJobs(write_jobs, write_count);
+
+        /* F6: cap consumed jobs per call under ownership — return to the
+         * event loop so this chunk's owned replies flush; a pending pipe
+         * byte (or the next doorbell ring) re-enters us for the rest. */
+        drain_cap_used += received_responses;
+        if (server.io_threads_ownership && drain_cap_used >= DPLUS_DRAIN_CAP && dequeued_count != 0) {
+            /* Self-ring: leftover jobs exist but workers may enqueue nothing
+             * further until our replies flush (lockstep tail) — a pending
+             * pipe byte guarantees re-entry next event-loop iteration. */
+            while (write(server.module_pipe[1], "A", 1) != 1) {
+                if (errno != EINTR) break;
+            }
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            if (total_processed > 0) {
+                dplus_drain_nonempty++;
+                dplus_drain_jobs += total_processed;
+            }
+#endif
+            return total_processed;
+        }
 
         /* If the queue was empty at the last try - don't try again */
         if (dequeued_count == 0) {
