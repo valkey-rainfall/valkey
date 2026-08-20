@@ -368,6 +368,7 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->owner_tid = 0;
+    memset(c->dplus_pt, 0, sizeof(c->dplus_pt));
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -2425,6 +2426,8 @@ void beforeNextClient(client *c) {
             c->pubsub_data != NULL) { /* lazily allocated on first pubsub/tracking use */
             disownClient(c);
         }
+        /* Q7 T2: main done processing this client's punted commands. */
+        if (c->dplus_pt[0]) c->dplus_pt[2] = getMonotonicUs();
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
     }
@@ -4556,6 +4559,18 @@ void readQueryFromClient(connection *conn) {
          * touch c->buf below. volatile alone orders the compiler, not the
          * ARM memory system. */
         atomic_thread_fence(memory_order_acquire);
+        /* Q7 T3: worker starts next read after a handoff. Compute and
+         * accumulate the 3 stage deltas, then clear. Per-thread accumulator
+         * (owner_tid == getCurTid()) so this is race-free. */
+        if (c->dplus_pt[0]) {
+            uint64_t t3 = getMonotonicUs();
+            int tid = getCurTid();
+            dplus_thread_stats[tid].sum_d01 += (long long)(c->dplus_pt[1] - c->dplus_pt[0]);
+            dplus_thread_stats[tid].sum_d12 += (long long)(c->dplus_pt[2] - c->dplus_pt[1]);
+            dplus_thread_stats[tid].sum_d23 += (long long)(t3 - c->dplus_pt[2]);
+            dplus_thread_stats[tid].punt_rt_count++;
+            c->dplus_pt[0] = 0;
+        }
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
         /* FLAG PARITY with trySendReadToIOThreads: without the REPLICATED
@@ -4569,6 +4584,8 @@ void readQueryFromClient(connection *conn) {
          * while this handoff can still be queued in the MPSC (found as a
          * reads_pending underflow assert under accept/kill churn). */
         c->read_flags |= READ_FLAGS_OWNED_HANDOFF;
+        /* Q7 T0: worker stamps handoff start (punt begins). */
+        c->dplus_pt[0] = getMonotonicUs();
         c->io_read_state = CLIENT_PENDING_IO;
         c->flag.pending_read = 1;
         connSetPostponeUpdateState(c->conn, 1);

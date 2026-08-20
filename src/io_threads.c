@@ -1058,6 +1058,9 @@ static void handleReadJobs(client **read_jobs, int read_count) {
          * made this decrement fire for reads that never incremented the
          * counter (underflow assert under accept/kill churn). */
         if (!(c->read_flags & READ_FLAGS_OWNED_HANDOFF)) legacy_count++;
+        /* Q7 T1: main picks up this owned-handoff client. */
+        if ((c->read_flags & READ_FLAGS_OWNED_HANDOFF) && c->dplus_pt[0])
+            c->dplus_pt[1] = getMonotonicUs();
         processClientIOReadsDone(c);
     }
     /* Only decrement for legacy (offloaded) reads — owned-path handoffs
