@@ -368,6 +368,7 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->owner_tid = 0;
+    c->f11 = NULL;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -2271,6 +2272,7 @@ int freeClient(client *c) {
     c->buf = NULL;
     listRelease(c->deferred_reply);
 
+    dplusF11SidecarFree(c);
     freeClientArgv(c);
     freeClientOriginalArgv(c);
     discardCommandQueue(c);

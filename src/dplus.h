@@ -74,6 +74,30 @@ extern _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS];
  * Instead, each IO thread accumulates into its own cache-line-aligned counter.
  * The main thread aggregates (add-and-zero) once per event-loop iteration in
  * beforeSleep — a per-LOOP touch, not per-command. */
+/* F11 (dependency-aware speculation) per-client sidecar. Holds speculated
+ * replies that land AFTER the first punted command in a batch (they cannot
+ * go to c->buf without breaking reply order) plus the segment map and the
+ * main-side punt-reply boundary offsets used for owner-side reassembly.
+ * Lazily allocated on the first interleaved batch; freed with the client. */
+#define DPLUS_F11_MAX_SLOTS 32
+#define DPLUS_F11_SCRATCH_CAP (16 * 1024)
+typedef struct dplusF11Sidecar {
+    char *scratch;               /* speculated reply bytes (after first punt) */
+    uint32_t scratch_len;
+    struct {
+        int32_t queue_idx;       /* command index this segment replies to (-1 = unused) */
+        uint32_t off, len;       /* range within scratch */
+    } segs[DPLUS_F11_MAX_SLOTS];
+    uint8_t nsegs;
+    /* Main-side: c->buf end-offset after each executed punt (assembly boundaries). */
+    uint32_t punt_end[DPLUS_F11_MAX_SLOTS];
+    uint8_t npunts;
+    uint8_t active;              /* this batch used interleaved speculation */
+} dplusF11Sidecar;
+
+void dplusF11SidecarFree(struct client *c);
+void dplusF11SidecarReset(struct client *c);
+
 typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
     long long usec;               /* wall time spent executing them (for commandstats) */

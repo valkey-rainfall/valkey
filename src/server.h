@@ -1360,6 +1360,8 @@ typedef struct client {
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t owner_tid;                    /* Stable owner thread ID (door-2). 0 = legacy/writer-owned. */
+    struct dplusF11Sidecar *f11;          /* F11 interleaved-speculation sidecar (lazy; NULL until first
+                                           * interleaved batch). Owned by the client lifecycle. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each

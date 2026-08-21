@@ -661,6 +661,21 @@ out:
  * After this, c->argc == 0, pending_command is clear, and cmd_queue has no
  * speculated entries. Main-thread processClientIOReadsDone sees nothing to
  * execute. */
+void dplusF11SidecarFree(client *c) {
+    if (!c->f11) return;
+    zfree(c->f11->scratch);
+    zfree(c->f11);
+    c->f11 = NULL;
+}
+
+void dplusF11SidecarReset(client *c) {
+    if (!c->f11) return;
+    c->f11->scratch_len = 0;
+    c->f11->nsegs = 0;
+    c->f11->npunts = 0;
+    c->f11->active = 0;
+}
+
 void dplusConsumeSpeculated(client *c, int count, int tid) {
     int consumed = 0;
 
