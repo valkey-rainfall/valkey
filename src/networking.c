@@ -418,6 +418,8 @@ void installClientWriteHandler(client *c) {
  * handleClientsWithPendingWrites() function).
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
+static void f7OwnerWriteHandler(connection *conn);
+
 void putClientInPendingWriteQueue(client *c) {
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
@@ -2428,6 +2430,49 @@ void beforeNextClient(client *c) {
         }
         /* Q7 T2: main done processing this client's punted commands. */
         if (c->dplus_pt[0]) c->dplus_pt[2] = getMonotonicUs();
+        /* F8 (drain-time staging): if this punted batch produced replies and
+         * the client still qualifies (not disowned above), stage the owner
+         * write HERE — at per-client handback — instead of leaving it for the
+         * beforeSleep flush. The flush runs once per main iteration, which
+         * made all clients' replies stage as ONE WAVE (measured: 32 waves/s,
+         * 2,399 jobs/drain, d23 25.5ms); staging at handback releases each
+         * client the moment its batch executes, so owners get work
+         * continuously. Ordering: staging (PENDING_IO) is published by the
+         * SAME release fence that publishes read-IDLE below — one fence, two
+         * fields, worker acquires both. The queue-on-first-reply edge may
+         * have queued this client for the beforeSleep flush; unlink so main
+         * never touches it again this iteration. Shapes that don't qualify
+         * keep the legacy flush path (it remains correct behind us). */
+        if (c->owner_tid != 0 && c->io_write_state == CLIENT_IDLE &&
+            getClientType(c) == CLIENT_TYPE_NORMAL && !c->flag.close_after_reply &&
+            !c->flag.close_asap && !c->flag.lua_debug &&
+            (c->bufpos > 0 || listLength(c->reply) > 0)) {
+            if (c->flag.pending_write) {
+                listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+                c->flag.pending_write = 0;
+            }
+            c->io_last_reply_block = listLast(c->reply);
+            if (c->io_last_reply_block) {
+                clientReplyBlock *f8blk = (clientReplyBlock *)listNodeValue(c->io_last_reply_block);
+                c->io_last_bufpos = f8blk->used;
+            } else {
+                c->io_last_bufpos = (size_t)c->bufpos;
+            }
+            connSetPostponeUpdateState(c->conn, 1);
+            c->write_flags = (!c->flag.buf_encoded && c->io_last_reply_block == NULL)
+                                 ? WRITE_FLAGS_OWNED_LOCAL : 0;
+            if (c->write_flags == 0) server.stat_io_writes_pending++;
+            c->io_write_state = CLIENT_PENDING_IO;
+            if (connSetWriteHandler(c->conn, f7OwnerWriteHandler) != C_OK) {
+                /* Unstage (effectively unreachable: ERANGE-class only). */
+                c->io_write_state = CLIENT_IDLE;
+                if (c->write_flags == 0) server.stat_io_writes_pending--;
+                c->write_flags = 0;
+                c->io_last_reply_block = NULL;
+                connSetPostponeUpdateState(c->conn, 0);
+                putClientInPendingWriteQueue(c);
+            }
+        }
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
     }
