@@ -9,6 +9,7 @@ typedef enum {
     JOB_REQ_FREE_ARGV,
     JOB_REQ_FREE_OBJ,
     JOB_REQ_POLL,
+    JOB_REQ_OWNER_WRITE, /* F8b: main staged an owned punted reply; owner writes it */
     JOB_REQ_ACCEPT,
     JOB_REQ_COUNT
 } JobRequest;

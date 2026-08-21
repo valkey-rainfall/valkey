@@ -415,6 +415,11 @@ static void *IOThreadMain(void *myid) {
                 case JOB_REQ_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
+                case JOB_REQ_OWNER_WRITE:
+                    /* F8b: staged by main at punt handback (PENDING_IO already
+                     * published). Same write path as the F7 handler. */
+                    ioThreadWriteToClient((client *)data);
+                    break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
@@ -866,6 +871,19 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
     io_jobs_submitted++;
 
     return C_OK;
+}
+
+/* F8b: submit a staged owned-punted-reply write to the OWNER worker's private
+ * SPSC. Caller (main, punt handback) has already snapshotted io_last_*, set
+ * write_flags, bumped stat_io_writes_pending for the offload tier, and set
+ * io_write_state = CLIENT_PENDING_IO. Enqueue commits immediately: the punt
+ * handback is itself batched per drain, and the worker's sweep polls the
+ * SPSC every iteration. */
+void ioSubmitOwnerWrite(client *c) {
+    serverAssert(c->owner_tid != 0 && c->io_write_state == CLIENT_PENDING_IO);
+    void *job = tagJob(c, JOB_REQ_OWNER_WRITE);
+    spscEnqueue(&io_private_inbox[c->owner_tid], job, true);
+    io_jobs_submitted++;
 }
 
 /* This function attempts to offload the free of an object to an IO thread.
