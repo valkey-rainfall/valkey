@@ -2429,6 +2429,66 @@ void beforeNextClient(client *c) {
             c->pubsub_data != NULL) { /* lazily allocated on first pubsub/tracking use */
             disownClient(c);
         }
+        /* F11 Stage 4: ordered reply assembly. If interleaved speculation
+         * was active, c->buf currently holds: [prefix_replies][punt_replies...]
+         * and scratch holds speculated-after-punt replies keyed by queue_idx.
+         * Reassemble into original command order. The post-prefix queue_idx
+         * space is contiguous: base..base+npunts+nsegs-1. Scratch segs have
+         * explicit queue_idx; everything else is a punt (executed by main in
+         * queue order). Walk the contiguous range and dispatch.
+         * GUARANTEED to fit PROTO_REPLY_CHUNK_BYTES (allowlist tiny replies +
+         * scratch cap ≤ buf constraints). */
+        if (c->f11 && c->f11->active) {
+            char assembled[PROTO_REPLY_CHUNK_BYTES];
+            uint32_t alen = 0;
+            dplusF11Sidecar *s = c->f11;
+
+            /* (1) Emit pre-punt speculated prefix: buf[0..buf_prefix_end) */
+            if (s->buf_prefix_end > 0) {
+                memcpy(assembled, c->buf, s->buf_prefix_end);
+                alen = s->buf_prefix_end;
+            }
+
+            /* (2) Merge punt and scratch in original command order.
+             * Post-prefix positions are contiguous: batch_start_idx ..
+             * batch_start_idx + npunts + nsegs - 1.
+             * For each position: if it matches next scratch seg's queue_idx,
+             * emit scratch; otherwise emit next punt segment. */
+            uint8_t punt_idx = 0;
+            uint8_t scratch_idx = 0;
+            uint32_t prev_punt_off = s->buf_prefix_end;
+            int32_t base = s->batch_start_idx;
+            int total = (int)s->npunts + (int)s->nsegs;
+
+            for (int i = 0; i < total; i++) {
+                int32_t pos = base + i;
+                if (scratch_idx < s->nsegs &&
+                    s->segs[scratch_idx].queue_idx == pos) {
+                    /* This position was speculated — emit from scratch */
+                    uint32_t len = s->segs[scratch_idx].len;
+                    serverAssert(alen + len <= PROTO_REPLY_CHUNK_BYTES);
+                    memcpy(assembled + alen,
+                           s->scratch + s->segs[scratch_idx].off, len);
+                    alen += len;
+                    scratch_idx++;
+                } else {
+                    /* This position was punted — emit from c->buf */
+                    serverAssert(punt_idx < s->npunts);
+                    uint32_t end = s->punt_end[punt_idx];
+                    uint32_t len = end - prev_punt_off;
+                    serverAssert(alen + len <= PROTO_REPLY_CHUNK_BYTES);
+                    memcpy(assembled + alen, c->buf + prev_punt_off, len);
+                    alen += len;
+                    prev_punt_off = end;
+                    punt_idx++;
+                }
+            }
+
+            serverAssert(alen <= PROTO_REPLY_CHUNK_BYTES);
+            memcpy(c->buf, assembled, alen);
+            c->bufpos = (int)alen;
+            s->active = 0; /* reset for next batch */
+        }
         /* F8 (drain-time staging): if this punted batch produced replies and
          * the client still qualifies (not disowned above), stage the owner
          * write HERE — at per-client handback — instead of leaving it for the
@@ -4545,6 +4605,26 @@ int processInputBuffer(client *c) {
             continue;
         }
 
+        /* F11 Stage 3: skip mid-queue entries whose replies were already
+         * speculatively written to the sidecar scratch by the IO thread.
+         * Free argv INLINE (NOT freeClientArgv — it routes through
+         * tryOffloadFreeArgvToIOThreads which data-races io_jobs_submitted
+         * from this context; see dplusConsumeSpeculated comment). */
+        if (c->read_flags & READ_FLAGS_DPLUS_SPECULATED) {
+            c->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+            for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+            zfree(c->argv);
+            c->argv = NULL;
+            c->argc = 0;
+            c->cmd = NULL;
+            c->parsed_cmd = NULL;
+            c->argv_len_sum = 0;
+            c->argv_len = 0;
+            c->slot = -1;
+            c->commands_processed++;
+            continue;
+        }
+
         if (c->querybuf == thread_shared_qb) {
             /* Before processing the command, reset the shared query buffer to its default state.
              * This avoids unintentionally modifying the shared qb during processCommand as we may use
@@ -4558,6 +4638,13 @@ int processInputBuffer(client *c) {
              * loop and trimming the client buffer later. So we return
              * ASAP in that case. */
             return C_ERR;
+        }
+
+        /* F11 Stage 3b: record punt-reply boundary after each executed
+         * (non-skipped) command when F11 assembly is active. The owner
+         * uses these offsets to know where each punt reply ends in c->buf. */
+        if (c->f11 && c->f11->active && c->f11->npunts < DPLUS_F11_MAX_SLOTS) {
+            c->f11->punt_end[c->f11->npunts++] = (uint32_t)c->bufpos;
         }
     }
 

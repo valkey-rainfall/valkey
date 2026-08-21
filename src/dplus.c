@@ -278,6 +278,7 @@ static int dplusF11MoveReplyToScratch(client *c, dplusBatchEntry *e, int start) 
     s->nsegs++;
     s->scratch_len += len;
     c->bufpos = start; /* roll the buffer back — bytes now live in scratch */
+    s->active = 1;     /* F11 stage 3.5: this batch uses interleaved speculation */
     return 1;
 }
 
@@ -644,6 +645,9 @@ int dplusSpeculateBatch(client *c, int tid) {
                         c->f11->scratch = zmalloc(DPLUS_F11_SCRATCH_CAP);
                     }
                     f11_wkeys[f11_wn++] = objectGetVal(p->argv[1]);
+                    if (!f11_past_punt) {
+                        c->f11->batch_start_idx = queue_pos; /* first post-prefix cmd */
+                    }
                     f11_past_punt = 1;
                     queue_pos++;
                     continue; /* write stays queued for main; keep walking */
@@ -717,6 +721,14 @@ int dplusSpeculateBatch(client *c, int tid) {
     }
 
 out:
+    /* F11 stage 3.5: capture the buf position at end of speculation walk.
+     * This is the boundary between the speculated prefix (replies already in
+     * c->buf from contiguous-prefix GETs) and what main will write (punt
+     * replies). The owner's assembly uses this to emit the prefix first. */
+    if (c->f11 && c->f11->active) {
+        c->f11->buf_prefix_end = (uint32_t)c->bufpos;
+    }
+
     /* Update write-tax gate: shift in 1 if any speculation succeeded, 0 if punted. */
     gate->history = (gate->history << 1) | (speculated > 0 ? 1 : 0);
 
@@ -759,6 +771,8 @@ void dplusF11SidecarReset(client *c) {
     c->f11->nsegs = 0;
     c->f11->npunts = 0;
     c->f11->active = 0;
+    c->f11->buf_prefix_end = 0;
+    c->f11->batch_start_idx = -1;
 }
 
 void dplusConsumeSpeculated(client *c, int count, int tid) {

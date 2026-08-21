@@ -93,6 +93,8 @@ typedef struct dplusF11Sidecar {
     uint32_t punt_end[DPLUS_F11_MAX_SLOTS];
     uint8_t npunts;
     uint8_t active;              /* this batch used interleaved speculation */
+    uint32_t buf_prefix_end;     /* c->bufpos at end of IO-thread speculation walk (pre-punt prefix boundary) */
+    int32_t batch_start_idx;     /* absolute queue_idx of first post-prefix command (for assembly merge) */
 } dplusF11Sidecar;
 
 void dplusF11SidecarFree(struct client *c);
