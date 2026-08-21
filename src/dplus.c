@@ -231,12 +231,59 @@ typedef struct dplusBatchEntry {
     hashtableIncrementalFindState find_state; /* Incremental find state */
     int is_first_cmd;                        /* 1 if this is c->argv, 0 if queue */
     int queue_idx;                           /* Index in cmd_queue (if !is_first_cmd) */
+    int to_scratch;                          /* F11: reply goes to the sidecar scratch
+                                              * (entry is beyond the first punted write) */
 } dplusBatchEntry;
 
 /* Execute the validate+copy+reply phase for a single prefetched entry.
  * Returns 1 on success (reply written), 0 on punt. */
+/* F11: append a completed reply's bytes to the sidecar scratch, recording the
+ * segment. Called instead of leaving the bytes in c->buf when e->to_scratch.
+ * The reply was just written at c->buf[start..bufpos) by the normal path —
+ * move it: scratch gets the bytes, buf rolls back. Returns 0 on overflow
+ * (caller treats as punt: entry stays unmarked, main executes it). */
+/* F11 allowlist: single-key plain writes with FIXED arity and tiny fixed-size
+ * replies (<=32B: +OK / :int). Exact-arity checks exclude option forms with
+ * bulk replies (e.g. SET ... GET). GETSET intentionally absent (bulk reply). */
+static int dplusF11IsAllowlistedWrite(parsedCommand *p) {
+    static struct serverCommand *w_set, *w_del, *w_unlink, *w_expire, *w_pexpire,
+        *w_setex, *w_psetex, *w_incr, *w_decr, *w_incrby, *w_decrby, *w_append;
+    static int init = 0;
+    if (!init) {
+        w_set = lookupCommandByCString("set");       w_del = lookupCommandByCString("del");
+        w_unlink = lookupCommandByCString("unlink"); w_expire = lookupCommandByCString("expire");
+        w_pexpire = lookupCommandByCString("pexpire"); w_setex = lookupCommandByCString("setex");
+        w_psetex = lookupCommandByCString("psetex"); w_incr = lookupCommandByCString("incr");
+        w_decr = lookupCommandByCString("decr");     w_incrby = lookupCommandByCString("incrby");
+        w_decrby = lookupCommandByCString("decrby"); w_append = lookupCommandByCString("append");
+        init = 1;
+    }
+    struct serverCommand *m = p->cmd;
+    if (m == w_set) return p->argc == 3;
+    if (m == w_del || m == w_unlink || m == w_incr || m == w_decr) return p->argc == 2;
+    if (m == w_expire || m == w_pexpire || m == w_incrby || m == w_decrby || m == w_append) return p->argc == 3;
+    if (m == w_setex || m == w_psetex) return p->argc == 4;
+    return 0;
+}
+
+static int dplusF11MoveReplyToScratch(client *c, dplusBatchEntry *e, int start) {
+    dplusF11Sidecar *s = c->f11;
+    uint32_t len = (uint32_t)(c->bufpos - start);
+    if (!s || s->nsegs >= DPLUS_F11_MAX_SLOTS ||
+        s->scratch_len + len > DPLUS_F11_SCRATCH_CAP) return 0;
+    memcpy(s->scratch + s->scratch_len, c->buf + start, len);
+    s->segs[s->nsegs].queue_idx = e->queue_idx;
+    s->segs[s->nsegs].off = s->scratch_len;
+    s->segs[s->nsegs].len = len;
+    s->nsegs++;
+    s->scratch_len += len;
+    c->bufpos = start; /* roll the buffer back — bytes now live in scratch */
+    return 1;
+}
+
 static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, int resp) {
     dplusVersionArray *va = hashtableGetVersionArray(ht);
+    int f11_start = c->bufpos; /* F11: reply-start capture for scratch move */
 
     /* Get the find result — entry is now in cache from prefetch. */
     void *entry = NULL;
@@ -254,7 +301,9 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
 #endif
-        return dplusWriteNilReply(c, resp) > 0 ? 1 : 0;
+        if (dplusWriteNilReply(c, resp) <= 0) return 0;
+        if (e->to_scratch && !dplusF11MoveReplyToScratch(c, e, f11_start)) return 0;
+        return 1;
     }
 
     /* Found an entry. It's an robj*. */
@@ -308,6 +357,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
     /* Version valid — write reply. */
     int written = dplusWriteBulkReply(c, valbuf, vallen);
     if (written <= 0) return 0;
+    if (e->to_scratch && !dplusF11MoveReplyToScratch(c, e, f11_start)) return 0;
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
@@ -526,6 +576,7 @@ int dplusSpeculateBatch(client *c, int tid) {
         e->v_before = dplusVersionRead(va, e->shard);
         e->is_first_cmd = 1;
         e->queue_idx = -1;
+        e->to_scratch = 0;
         batch_count++;
     } else {
         /* First command not eligible — nothing to speculate. */
@@ -554,6 +605,11 @@ int dplusSpeculateBatch(client *c, int tid) {
     cmdQueue *queue = &c->cmd_queue;
     int queue_pos = queue->off;
     int prefix_open = 1;
+    /* F11 walk state: written-key set + past-first-punt flag. */
+    sds f11_wkeys[DPLUS_F11_MAX_SLOTS];
+    int f11_wn = 0;
+    int f11_past_punt = 0;
+    if (c->f11) dplusF11SidecarReset(c);
 
     /* Ring state: batch[] reused as the slot array. head..tail are monotonic;
      * slot index = seq % DPLUS_BATCH_DEPTH. done[] marks completed finds so
@@ -572,18 +628,46 @@ int dplusSpeculateBatch(client *c, int tid) {
             parsedCommand *p = &queue->cmds[queue_pos];
             if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
                 !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
-                /* F11 STAGE-1 INSTRUMENTATION (no behavior change): from the
-                 * command that closes the prefix, continue scanning with the
-                 * dependency rule to count what dependency-aware speculation
-                 * WOULD have speculated. Real keys, real collisions — the
-                 * honest engagement ceiling for F11 on this workload.
-                 * Rule: single-key plain writes (SET/DEL/EXPIRE-class,
-                 * key at argv[1]) join the written-key set; a later GET
-                 * speculates iff its key collides with NO earlier write;
-                 * anything else is a full barrier. */
+                /* F11 DEPENDENCY WALK: an allowlisted single-key write (tiny
+                 * fixed-size reply, exact arity — SET k v / DEL k / EXPIRE-class /
+                 * INCR-class / APPEND) does NOT close speculation: it joins the
+                 * written-key set and the walk continues. Later GETs speculate
+                 * iff their key collides with NO earlier write — their replies
+                 * go to the sidecar scratch (order restored at owner assembly).
+                 * Anything else is a FULL BARRIER (prefix semantics resume).
+                 * Ownership required: assembly happens on the owner path only. */
+                if (server.io_threads_ownership && c->owner_tid != 0 &&
+                    f11_wn < DPLUS_F11_MAX_SLOTS &&
+                    dplusF11IsAllowlistedWrite(p)) {
+                    if (!c->f11) {
+                        c->f11 = zcalloc(sizeof(dplusF11Sidecar));
+                        c->f11->scratch = zmalloc(DPLUS_F11_SCRATCH_CAP);
+                    }
+                    f11_wkeys[f11_wn++] = objectGetVal(p->argv[1]);
+                    f11_past_punt = 1;
+                    queue_pos++;
+                    continue; /* write stays queued for main; keep walking */
+                }
                 dplusF11ScanRemainder(c, queue, queue_pos, dplus_get_cmd, tid, NULL, 0);
-                prefix_open = 0; /* ineligible command ends the global prefix */
+                prefix_open = 0; /* barrier: ends speculation for the rest */
                 break;
+            }
+            if (f11_past_punt) {
+                /* GET beyond the first punt: dependency check. Collision →
+                 * leave it for main (do NOT barrier; keep walking). */
+                sds gk = objectGetVal(p->argv[1]);
+                int collide = 0;
+                for (int wi = 0; wi < f11_wn; wi++) {
+                    if (sdslen(f11_wkeys[wi]) == sdslen(gk) &&
+                        memcmp(f11_wkeys[wi], gk, sdslen(gk)) == 0) { collide = 1; break; }
+                }
+                if (collide) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                    dplus_thread_stats[tid].f11_dependency_punts++;
+#endif
+                    queue_pos++;
+                    continue;
+                }
             }
             dplusBatchEntry *e = &batch[tail % DPLUS_BATCH_DEPTH];
             e->key_sds = objectGetVal(p->argv[1]);
@@ -592,6 +676,7 @@ int dplusSpeculateBatch(client *c, int tid) {
             e->v_before = dplusVersionRead(va, e->shard);
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
+            e->to_scratch = f11_past_punt;
             hashtableIncrementalFindInit(&e->find_state, ht, e->key_sds);
             done[tail % DPLUS_BATCH_DEPTH] = 0;
             tail++;
