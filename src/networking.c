@@ -267,6 +267,13 @@ static inline int isReplicaReadyForReplData(client *replica) {
 static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (c->flag.fake || isDeferredReplyEnabled(c)) return 0;
 
+    /* F11: during interleaved speculation, all punt replies MUST go to c->buf
+     * (the assembly reads them by offset). Copy-avoidance's encoded-buffer
+     * path can spill to the reply list when the buffer already holds plain
+     * data, breaking the offset-based boundary recording. Disable it for the
+     * duration of the batch — replies are small (allowlist guarantees). */
+    if (c->f11 && c->f11->active) return 0;
+
     int type = getClientType(c);
     if (type != CLIENT_TYPE_NORMAL && type != CLIENT_TYPE_PUBSUB) return 0;
 
@@ -2439,6 +2446,7 @@ void beforeNextClient(client *c) {
          * GUARANTEED to fit PROTO_REPLY_CHUNK_BYTES (allowlist tiny replies +
          * scratch cap ≤ buf constraints). */
         if (c->f11 && c->f11->active) {
+            serverAssert(listLength(c->reply) == 0); /* F11: all punt replies must be in c->buf */
             char assembled[PROTO_REPLY_CHUNK_BYTES];
             uint32_t alen = 0;
             dplusF11Sidecar *s = c->f11;
@@ -2485,6 +2493,8 @@ void beforeNextClient(client *c) {
             }
 
             serverAssert(alen <= PROTO_REPLY_CHUNK_BYTES);
+            serverAssert(punt_idx == s->npunts);
+            serverAssert(scratch_idx == s->nsegs);
             memcpy(c->buf, assembled, alen);
             c->bufpos = (int)alen;
             s->active = 0; /* reset for next batch */
@@ -4643,7 +4653,7 @@ int processInputBuffer(client *c) {
         /* F11 Stage 3b: record punt-reply boundary after each executed
          * (non-skipped) command when F11 assembly is active. The owner
          * uses these offsets to know where each punt reply ends in c->buf. */
-        if (c->f11 && c->f11->active && c->f11->npunts < DPLUS_F11_MAX_SLOTS) {
+        if (c->f11 && c->f11->active && c->f11->npunts < DPLUS_F11_MAX_PUNTS) {
             c->f11->punt_end[c->f11->npunts++] = (uint32_t)c->bufpos;
         }
     }

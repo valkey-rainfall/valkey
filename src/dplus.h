@@ -80,6 +80,7 @@ extern _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS];
  * main-side punt-reply boundary offsets used for owner-side reassembly.
  * Lazily allocated on the first interleaved batch; freed with the client. */
 #define DPLUS_F11_MAX_SLOTS 32
+#define DPLUS_F11_MAX_PUNTS 512   /* punt_end can cover the full cmd_queue (cap 512) */
 #define DPLUS_F11_SCRATCH_CAP (16 * 1024)
 typedef struct dplusF11Sidecar {
     char *scratch;               /* speculated reply bytes (after first punt) */
@@ -90,8 +91,8 @@ typedef struct dplusF11Sidecar {
     } segs[DPLUS_F11_MAX_SLOTS];
     uint8_t nsegs;
     /* Main-side: c->buf end-offset after each executed punt (assembly boundaries). */
-    uint32_t punt_end[DPLUS_F11_MAX_SLOTS];
-    uint8_t npunts;
+    uint32_t punt_end[DPLUS_F11_MAX_PUNTS];
+    uint16_t npunts;
     uint8_t active;              /* this batch used interleaved speculation */
     uint32_t buf_prefix_end;     /* c->bufpos at end of IO-thread speculation walk (pre-punt prefix boundary) */
     int32_t batch_start_idx;     /* absolute queue_idx of first post-prefix command (for assembly merge) */
