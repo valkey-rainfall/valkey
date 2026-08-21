@@ -2460,15 +2460,15 @@ void beforeNextClient(client *c) {
                                  ? WRITE_FLAGS_OWNED_LOCAL : 0;
             if (c->write_flags == 0) server.stat_io_writes_pending++;
             c->io_write_state = CLIENT_PENDING_IO;
-            if (connSetWriteHandler(c->conn, f7OwnerWriteHandler) != C_OK) {
-                /* Unstage (effectively unreachable: ERANGE-class only). */
-                c->io_write_state = CLIENT_IDLE;
-                if (c->write_flags == 0) server.stat_io_writes_pending--;
-                c->write_flags = 0;
-                c->io_last_reply_block = NULL;
-                connSetPostponeUpdateState(c->conn, 0);
-                putClientInPendingWriteQueue(c);
-            }
+            /* F8b: hand the write to the owner via its lock-free private SPSC
+             * (uncommitted — batched; committed once at end of drain like the
+             * FREE_ARGV pattern). The gauge falsified event-registration here:
+             * connSetWriteHandler takes the owner's poll mutex, and mid-drain
+             * that serializes main against now-busy workers (rt/s 38.6K→13K,
+             * per-job drain cost 59→330µs). SPSC enqueue is wait-free for
+             * main; the worker's PRIORITY-1 dequeue picks it up next sweep
+             * iteration without waking machinery. */
+            ioSubmitOwnerWrite(c);
         }
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
