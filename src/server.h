@@ -3557,6 +3557,7 @@ robj *activeDefragStringOb(robj *ob);
 void dismissSds(sds s);
 void dismissMemoryInChild(void);
 void tlsResetCertInfo(void);
+size_t tlsMemoryUsage(void);
 void trackInstantaneousMetric(int metric, long long current_value, long long current_base, long long factor);
 long long getInstantaneousMetric(int metric);
 

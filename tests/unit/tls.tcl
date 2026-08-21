@@ -917,3 +917,42 @@ start_server {tags {"tls"}} {
         }
     }
 }
+
+start_server {tags {"tls"}} {
+    if {$::tls} {
+        package require tls
+
+        test {TLS: used_memory_tls reports nonzero after TLS connections} {
+            # The server itself uses TLS internally for the test connection,
+            # so used_memory_tls should already be nonzero.
+            set mem_tls [s used_memory_tls]
+            assert {$mem_tls > 0}
+        }
+
+        test {TLS: used_memory_tls grows with additional connections} {
+            set baseline [s used_memory_tls]
+
+            # Open 50 additional TLS connections
+            set clients {}
+            for {set i 0} {$i < 50} {incr i} {
+                lappend clients [valkey [srv 0 host] [srv 0 port] 0 1]
+            }
+
+            # Verify each connection works
+            foreach c $clients {
+                assert_equal {PONG} [$c PING]
+            }
+
+            set after [s used_memory_tls]
+            # Memory must have grown (50 TLS connections add significant state)
+            assert {$after > $baseline}
+            # Sanity: growth should be at least 1 KiB per connection
+            assert {$after - $baseline > 50 * 1024}
+
+            # Cleanup
+            foreach c $clients {
+                $c close
+            }
+        }
+    }
+}

@@ -6398,6 +6398,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "used_memory_functions:%lld\r\n", (long long)mh->functions_caches,
                 "used_memory_scripts:%lld\r\n", (long long)mh->lua_caches + (long long)mh->functions_caches,
                 "used_memory_scripts_human:%s\r\n", used_memory_scripts_hmem,
+                "used_memory_tls:%zu\r\n", tlsMemoryUsage(),
                 "maxmemory:%lld\r\n", server.maxmemory,
                 "maxmemory_human:%s\r\n", maxmemory_hmem,
                 "maxmemory_policy:%s\r\n", evict_policy,

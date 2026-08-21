@@ -65,6 +65,104 @@
 #define REDIS_TLS_PROTO_TLSv1_2 (1 << 2)
 #define REDIS_TLS_PROTO_TLSv1_3 (1 << 3)
 
+/* ---------------------------------------------------------------------------
+ * TLS memory tracking
+ *
+ * OpenSSL allocations are invisible to zmalloc because they go through libc
+ * directly. We intercept them via CRYPTO_set_mem_functions to maintain a
+ * separate atomic byte counter exposed as INFO memory "used_memory_tls".
+ * This counter is intentionally NOT added to used_memory -- doing so would
+ * change maxmemory/eviction semantics on existing deployments.
+ *
+ * We always use a size-prefix header rather than querying the allocator's
+ * usable-size function (e.g. je_malloc_usable_size) because we cannot
+ * guarantee that the same allocator backs both the main heap and the OpenSSL
+ * allocations on all platforms. The sizeof(size_t) per-allocation overhead is
+ * negligible for a monitoring counter.
+ * --------------------------------------------------------------------------- */
+/* Cache-line aligned to avoid false sharing with adjacent statics. Updated
+ * only at allocation frequency (handshake/connection lifecycle), not per
+ * TLS record, so a single relaxed atomic suffices. */
+static __attribute__((aligned(CACHE_LINE_SIZE))) _Atomic size_t tls_used_memory = 0;
+
+/* Suppress the server.h deprecation of raw malloc/realloc/free. These wrappers
+ * intentionally bypass zmalloc to avoid counting OpenSSL memory into
+ * used_memory (which would change maxmemory/eviction behavior). */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
+/* OpenSSL 1.1.0+ callback signatures include (const char *file, int line)
+ * for debugging. OpenSSL 1.0.2 uses plain (size_t) / (void*,size_t) / (void*).
+ * We guard on OPENSSL_VERSION_NUMBER to support both. */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+
+static void *tls_malloc(size_t size, const char *file, int line) {
+    (void)file; (void)line;
+    void *ptr = malloc(size + sizeof(size_t));
+    if (!ptr) return NULL;
+    *((size_t *)ptr) = size;
+    atomic_fetch_add_explicit(&tls_used_memory, size + sizeof(size_t), memory_order_relaxed);
+    return (char *)ptr + sizeof(size_t);
+}
+
+static void *tls_realloc(void *orig, size_t size, const char *file, int line) {
+    (void)file; (void)line;
+    void *real_orig = orig ? (char *)orig - sizeof(size_t) : NULL;
+    size_t old_size = orig ? *((size_t *)real_orig) + sizeof(size_t) : 0;
+    void *ptr = realloc(real_orig, size + sizeof(size_t));
+    if (!ptr) return NULL;
+    *((size_t *)ptr) = size;
+    atomic_fetch_sub_explicit(&tls_used_memory, old_size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&tls_used_memory, size + sizeof(size_t), memory_order_relaxed);
+    return (char *)ptr + sizeof(size_t);
+}
+
+static void tls_free(void *ptr, const char *file, int line) {
+    (void)file; (void)line;
+    if (!ptr) return;
+    void *real_ptr = (char *)ptr - sizeof(size_t);
+    size_t old_size = *((size_t *)real_ptr) + sizeof(size_t);
+    atomic_fetch_sub_explicit(&tls_used_memory, old_size, memory_order_relaxed);
+    free(real_ptr);
+}
+
+#else /* OpenSSL < 1.1.0 */
+
+static void *tls_malloc(size_t size) {
+    void *ptr = malloc(size + sizeof(size_t));
+    if (!ptr) return NULL;
+    *((size_t *)ptr) = size;
+    atomic_fetch_add_explicit(&tls_used_memory, size + sizeof(size_t), memory_order_relaxed);
+    return (char *)ptr + sizeof(size_t);
+}
+
+static void *tls_realloc(void *orig, size_t size) {
+    void *real_orig = orig ? (char *)orig - sizeof(size_t) : NULL;
+    size_t old_size = orig ? *((size_t *)real_orig) + sizeof(size_t) : 0;
+    void *ptr = realloc(real_orig, size + sizeof(size_t));
+    if (!ptr) return NULL;
+    *((size_t *)ptr) = size;
+    atomic_fetch_sub_explicit(&tls_used_memory, old_size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&tls_used_memory, size + sizeof(size_t), memory_order_relaxed);
+    return (char *)ptr + sizeof(size_t);
+}
+
+static void tls_free(void *ptr) {
+    if (!ptr) return;
+    void *real_ptr = (char *)ptr - sizeof(size_t);
+    size_t old_size = *((size_t *)real_ptr) + sizeof(size_t);
+    atomic_fetch_sub_explicit(&tls_used_memory, old_size, memory_order_relaxed);
+    free(real_ptr);
+}
+
+#endif /* OPENSSL_VERSION_NUMBER >= 0x10100000L */
+
+#pragma GCC diagnostic pop
+
+size_t tlsMemoryUsage(void) {
+    return atomic_load_explicit(&tls_used_memory, memory_order_relaxed);
+}
+
 /* Use safe defaults */
 #ifdef TLS1_3_VERSION
 #define REDIS_TLS_PROTO_DEFAULT (REDIS_TLS_PROTO_TLSv1_2 | REDIS_TLS_PROTO_TLSv1_3)
@@ -159,6 +257,15 @@ static void initCryptoLocks(void) {
 #endif /* USE_CRYPTO_LOCKS */
 
 static void tlsInit(void) {
+    /* Register custom allocator wrappers to track OpenSSL memory usage.
+     * This must happen before ANY other OpenSSL API call; once OpenSSL has
+     * allocated internally, CRYPTO_set_mem_functions returns failure. */
+    if (!CRYPTO_set_mem_functions(tls_malloc, tls_realloc, tls_free)) {
+        serverLog(LL_WARNING,
+            "Failed to register OpenSSL memory tracking callbacks. "
+            "used_memory_tls will report 0.");
+    }
+
 /* Enable configuring OpenSSL using the standard openssl.cnf
  * OPENSSL_config()/OPENSSL_init_crypto() should be the first
  * call to the OpenSSL* library.
@@ -2036,6 +2143,10 @@ static void tlsClearAllCertInfo(void);
 void tlsResetCertInfo(void) {
     if (server.tls_port || server.tls_replication || server.tls_cluster) return;
     tlsClearAllCertInfo();
+}
+
+size_t tlsMemoryUsage(void) {
+    return 0;
 }
 
 int RedisRegisterConnectionTypeTLS(void) {
