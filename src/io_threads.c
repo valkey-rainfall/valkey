@@ -415,14 +415,22 @@ static void *IOThreadMain(void *myid) {
                 case JOB_REQ_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
-                case JOB_REQ_OWNER_WRITE:
+                case JOB_REQ_OWNER_WRITE: {
                     /* F8b: staged by main at punt handback (PENDING_IO already
                      * published). Same write path as the F7 handler. Counter
                      * lives HERE (worker's own stats slot — single-writer) now
                      * that the F7 event-handler is bypassed. */
+                    client *owc = (client *)data;
+                    /* F9 probe: T2b — SPSC wait = now - T2 (main stamped T2 at
+                     * punt handback). Splits d23 into queue-wait vs
+                     * write+turnaround. */
+                    if (owc->dplus_pt[2]) {
+                        dplus_thread_stats[id].sum_d2b += getMonotonicUs() - owc->dplus_pt[2];
+                    }
                     dplus_thread_stats[id].punted_replies_written++;
-                    ioThreadWriteToClient((client *)data);
+                    ioThreadWriteToClient(owc);
                     break;
+                }
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }

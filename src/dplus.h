@@ -91,7 +91,8 @@ typedef struct dplusThreadStats {
     long long sweeps;             /* outer loop iterations (per-worker sweep rate) */
     long long handoffs_started;   /* Q7c: T0 count (per owner thread) */
     long long handoffs_done;      /* Q7c: T3 count */
-    char _pad[2 * DPLUS_CACHELINE - 14 * sizeof(long long)]; /* pad to 2 cache lines */
+    long long sum_d2b;            /* F9 probe: T2→owner-dequeue (SPSC wait) in µs */
+    char _pad[2 * DPLUS_CACHELINE - 15 * sizeof(long long)]; /* pad to 2 cache lines */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
