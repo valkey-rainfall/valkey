@@ -406,7 +406,10 @@ static void *IOThreadMain(void *myid) {
                     break;
                 case JOB_REQ_OWNER_WRITE:
                     /* F8b: staged by main at punt handback (PENDING_IO already
-                     * published). Same write path as the F7 handler. */
+                     * published). Same write path as the F7 handler. Counter
+                     * lives HERE (worker's own stats slot — single-writer) now
+                     * that the F7 event-handler is bypassed. */
+                    dplus_thread_stats[id].punted_replies_written++;
                     ioThreadWriteToClient((client *)data);
                     break;
                 default:
