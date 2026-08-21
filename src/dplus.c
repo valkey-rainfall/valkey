@@ -328,6 +328,74 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
  *
  * Returns the number of commands speculatively completed.
  */
+/* F11 Stage 1: dependency-aware would-speculate scanner (instrumentation
+ * only). Counts, per batch remainder after the contiguous prefix closes:
+ *  - f11_would_speculate: reads that pass the dependency rule
+ *  - f11_dependency_punts: reads blocked by an earlier same-key write
+ *  - f11_barrier_punts: commands at/after a non-single-key-write barrier
+ * Single-key plain write = CMD_WRITE, argc>=2, key position 1, and NOT
+ * multi-key/blocking/admin (approximated: cmd->key_specs... kept simple:
+ * an allowlist by name pointer, lazily cached — SET/DEL/UNLINK/EXPIRE/
+ * PEXPIRE/SETEX/PSETEX/GETSET/INCR/DECR/INCRBY/DECRBY/APPEND). */
+static void dplusF11ScanRemainder(client *c, cmdQueue *queue, int from,
+                                  struct serverCommand *get_cmd, int tid,
+                                  sds seed_wkey, int seed_barrier) {
+    (void)c;
+    static struct serverCommand *wl[13];
+    static int wl_init = 0;
+    if (!wl_init) {
+        const char *names[13] = {"set","del","unlink","expire","pexpire","setex",
+                                 "psetex","getset","incr","decr","incrby","decrby","append"};
+        for (int i = 0; i < 13; i++) wl[i] = lookupCommandByCString((char*)names[i]);
+        wl_init = 1;
+    }
+    /* Written-key set: tiny linear array of sds pointers + lens (batches are
+     * small; O(n*m) compares on <=32 entries is cheap). */
+    sds wkeys[32];
+    int wn = 0;
+    long long would = 0, dep = 0, barrier = 0;
+    if (seed_barrier) {
+        for (int r = from; r < queue->len; r++) {
+            parsedCommand *pr = &queue->cmds[r];
+            if (pr->cmd == get_cmd && pr->argc == 2) barrier++;
+        }
+        dplus_thread_stats[tid].f11_barrier_punts += barrier;
+        return;
+    }
+    if (seed_wkey) wkeys[wn++] = seed_wkey;
+    for (int qp = from; qp < queue->len; qp++) {
+        parsedCommand *p = &queue->cmds[qp];
+        if (p->cmd == get_cmd && p->argc == 2) {
+            sds k = objectGetVal(p->argv[1]);
+            int collide = 0;
+            for (int i = 0; i < wn; i++) {
+                if (sdslen(wkeys[i]) == sdslen(k) &&
+                    memcmp(wkeys[i], k, sdslen(k)) == 0) { collide = 1; break; }
+            }
+            if (collide) dep++; else would++;
+            continue;
+        }
+        int is_wl = 0;
+        if (p->cmd && p->argc >= 2) {
+            for (int i = 0; i < 13; i++) if (p->cmd == wl[i]) { is_wl = 1; break; }
+        }
+        if (is_wl && wn < 32) {
+            wkeys[wn++] = objectGetVal(p->argv[1]);
+            continue;
+        }
+        /* Non-allowlisted command (or written-set overflow) = FULL BARRIER:
+         * everything from here punts, count remaining reads as barrier. */
+        for (int r = qp; r < queue->len; r++) {
+            parsedCommand *pr = &queue->cmds[r];
+            if (pr->cmd == get_cmd && pr->argc == 2) barrier++;
+        }
+        break;
+    }
+    dplus_thread_stats[tid].f11_would_speculate += would;
+    dplus_thread_stats[tid].f11_dependency_punts += dep;
+    dplus_thread_stats[tid].f11_barrier_punts += barrier;
+}
+
 int dplusSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
@@ -366,7 +434,30 @@ int dplusSpeculateBatch(client *c, int tid) {
     {
         static struct serverCommand *dplus_get_cmd_fast = NULL;
         if (!dplus_get_cmd_fast) dplus_get_cmd_fast = lookupCommandByCString("get");
-        if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd_fast) return 0;
+        if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd_fast) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            /* F11 stage-1: write-first batches never reach the prefix walk —
+             * scan them here so the would-speculate count covers ALL batches.
+             * Stats builds only: production keeps the zero-cost exit. */
+            {
+                static struct serverCommand *wl1[13];
+                static int wl1_init = 0;
+                if (!wl1_init) {
+                    const char *nm[13] = {"set","del","unlink","expire","pexpire","setex",
+                                          "psetex","getset","incr","decr","incrby","decrby","append"};
+                    for (int i = 0; i < 13; i++) wl1[i] = lookupCommandByCString((char*)nm[i]);
+                    wl1_init = 1;
+                }
+                int first_wl = 0;
+                if (c->parsed_cmd && c->argc >= 2)
+                    for (int i = 0; i < 13; i++) if (c->parsed_cmd == wl1[i]) { first_wl = 1; break; }
+                dplusF11ScanRemainder(c, &c->cmd_queue, c->cmd_queue.off, dplus_get_cmd_fast, tid,
+                                      first_wl ? objectGetVal(c->argv[1]) : NULL,
+                                      first_wl ? 0 : 1);
+            }
+#endif
+            return 0;
+        }
     }
 
     /* Write-tax gate pointer — declared early so the out: label can update it.
@@ -481,6 +572,16 @@ int dplusSpeculateBatch(client *c, int tid) {
             parsedCommand *p = &queue->cmds[queue_pos];
             if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
                 !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
+                /* F11 STAGE-1 INSTRUMENTATION (no behavior change): from the
+                 * command that closes the prefix, continue scanning with the
+                 * dependency rule to count what dependency-aware speculation
+                 * WOULD have speculated. Real keys, real collisions — the
+                 * honest engagement ceiling for F11 on this workload.
+                 * Rule: single-key plain writes (SET/DEL/EXPIRE-class,
+                 * key at argv[1]) join the written-key set; a later GET
+                 * speculates iff its key collides with NO earlier write;
+                 * anything else is a full barrier. */
+                dplusF11ScanRemainder(c, queue, queue_pos, dplus_get_cmd, tid, NULL, 0);
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
@@ -812,10 +913,14 @@ sds dplusInfoString(sds info) {
     /* Doorbell counters are per-thread plain fields written only by their
      * owning worker; summing here is a racy-by-design stats read. */
     long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
+    long long f11_would = 0, f11_dep = 0, f11_bar = 0;
     for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
         punted_replies += dplus_thread_stats[i].punted_replies_written;
+        f11_would += dplus_thread_stats[i].f11_would_speculate;
+        f11_dep += dplus_thread_stats[i].f11_dependency_punts;
+        f11_bar += dplus_thread_stats[i].f11_barrier_punts;
     }
     info = sdscatprintf(info,
         "# Dplus\r\n"
@@ -828,7 +933,10 @@ sds dplusInfoString(sds info) {
         "dplus_intra_batch_write_punts:%llu\r\n"
         "dplus_doorbell_rings:%llu\r\n"
         "dplus_doorbell_coalesced:%llu\r\n"
-        "dplus_punted_replies_written:%llu\r\n",
+        "dplus_punted_replies_written:%llu\r\n"
+        "dplus_f11_would_speculate:%llu\r\n"
+        "dplus_f11_dependency_punts:%llu\r\n"
+        "dplus_f11_barrier_punts:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
@@ -838,7 +946,10 @@ sds dplusInfoString(sds info) {
         (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
         (unsigned long long)doorbell_rings,
         (unsigned long long)doorbell_coalesced,
-        (unsigned long long)punted_replies);
+        (unsigned long long)punted_replies,
+        (unsigned long long)f11_would,
+        (unsigned long long)f11_dep,
+        (unsigned long long)f11_bar);
     return info;
 }
 #endif

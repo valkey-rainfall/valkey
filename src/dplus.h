@@ -82,7 +82,10 @@ typedef struct dplusThreadStats {
     long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
     long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
-    char _pad[DPLUS_CACHELINE - 7 * sizeof(long long)]; /* pad to full cache line */
+    long long f11_would_speculate; /* F11 stage-1: reads passing the dependency rule */
+    long long f11_dependency_punts;/* F11 stage-1: reads blocked by earlier same-key write */
+    long long f11_barrier_punts;   /* F11 stage-1: reads behind a non-allowlisted barrier */
+    char _pad[2 * DPLUS_CACHELINE - 10 * sizeof(long long)]; /* pad to 2 cache lines */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
