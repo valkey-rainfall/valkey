@@ -31,6 +31,15 @@ static spmcQueue io_shared_inbox = {0};
 static mpscQueue io_shared_outbox = {0};
 // Main -> IO (Thread-Specific) for tasks that must run on specific IO thread where IO threads check their private inbox before the shared queue
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
+/* F13a: per-worker wake pipe. Main writes wake_pipe[id][1] after a committed
+ * SPSC enqueue when the owner worker is parked in aePollDirect (see
+ * consumer_parked in queues.h); the read end is registered in worker_el[id]
+ * so the write lands as an fd event and ends the park immediately.
+ * Contrast with ringMainDoorbell: no seq_cst Dekker fences here — a lost
+ * ring is backstopped by the park's 2ms timeout (latency, never liveness),
+ * so the producer-side check stays a single acquire load per enqueue.
+ * fd = -1 when creation failed: everything degrades to the 2ms park. */
+static int io_wake_pipe[IO_THREADS_MAX_NUM][2];
 static size_t io_jobs_submitted;
 static _Atomic(size_t) io_jobs_finished;
 static int io_threads_initialized = 0;
@@ -507,7 +516,18 @@ static void *IOThreadMain(void *myid) {
                  * newly-migrated fds (registered by main via epoll_ctl — visible
                  * to an in-progress epoll_wait) are picked up promptly. */
                 struct timeval tv = {0, 2000};
-                aePollDirect(worker_el[id], &tv);
+                /* F13a park protocol: publish parked, then RE-CHECK the SPSC
+                 * inbox before blocking — a producer that read the bit as 0
+                 * just before our store won't ring, but its enqueue then
+                 * precedes this check. Without seq_cst fences on both sides
+                 * (cf. ringMainDoorbell) a lost ring remains theoretically
+                 * possible; the 2ms timeout bounds it — the ring is a latency
+                 * accelerator, never a liveness requirement. */
+                atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
+                if (spscIsEmpty(&io_private_inbox[id])) {
+                    aePollDirect(worker_el[id], &tv);
+                }
+                atomic_store_explicit(&io_private_inbox[id].consumer_parked, 0, memory_order_relaxed);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
@@ -521,6 +541,28 @@ static void *IOThreadMain(void *myid) {
 
 long long getIOThreadActiveTimeMicroseconds(int id) {
     return atomic_load_explicit(&used_active_time_io_thread[id], memory_order_relaxed);
+}
+
+/* F13a: drain the worker's wake pipe. The byte's only job was ending the
+ * park; the sweep at the top of IOThreadMain's loop does the actual SPSC
+ * work. Runs on the worker thread via worker_el[id]. */
+static void wakePipeReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(privdata);
+    UNUSED(mask);
+    char buf[64];
+    while (read(fd, buf, sizeof(buf)) == sizeof(buf))
+        ;
+}
+
+/* F13a: ring a parked owner worker after a committed SPSC enqueue.
+ * EAGAIN = a wakeup byte is already pending, free to skip. EINTR = retry:
+ * failing to write would defer the reply to the 2ms park timeout. */
+static void ringWorkerWakePipe(int tid) {
+    if (io_wake_pipe[tid][1] == -1) return;
+    while (write(io_wake_pipe[tid][1], "W", 1) != 1) {
+        if (errno != EINTR) break;
+    }
 }
 
 static void createIOThread(int id) {
@@ -547,6 +589,24 @@ static void createIOThread(int id) {
      * for future fd modifications (handler changes, deletions). */
     aeSetPollProtect(worker_el[id], 1);
     serverLog(LL_NOTICE, "IO thread %d: created per-worker event loop (setsize=%d)", id, setsize);
+
+    /* F13a: create + register the wake pipe before the thread starts (no
+     * concurrent registration race). Failure is non-fatal: fds stay -1 and
+     * punt-reply pickup falls back to the 2ms park timeout. */
+    io_wake_pipe[id][0] = io_wake_pipe[id][1] = -1;
+    int wakefds[2];
+    if (anetPipe(wakefds, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK) == 0) {
+        if (aeCreateFileEvent(worker_el[id], wakefds[0], AE_READABLE, wakePipeReadHandler, NULL) == AE_OK) {
+            io_wake_pipe[id][0] = wakefds[0];
+            io_wake_pipe[id][1] = wakefds[1];
+        } else {
+            close(wakefds[0]);
+            close(wakefds[1]);
+            serverLog(LL_WARNING, "IO thread %d: wake pipe fd registration failed; parked-reply pickup degrades to poll timeout", id);
+        }
+    } else {
+        serverLog(LL_WARNING, "IO thread %d: wake pipe creation failed (%s); parked-reply pickup degrades to poll timeout", id, strerror(errno));
+    }
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
@@ -584,6 +644,13 @@ static void shutdownIOThread(int id) {
     if (worker_el[id]) {
         aeDeleteEventLoop(worker_el[id]);
         worker_el[id] = NULL;
+    }
+
+    /* F13a: close the wake pipe (event already gone with the loop). */
+    if (io_wake_pipe[id][0] != -1) {
+        close(io_wake_pipe[id][0]);
+        close(io_wake_pipe[id][1]);
+        io_wake_pipe[id][0] = io_wake_pipe[id][1] = -1;
     }
 }
 
@@ -895,6 +962,12 @@ void ioSubmitOwnerWrite(client *c) {
     void *job = tagJob(c, JOB_REQ_OWNER_WRITE);
     spscEnqueue(&io_private_inbox[c->owner_tid], job, true);
     io_jobs_submitted++;
+    /* F13a: if the owner is parked in its poll, ring its wake pipe so the
+     * staged reply is written in µs instead of waiting out the 2ms park.
+     * One acquire load on a line we just owned (the tail store above). */
+    if (atomic_load_explicit(&io_private_inbox[c->owner_tid].consumer_parked, memory_order_acquire)) {
+        ringWorkerWakePipe(c->owner_tid);
+    }
 }
 
 /* This function attempts to offload the free of an object to an IO thread.
