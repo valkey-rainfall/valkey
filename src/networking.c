@@ -2468,7 +2468,8 @@ void beforeNextClient(client *c) {
              * per-job drain cost 59→330µs). SPSC enqueue is wait-free for
              * main; the worker's PRIORITY-1 dequeue picks it up next sweep
              * iteration without waking machinery. */
-            ioSubmitOwnerWrite(c);
+            ioSubmitOwnerWrite(c); /* F12-B: enqueue is now commit=false;
+                                     * batched commitIOJobs at drain end. */
         }
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
@@ -4251,7 +4252,13 @@ int processCommandAndResetClient(client *c) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
          * processed command. */
-        if (c->conn) updateClientMemUsageAndBucket(c);
+        /* F12-A: for OWNED clients, defer memory-bucket accounting to the
+         * per-batch call in beforeNextClient — this per-command call walks
+         * reply list + querybuf + bucket lists (~200-400 insn) and is
+         * redundant inside a batch. Kept when client eviction is active
+         * (bucket freshness feeds eviction decisions mid-batch). */
+        if (c->conn && (c->owner_tid == 0 || server.maxmemory_clients != 0))
+            updateClientMemUsageAndBucket(c);
     }
 
     if (server.current_client == NULL) deadclient = 1;
