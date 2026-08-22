@@ -811,6 +811,44 @@ long long dplusDoorbellCoalesced(void) {
 }
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
+/* DIAG: periodic scale-gauge dump to the server log (every ~10s at hz=10).
+ * Windowed DELTAS so each line is a per-window average — readable from the
+ * host's valkey-server.log after a conductress cell, no harvest plumbing. */
+void dplusScaleGaugeCron(void) {
+    static int calls = 0;
+    static long long p_rt = 0, p_d01 = 0, p_d23 = 0, p_d2b = 0, p_prw = 0;
+    static long long p_dc = 0, p_dj = 0;
+    static monotime p_t = 0;
+    if (++calls % 100 != 0) return;
+    long long rt = 0, d01 = 0, d23 = 0, d2b = 0, prw = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        rt  += dplus_thread_stats[i].punt_rt_count;
+        d01 += dplus_thread_stats[i].sum_d01;
+        d23 += dplus_thread_stats[i].sum_d23;
+        d2b += dplus_thread_stats[i].sum_d2b;
+        prw += dplus_thread_stats[i].punted_replies_written;
+    }
+    long long dc, dn, dj;
+    dplusGetDrainCounters(&dc, &dn, &dj);
+    monotime now = getMonotonicUs();
+    if (p_t != 0) {
+        double secs = (now - p_t) / 1e6;
+        long long w_rt = rt - p_rt;
+        serverLog(LL_NOTICE,
+            "SCALEGAUGE win=%.1fs rt/s=%.0f d01us=%.1f d23us=%.1f d2bus=%.1f "
+            "drains/s=%.0f jobs/drain=%.0f staged/s=%.0f",
+            secs, w_rt / secs,
+            w_rt ? (double)(d01 - p_d01) / w_rt : 0,
+            w_rt ? (double)(d23 - p_d23) / w_rt : 0,
+            w_rt ? (double)(d2b - p_d2b) / w_rt : 0,
+            (dc - p_dc) / secs,
+            (dc - p_dc) ? (double)(dj - p_dj) / (dc - p_dc) : 0,
+            (prw - p_prw) / secs);
+    }
+    p_rt = rt; p_d01 = d01; p_d23 = d23; p_d2b = d2b; p_prw = prw;
+    p_dc = dc; p_dj = dj; p_t = now;
+}
+
 sds dplusInfoString(sds info) {
     /* Doorbell counters are per-thread plain fields written only by their
      * owning worker; summing here is a racy-by-design stats read. */

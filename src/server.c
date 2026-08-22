@@ -1534,6 +1534,9 @@ void cronUpdateMemoryStats(void) {
  */
 
 long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    dplusScaleGaugeCron(); /* DIAG branch: periodic stage-decomposition log */
+#endif
     int j;
     UNUSED(eventLoop);
     UNUSED(id);
