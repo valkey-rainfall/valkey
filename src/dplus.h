@@ -31,6 +31,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* DIAG BRANCH ONLY: force stats on unconditionally so conductress cells
+ * (which do not pass -DIO_LOOKUP_OFFLOAD_STATS) still instrument. MUST be
+ * defined before ANY #ifdef IO_LOOKUP_OFFLOAD_STATS test in this header or
+ * any includer. */
+#ifndef IO_LOOKUP_OFFLOAD_STATS
+#define IO_LOOKUP_OFFLOAD_STATS 1
+#endif
+
 /* --- Component 1: Sharded version array --- */
 
 /* Number of version shards. 256 = 32 cache lines × 8 counters per line = 2KB. */
@@ -213,12 +221,6 @@ long long dplusDoorbellCoalesced(void);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 sds dplusInfoString(sds info);
 /* Q7b cadence counters: main-side drain stats (defined in io_threads.c) */
-/* DIAG BRANCH ONLY: stats compiled in unconditionally so conductress cells
- * (which do not pass the flag) still instrument. */
-#ifndef IO_LOOKUP_OFFLOAD_STATS
-#define IO_LOOKUP_OFFLOAD_STATS 1
-#endif
-
 void dplusScaleGaugeCron(void);
 void dplusGetDrainCounters(long long *calls, long long *nonempty, long long *jobs);
 #endif
