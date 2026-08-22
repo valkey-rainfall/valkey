@@ -874,7 +874,12 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
 void ioSubmitOwnerWrite(client *c) {
     serverAssert(c->owner_tid != 0 && c->io_write_state == CLIENT_PENDING_IO);
     void *job = tagJob(c, JOB_REQ_OWNER_WRITE);
-    spscEnqueue(&io_private_inbox[c->owner_tid], job, true);
+    /* F12-B: enqueue WITHOUT committing (tail_local is main-private) — one
+     * spscCommit per worker at drain end (commitIOJobs in
+     * processIOThreadsResponses) publishes the whole batch with a single
+     * release-store per worker. Safe: staged PENDING_IO defers the worker
+     * regardless; sweeps poll the SPSC every iteration (bounded latency). */
+    spscEnqueue(&io_private_inbox[c->owner_tid], job, false);
     io_jobs_submitted++;
 }
 
@@ -1136,7 +1141,13 @@ int processIOThreadsResponses(void) {
          * Check if the MPSC has data by comparing head vs tail. */
         size_t head = atomic_load_explicit(&io_shared_outbox.head, memory_order_relaxed);
         size_t tail = atomic_load_explicit(&io_shared_outbox.tail, memory_order_acquire);
-        if (head == tail) return 0;
+        if (head == tail) {
+            /* F12-B: an earlier partial drain may have left uncommitted
+             * owner-write enqueues — publish before sleeping, or staged
+             * clients (PENDING_IO) wait a full timer tick. */
+            commitIOJobs();
+            return 0;
+        }
     }
 
     int total_processed = 0;
@@ -1190,6 +1201,10 @@ int processIOThreadsResponses(void) {
         if (write_count) handleWriteJobs(write_jobs, write_count);
 
         /* If the queue was empty at the last try - don't try again */
-        if (dequeued_count == 0) return total_processed;
+        if (dequeued_count == 0) {
+            /* F12-B: publish all owner-write enqueues from this drain. */
+            commitIOJobs();
+            return total_processed;
+        }
     }
 }
