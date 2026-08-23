@@ -118,6 +118,15 @@ typedef struct spscQueue {
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) tail;
     size_t tail_local; /* Private write index */
     size_t head_cache;
+    /* F13a: consumer-parked hint. Consumer sets 1 (release) before blocking in
+     * its poll and re-checks the queue; producer loads it (acquire) after a
+     * committed enqueue and rings the consumer's wake pipe when set. Lives on
+     * the producer line deliberately: the producer already owns this line at
+     * every tail store, so the per-enqueue load is free; the consumer writes
+     * it only at park/unpark transitions (idle by definition). NOT a
+     * correctness mechanism — a lost ring degrades to the consumer's bounded
+     * poll timeout (see IOThreadMain), never to a hang. */
+    _Atomic(uint32_t) consumer_parked;
 
     /* Dynamic buffer */
     _Alignas(CACHE_LINE_SIZE) void **buffer;
