@@ -394,6 +394,15 @@ static void *IOThreadMain(void *myid) {
     thread_id = (int)id;
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
+    /* F13a-v2 (spin-then-park): consecutive all-empty sweeps. The parked-bit
+     * protocol only engages after DPLUS_F13_SPIN_SWEEPS empty passes — at
+     * load the park path cycles hot (measured 2.1M parks/s at bench s20) and
+     * per-cycle parked-bit stores ping-pong main's SPSC producer line, taxing
+     * every enqueue. Spinning through brief gaps keeps the bit (and main's
+     * line) untouched; a genuinely idle worker still parks after ~50 sweeps
+     * and gets the µs wake-fd latency path. */
+    int idle_streak = 0;
+#define DPLUS_F13_SPIN_SWEEPS 50
     monotime work_start_time = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
@@ -501,6 +510,7 @@ static void *IOThreadMain(void *myid) {
         }
 
         /* If both queues were empty (no processing done), wait for signal. */
+        if (processed != 0) idle_streak = 0;
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
                 flushPendingIOResponses(0);
@@ -515,19 +525,27 @@ static void *IOThreadMain(void *myid) {
                  * ~zero idle cost. Bounded at 2ms so cross-thread queue jobs and
                  * newly-migrated fds (registered by main via epoll_ctl — visible
                  * to an in-progress epoll_wait) are picked up promptly. */
-                struct timeval tv = {0, 2000};
-                /* F13a park protocol: publish parked, then RE-CHECK the SPSC
-                 * inbox before blocking — a producer that read the bit as 0
-                 * just before our store won't ring, but its enqueue then
-                 * precedes this check. Without seq_cst fences on both sides
-                 * (cf. ringMainDoorbell) a lost ring remains theoretically
-                 * possible; the 2ms timeout bounds it — the ring is a latency
-                 * accelerator, never a liveness requirement. */
-                atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
-                if (spscIsEmpty(&io_private_inbox[id])) {
-                    aePollDirect(worker_el[id], &tv);
+                if (++idle_streak < DPLUS_F13_SPIN_SWEEPS) {
+                    /* Spin window: non-blocking poll only. No parked-bit
+                     * traffic, no ring eligibility — an SPSC job landing now
+                     * is seen by the next sweep within ~1µs. */
+                    struct timeval tv0 = {0, 0};
+                    aePollDirect(worker_el[id], &tv0);
+                } else {
+                    struct timeval tv = {0, 2000};
+                    /* F13a park protocol: publish parked, then RE-CHECK the SPSC
+                     * inbox before blocking — a producer that read the bit as 0
+                     * just before our store won't ring, but its enqueue then
+                     * precedes this check. Without seq_cst fences on both sides
+                     * (cf. ringMainDoorbell) a lost ring remains theoretically
+                     * possible; the 2ms timeout bounds it — the ring is a latency
+                     * accelerator, never a liveness requirement. */
+                    atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
+                    if (spscIsEmpty(&io_private_inbox[id])) {
+                        aePollDirect(worker_el[id], &tv);
+                    }
+                    atomic_store_explicit(&io_private_inbox[id].consumer_parked, 0, memory_order_relaxed);
                 }
-                atomic_store_explicit(&io_private_inbox[id].consumer_parked, 0, memory_order_relaxed);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
