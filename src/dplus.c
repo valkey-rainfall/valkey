@@ -819,6 +819,7 @@ void dplusScaleGaugeCron(void) {
     static long long p_rt = 0, p_d01 = 0, p_d23 = 0, p_d2b = 0, p_prw = 0;
     static long long p_dc = 0, p_dj = 0;
     static long long p_f13r = 0, p_f13p = 0;
+    static long long p_busy = 0;
     static monotime p_t = 0;
     if (++calls % 100 != 0) return;
     long long rt = 0, d01 = 0, d23 = 0, d2b = 0, prw = 0;
@@ -833,13 +834,15 @@ void dplusScaleGaugeCron(void) {
     dplusGetDrainCounters(&dc, &dn, &dj);
     long long f13r, f13p;
     dplusGetF13Counters(&f13r, &f13p);
+    long long busy = dplus_drain_busy_us;
     monotime now = getMonotonicUs();
     if (p_t != 0) {
         double secs = (now - p_t) / 1e6;
         long long w_rt = rt - p_rt;
         serverLog(LL_NOTICE,
             "SCALEGAUGE win=%.1fs rt/s=%.0f d01us=%.1f d23us=%.1f d2bus=%.1f "
-            "drains/s=%.0f jobs/drain=%.0f staged/s=%.0f rings/s=%.0f parks/s=%.0f",
+            "drains/s=%.0f jobs/drain=%.0f staged/s=%.0f rings/s=%.0f parks/s=%.0f "
+            "execus/job=%.2f",
             secs, w_rt / secs,
             w_rt ? (double)(d01 - p_d01) / w_rt : 0,
             w_rt ? (double)(d23 - p_d23) / w_rt : 0,
@@ -848,10 +851,11 @@ void dplusScaleGaugeCron(void) {
             (dc - p_dc) ? (double)(dj - p_dj) / (dc - p_dc) : 0,
             (prw - p_prw) / secs,
             (f13r - p_f13r) / secs,
-            (f13p - p_f13p) / secs);
+            (f13p - p_f13p) / secs,
+            (dj - p_dj) ? (double)(busy - p_busy) / (dj - p_dj) : 0);
     }
     p_rt = rt; p_d01 = d01; p_d23 = d23; p_d2b = d2b; p_prw = prw;
-    p_dc = dc; p_dj = dj; p_f13r = f13r; p_f13p = f13p; p_t = now;
+    p_dc = dc; p_dj = dj; p_f13r = f13r; p_f13p = f13p; p_busy = busy; p_t = now;
 }
 
 sds dplusInfoString(sds info) {
