@@ -40,6 +40,17 @@ static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
  * so the producer-side check stays a single acquire load per enqueue.
  * fd = -1 when creation failed: everything degrades to the 2ms park. */
 static int io_wake_pipe[IO_THREADS_MAX_NUM][2];
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+/* F13 DIAG: main-only ring count + per-worker park-episode counts. */
+static long long dplus_f13_rings = 0;
+static long long dplus_f13_parks[IO_THREADS_MAX_NUM] = {0};
+void dplusGetF13Counters(long long *rings, long long *parks) {
+    long long p = 0;
+    for (int i = 0; i < IO_THREADS_MAX_NUM; i++) p += dplus_f13_parks[i];
+    *rings = dplus_f13_rings;
+    *parks = p;
+}
+#endif
 /* F13a-v3: load signal for ring gating — size of main's last nonempty punt
  * drain (decayed by half on empty visits). Main-thread-only, plain. The two
  * load regimes want OPPOSITE wake policies: at low load, latency is
@@ -551,6 +562,9 @@ static void *IOThreadMain(void *myid) {
                      * possible; the 2ms timeout bounds it — the ring is a latency
                      * accelerator, never a liveness requirement. */
                     atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                    dplus_f13_parks[id]++;
+#endif
                     if (spscIsEmpty(&io_private_inbox[id])) {
                         aePollDirect(worker_el[id], &tv);
                     }
@@ -588,6 +602,9 @@ static void wakePipeReadHandler(aeEventLoop *el, int fd, void *privdata, int mas
  * failing to write would defer the reply to the 2ms park timeout. */
 static void ringWorkerWakePipe(int tid) {
     if (io_wake_pipe[tid][1] == -1) return;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    dplus_f13_rings++;
+#endif
     while (write(io_wake_pipe[tid][1], "W", 1) != 1) {
         if (errno != EINTR) break;
     }

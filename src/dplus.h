@@ -223,6 +223,7 @@ sds dplusInfoString(sds info);
 /* Q7b cadence counters: main-side drain stats (defined in io_threads.c) */
 void dplusScaleGaugeCron(void);
 void dplusGetDrainCounters(long long *calls, long long *nonempty, long long *jobs);
+void dplusGetF13Counters(long long *rings, long long *parks);
 #endif
 
 #endif /* DPLUS_H */
