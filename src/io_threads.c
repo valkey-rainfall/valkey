@@ -610,18 +610,27 @@ static void createIOThread(int id) {
      * concurrent registration race). Failure is non-fatal: fds stay -1 and
      * punt-reply pickup falls back to the 2ms park timeout. */
     io_wake_pipe[id][0] = io_wake_pipe[id][1] = -1;
-    int wakefds[2];
-    if (anetPipe(wakefds, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK) == 0) {
-        if (aeCreateFileEvent(worker_el[id], wakefds[0], AE_READABLE, wakePipeReadHandler, NULL) == AE_OK) {
-            io_wake_pipe[id][0] = wakefds[0];
-            io_wake_pipe[id][1] = wakefds[1];
+    /* OFF-mode fix (battery finding #2, Aug 24): only create/register the
+     * wake pipe under ownership — its sole ring site (ioSubmitOwnerWrite) is
+     * ownership-only, and registering it unconditionally made
+     * worker_el->maxfd != -1 in ALL modes, which permanently tripped the
+     * scale-down guard ("don't deactivate workers with owned fds") so
+     * io_threads_active could never return to 0. Restores the invariant
+     * that OFF-mode worker_el is empty (OFF == stock behavior). */
+    if (server.io_threads_ownership) {
+        int wakefds[2];
+        if (anetPipe(wakefds, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK) == 0) {
+            if (aeCreateFileEvent(worker_el[id], wakefds[0], AE_READABLE, wakePipeReadHandler, NULL) == AE_OK) {
+                io_wake_pipe[id][0] = wakefds[0];
+                io_wake_pipe[id][1] = wakefds[1];
+            } else {
+                close(wakefds[0]);
+                close(wakefds[1]);
+                serverLog(LL_WARNING, "IO thread %d: wake pipe fd registration failed; parked-reply pickup degrades to poll timeout", id);
+            }
         } else {
-            close(wakefds[0]);
-            close(wakefds[1]);
-            serverLog(LL_WARNING, "IO thread %d: wake pipe fd registration failed; parked-reply pickup degrades to poll timeout", id);
+            serverLog(LL_WARNING, "IO thread %d: wake pipe creation failed (%s); parked-reply pickup degrades to poll timeout", id, strerror(errno));
         }
-    } else {
-        serverLog(LL_WARNING, "IO thread %d: wake pipe creation failed (%s); parked-reply pickup degrades to poll timeout", id, strerror(errno));
     }
 
     pthread_t tid;
