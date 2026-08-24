@@ -188,6 +188,30 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
 
 # The same file must also pass with ownership OFF (differential sanity: these
 # behaviors are mode-independent).
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes save {} appendonly yes appendfsync always}} {
+    test {OWNERSHIP: fsync=always guard - writes acked and durable, replies not wedged} {
+        # Regression guard for the F8b ack-before-durability gap: with
+        # appendfsync always, drain-time staging let the owner worker write a
+        # SET's ack to the socket BEFORE beforeSleep fsynced the AOF. The
+        # guard routes owned clients to the legacy queue path (which already
+        # sequences reply-after-fsync). This leg verifies the guard's
+        # functional safety: replies still flow (no wedge from the bypassed
+        # queue-on-first-reply edge), values are correct, and the AOF holds
+        # every acked write. The µs-scale race itself needs fault injection
+        # and is covered by the code-path guarantee, not this test.
+        for {set i 0} {$i < 200} {incr i} {
+            assert_equal "OK" [r set fsynckey:$i val$i]
+        }
+        for {set i 0} {$i < 200} {incr i} {
+            assert_equal "val$i" [r get fsynckey:$i]
+        }
+        # Every acked SET must already be in the AOF (fsync=always).
+        r debug loadaof
+        assert_equal "val199" [r get fsynckey:199]
+        r ping
+    } {PONG}
+}
+
 start_server {tags {"ownership"} overrides {io-threads 4 save {}}} {
     test {OWNERSHIP-OFF control: MULTI split round-trips} {
         r set mkey v1

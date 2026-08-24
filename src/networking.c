@@ -2443,6 +2443,13 @@ void beforeNextClient(client *c) {
         if (c->owner_tid != 0 && c->io_write_state == CLIENT_IDLE &&
             getClientType(c) == CLIENT_TYPE_NORMAL && !c->flag.close_after_reply &&
             !c->flag.close_asap && !c->flag.lua_debug &&
+            /* fsync=always: the ack must not reach the socket before
+             * beforeSleep fsyncs the AOF. The legacy queue path below already
+             * sequences reply-after-fsync (see the aof_fsync check at the
+             * trySendWriteToIOThreads site); F8b's drain-time staging would
+             * let the owner write the reply immediately — an
+             * ack-before-durability violation. Fall through to legacy. */
+            server.aof_fsync != AOF_FSYNC_ALWAYS &&
             (c->bufpos > 0 || listLength(c->reply) > 0)) {
             if (c->flag.pending_write) {
                 listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
