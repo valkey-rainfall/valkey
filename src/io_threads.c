@@ -404,7 +404,14 @@ static void *IOThreadMain(void *myid) {
      * line) untouched; a genuinely idle worker still parks after ~50 sweeps
      * and gets the µs wake-fd latency path. */
     int idle_streak = 0;
-#define DPLUS_F13_SPIN_SWEEPS 50
+/* v3b: 150 sweeps (~150µs). The f13v3 bench gauge showed 50 sweeps (~50µs)
+ * sitting right AT the per-worker arrival gap (~40µs at s20): the window
+ * expired between arrivals, re-engaging the park path 170K times/s — that
+ * is both parked-bit producer-line traffic and, with the ring gate closed
+ * at load, park-remainder delay on staged replies (d2b 600µs). 150µs
+ * clears the gap with margin; true idle still parks after ~150µs of
+ * bounded spin. */
+#define DPLUS_F13_SPIN_SWEEPS 150
     monotime work_start_time = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
