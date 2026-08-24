@@ -40,6 +40,16 @@ static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
  * so the producer-side check stays a single acquire load per enqueue.
  * fd = -1 when creation failed: everything degrades to the 2ms park. */
 static int io_wake_pipe[IO_THREADS_MAX_NUM][2];
+/* F13a-v3: load signal for ring gating — size of main's last nonempty punt
+ * drain (decayed by half on empty visits). Main-thread-only, plain. The two
+ * load regimes want OPPOSITE wake policies: at low load, latency is
+ * everything and there is nothing to batch (ring, µs delivery); at
+ * saturation, batching amortization is everything and a 2ms park is
+ * invisible inside a ~2ms RTT (don't ring — jobcost pair measured the
+ * always-ring policy costing −7% s20 with FLAT per-job exec cost, i.e. pure
+ * amortization loss, Aug 23). */
+static long long dplus_last_drain_jobs = 0;
+#define DPLUS_F13_RING_MAX_DRAIN 32
 static size_t io_jobs_submitted;
 static _Atomic(size_t) io_jobs_finished;
 static int io_threads_initialized = 0;
@@ -980,10 +990,13 @@ void ioSubmitOwnerWrite(client *c) {
     void *job = tagJob(c, JOB_REQ_OWNER_WRITE);
     spscEnqueue(&io_private_inbox[c->owner_tid], job, true);
     io_jobs_submitted++;
-    /* F13a: if the owner is parked in its poll, ring its wake pipe so the
-     * staged reply is written in µs instead of waiting out the 2ms park.
-     * One acquire load on a line we just owned (the tail store above). */
-    if (atomic_load_explicit(&io_private_inbox[c->owner_tid].consumer_parked, memory_order_acquire)) {
+    /* F13a-v3: ring the parked owner ONLY at low load (small last drain).
+     * At saturation the ring's instant wake destroys worker/main batching
+     * amortization (−7% s20 measured) while buying nothing — the park is
+     * shorter than the RTT. At low load the ring is the 2000x latency win.
+     * One plain load + compare; both sides main-thread. */
+    if (dplus_last_drain_jobs <= DPLUS_F13_RING_MAX_DRAIN &&
+        atomic_load_explicit(&io_private_inbox[c->owner_tid].consumer_parked, memory_order_acquire)) {
         ringWorkerWakePipe(c->owner_tid);
     }
 }
@@ -1267,7 +1280,12 @@ int processIOThreadsResponses(void) {
          * Check if the MPSC has data by comparing head vs tail. */
         size_t head = atomic_load_explicit(&io_shared_outbox.head, memory_order_relaxed);
         size_t tail = atomic_load_explicit(&io_shared_outbox.tail, memory_order_acquire);
-        if (head == tail) return 0;
+        if (head == tail) {
+            /* F13a-v3: empty visit — decay the load signal so a system going
+             * idle re-opens the ring gate within a few main-loop iterations. */
+            dplus_last_drain_jobs >>= 1;
+            return 0;
+        }
     }
 
     int total_processed = 0;
@@ -1329,6 +1347,13 @@ int processIOThreadsResponses(void) {
             }
             dplus_drain_busy_us += getMonotonicUs() - dplus_drain_t0;
 #endif
+            /* F13a-v3: record this drain's size as the load signal for ring
+             * gating (see ioSubmitOwnerWrite). Decay on empty so idle
+             * transitions re-open the gate. Main-thread-only, plain. */
+            if (total_processed > 0)
+                dplus_last_drain_jobs = total_processed;
+            else
+                dplus_last_drain_jobs >>= 1;
             return total_processed;
         }
     }
