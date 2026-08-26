@@ -388,6 +388,10 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
 int dplusSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
+    /* [b8a:B DIAG] speculation hard-disabled: isolates H5 (lineage tax) from
+     * the speculation path (H1/H2/H4). Cell must show speculative_hits == 0. */
+    return 0;
+
     /* Early exit: speculation disabled (single-threaded or cluster mode). */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
