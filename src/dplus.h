@@ -131,12 +131,16 @@ static inline uint64_t dplusVersionRead(dplusVersionArray *va, unsigned shard) {
     return atomic_load_explicit(&va->lines[shard / 8].v[shard % 8], memory_order_acquire);
 }
 static inline void dplusVersionBumpShard(dplusVersionArray *va, unsigned shard) {
+    /* [b8a:C2 DIAG] bumps OFF. */
+    (void)va; (void)shard; return;
     /* Relaxed store — single writer (main thread). The release ordering
      * rides existing sync points (see spec §1, b4v4 lesson). */
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
     atomic_store_explicit(slot, atomic_load_explicit(slot, memory_order_relaxed) + 1, memory_order_relaxed);
 }
 static inline void dplusVersionBumpAll(dplusVersionArray *va) {
+    /* [b8a:C2 DIAG] bumps OFF. */
+    (void)va; return;
     /* Structural mutation (rehash/resize): bump all shards with relaxed stores,
      * then one release fence to publish. Rare operation. */
     for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {

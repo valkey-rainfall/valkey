@@ -388,7 +388,10 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
      * hashtable.c's bump sites never fire — a concurrent speculative read
      * of this key must fail validation (the in-place branch additionally
      * tears type/encoding/ptr across three stores). */
-    {
+    /* [b8a:C2 DIAG] bump block OFF — including the per-mutation
+     * hashtableSdsHash (full siphash of the key) computed only for the
+     * shard index. Prime per-SET tax suspect. */
+    if (0) {
         int dict_index = getKVStoreIndexForKey(objectGetVal(key));
         hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
         if (ht) {
@@ -551,6 +554,8 @@ int dbGenericDelete(serverDb *db, robj *key, int async, int flags) {
 
 /* Add a key with volatile items to the tracking kvstore. */
 void dbTrackKeyWithVolatileItems(serverDb *db, robj *o) {
+    /* [b8a:C2 DIAG] volatile tracking OFF. */
+    (void)db; (void)o; return;
     serverAssert(objectGetKey(o));
     if (objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields(o)) {
         int dict_index = getKVStoreIndexForKey(objectGetKey(o));
@@ -560,6 +565,8 @@ void dbTrackKeyWithVolatileItems(serverDb *db, robj *o) {
 
 /* Delete a key from the keys with volatile entries tracking kvstore */
 void dbUntrackKeyWithVolatileItems(serverDb *db, robj *o) {
+    /* [b8a:C2 DIAG] volatile tracking OFF. */
+    (void)db; (void)o; return;
     serverAssert(objectGetKey(o));
     int dict_index = getKVStoreIndexForKey(objectGetKey(o));
     kvstoreHashtableDelete(db->keys_with_volatile_items, dict_index, objectGetKey(o));
