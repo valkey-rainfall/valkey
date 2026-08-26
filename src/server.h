@@ -1360,6 +1360,10 @@ typedef struct client {
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t owner_tid;                    /* Stable owner thread ID (door-2). 0 = legacy/writer-owned. */
+    _Atomic(uint8_t) spec_acl_ok;         /* D+ ACL gate: 1 = authenticated AND user may run GET with
+                                           * unrestricted key read access, so workers may speculate.
+                                           * Written ONLY on the main thread at auth-state changes
+                                           * (clientSetUser, SELECT, ACL admin ops); read by workers. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each

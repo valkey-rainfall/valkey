@@ -67,6 +67,7 @@
 #include "module.h"
 #include "call_reply.h"
 #include "io_threads.h"
+#include "dplus.h"
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include <dlfcn.h>
@@ -10359,7 +10360,11 @@ int VM_FreeModuleUser(ValkeyModuleUser *user) {
  * Returns VALKEYMODULE_OK on success and VALKEYMODULE_ERR on failure
  * and will set an errno describing why the operation failed. */
 int VM_SetModuleUserACL(ValkeyModuleUser *user, const char *acl) {
-    return ACLSetUser(user->user, acl, -1);
+    int ret = ACLSetUser(user->user, acl, -1);
+    /* Module users can be attached to clients (VM_AuthenticateClient*) —
+     * re-gate D+ speculation for any client pointing at the mutated user. */
+    if (ret == C_OK) dplusOnAclRulesChanged();
+    return ret;
 }
 
 /* Sets the permission of a user with a complete ACL string, such as one
@@ -10393,6 +10398,8 @@ int VM_SetModuleUserACLString(ValkeyModuleCtx *ctx,
         return VALKEYMODULE_ERR;
     }
 
+    /* Re-gate D+ speculation for clients attached to the mutated user. */
+    dplusOnAclRulesChanged();
     return VALKEYMODULE_OK;
 }
 

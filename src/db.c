@@ -941,6 +941,8 @@ void selectCommand(client *c) {
         addReplyError(c, "DB index is out of range");
         return;
     }
+    /* Per-db ACL selectors: the D+ speculation gate is db-dependent. */
+    dplusRecomputeSpecAclOk(c);
 
     if (c->flag.multi) {
         serverAssert(c->mstate != NULL);

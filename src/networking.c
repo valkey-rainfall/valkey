@@ -241,6 +241,9 @@ void clientSetUser(client *c, user *u, int authenticated) {
     c->flag.authenticated = authenticated;
     if (authenticated)
         c->flag.ever_authenticated = authenticated;
+    /* D+ speculation ACL gate follows auth state (AUTH/HELLO/RESET/module
+     * auth/deluser-kick all funnel through here). Main thread only. */
+    dplusRecomputeSpecAclOk(c);
 }
 
 static int clientEverAuthenticated(client *c) {

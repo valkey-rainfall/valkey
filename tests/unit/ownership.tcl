@@ -209,3 +209,145 @@ start_server {tags {"ownership"} overrides {io-threads 4 save {}}} {
         }
     }
 }
+
+# --- D+ ACL/AUTH gate regression tests (B-ACL fix) ---
+# Bug: dplusSpeculateBatch executed GETs with NO auth/ACL checks — speculation
+# bypasses processCommand entirely (both the NOAUTH check and ACLCheckAllPerm).
+# Found by acl-v2.tcl failing 3/3 deterministic under ownership.
+# Tests use PIPELINED batches at depth (encoded-buffer lesson: engagement
+# differs at P>1) and prove path engagement via dplus_speculative_hits.
+
+proc dplus_spec_hits {r} {
+    regexp {dplus_speculative_hits:(\d+)} [$r info dplus] -> hits
+    return $hits
+}
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes save {}}} {
+
+    test {OWNERSHIP ACL: engagement sanity - default user GETs do speculate} {
+        r set akey aval
+        set before [dplus_spec_hits r]
+        set rd [valkey_deferring_client]
+        for {set i 0} {$i < 50} {incr i} { $rd get akey }
+        for {set i 0} {$i < 50} {incr i} { assert_equal "aval" [$rd read] }
+        $rd close
+        # Owned-client pipelined GETs must ride the speculative path.
+        wait_for_condition 100 50 {
+            [dplus_spec_hits r] > $before
+        } else {
+            fail "speculative path never engaged - test preconditions broken"
+        }
+    }
+
+    test {OWNERSHIP ACL: -get user is denied NOPERM, pipelined at depth} {
+        r set akey aval
+        r acl setuser nogetter on >pw ~* +@all -get
+        set rd [valkey_deferring_client]
+        $rd auth nogetter pw
+        assert_equal "OK" [$rd read]
+        # Pipelined depth > 1: every GET must be NOPERM, never a value.
+        for {set i 0} {$i < 20} {incr i} { $rd get akey }
+        for {set i 0} {$i < 20} {incr i} {
+            assert_error "*NOPERM*" {$rd read}
+        }
+        $rd close
+        r acl deluser nogetter
+    } {1}
+
+    test {OWNERSHIP ACL: key-pattern-restricted user punts - correct per-key verdicts} {
+        r set allowed:k v1
+        r set secret:k v2
+        r acl setuser scoped on >pw ~allowed:* +@all
+        set rd [valkey_deferring_client]
+        $rd auth scoped pw
+        assert_equal "OK" [$rd read]
+        # Mixed batch: in-pattern key succeeds, out-of-pattern is NOPERM.
+        for {set i 0} {$i < 10} {incr i} {
+            $rd get allowed:k
+            $rd get secret:k
+        }
+        for {set i 0} {$i < 10} {incr i} {
+            assert_equal "v1" [$rd read]
+            assert_error "*NOPERM*" {$rd read}
+        }
+        $rd close
+        r acl deluser scoped
+    } {1}
+
+    test {OWNERSHIP ACL: revocation mid-connection - next batch is denied} {
+        r set akey aval
+        r acl setuser revokee on >pw ~* +@all
+        set rd [valkey_deferring_client]
+        $rd auth revokee pw
+        assert_equal "OK" [$rd read]
+        $rd get akey
+        assert_equal "aval" [$rd read]
+        # Revoke GET while the connection is idle-owned.
+        r acl setuser revokee -get
+        for {set i 0} {$i < 10} {incr i} { $rd get akey }
+        for {set i 0} {$i < 10} {incr i} {
+            assert_error "*NOPERM*" {$rd read}
+        }
+        $rd close
+        r acl deluser revokee
+    } {1}
+
+    test {OWNERSHIP ACL: ACL LOAD-free deluser kick re-gates survivors} {
+        # deluser on a connected user kicks it to DefaultUser unauthenticated;
+        # a subsequent GET on that connection must not be served speculatively.
+        r set akey aval
+        r acl setuser doomed on >pw ~* +@all
+        set rd [valkey_deferring_client]
+        $rd auth doomed pw
+        assert_equal "OK" [$rd read]
+        $rd get akey
+        assert_equal "aval" [$rd read]
+        r acl deluser doomed
+        $rd get akey
+        # Connection is closed or the command is rejected - never a value
+        # via the speculative path.
+        catch {$rd read} e
+        assert {$e ne "aval"}
+        catch {$rd close}
+    }
+}
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes requirepass secret save {}}} {
+
+    test {OWNERSHIP ACL: requirepass without AUTH gets NOAUTH, never values} {
+        r auth secret
+        r set akey aval
+        # Raw deferring connection (no implicit SELECT), pipelined at depth.
+        set rd [valkey [srv "host"] [srv "port"] 1 $::tls]
+        for {set i 0} {$i < 20} {incr i} { $rd get akey }
+        for {set i 0} {$i < 20} {incr i} {
+            assert_error "*NOAUTH*" {$rd read}
+        }
+        # After AUTH the same connection is served normally. (Both this raw
+        # connection and r are on db 0 - r's implicit SELECT 9 failed NOAUTH.)
+        $rd auth secret
+        assert_equal "OK" [$rd read]
+        $rd get akey
+        assert_equal "aval" [$rd read]
+        $rd close
+    }
+}
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
+
+    test {OFF-mode forced-offload ACL: -get user denied at depth} {
+        # door-1 config (workers parse, no ownership): the same speculation
+        # path runs on worker-parsed batches - same gate must hold.
+        r set akey aval
+        r acl setuser nogetter on >pw ~* +@all -get
+        set rd [valkey_deferring_client]
+        $rd auth nogetter pw
+        assert_equal "OK" [$rd read]
+        for {set i 0} {$i < 20} {incr i} { $rd get akey }
+        for {set i 0} {$i < 20} {incr i} {
+            assert_error "*NOPERM*" {$rd read}
+        }
+        $rd close
+        r acl deluser nogetter
+    } {1}
+}

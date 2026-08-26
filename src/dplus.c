@@ -56,6 +56,63 @@ void dplusExclusiveLeave(void) {
     atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 }
 
+/* --- ACL/AUTH gate for speculation --- */
+
+/* Recompute the per-client speculation ACL gate. MAIN THREAD ONLY.
+ * Speculation bypasses processCommand(), so the NOAUTH check and
+ * ACLCheckAllPerm never run on the speculative path — this byte is the
+ * substitute, computed at every auth-state change (clientSetUser covers
+ * AUTH/HELLO/RESET/module-auth/deluser-kick), on SELECT (per-db ACLs), and
+ * on ACL admin ops (dplusOnAclRulesChanged).
+ *
+ * Condition (graceful give-up, per design): authenticated AND some selector
+ * permits GET with UNRESTRICTED key read access (~* / %R~* / allkeys).
+ * Key-pattern-restricted users PUNT to the stock main-thread path — per-key
+ * pattern matching on workers would race main-mutated user structs.
+ * flag.authenticated (sticky, only changed via clientSetUser) is used
+ * instead of authRequired(): the latter reads DefaultUser->flags which can
+ * change with no per-client event (CONFIG SET requirepass) — conservative
+ * punts only, never a bypass. */
+void dplusRecomputeSpecAclOk(client *c) {
+    uint8_t ok = 0;
+    if (c->flag.authenticated) {
+        if (c->user == NULL) {
+            /* No associated user = unrestricted context (stock semantics). */
+            ok = 1;
+        } else {
+            static struct serverCommand *get_cmd = NULL;
+            if (!get_cmd) get_cmd = lookupCommandByCString("get");
+            /* Synthetic argv: the helper only needs cmd identity + dbid for
+             * the command/db checks; the ALLKEYS-or-%R~* requirement is what
+             * actually gates key access, so a placeholder key can only cause
+             * a (safe) conservative punt, never a false allow. */
+            robj *argv[2];
+            argv[0] = createStringObject("get", 3);
+            argv[1] = createStringObject("k", 1);
+            int dbid = c->db ? c->db->id : 0;
+            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(c->user, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
+            decrRefCount(argv[0]);
+            decrRefCount(argv[1]);
+        }
+    }
+    atomic_store_explicit(&c->spec_acl_ok, ok, memory_order_release);
+}
+
+/* ACL rules changed (ACL SETUSER/DELUSER/LOAD, module SetUserACL).
+ * MAIN THREAD ONLY. Enter exclusive FIRST: blocks new speculation and drains
+ * in-flight batches that passed the OLD gate (they serialize before the
+ * change — stock-equivalent semantics, F12-C temporal-window class), then
+ * recompute every client's gate under the new rules. Rare admin op — the
+ * blanket client walk is deliberate simplicity. */
+void dplusOnAclRulesChanged(void) {
+    dplusExclusiveEnter();
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients, &li);
+    while ((ln = listNext(&li))) dplusRecomputeSpecAclOk((client *)listNodeValue(ln));
+    dplusExclusiveLeave();
+}
+
 /* --- Component 2: Speculative GET — reply helpers --- */
 
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
@@ -368,6 +425,16 @@ int dplusSpeculateBatch(client *c, int tid) {
         if (!dplus_get_cmd_fast) dplus_get_cmd_fast = lookupCommandByCString("get");
         if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd_fast) return 0;
     }
+
+    /* ACL/AUTH GUARD: speculation bypasses processCommand, so neither the
+     * NOAUTH check nor ACLCheckAllPerm ever runs on this path. Only clients
+     * pre-cleared on the main thread may speculate; everyone else punts to
+     * the stock path which enforces auth/ACL as usual. The byte is written
+     * only at rare auth-state changes, so this read does not ping-pong the
+     * line. Placed after the GET fast-exit to keep pure-write batches at
+     * zero added cost. ACL admin ops drain in-flight speculation before
+     * gates update (dplusOnAclRulesChanged), closing the temporal window. */
+    if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
 
     /* Write-tax gate pointer — declared early so the out: label can update it.
      * The actual gate CHECK happens below, after first-command eligibility is

@@ -163,6 +163,11 @@ dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 void dplusExclusiveEnter(void);  /* Main thread: set exclusive + spin-wait */
 void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
 
+/* ACL/AUTH gate for speculation (main-thread writers; workers read the
+ * per-client spec_acl_ok byte inside dplusSpeculateBatch). */
+void dplusRecomputeSpecAclOk(struct client *c);
+void dplusOnAclRulesChanged(void);
+
 /* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
 struct client;
 int dplusSpeculativeGet(struct client *c, void *key_sds, int resp);
