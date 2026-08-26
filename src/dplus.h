@@ -201,8 +201,13 @@ void dplusAggregateStats(void);
 long long dplusDoorbellRings(void);
 long long dplusDoorbellCoalesced(void);
 
-/* Maximum embedded value size for speculative copy. Larger values punt. */
-#define DPLUS_MAX_SPECULATIVE_VALUE_LEN 64
+/* Maximum embedded value size for speculative copy. Larger values punt.
+ * W14 (Rain-blessed Aug 25 2026): 1024 is the Track-1 shipping default. The
+ * value-size sweep showed a smooth gradient with NO cliff (96B parity, 512B
+ * 3.3x above OFF, 1KB gradient) and wider copies did not inflate validation
+ * misses, so no per-size knob is warranted (simplicity bar). D+-only constant,
+ * not a standalone upstream PR. */
+#define DPLUS_MAX_SPECULATIVE_VALUE_LEN 1024
 
 /* Component 6: INFO section (dplus.c, only if -DIO_LOOKUP_OFFLOAD_STATS) */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
