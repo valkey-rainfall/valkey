@@ -319,9 +319,12 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * The program is aborted if the key was not already present. */
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
     robj *val = *valref;
+    uint64_t dplus_key_hash = 0;
+    int dplus_have_hash = 0;
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
+        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &dplus_key_hash);
+        dplus_have_hash = 1;
     }
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
@@ -393,7 +396,15 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
         if (ht) {
             dplusVersionArray *va = hashtableGetVersionArray(ht);
-            if (va) dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(hashtableSdsHash(objectGetVal(key))));
+            /* Reuse the hash the self-find already computed (dplus_have_hash);
+             * only fall back to a fresh siphash when the caller passed oldref
+             * in and we skipped our own find. Eliminates one full key siphash
+             * per SET on the common path (B8a lineage-tax reduction). */
+            if (va) {
+                uint64_t h = dplus_have_hash ? dplus_key_hash
+                                             : hashtableSdsHash(objectGetVal(key));
+                dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(h));
+            }
         }
     }
 

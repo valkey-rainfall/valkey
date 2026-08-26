@@ -1782,6 +1782,19 @@ void **hashtableFindRef(hashtable *ht, const void *key) {
     return b ? &b->entries[pos_in_bucket] : NULL;
 }
 
+/* Like hashtableFindRef, but also writes the computed key hash to *hash_out
+ * (always, even when the entry is not found or the table is empty). Lets a
+ * caller that will subsequently need the key's hash (e.g. the D+ shard-version
+ * bump in dbSetValue) reuse it instead of recomputing the siphash. */
+void **hashtableFindRefWithHash(hashtable *ht, const void *key, uint64_t *hash_out) {
+    uint64_t hash = hashKey(ht, key);
+    if (hash_out) *hash_out = hash;
+    if (hashtableSize(ht) == 0) return NULL;
+    int pos_in_bucket = 0;
+    bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
+    return b ? &b->entries[pos_in_bucket] : NULL;
+}
+
 /* Adds an entry. Returns true on success. Returns false if there was already an entry
  * with the same key. */
 bool hashtableAdd(hashtable *ht, void *entry) {

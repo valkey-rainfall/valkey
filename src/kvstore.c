@@ -885,6 +885,15 @@ void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     return hashtableFindRef(ht, key);
 }
 
+/* Like kvstoreHashtableFindRef but also writes the computed key hash to
+ * *hash_out (see hashtableFindRefWithHash). When the hashtable does not exist
+ * yet, *hash_out is left untouched and NULL is returned. */
+void **kvstoreHashtableFindRefWithHash(kvstore *kvs, int didx, const void *key, uint64_t *hash_out) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return NULL;
+    return hashtableFindRefWithHash(ht, key, hash_out);
+}
+
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry) {
     hashtable *ht = createHashtableIfNeeded(kvs, didx);
     bool ret = hashtableAdd(ht, entry);
