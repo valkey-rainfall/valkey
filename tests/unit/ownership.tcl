@@ -413,3 +413,32 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-always-activ
         r ping
     } {PONG}
 }
+
+# --- D+ eviction-vs-limbo regression test (B15 fix) ---
+# Bug: performEvictions measures used-memory deltas around each delete; the
+# limbo deferred frees so deltas read ~0 and eviction returned spurious OOM
+# under deep-pipelined write bursts (limbo accumulates within one event-loop
+# iteration). Fix: exclusive window + limbo flush across the eviction pass.
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes maxmemory 20mb maxmemory-policy allkeys-lru save {}}} {
+
+    test {OWNERSHIP B15: pipelined write burst under maxmemory does not OOM} {
+        set rd [valkey_deferring_client]
+        set val [string repeat x 4096]
+        set batches 40
+        set per_batch 100
+        for {set b 0} {$b < $batches} {incr b} {
+            for {set i 0} {$i < $per_batch} {incr i} {
+                $rd set key:[expr {$b*$per_batch+$i}] $val
+            }
+            for {set i 0} {$i < $per_batch} {incr i} {
+                set res [$rd read]
+                assert_equal "OK" $res
+            }
+        }
+        $rd close
+        # Eviction kept us under the limit and no OOM errors were returned.
+        assert {[s used_memory] < [expr {30*1024*1024}]}
+        assert {![string match "*errorstat_OOM*" [r info errorstats]]}
+    }
+}
