@@ -845,11 +845,14 @@ void dplusFlushLimbo(void) {
     dplus_limbo_len = 0;
     dplus_limbo_cap = 0;
 
-    dplusExclusiveEnter();
-    /* All in-flight walks have completed; new speculation punts until Leave.
-     * Nothing to do inside the window — the objects are already unlinked;
-     * the drain itself is the synchronization. */
-    dplusExclusiveLeave();
+    /* [B8a limbo discriminator — DIAGNOSTIC ONLY]
+     * This branch is stacked on diag/b8a-spec-off, where
+     * dplusSpeculateBatch hard-returns 0 before announcing any reader.
+     * Therefore no speculative pointer can exist and skipping the grace
+     * period is safe HERE ONLY. Keep the limbo enqueue, list detach, delayed
+     * allocator reuse, and routed frees unchanged; the scale cell isolates
+     * the once-per-flush ExclusiveEnter/Leave + reader scan/fences.
+     * NEVER ship or re-enable speculation on this branch. */
 
     for (size_t i = 0; i < n; i++) {
         robj *o = batch[i].o;
