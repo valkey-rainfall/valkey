@@ -789,6 +789,12 @@ int dplusDeferFree(robj *o, int route) {
     /* No IO threads => no speculative walkers => immediate free is safe.
      * (Also keeps single-threaded perf and boot paths untouched.) */
     if (server.io_threads_num <= 1) return 0;
+    /* Main holds exclusive: in-flight walks are drained and new speculation
+     * punts until Leave — immediate free is safe, and REQUIRED by
+     * delete→re-add paths (RENAME/MOVE): a deferred table decref leaves the
+     * refcount inflated and the key re-embed in objectSetKeyAndExpire
+     * panics for non-string types (B10). */
+    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0) return 0;
     if (dplus_limbo_len == dplus_limbo_cap) {
         dplus_limbo_cap = dplus_limbo_cap ? dplus_limbo_cap * 2 : 128;
         dplus_limbo = zrealloc(dplus_limbo, dplus_limbo_cap * sizeof(dplusLimboEntry));
@@ -808,6 +814,8 @@ int dplusDeferFree(robj *o, int route) {
  * expiry delete compacted it away). */
 int dplusDeferFreeRaw(void *ptr) {
     if (server.io_threads_num <= 1) return 0;
+    /* See dplusDeferFree: exclusive window makes immediate free safe. */
+    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0) return 0;
     if (dplus_limbo_len == dplus_limbo_cap) {
         dplus_limbo_cap = dplus_limbo_cap ? dplus_limbo_cap * 2 : 128;
         dplus_limbo = zrealloc(dplus_limbo, dplus_limbo_cap * sizeof(dplusLimboEntry));

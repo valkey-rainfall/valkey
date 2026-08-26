@@ -351,3 +351,65 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-always-activ
         r acl deluser nogetter
     } {1}
 }
+
+# --- D+ delete→re-add refcount regression tests (B10 fix) ---
+# Bug: dplusDeferFree deferred the table's decref at dbDelete, so RENAME/MOVE
+# (incrRefCount → dbDelete → dbAdd) re-embedded the key while refcount was
+# still inflated — serverPanic("Not implemented") in objectSetKeyAndExpire
+# for ANY non-string type. Invisible pre-Aug-26: ownership batteries always
+# truncated at client-eviction, so keyspace/hashexpire never ran.
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes save {}}} {
+
+    test {OWNERSHIP B10: RENAME of non-string types survives} {
+        r hset bh f1 v1 f2 v2
+        r rename bh bh2
+        assert_equal 2 [r hlen bh2]
+        r sadd bs m1
+        r rename bs bs2
+        r rpush bl a
+        r rename bl bl2
+        r zadd bz 1 m
+        r rename bz bz2
+        r ping
+    } {PONG}
+
+    test {OWNERSHIP B10: RENAME preserves hash-field TTLs} {
+        r del th
+        r hset th f1 v1 f2 v2
+        r hexpire th 300 FIELDS 1 f1
+        r rename th th2
+        assert_morethan [lindex [r httl th2 FIELDS 1 f1] 0] 290
+        assert_equal 2 [r hlen th2]
+    }
+
+    test {OWNERSHIP B10: RENAME overwriting an existing dest key} {
+        r hset src f v
+        r hset dst g w
+        r rename src dst
+        assert_equal 1 [r hlen dst]
+        assert_equal v [r hget dst f]
+    }
+
+    test {OWNERSHIP B10: MOVE of non-string type across dbs} {
+        r select 9
+        r del mh
+        r hset mh f v
+        assert_equal 1 [r move mh 5]
+        r select 5
+        assert_equal v [r hget mh f]
+        r del mh
+        r select 9
+        r ping
+    } {PONG}
+}
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
+
+    test {door-1 B10: RENAME of hash survives under always-active io-threads} {
+        r hset bh f1 v1 f2 v2
+        r rename bh bh2
+        assert_equal 2 [r hlen bh2]
+        r ping
+    } {PONG}
+}

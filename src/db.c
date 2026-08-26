@@ -1546,9 +1546,16 @@ void renameGenericCommand(client *c, int nx) {
          * with the same name. */
         dbDelete(c->db, c->argv[2]);
     }
+    /* D+ (B10): hold exclusive across delete→re-add. The table's decref
+     * must apply immediately — a limbo-deferred decref leaves the value's
+     * refcount inflated, and the key re-embed (objectSetKeyAndExpire)
+     * panics for non-string types with refcount > 1. The drain also makes
+     * the old shell's free safe against in-flight speculative walks. */
+    dplusExclusiveEnter();
     dbDelete(c->db, c->argv[1]);
     dbAdd(c->db, c->argv[2], &o);
     if (expire != -1) o = setExpire(c, c->db, c->argv[2], expire);
+    dplusExclusiveLeave();
     signalModifiedKey(c, c->db, c->argv[1]);
     signalModifiedKey(c, c->db, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_from", c->argv[1], c->db->id);
@@ -1622,11 +1629,14 @@ void moveCommand(client *c) {
         return;
     }
 
-    incrRefCount(o);           /* ref counter = 2 */
+    incrRefCount(o); /* ref counter = 2 */
+    /* D+ (B10): exclusive across delete→re-add — see renameGenericCommand. */
+    dplusExclusiveEnter();
     dbDelete(src, c->argv[1]); /* ref counter = 1 */
 
     setKey(c, dst, c->argv[1], &o, set_key_flags);
     if (expire != -1) o = setExpire(c, dst, c->argv[1], expire);
+    dplusExclusiveLeave();
 
     /* OK! key moved */
     signalModifiedKey(c, src, c->argv[1]);
