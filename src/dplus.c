@@ -790,6 +790,9 @@ static size_t dplus_limbo_peak = 0; /* high-water for INFO/tests */
  *   DPLUS_LIMBO_ASYNC         hand to BIO lazyfree at flush (pre-judged)
  *   DPLUS_LIMBO_OFFLOAD_PREF  prefer IO-thread free offload, else sync */
 int dplusDeferFree(robj *o, int route) {
+    /* [b8a:C1 DIAG] limbo OFF: always immediate free (upstream semantics).
+     * SAFE ONLY stacked on spec-off (no walkers exist). */
+    return 0;
     /* No IO threads => no speculative walkers => immediate free is safe.
      * (Also keeps single-threaded perf and boot paths untouched.) */
     if (server.io_threads_num <= 1) return 0;
@@ -817,6 +820,8 @@ int dplusDeferFree(robj *o, int route) {
  * (OFF-mode expiry-leg crash: walker held a chain bucket while main's
  * expiry delete compacted it away). */
 int dplusDeferFreeRaw(void *ptr) {
+    /* [b8a:C1 DIAG] limbo OFF. */
+    return 0;
     if (server.io_threads_num <= 1) return 0;
     /* See dplusDeferFree: exclusive window makes immediate free safe. */
     if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0) return 0;
