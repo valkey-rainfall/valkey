@@ -697,10 +697,13 @@ void ioWorkerCountUselessFire(void) {
     io_worker_useless_fires++;
 }
 
-/* Return the per-worker event loop for the given thread ID.
- * tid must be in [1, io_threads_num-1]. Returns NULL if tid is invalid. */
+/* Return the per-worker event loop for the given thread ID, or NULL if the
+ * slot has no live loop. Bounded by slot liveness (worker_el), NOT by
+ * server.io_threads_num: during a runtime shrink the config is updated
+ * before the removed workers' clients are disowned, so their loops must
+ * remain reachable until shutdownIOThread frees them (B11). */
 aeEventLoop *ioGetWorkerEventLoop(int tid) {
-    if (tid < 1 || tid >= server.io_threads_num) return NULL;
+    if (tid < 1 || tid >= IO_THREADS_MAX_NUM) return NULL;
     return worker_el[tid];
 }
 
@@ -731,6 +734,38 @@ int updateIOThreads(const char **err) {
     serverLog(LL_NOTICE, "Changing number of IO threads from %d to %d.", prev_threads_num, server.io_threads_num);
     drainIOThreadsQueue();
 
+    /* Door-2 ownership (B11/D1): resizing while workers own client fds crashed
+     * in ioSubmitOwnerWrite -- shrink freed a removed worker's event loop and
+     * SPSC inbox while clients still carried its owner_tid. Follow the epoch
+     * lifecycle resize sequence: exclusive mode drains speculation, then every
+     * client owned by a removed slot completes its pending IO and is disowned
+     * back to main BEFORE the worker is cancelled and its structures freed. */
+    if (server.io_threads_ownership) {
+        dplusExclusiveEnter();
+        if (server.io_threads_num < prev_threads_num) {
+            listIter li;
+            listNode *ln;
+            listRewind(server.clients, &li);
+            while ((ln = listNext(&li))) {
+                client *c = listNodeValue(ln);
+                if (c->owner_tid >= server.io_threads_num) {
+                    waitForClientIO(c);
+                    disownClient(c);
+                    /* A client disowned mid-execution (e.g. the very client
+                     * issuing this CONFIG SET) sits at CLIENT_COMPLETED_IO;
+                     * the owned release in beforeNextClient() is gated on
+                     * owner_tid != 0 and will never run for it again, and
+                     * writeToClient() no-ops while either IO state is
+                     * non-idle -- the reply wedges forever (B11 lost-reply).
+                     * Mirror that release here. Workers for these slots are
+                     * quiesced under exclusive mode, so a plain store is
+                     * sufficient. */
+                    if (c->io_read_state == CLIENT_COMPLETED_IO) c->io_read_state = CLIENT_IDLE;
+                }
+            }
+        }
+    }
+
     /* Set active threads to 1, will be adjusted based on workload later. */
     for (int i = 1; i < server.active_io_threads_num; i++) {
         pthread_mutex_lock(&io_threads_mutex[i]);
@@ -746,6 +781,20 @@ int updateIOThreads(const char **err) {
             shutdownIOThread(i);
             io_threads[i] = 0;
         }
+    }
+
+    /* Door-2 ownership: restore the permanently-active invariant for the
+     * surviving workers after a shrink (grow restores it in initIOThreads).
+     * All deactivation paths are skipped under ownership, so a worker left
+     * parked here would never reactivate and its owned clients would hang. */
+    if (server.io_threads_ownership) {
+        if (server.io_threads_num < prev_threads_num) {
+            for (int i = server.active_io_threads_num; i < server.io_threads_num; i++) {
+                pthread_mutex_unlock(&io_threads_mutex[i]);
+            }
+            server.active_io_threads_num = server.io_threads_num;
+        }
+        dplusExclusiveLeave();
     }
     return 1;
 }
