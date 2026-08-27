@@ -12735,9 +12735,10 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
         if (callback == NULL) {
             listDelNode(ValkeyModule_EventListeners, ln);
             zfree(el);
-            if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+            if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-            else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+            } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
                 commandResultRejectedListeners--;
@@ -12757,9 +12758,10 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
     el->event = event;
     el->callback = callback;
     listAddNodeTail(ValkeyModule_EventListeners, el);
-    if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+    if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
         commandResultSuccessListeners++;
-    else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+        dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+    } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
         commandResultFailureListeners++;
     else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
         commandResultRejectedListeners++;
@@ -12915,9 +12917,10 @@ void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
     while ((ln = listNext(&li))) {
         el = ln->value;
         if (el->module == module) {
-            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-            else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+            } else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
                 commandResultRejectedListeners--;

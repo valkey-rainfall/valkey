@@ -177,6 +177,8 @@ void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
  * per-client spec_acl_ok byte inside dplusSpeculateBatch). */
 void dplusRecomputeSpecAclOk(struct client *c);
 void dplusOnAclRulesChanged(void);
+/* F6: called when module command-result SUCCESS listener count transitions. */
+void dplusOnCommandResultListenersChanged(int success_listeners);
 
 /* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
 struct client;

@@ -189,6 +189,21 @@ void dplusOnAclRulesChanged(void) {
     dplusExclusiveLeave();
 }
 
+/* F6: module command-result SUCCESS subscribers require an exact per-command
+ * event from call(); speculated GETs bypass call() entirely, so speculation
+ * must be off while any such subscriber exists. Speculated GETs can only be
+ * SUCCESS events (failures always punt), so only the success listener count
+ * matters. Published gate read by workers each batch; transitions are rare
+ * module admin ops (subscribe / unload) and drain in-flight speculation via
+ * exclusive mode, same temporal-window treatment as ACL changes. */
+_Atomic int dplus_module_cmdresult_gate = 0;
+
+void dplusOnCommandResultListenersChanged(int success_listeners) {
+    dplusExclusiveEnter();
+    atomic_store_explicit(&dplus_module_cmdresult_gate, success_listeners > 0, memory_order_release);
+    dplusExclusiveLeave();
+}
+
 /* --- Component 2: Speculative GET — reply helpers --- */
 
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
@@ -497,6 +512,13 @@ int dplusSpeculateBatch(client *c, int tid) {
      * TRACKING command while its read is parsed, and a tracking command
      * inside this batch ends the speculative prefix before any later GET. */
     if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
+
+    /* MODULE COMMAND-RESULT GUARD (F6): a subscribed module expects an exact
+     * success event per executed command; speculation bypasses call() and
+     * would silently drop those events. Global, module-rare gate -- zero cost
+     * when no module subscribes (single acquire load of a main-written int
+     * that changes only on module admin ops). */
+    if (atomic_load_explicit(&dplus_module_cmdresult_gate, memory_order_acquire)) return 0;
 
     /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
      * the originals outside the limbo hooks — reads racing a move are the
