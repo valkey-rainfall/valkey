@@ -561,6 +561,84 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         assert {![string match "*errorstat_OOM*" [r info errorstats]]}
     }
 
+    test {OWNERSHIP C8: eviction with epoch backlog and held reader stays exact} {
+        # C8 accounting contract under epochs: an eviction pass must (1) enter
+        # exclusive mode (waiting out any active reader), (2) force-reclaim the
+        # retirement backlog FIRST so its memory counts before live keys are
+        # evicted, and (3) never return spurious OOM. Deterministic shape:
+        # build a real retired backlog with big-value overwrites, hold a real
+        # reader past its final recheck, then push past maxmemory from a
+        # different-owner writer.
+        r flushall
+        wait_for_condition 100 10 {
+            [dplus_info_field r dplus_retired_entries] == 0
+        } else { fail "retirement backlog did not drain after flushall" }
+        r config set maxmemory 0
+        r set epoch:held epoch:value
+        set payload [string repeat x 4096]
+        set rd [valkey_deferring_client]
+        $rd debug dplus-owner
+        set reader_owner [$rd read]
+        set writer ""
+        set spares {}
+        for {set i 0} {$i < 6} {incr i} {
+            set c [valkey_deferring_client]
+            $c debug dplus-owner
+            if {$writer eq "" && [$c read] != $reader_owner} { set writer $c } else { lappend spares $c }
+        }
+        assert {$writer ne ""}
+        foreach c $spares { $c close }
+        # Live working set ~12MB, pipelined (sync per-op writes cost ~51 ms
+        # each through the harness Tcl client -- a client-side artifact).
+        for {set i 0} {$i < 3000} {incr i} { $writer set live:$i $payload }
+        for {set i 0} {$i < 3000} {incr i} { assert_equal OK [$writer read] }
+        # Warm the reader connection, then arm a 2000 ms hold and consume it:
+        # the held reader stays ACTIVE in its epoch, so retirements below
+        # CANNOT be reclaimed behind it -- guaranteed persistent backlog.
+        for {set i 0} {$i < 64} {incr i} { $rd get epoch:held }
+        for {set i 0} {$i < 64} {incr i} { assert_equal "epoch:value" [$rd read] }
+        assert_equal OK [r debug dplus-epoch-hold 2000]
+        for {set i 0} {$i < 64} {incr i} { $rd get epoch:held }
+        # Retirement backlog: overwrite 500 big keys 4x = 2000 retired 4KB
+        # values (~8MB) pinned behind the held reader.
+        for {set rep 0} {$rep < 4} {incr rep} {
+            for {set i 0} {$i < 500} {incr i} { $writer set live:$i $payload }
+            for {set i 0} {$i < 500} {incr i} { assert_equal OK [$writer read] }
+        }
+        # Mid-hold observation MUST use the non-exclusive DEBUG stats hook:
+        # INFO internally creates/releases a temp hashtable whose release
+        # enters exclusive mode (stats[1]=retired, stats[3]=forced reclaims).
+        set stats [r debug dplus-epoch-stats]
+        assert {[lindex $stats 1] > 0}
+        set forced_before [lindex $stats 3]
+        # Cap memory BELOW current usage: the next write forces an eviction
+        # pass whose exclusive window must wait out the held reader, then
+        # force-reclaim the backlog BEFORE evicting live keys.
+        r config set maxmemory 10mb
+        $writer set trigger:key $payload
+        assert_equal OK [$writer read]
+        # Liveness: all 64 held-batch replies must arrive. Value-or-nil is
+        # acceptable -- allkeys-lru may legitimately evict epoch:held itself
+        # during the pass; what C8 forbids is a lost/blocked reply.
+        for {set i 0} {$i < 64} {incr i} {
+            set v [$rd read]
+            assert {$v eq "epoch:value" || $v eq ""}
+        }
+        $rd close
+        $writer close
+        # Exactness: forced reclaim ran, backlog fully drained, memory under
+        # the limit, and no spurious OOM was returned to any client.
+        assert {[dplus_info_field r dplus_forced_reclaims] > $forced_before}
+        wait_for_condition 100 10 {
+            [dplus_info_field r dplus_retired_entries] == 0 &&
+            [dplus_info_field r dplus_epoch_debug_reader_holding] == 0
+        } else { fail "eviction pass left retirement backlog: [r info dplus]" }
+        assert {[s used_memory] <= [expr {10*1024*1024}]}
+        assert {![string match "*errorstat_OOM*" [r info errorstats]]}
+        assert {[s evicted_keys] > 0}
+        r config set maxmemory 20mb
+    }
+
     test {D+ EPOCH: non-BCAST CLIENT TRACKING registers every read (E7)} {
         # Regression for the E7 correctness gap: reads that speculate bypass
         # trackingRememberKeys, so a non-BCAST tracking client could cache a

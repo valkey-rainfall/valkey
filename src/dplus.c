@@ -112,6 +112,15 @@ static int dplusReaderEnter(int tid) {
  * all slots until runtime-resize ordering is proven under the new lifecycle. */
 void dplusExclusiveEnter(void) {
     atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    /* Test-only: a debug-held reader models a descheduled thread. ANY
+     * exclusive entrant (hard pressure, eviction, INFO temp-table release,
+     * resize) must be able to preempt it, so the release lives here -- the
+     * held reader then sleeps its configured lag and quiesces, exactly the
+     * scenario the hold exists to exercise. Without this, any non-pressure
+     * exclusive caller would spin against the handshake to the panic bound. */
+    atomic_store_explicit(&dplus_debug_reader_release, 1, memory_order_seq_cst);
+#endif
     for (int word = 0; word < DPLUS_READER_ONLINE_WORDS; word++) {
         uint64_t online = atomic_load_explicit(&dplus_reader_online[word], memory_order_seq_cst);
         while (online) {
@@ -1001,11 +1010,8 @@ static void dplusClearPressureGate(void) {
 }
 
 static void dplusForceRetirePressure(void) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    atomic_store_explicit(&dplus_debug_reader_release, 1, memory_order_seq_cst);
-#endif
     monotime start = getMonotonicUs();
-    dplusExclusiveEnter();
+    dplusExclusiveEnter(); /* releases any debug-held reader (see enter) */
     dplus_pressure_forced_wait_us += getMonotonicUs() - start;
     dplus_pressure_forced_drains++;
     /* The pressure gate excluded new readers and exclusive entry drained every
