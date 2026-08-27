@@ -560,4 +560,37 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         assert {[s used_memory] < [expr {30*1024*1024}]}
         assert {![string match "*errorstat_OOM*" [r info errorstats]]}
     }
+
+    test {D+ EPOCH: non-BCAST CLIENT TRACKING registers every read (E7)} {
+        # Regression for the E7 correctness gap: reads that speculate bypass
+        # trackingRememberKeys, so a non-BCAST tracking client could cache a
+        # value with no TrackingTable registration -- a later write would
+        # never invalidate it. The eligibility gate must punt such clients.
+        set rd_redirection [valkey_deferring_client]
+        $rd_redirection client id
+        set redir_id [$rd_redirection read]
+        $rd_redirection subscribe __redis__:invalidate
+        $rd_redirection read
+        set rd_sg [valkey_client]
+        r CLIENT TRACKING on REDIRECT $redir_id
+        set n 50
+        for {set i 0} {$i < $n} {incr i} {
+            $rd_sg SET e7key$i $i
+            r GET e7key$i
+        }
+        set info [r info]
+        regexp "\r\ntracking_total_keys:(.*?)\r\n" $info _ total_keys
+        assert_equal $n $total_keys
+        # Every overwrite must deliver an invalidation (the pre-fix failure
+        # mode was a permanently blocked read here).
+        for {set i 0} {$i < $n} {incr i} {
+            $rd_sg SET e7key$i again
+        }
+        for {set i 0} {$i < $n} {incr i} {
+            $rd_redirection read
+        }
+        r CLIENT TRACKING off
+        $rd_redirection close
+        $rd_sg close
+    }
 }

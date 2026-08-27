@@ -486,6 +486,18 @@ int dplusSpeculateBatch(client *c, int tid) {
         c->flag.buf_encoded || listLength(c->reply) != 0)
         return 0;
 
+    /* CLIENT TRACKING GUARD (E7): speculation bypasses trackingRememberKeys,
+     * so a non-BCAST tracking client could cache a speculatively-read value
+     * WITHOUT being registered in the TrackingTable — a later write would
+     * never invalidate it (stale client cache = correctness violation).
+     * Punt such clients to the stock path. BCAST tracking is unaffected
+     * (invalidation is prefix-based, not registration-based) and keeps
+     * speculating. Safe to test plain flags here: per-client io_read_state
+     * serialization means main cannot be executing this client's CLIENT
+     * TRACKING command while its read is parsed, and a tracking command
+     * inside this batch ends the speculative prefix before any later GET. */
+    if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
+
     /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
      * the originals outside the limbo hooks — reads racing a move are the
      * same UAF class. Punt speculation while defrag is running (rare,
