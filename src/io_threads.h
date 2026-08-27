@@ -27,6 +27,7 @@ void killIOThreads(void);
 int inMainThread(void);
 int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
+void ioSubmitOwnerWrite(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 void IOThreadsAfterSleep(int numevents);

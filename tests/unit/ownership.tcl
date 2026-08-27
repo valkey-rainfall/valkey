@@ -222,6 +222,23 @@ proc dplus_spec_hits {r} {
     return $hits
 }
 
+proc dplus_info_field {r field} {
+    set payload [$r info dplus]
+    if {![regexp "${field}:(\\d+)" $payload -> value]} {
+        fail "missing $field in INFO dplus: $payload"
+    }
+    return $value
+}
+
+proc dplus_epoch_debug_stats {r} {
+    return [$r debug dplus-epoch-stats]
+}
+
+proc dplus_epoch_is_blocked {r pinned_epoch minimum_retired} {
+    lassign [dplus_epoch_debug_stats $r] epoch retired reclaimed forced advances scans
+    return [expr {$epoch > $pinned_epoch && $retired >= $minimum_retired}]
+}
+
 start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes save {}}} {
 
     test {OWNERSHIP ACL: engagement sanity - default user GETs do speculate} {
@@ -237,6 +254,108 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         } else {
             fail "speculative path never engaged - test preconditions broken"
         }
+    }
+
+    test {OWNERSHIP EPOCH: reader state engages and returns quiescent} {
+        r set epoch:key epoch:value
+        set before [dplus_info_field r dplus_epoch_reader_entries]
+        set rd [valkey_deferring_client]
+        for {set i 0} {$i < 64} {incr i} { $rd get epoch:key }
+        for {set i 0} {$i < 64} {incr i} { assert_equal "epoch:value" [$rd read] }
+        $rd close
+
+        wait_for_condition 100 50 {
+            [dplus_info_field r dplus_epoch_reader_entries] > $before &&
+            [dplus_info_field r dplus_epoch_workers_active] == 0
+        } else {
+            fail "epoch reader path did not engage and quiesce: [r info dplus]"
+        }
+        assert {[dplus_info_field r dplus_reclaim_epoch] >= 1}
+        assert_equal 3 [dplus_info_field r dplus_epoch_workers_online]
+        assert_equal 3 [dplus_info_field r dplus_epoch_workers_quiescent]
+    }
+
+    test {OWNERSHIP EPOCH: pinned reader blocks reclamation until quiescent} {
+        r set epoch:retire value:0
+        set reclaimed_before [dplus_info_field r dplus_reclaimed_entries]
+        set forced_before [dplus_info_field r dplus_forced_reclaims]
+        set pinned_epoch [r debug dplus-epoch-pin]
+        try {
+            for {set i 1} {$i <= 64} {incr i} {
+                r set epoch:retire value:$i
+            }
+            wait_for_condition 100 10 {
+                [dplus_epoch_is_blocked r $pinned_epoch 64]
+            } else {
+                fail "retirements did not accumulate behind pinned reader"
+            }
+            lassign [dplus_epoch_debug_stats r] epoch retired reclaimed forced advances scans
+            assert_equal $reclaimed_before $reclaimed
+            assert_equal $forced_before $forced
+        } finally {
+            assert_equal OK [r debug dplus-epoch-unpin]
+        }
+        wait_for_condition 100 10 {
+            [dplus_info_field r dplus_retired_entries] == 0 &&
+            [dplus_info_field r dplus_reclaimed_entries] >= $reclaimed_before + 64
+        } else {
+            fail "retirements did not reclaim after synthetic quiescence: [r info dplus]"
+        }
+        assert {[dplus_info_field r dplus_epoch_advances] > 0}
+        assert {[dplus_info_field r dplus_epoch_scans] > 0}
+    }
+
+    test {OWNERSHIP EPOCH: hard pressure drains a preempted real reader at the watermark} {
+        r set epoch:held epoch:value
+        r set epoch:pressure value:0
+        set mset_args {}
+        for {set i 1} {$i <= 40000} {incr i} {
+            lappend mset_args epoch:pressure value:$i
+        }
+        set forced_before [dplus_info_field r dplus_forced_reclaims]
+        set pressure_forced_before [dplus_info_field r dplus_pressure_forced_drains]
+        set wait_us_before [dplus_info_field r dplus_pressure_forced_wait_us]
+        set activations_before [dplus_info_field r dplus_pressure_activations]
+
+        set rd [valkey_deferring_client]
+        $rd debug dplus-owner
+        set reader_owner [$rd read]
+        set writer ""
+        set spare_writers {}
+        for {set i 0} {$i < 6} {incr i} {
+            set candidate [valkey_deferring_client]
+            $candidate debug dplus-owner
+            set candidate_owner [$candidate read]
+            if {$writer eq "" && $candidate_owner != $reader_owner} { set writer $candidate } else { lappend spare_writers $candidate }
+        }
+        assert {$writer ne ""}
+        foreach candidate $spare_writers { $candidate close }
+        for {set i 0} {$i < 64} {incr i} { $rd get epoch:held }
+        for {set i 0} {$i < 64} {incr i} { assert_equal "epoch:value" [$rd read] }
+        assert_equal OK [r debug dplus-epoch-hold 200]
+        for {set i 0} {$i < 64} {incr i} { $rd get epoch:held }
+
+        set start_ms [clock milliseconds]
+        $writer mset {*}$mset_args
+        assert_equal OK [$writer read]
+        set elapsed_ms [expr {[clock milliseconds] - $start_ms}]
+        for {set i 0} {$i < 64} {incr i} { assert_equal "epoch:value" [$rd read] }
+        $rd close
+        $writer close
+
+        wait_for_condition 100 10 {
+            [dplus_info_field r dplus_retired_entries] == 0 &&
+            [dplus_info_field r dplus_reclaim_pressure_gate] == 0 &&
+            [dplus_info_field r dplus_epoch_debug_reader_holding] == 0
+        } else {
+            fail "hard-pressure drain did not reach a clean state: [r info dplus]"
+        }
+        assert {$elapsed_ms >= 100}
+        assert_equal 32768 [dplus_info_field r dplus_retired_peak]
+        assert_equal [expr {$forced_before + 1}] [dplus_info_field r dplus_forced_reclaims]
+        assert_equal [expr {$pressure_forced_before + 1}] [dplus_info_field r dplus_pressure_forced_drains]
+        assert {[dplus_info_field r dplus_pressure_forced_wait_us] >= $wait_us_before + 100000}
+        assert {[dplus_info_field r dplus_pressure_activations] > $activations_before}
     }
 
     test {OWNERSHIP ACL: -get user is denied NOPERM, pipelined at depth} {

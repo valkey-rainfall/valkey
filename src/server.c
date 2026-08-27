@@ -1901,9 +1901,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * instantaneous metrics). One shared-line touch per event-loop, not
      * per-command. */
     dplusAggregateStats();
-    /* D+ entry-lifetime: free objects deferred past speculative-walk
-     * quiescence (one bounded drain, only when the limbo is non-empty). */
-    dplusFlushLimbo();
+    /* D+ epoch reclamation: seal this loop's retirements, advance the
+     * epoch, and perform bounded safe reclamation without a global drain. */
+    dplusReclaimRetired();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -3982,10 +3982,14 @@ void call(client *c, int flags) {
          * by the outer command's exclusive window). */
         /* Check if this is an exclusive-mode command by proc pointer. */
         serverCommandProc *proc = c->cmd->proc;
+        int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
+                                     (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
+                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
+                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
         if (proc == evalCommand || proc == evalShaCommand ||
             proc == fcallCommand || proc == execCommand ||
             proc == keysCommand || proc == flushdbCommand ||
-            proc == flushallCommand || proc == debugCommand) {
+            proc == flushallCommand || (proc == debugCommand && !dplus_epoch_debug_hook)) {
             dplusExclusiveEnter();
             dplus_exclusive = 1;
         }
@@ -6876,13 +6880,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         }
     }
 
-    /* D+ Read-Side stats (only when compiled with -DIO_LOOKUP_OFFLOAD_STATS). */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
+    /* D+ epoch engagement and lifecycle gauges are always available. Detailed
+     * speculative counters are appended when IO_LOOKUP_OFFLOAD_STATS is set. */
     if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = dplusInfoString(info);
     }
-#endif
 
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.

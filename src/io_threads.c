@@ -375,6 +375,10 @@ out:
 void cleanupThreadResources(void *dummy) {
     UNUSED(dummy);
 
+    /* Cancellation cannot leave an ACTIVE epoch pin behind. Main still waits
+     * for pthread_join before publishing OFFLINE. */
+    dplusReaderWorkerQuiescent(thread_id);
+
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
 
@@ -636,6 +640,8 @@ static void createIOThread(int id) {
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
+    /* Publish a safe lifecycle state before the new thread can run. */
+    dplusReaderWorkerOnline(id);
     int err = pthread_create(&tid, NULL, IOThreadMain, (void *)(long)id);
     if (err) {
         serverLog(LL_WARNING, "Fatal: Can't initialize IO thread, pthread_create failed with: %s", strerror(err));
@@ -660,6 +666,8 @@ static void shutdownIOThread(int id) {
     if ((err = pthread_join(tid, NULL)) != 0) {
         serverLog(LL_WARNING, "IO thread(tid:%lu) can not be joined: %s", (unsigned long)tid, strerror(err));
     } else {
+        /* Join is the proof that no stale worker can publish into this slot. */
+        dplusReaderWorkerOffline(id);
         serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);

@@ -31,6 +31,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+struct client;
+struct serverObject;
+
 /* --- Component 1: Sharded version array --- */
 
 /* Number of version shards. 256 = 32 cache lines × 8 counters per line = 2KB. */
@@ -62,10 +65,17 @@ struct dplusVersionArray {
  * Readers check this before speculating. */
 extern _Atomic(int) dplus_exclusive_mode;
 
-/* Per-IO-thread in_speculative_read flag. Reader sets before speculation,
- * clears after. Writer spins until all clear before running exclusive ops. */
+/* Epoch/QSBR reader states. OFFLINE and QUIESCENT never hold speculative
+ * pointers; every other value is the epoch announced by an active reader. */
 #define DPLUS_MAX_IO_THREADS 256
-extern _Atomic(int) dplus_in_speculative_read[DPLUS_MAX_IO_THREADS];
+#define DPLUS_READER_OFFLINE 0
+#define DPLUS_READER_QUIESCENT UINT64_MAX
+
+/* IO-thread lifecycle hooks. A slot is initialized QUIESCENT before thread
+ * creation and becomes OFFLINE only after pthread_join completes. */
+void dplusReaderWorkerOnline(int tid);
+void dplusReaderWorkerQuiescent(int tid);
+void dplusReaderWorkerOffline(int tid);
 
 /* --- Per-IO-thread command counters (no-enqueue Phase-1) ---
  *
@@ -182,8 +192,13 @@ int dplusSpeculativeGet(struct client *c, void *key_sds, int resp);
 #define DPLUS_LIMBO_RAW 3 /* zfree() at flush — bucket arrays etc. */
 int dplusDeferFree(struct serverObject *o, int route);
 int dplusDeferFreeRaw(void *ptr);
-void dplusFlushLimbo(void);
+void dplusReclaimRetired(void);
+void dplusForceReclaimAll(void);
 size_t dplusLimboPeak(void);
+int dplusDebugHoldNextReader(long long usec);
+int dplusDebugPinReader(uint64_t *epoch);
+int dplusDebugUnpinReader(void);
+void dplusDebugEpochStats(uint64_t stats[8]);
 
 int dplusSpeculateBatch(struct client *c, int tid);
 
@@ -209,9 +224,8 @@ long long dplusDoorbellCoalesced(void);
  * not a standalone upstream PR. */
 #define DPLUS_MAX_SPECULATIVE_VALUE_LEN 1024
 
-/* Component 6: INFO section (dplus.c, only if -DIO_LOOKUP_OFFLOAD_STATS) */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
+/* Component 6: INFO section. Epoch engagement/lifecycle gauges are always
+ * available; detailed speculative counters remain build-flag dependent. */
 sds dplusInfoString(sds info);
-#endif
 
 #endif /* DPLUS_H */

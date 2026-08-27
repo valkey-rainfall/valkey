@@ -446,7 +446,7 @@ int performEvictions(void) {
      * memory is reclaimed before we start evicting live keys. Eviction is
      * already a rare slow path; the drain is bounded by one GET. */
     dplusExclusiveEnter();
-    dplusFlushLimbo();
+    dplusForceReclaimAll();
     /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {

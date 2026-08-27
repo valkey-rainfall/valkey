@@ -7217,7 +7217,7 @@ void ioThreadWriteToClient(client *c) {
      *   handoff (rare paths keep the battle-tested protocol). */
     if ((c->write_flags & WRITE_FLAGS_OWNED_LOCAL) && c->nwritten > 0 &&
         !(c->write_flags & WRITE_FLAGS_WRITE_ERROR) &&
-        (size_t)c->nwritten == c->io_last_bufpos && c->bufpos == (int)c->io_last_bufpos) {
+        (size_t)c->nwritten == c->io_last_bufpos && c->bufpos == c->io_last_bufpos) {
         int tid = getCurTid();
         dplus_thread_stats[tid].owned_writes++;
         dplus_thread_stats[tid].owned_net_bytes += c->nwritten;
