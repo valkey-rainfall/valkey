@@ -639,6 +639,87 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         r config set maxmemory 20mb
     }
 
+    test {OWNERSHIP B13: WAITING_WRITABLE preserves reads, inspection, and replies} {
+        # A live peer stops reading large replies. The owner write handler must
+        # become dormant without making CLIENT LIST wait on socket progress.
+        # Reads remain active: a later GET is handed to main while the handler
+        # is suspended, then the refreshed handler drains every reply in order.
+        r config set min-io-threads-avoid-copy-reply 1
+        r config set client-output-buffer-limit {normal 64mb 0 0}
+        set payload [string repeat x [expr {1024*1024}]]
+        r set b13:key $payload
+        set rd [valkey_deferring_client]
+        $rd client setname b13_waiter
+        assert_equal OK [$rd read]
+        $rd client id
+        set id [$rd read]
+
+        set waiting0 [dplus_info_field r dplus_b13_waiting_transitions]
+        set suspend0 [dplus_info_field r dplus_b13_read_suspends]
+        set lock0 [dplus_info_field r dplus_b13_info_lock_calls]
+        set sent 0
+        # Keep sending after WAITING engages: b13_read_suspends proves the
+        # readable event fired while the write retry was armed. CLIENT LIST
+        # on every turn is the original panic trigger and must stay bounded.
+        while {$sent < 16 && [dplus_info_field r dplus_b13_read_suspends] == $suspend0} {
+            $rd get b13:key
+            $rd flush
+            incr sent
+            after 10
+            assert_match "*id=$id*name=b13_waiter*" [r client list id $id]
+        }
+        assert {[dplus_info_field r dplus_b13_waiting_transitions] > $waiting0}
+        assert {[dplus_info_field r dplus_b13_read_suspends] > $suspend0}
+        assert {[dplus_info_field r dplus_b13_info_lock_calls] > $lock0}
+
+        # Queue a sentinel after the waiting-state handoff and then let the
+        # peer read. All large replies plus the sentinel must arrive in order.
+        $rd echo B13_DONE
+        $rd flush
+        for {set i 0} {$i < $sent} {incr i} {
+            assert_equal [string length $payload] [string length [$rd read]]
+        }
+        assert_equal B13_DONE [$rd read]
+        wait_for_condition 100 10 {
+            [dplus_info_field r dplus_b13_handler_fires] > 0
+        } else { fail "owner writable handler never fired: [r info dplus]" }
+        assert_match "*id=$id*name=b13_waiter*" [r client list id $id]
+        $rd close
+        r config set client-output-buffer-limit {normal 0 0 0}
+    }
+
+    test {OWNERSHIP B13: runtime shrink migrates a waiting writer without loss} {
+        r config set min-io-threads-avoid-copy-reply 1
+        r config set client-output-buffer-limit {normal 64mb 0 0}
+        set payload [string repeat z [expr {1024*1024}]]
+        r set b13:resize:key $payload
+        set rd [valkey_deferring_client]
+        $rd client setname b13_resize
+        assert_equal OK [$rd read]
+        set waiting0 [dplus_info_field r dplus_b13_waiting_transitions]
+        set sent 0
+        while {$sent < 16 && [dplus_info_field r dplus_b13_waiting_transitions] == $waiting0} {
+            $rd get b13:resize:key
+            $rd flush
+            incr sent
+            after 10
+        }
+        assert {[dplus_info_field r dplus_b13_waiting_transitions] > $waiting0}
+        $rd echo B13_RESIZE_DONE
+        $rd flush
+        # Shrink removes every owner worker. disownClient must cancel the worker
+        # event, preserve buffered output, and install the stock main handler.
+        assert_equal OK [r config set io-threads 1]
+        for {set i 0} {$i < $sent} {incr i} {
+            assert_equal [string length $payload] [string length [$rd read]]
+        }
+        assert_equal B13_RESIZE_DONE [$rd read]
+        assert_equal PONG [r ping]
+        assert_equal OK [r config set io-threads 4]
+        $rd close
+        r config set client-output-buffer-limit {normal 0 0 0}
+    }
+
     test {D+ EPOCH: non-BCAST CLIENT TRACKING registers every read (E7)} {
         # Regression for the E7 correctness gap: reads that speculate bypass
         # trackingRememberKeys, so a non-BCAST tracking client could cache a

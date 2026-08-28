@@ -152,17 +152,22 @@ void drainIOThreadsQueue(void) {
     }
 }
 
-/* Returns if there is an IO operation in progress for the given client. */
+/* Returns if a worker operation is active or awaiting main completion.
+ * WAITING_WRITABLE is intentionally excluded: an event is armed (or suspended
+ * across a main handoff), but no worker is touching mutable client state. */
 int clientHasPendingIO(client *c) {
-    return c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE;
+    return c->io_read_state != CLIENT_IDLE ||
+           (c->io_write_state != CLIENT_IDLE && c->io_write_state != CLIENT_WAITING_WRITABLE);
 }
 
 static void ringWorkerWakePipe(int tid); /* fwd (defined with the F13a machinery) */
 
-/* Wait until the IO-thread is done with the client */
+/* Wait until active IO-thread work is done. WAITING_WRITABLE never waits on
+ * remote socket progress; callers that inspect/migrate the client synchronize
+ * with its owner event-loop lock instead. */
 void waitForClientIO(client *c) {
-    /* No need to wait if the client was not offloaded to the IO thread. */
-    if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE) return;
+    if (c->io_read_state == CLIENT_IDLE &&
+        (c->io_write_state == CLIENT_IDLE || c->io_write_state == CLIENT_WAITING_WRITABLE)) return;
 
     /* Door-2 ownership (B13): a staged owner-write may still be UNCOMMITTED
      * in the owner's SPSC (F12-B batches commits until drain end), and at
@@ -1311,7 +1316,7 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
      * stat_io_writes_pending — don't decrement for them. */
     int offloaded = 0;
     for (int i = 0; i < write_count; i++) {
-        if (!(write_jobs[i]->write_flags & WRITE_FLAGS_OWNED_LOCAL)) offloaded++;
+        if (!(write_jobs[i]->write_flags & (WRITE_FLAGS_OWNED_LOCAL | WRITE_FLAGS_OWNED_HANDLER))) offloaded++;
     }
     server.stat_io_writes_pending -= offloaded;
     serverAssert(server.stat_io_writes_pending >= 0);

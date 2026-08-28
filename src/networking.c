@@ -394,11 +394,9 @@ client *createClient(connection *conn) {
 
 void installClientWriteHandler(client *c) {
     int ae_barrier = 0;
-    /* Door-2 ownership: the write handler (sendReplyToClient → writeToClient)
-     * runs main-only reply machinery. For an owned client, conn->el is the
-     * worker's loop — the handler would fire ON THE WORKER. Disown first
-     * (partial writes / slow clients are rare; such a client degrades to the
-     * legacy path permanently, which handles retry natively). */
+    /* Stock/main-loop handler installation is used for legacy clients and
+     * ownership-incompatible/error fallback. Ordinary partial/EAGAIN on an
+     * owned client stays on its worker via B13's f7 WAITING_WRITABLE handler. */
     if (c->owner_tid != 0 && inMainThread()) disownClient(c);
     /* For the fsync=always policy, we want that a given FD is never
      * served for reading and writing in the same event loop iteration,
@@ -421,6 +419,9 @@ void installClientWriteHandler(client *c) {
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
 static void f7OwnerWriteHandler(connection *conn);
+static int b13ArmOwnerWriteHandler(client *c);
+static void b13CancelOwnerWriteHandler(client *c);
+static void b13ReleaseOrRearmAfterRead(client *c);
 
 void putClientInPendingWriteQueue(client *c) {
     /* Schedule the client to write the output buffers to the socket only
@@ -2175,6 +2176,7 @@ int freeClient(client *c) {
      * existing deferral below: clientHasPendingIO → freeClientAsync retries
      * after IO settles. */
     if (c->owner_tid != 0 && inMainThread()) {
+        if (clientWriteIsWaiting(c)) b13CancelOwnerWriteHandler(c);
         aeEventLoop *worker_loop = ioGetWorkerEventLoop(c->owner_tid);
         if (worker_loop) {
             aeAcquireLock(worker_loop);
@@ -2486,6 +2488,7 @@ void beforeNextClient(client *c) {
          * worker still defers on io_read_state != IDLE. The trim at the
          * bottom then no-ops for this path (qb_pos == 0). */
         if (!isReplicatedClient(c)) trimClientQueryBuffer(c);
+        b13ReleaseOrRearmAfterRead(c);
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
     }
@@ -3462,6 +3465,98 @@ parseResult handleParseResults(client *c) {
     }
 }
 
+/* B13: snapshot all output currently visible to the owner write handler.
+ * Caller holds (or is serialized by) the owner event-loop lock. */
+static void b13SnapshotOwnerWrite(client *c) {
+    c->io_last_reply_block = listLast(c->reply);
+    if (c->io_last_reply_block) {
+        clientReplyBlock *blk = listNodeValue(c->io_last_reply_block);
+        c->io_last_bufpos = blk->used;
+    } else {
+        c->io_last_bufpos = (size_t)c->bufpos;
+    }
+    c->write_flags = WRITE_FLAGS_OWNED_HANDLER;
+    if (!c->flag.buf_encoded && c->io_last_reply_block == NULL)
+        c->write_flags |= WRITE_FLAGS_OWNED_LOCAL;
+}
+
+/* Arm (or rearm after a main handoff) the owner-loop writable event without
+ * claiming active IO. WAITING_WRITABLE permits reads; the loop mutex prevents
+ * a read/write callback overlap while this transition publishes its snapshot. */
+static int b13ArmOwnerWriteHandler(client *c) {
+    if (c->owner_tid == 0 || c->conn == NULL || !clientHasPendingReplies(c)) return C_ERR;
+    aeEventLoop *loop = ioGetWorkerEventLoop(c->owner_tid);
+    if (loop == NULL) return C_ERR;
+    aeAcquireLock(loop);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    int was_waiting = clientWriteIsWaiting(c);
+#endif
+    if (c->flag.pending_write) {
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        c->flag.pending_write = 0;
+    }
+    b13SnapshotOwnerWrite(c);
+    connSetPostponeUpdateState(c->conn, 1);
+    atomic_thread_fence(memory_order_release);
+    c->io_write_state = CLIENT_WAITING_WRITABLE;
+    int rc = connSetWriteHandler(c->conn, f7OwnerWriteHandler);
+    if (rc == C_ERR) {
+        c->io_write_state = CLIENT_IDLE;
+        c->write_flags = 0;
+        c->io_last_reply_block = NULL;
+        c->io_last_bufpos = 0;
+        connSetPostponeUpdateState(c->conn, 0);
+    } else {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.b13_waiting_transitions, 1, memory_order_relaxed);
+        if (was_waiting) atomic_fetch_add_explicit(&dplus_stats.b13_rearms, 1, memory_order_relaxed);
+#endif
+    }
+    aeReleaseLock(loop);
+    return rc;
+}
+
+/* Cancel a dormant owner write event for teardown/disown. No reply bytes are
+ * consumed here; the caller either closes the connection or migrates the intact
+ * buffered output to main. */
+static void b13CancelOwnerWriteHandler(client *c) {
+    if (!clientWriteIsWaiting(c)) return;
+    aeEventLoop *loop = c->owner_tid ? ioGetWorkerEventLoop(c->owner_tid) : NULL;
+    if (loop) aeAcquireLock(loop);
+    if (c->conn && connHasWriteHandler(c->conn)) connSetWriteHandler(c->conn, NULL);
+    atomic_thread_fence(memory_order_release);
+    c->io_write_state = CLIENT_IDLE;
+    c->write_flags = 0;
+    c->io_last_reply_block = NULL;
+    c->io_last_bufpos = 0;
+    if (c->conn) connSetPostponeUpdateState(c->conn, 0);
+    if (loop) aeReleaseLock(loop);
+}
+
+/* Every owned read path that suspended a waiting write converges here before
+ * publishing read-IDLE. Main's reply mutations are complete; refresh the write
+ * snapshot and rearm the owner event, or clear waiting if output vanished. */
+static void b13ReleaseOrRearmAfterRead(client *c) {
+    if (!clientWriteIsWaiting(c)) return;
+    /* Worker-side speculative replies can increase io_tracked_reply_len while
+     * the peer is backpressured. Owned clients are skipped by clientsCron, so
+     * enforce the existing configured hard/soft limits at this main handoff
+     * before rearming. This is stock safety policy, not adaptive throttling. */
+    if (!c->flag.close_asap && closeClientOnOutputBufferLimitReached(c, 1)) {
+        b13CancelOwnerWriteHandler(c);
+        return;
+    }
+    if (c->owner_tid == 0 || c->conn == NULL || c->flag.close_asap ||
+        !clientHasPendingReplies(c)) {
+        b13CancelOwnerWriteHandler(c);
+        return;
+    }
+    if (!connHasWriteHandler(c->conn) && b13ArmOwnerWriteHandler(c) == C_ERR) {
+        b13CancelOwnerWriteHandler(c);
+        if (c->owner_tid != 0 && clientHasPendingReplies(c)) installClientWriteHandler(c);
+    }
+}
+
 /* Process the completion of an IO write operation for a client.
  * This function handles various post-write tasks, including updating client state,
  * allow_async_writes - A flag indicating whether I/O threads can handle pending writes for this client.
@@ -3515,18 +3610,30 @@ void processClientIOWriteDone(client *c) {
         return;
     }
 
+    /* B13: a partial encoded write can make io_tracked_reply_len exceed the
+     * configured limit at this exact completion, before any subsequent read
+     * handoff exists. Enforce stock hard/soft policy before arming a dormant
+     * owner handler; otherwise a peer that sends nothing further is never
+     * revisited because clientsCron skips worker-owned clients. */
+    if (owned && closeClientOnOutputBufferLimitReached(c, 1)) {
+        DOOR2_RELEASE_OWNED_WRITE(c);
+        return;
+    }
+
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
          * able to write everything in one go. */
         if (owned) DOOR2_RELEASE_OWNED_WRITE(c);
         installClientWriteHandler(c);
     } else if (owned) {
-        /* Owned client with replies still pending: queue it BEFORE publishing
-         * IDLE — the worker defers on (pending_write || !IDLE), so the flag
-         * must be visible before the green light or it can start an
-         * owned-local write of a buffer main still intends to flush. */
-        putClientInPendingWriteQueue(c);
-        DOOR2_RELEASE_OWNED_WRITE(c);
+        /* Partial/EAGAIN: preserve ownership and wait on the owner's epoll.
+         * The handler is dormant until writable and WAITING_WRITABLE remains
+         * read-permissive. If registration fails, degrade to the stock main
+         * handler rather than strand output. */
+        if (b13ArmOwnerWriteHandler(c) == C_ERR) {
+            DOOR2_RELEASE_OWNED_WRITE(c);
+            installClientWriteHandler(c);
+        }
     } else {
         /* If we can send the client to the I/O thread, let it handle the write. */
         if (trySendWriteToIOThreads(c) == C_OK) return;
@@ -3543,18 +3650,27 @@ void processClientIOWriteDone(client *c) {
  * a punted-command reply staged by main. Fires on the worker; self-deletes
  * first (one-shot semantics on a level-triggered loop), then runs the
  * standard IO-thread write path. Clean full drains complete worker-side via
- * the fix #2 gate inside ioThreadWriteToClient's completion block; partial
- * writes and errors flow through JOB_RES_WRITE_CLIENT to main's
- * processClientIOWriteDone (which may disown via installClientWriteHandler --
- * the designed degradation for slow clients). */
+ * the fix #2 gate inside ioThreadWriteToClient. Partial writes return through
+ * JOB_RES_WRITE_CLIENT for accounting, then re-enter WAITING_WRITABLE on the
+ * same owner. Errors alone degrade through the stock main handler. */
 static void f7OwnerWriteHandler(connection *conn) {
     client *c = connGetPrivateData(conn);
     /* Self-delete during our own dispatch is safe: the dispatch lock is a
      * recursive mutex held by THIS thread (ae.c:104), and the fe->mask
      * recheck pattern tolerates events deleted mid-iteration. */
     connSetWriteHandler(conn, NULL);
-    serverAssert(c->io_write_state == CLIENT_PENDING_IO);
+    serverAssert(c->io_write_state == CLIENT_WAITING_WRITABLE);
     serverAssert(c->owner_tid == getCurTid());
+    if (c->io_read_state != CLIENT_IDLE) {
+        /* A read callback suspended us and handed work to main. It will refresh
+         * the snapshot and rearm before publishing read-IDLE. */
+        return;
+    }
+    atomic_thread_fence(memory_order_acquire);
+    c->io_write_state = CLIENT_PENDING_IO;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    atomic_fetch_add_explicit(&dplus_stats.b13_handler_fires, 1, memory_order_relaxed);
+#endif
     dplus_thread_stats[getCurTid()].punted_replies_written++;
     ioThreadWriteToClient(c);
 }
@@ -3579,6 +3695,7 @@ int handleClientsWithPendingWrites(void) {
         if (c->flag.close_asap) continue;
 
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
+        if (clientWriteIsWaiting(c)) continue;
 
         /* Door-2 ownership: main flushing an owned client's replies races the
          * owner worker's dispatch (speculation writes into c->buf; the worker's
@@ -3644,43 +3761,12 @@ int handleClientsWithPendingWrites(void) {
              * JOB_RES_WRITE_CLIENT -> processClientIOWriteDone (battle-tested
              * for encoded resets/partial writes). Main sheds the write phase
              * in ALL staged cases — that is F7's actual claim. */
-            c->io_last_reply_block = listLast(c->reply);
-            if (c->io_last_reply_block) {
-                clientReplyBlock *f7blk = (clientReplyBlock *)listNodeValue(c->io_last_reply_block);
-                c->io_last_bufpos = f7blk->used;
-            } else {
-                c->io_last_bufpos = (size_t)c->bufpos;
-            }
-            connSetPostponeUpdateState(c->conn, 1);
-            c->write_flags = (!c->flag.buf_encoded && c->io_last_reply_block == NULL)
-                                 ? WRITE_FLAGS_OWNED_LOCAL : 0;
-            /* The offload tier (write_flags==0) completes via JOB_RES →
-             * handleWriteJobs, which decrements stat_io_writes_pending for
-             * non-OWNED_LOCAL jobs — balance it here (we are on main; these
-             * are genuinely pending offloaded writes now). */
-            if (c->write_flags == 0) server.stat_io_writes_pending++;
-            c->io_write_state = CLIENT_PENDING_IO;
-            /* Lock discipline: poll_mutex is RECURSIVE (ae.c:104), so
-             * registering while holding the lock would not deadlock — we
-             * release first anyway to keep hold time minimal. Ordering is
-             * what matters: staging completes before the release (mutex
-             * release = the publish edge), and anything the worker
-             * dispatches in the gap sees io_write_state == PENDING_IO and
-             * defers (standard deferral guard), so no read can interleave
-             * before the handler fires. Free/kill paths defer on PENDING_IO
-             * likewise, so no disown window exists between stage and fire. */
-            aeReleaseLock(owner_loop);
-            if (connSetWriteHandler(c->conn, f7OwnerWriteHandler) == C_OK) {
+            if (b13ArmOwnerWriteHandler(c) == C_OK) {
+                aeReleaseLock(owner_loop);
                 continue;
             }
-            /* Registration failed (ERANGE-class, effectively unreachable):
-             * re-acquire, unstage, legacy synchronous write. */
-            aeAcquireLock(owner_loop);
-            c->io_write_state = CLIENT_IDLE;
-            if (c->write_flags == 0) server.stat_io_writes_pending--;
-            c->write_flags = 0;
-            c->io_last_reply_block = NULL;
-            connSetPostponeUpdateState(c->conn, 0);
+            /* Registration failed: central helper restored IDLE; fall back to
+             * the existing synchronous/main-handler path under the loop lock. */
         }
 
         /* Try to write buffers to the client socket. */
@@ -4731,7 +4817,7 @@ void readQueryFromClient(connection *conn) {
          * main's flush of previous replies reads/resets the same buffer:
          * touching it concurrently is a data race. Level-triggered epoll
          * re-fires this event, so deferring loses nothing. */
-        if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE ||
+        if (c->io_read_state != CLIENT_IDLE || clientWriteBlocksRead(c) ||
             c->flag.pending_write) {
             /* Level-triggered epoll will re-fire while we wait for main —
              * count the useless fire so the pump can back off (release its
@@ -4747,6 +4833,12 @@ void readQueryFromClient(connection *conn) {
          * touch c->buf below. volatile alone orders the compiler, not the
          * ARM memory system. */
         atomic_thread_fence(memory_order_acquire);
+        if (clientWriteIsWaiting(c) && connHasWriteHandler(c->conn)) {
+            connSetWriteHandler(c->conn, NULL);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.b13_read_suspends, 1, memory_order_relaxed);
+#endif
+        }
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
         /* FLAG PARITY with trySendReadToIOThreads: without the REPLICATED
@@ -4862,6 +4954,22 @@ int isClientConnIpV6(client *c) {
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
+    aeEventLoop *b13_info_loop = NULL;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    monotime b13_lock_start = 0, b13_hold_start = 0;
+#endif
+    if (!server.crashed && client->owner_tid != 0) {
+        b13_info_loop = ioGetWorkerEventLoop(client->owner_tid);
+        if (b13_info_loop) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            b13_lock_start = getMonotonicUs();
+#endif
+            aeAcquireLock(b13_info_loop);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            b13_hold_start = getMonotonicUs();
+#endif
+        }
+    }
     char flags[17], events[3], capa[9], conninfo[CONN_INFO_LEN], *p;
 
     p = flags;
@@ -4951,6 +5059,17 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " tot-net-in=%U", client->net_input_bytes,
             " tot-net-out=%U", client->net_output_bytes,
             " tot-cmds=%U", client->commands_processed));
+    if (b13_info_loop) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        monotime end = getMonotonicUs();
+#endif
+        aeReleaseLock(b13_info_loop);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_wait_us, b13_hold_start - b13_lock_start, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_hold_us, end - b13_hold_start, memory_order_relaxed);
+#endif
+    }
     return ret;
 }
 
@@ -4961,6 +5080,22 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
  * it only added some basic fields for tracking clients. */
 sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
+    aeEventLoop *b13_info_loop = NULL;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    monotime b13_lock_start = 0, b13_hold_start = 0;
+#endif
+    if (!server.crashed && client->owner_tid != 0) {
+        b13_info_loop = ioGetWorkerEventLoop(client->owner_tid);
+        if (b13_info_loop) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            b13_lock_start = getMonotonicUs();
+#endif
+            aeAcquireLock(b13_info_loop);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            b13_hold_start = getMonotonicUs();
+#endif
+        }
+    }
     char conninfo[CONN_INFO_LEN];
 
     sds ret = sdscatfmt(
@@ -4974,6 +5109,17 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
             " user=%s", hide_user_data ? "*redacted*" : (client->user ? client->user->name : "(superuser)"),
             " lib-name=%s", client->lib_name ? (char *)objectGetVal(client->lib_name) : "",
             " lib-ver=%s", client->lib_ver ? (char *)objectGetVal(client->lib_ver) : ""));
+    if (b13_info_loop) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        monotime end = getMonotonicUs();
+#endif
+        aeReleaseLock(b13_info_loop);
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_wait_us, b13_hold_start - b13_lock_start, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_hold_us, end - b13_hold_start, memory_order_relaxed);
+#endif
+    }
     return ret;
 }
 
@@ -6958,6 +7104,8 @@ int postponeClientRead(client *c) {
 void disownClient(client *c) {
     if (c->owner_tid == 0) return;
     serverAssert(inMainThread());
+    int had_waiting_output = clientWriteIsWaiting(c) && clientHasPendingReplies(c);
+    if (clientWriteIsWaiting(c)) b13CancelOwnerWriteHandler(c);
     serverAssert(c->io_read_state != CLIENT_PENDING_IO && c->io_write_state != CLIENT_PENDING_IO);
 
     aeEventLoop *worker_loop = ioGetWorkerEventLoop(c->owner_tid);
@@ -6973,6 +7121,7 @@ void disownClient(client *c) {
     }
     c->owner_tid = 0;
     aeReleaseLock(worker_loop);
+    if (had_waiting_output && c->conn && clientHasPendingReplies(c)) installClientWriteHandler(c);
 }
 
 void processClientIOReadsDone(client *c) {
@@ -7010,6 +7159,7 @@ void processClientIOReadsDone(client *c) {
 #define DOOR2_RELEASE_OWNED_READ(cl)                                        \
     do {                                                                    \
         if ((cl)->owner_tid != 0 && (cl)->io_read_state == CLIENT_COMPLETED_IO) { \
+            b13ReleaseOrRearmAfterRead(cl);                                 \
             atomic_thread_fence(memory_order_release);                      \
             (cl)->io_read_state = CLIENT_IDLE;                              \
         }                                                                   \
@@ -7197,6 +7347,7 @@ void ioThreadReadQueryFromClient(client *c) {
          * normal client type, not replicated — anything else falls through
          * to the battle-tested main handoff below. */
         if (c->owner_tid != 0 && c->owner_tid == getCurTid() &&
+            c->io_write_state == CLIENT_IDLE &&
             c->argc == 0 && !c->flag.pending_command &&
             c->cmd_queue.off >= c->cmd_queue.len &&
             c->bufpos > 0 && listLength(c->reply) == 0 && !c->flag.buf_encoded &&

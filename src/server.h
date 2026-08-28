@@ -1105,9 +1105,10 @@ typedef struct {
 #endif
 
 typedef enum {
-    CLIENT_IDLE = 0,        /* Initial state: client is idle. */
-    CLIENT_PENDING_IO = 1,  /* Main-thread sets this state when client is sent to IO-thread for read/write. */
-    CLIENT_COMPLETED_IO = 2 /* IO-thread sets this state after completing IO operation. */
+    CLIENT_IDLE = 0,             /* Initial state: client is idle. */
+    CLIENT_PENDING_IO = 1,       /* A worker operation may actively touch client state. */
+    CLIENT_COMPLETED_IO = 2,     /* Worker operation completed; main bookkeeping pending. */
+    CLIENT_WAITING_WRITABLE = 3  /* Door-2: owner write handler armed/suspended, no active IO. */
 } clientIOState;
 
 typedef struct ClientFlags {
@@ -1356,7 +1357,7 @@ typedef struct client {
     slotMigrationJob *slot_migration_job; /* Pointer to the slot migration job, or NULL. */
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
-    volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
+    _Atomic uint8_t io_write_state;      /* Cross-thread client write state; use atomic predicates/publication. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t owner_tid;                    /* Stable owner thread ID (door-2). 0 = legacy/writer-owned. */
@@ -2921,6 +2922,9 @@ void dictVanillaFree(void *val);
                                           * worker itself (worker-local completion), \
                                           * not offloaded by main — no pending-write \
                                           * accounting to unwind. */
+#define WRITE_FLAGS_OWNED_HANDLER (1 << 3) /* Door-2: write originated from the owner-loop \
+                                            * writable handler; not a legacy SPMC write and \
+                                            * therefore has no stat_io_writes_pending debit. */
 
 client *createClient(connection *conn);
 int freeClient(client *c);

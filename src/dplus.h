@@ -129,6 +129,13 @@ typedef struct {
     _Atomic(uint64_t) expired_replies;
     _Atomic(uint64_t) intra_batch_write_punts;
     _Atomic(uint64_t) miss_punts;
+    _Atomic(uint64_t) b13_waiting_transitions;
+    _Atomic(uint64_t) b13_handler_fires;
+    _Atomic(uint64_t) b13_read_suspends;
+    _Atomic(uint64_t) b13_rearms;
+    _Atomic(uint64_t) b13_info_lock_calls;
+    _Atomic(uint64_t) b13_info_lock_wait_us;
+    _Atomic(uint64_t) b13_info_lock_hold_us;
 } dplusStats;
 
 extern dplusStats dplus_stats;

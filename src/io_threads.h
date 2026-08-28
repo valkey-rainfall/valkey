@@ -38,6 +38,19 @@ int trySendAcceptToIOThreads(connection *conn);
 int updateIOThreads(const char **err);
 long long getIOThreadActiveTimeMicroseconds(int id);
 int clientHasPendingIO(struct client *c);
+static inline uint8_t clientWriteStateLoad(const client *c) {
+    return atomic_load_explicit(&c->io_write_state, memory_order_acquire);
+}
+static inline int clientWriteIsWaiting(const client *c) {
+    return clientWriteStateLoad(c) == CLIENT_WAITING_WRITABLE;
+}
+static inline int clientWriteIsActive(const client *c) {
+    return clientWriteStateLoad(c) == CLIENT_PENDING_IO;
+}
+static inline int clientWriteBlocksRead(const client *c) {
+    uint8_t state = clientWriteStateLoad(c);
+    return state == CLIENT_PENDING_IO || state == CLIENT_COMPLETED_IO;
+}
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);

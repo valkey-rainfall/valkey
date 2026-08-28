@@ -1225,6 +1225,14 @@ static void clientsCron(int clients_this_cycle) {
         head = listFirst(server.clients);
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
+        /* B13: a WAITING_WRITABLE owned client may have no socket callbacks
+         * while its peer remains non-reading. It still needs periodic stock
+         * hard/soft output-limit enforcement, especially the second soft-limit
+         * time check. closeClient... formats under the owner-loop lock. */
+        if (clientWriteIsWaiting(c)) {
+            closeClientOnOutputBufferLimitReached(c, 1);
+            continue;
+        }
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
         /* Door-2: skip worker-owned clients — their timeout/resize logic
          * will be handled by the worker in a future slice. For now, they

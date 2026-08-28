@@ -1411,7 +1411,14 @@ sds dplusInfoString(sds info) {
         "dplus_large_value_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
         "dplus_intra_batch_write_punts:%llu\r\n"
-        "dplus_miss_punts:%llu\r\n",
+        "dplus_miss_punts:%llu\r\n"
+        "dplus_b13_waiting_transitions:%llu\r\n"
+        "dplus_b13_handler_fires:%llu\r\n"
+        "dplus_b13_read_suspends:%llu\r\n"
+        "dplus_b13_rearms:%llu\r\n"
+        "dplus_b13_info_lock_calls:%llu\r\n"
+        "dplus_b13_info_lock_wait_us:%llu\r\n"
+        "dplus_b13_info_lock_hold_us:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
@@ -1419,7 +1426,14 @@ sds dplusInfoString(sds info) {
         (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.miss_punts, memory_order_relaxed));
+        (unsigned long long)atomic_load_explicit(&dplus_stats.miss_punts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_waiting_transitions, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_handler_fires, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_read_suspends, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_rearms, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_info_lock_calls, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_info_lock_wait_us, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_info_lock_hold_us, memory_order_relaxed));
 #endif
     return info;
 }
