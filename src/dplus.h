@@ -180,6 +180,7 @@ void dplusRecomputeSpecAclOk(struct client *c);
 void dplusOnAclRulesChanged(void);
 /* F6: called when module command-result SUCCESS listener count transitions. */
 void dplusOnCommandResultListenersChanged(int success_listeners);
+void dplusOnMonitorsChanged(void);
 
 /* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
 struct client;

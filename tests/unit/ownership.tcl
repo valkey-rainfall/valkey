@@ -761,4 +761,29 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
         r ping
         assert_equal [expr {$before_hits + 100}] [s keyspace_hits]
     }
+
+    test {OWNERSHIP F1: attached MONITOR observes GETs (speculation gated off while monitoring)} {
+        # Regression: speculative GET hits are served worker-side and bypass
+        # call()'s replicationFeedMonitors, so ~all speculated reads were invisible
+        # to MONITOR. Fix (F1): gate speculation off while any monitor is attached,
+        # so MONITOR sees the exact stock command stream.
+        r flushall
+        r set f1:k v
+        for {set i 0} {$i < 30} {incr i} { assert_equal "v" [r get f1:k] }
+        set mon [valkey_deferring_client]
+        $mon monitor
+        assert_equal "OK" [$mon read]
+        r get f1:k
+        # Sentinel (never speculated) guarantees the read loop terminates even if
+        # a regression re-hid the GET -- then saw_get stays 0 and the assert fails.
+        r echo SENTINEL_F1
+        set saw_get 0
+        while 1 {
+            set line [$mon read]
+            if {[string match {*"echo"*SENTINEL_F1*} $line]} break
+            if {[string match {*"get"*f1:k*} $line]} { set saw_get 1 }
+        }
+        assert_equal 1 $saw_get
+        $mon close
+    }
 }

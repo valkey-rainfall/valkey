@@ -2124,6 +2124,7 @@ void clearClientConnectionState(client *c) {
 
         c->flag.monitor = 0;
         c->flag.replica = 0;
+        dplusOnMonitorsChanged(); /* F1: re-enable speculation when the last monitor detaches */
     }
 
     serverAssert(!(c->flag.replica || c->flag.primary || c->slot_migration_job));

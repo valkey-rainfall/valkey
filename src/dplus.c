@@ -213,6 +213,22 @@ void dplusOnCommandResultListenersChanged(int success_listeners) {
     dplusExclusiveLeave();
 }
 
+/* F1: MONITOR feeds every executed command to attached monitor clients from
+ * main (replicationFeedMonitors in call()); speculated GETs bypass call(), so
+ * ~all speculative reads are invisible to MONITOR. Monitors are a rare
+ * diagnostic feature, so gate speculation OFF while any monitor is attached --
+ * MONITOR then observes the exact stock command stream. Published by main under
+ * an exclusive drain (in-flight speculation that passed the old gate settles
+ * first), same temporal treatment as the module/ACL gates; zero cost when no
+ * monitor (one acquire load of a main-written int per batch). */
+_Atomic int dplus_monitor_gate = 0;
+
+void dplusOnMonitorsChanged(void) {
+    dplusExclusiveEnter();
+    atomic_store_explicit(&dplus_monitor_gate, listLength(server.monitors) > 0, memory_order_release);
+    dplusExclusiveLeave();
+}
+
 /* --- Component 2: Speculative GET — reply helpers --- */
 
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
@@ -505,6 +521,12 @@ int dplusSpeculateBatch(client *c, int tid) {
      * when no module subscribes (single acquire load of a main-written int
      * that changes only on module admin ops). */
     if (atomic_load_explicit(&dplus_module_cmdresult_gate, memory_order_acquire)) return 0;
+
+    /* MONITOR GUARD (F1): a monitor feed is produced per executed command in
+     * call() on main; speculation bypasses call() and would hide the read from
+     * every attached monitor. Global, diagnostic-rare gate -- zero cost when no
+     * monitor is attached. */
+    if (atomic_load_explicit(&dplus_monitor_gate, memory_order_acquire)) return 0;
 
     /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
      * the originals outside the limbo hooks — reads racing a move are the

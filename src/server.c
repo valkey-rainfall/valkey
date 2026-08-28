@@ -6948,6 +6948,7 @@ void monitorCommand(client *c) {
     c->flag.replica = 1;
     c->flag.monitor = 1;
     listAddNodeTail(server.monitors, c);
+    dplusOnMonitorsChanged(); /* F1: gate speculation off while a monitor is attached */
     addReply(c, shared.ok);
 }
 
