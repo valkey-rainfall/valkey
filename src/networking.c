@@ -2514,7 +2514,15 @@ void beforeNextClient(client *c) {
             c->repl_data->repl_applied = 0;
         }
     } else {
-        trimClientQueryBuffer(c);
+        /* B12/D6 residual fix: NEVER bottom-trim an owned client here. The
+         * gated block above already trimmed and published read-IDLE -- the
+         * owner worker may be reading/parsing RIGHT NOW, advancing qb_pos
+         * and appending to this sds; a late sdsrange on main discards a
+         * prefix measured by a qb_pos the worker has moved (observed as a
+         * lost ~4.7KB chunk mid-giant-multibulk: parser lands on the NEXT
+         * command). Owned clients are trimmed only (a) worker-side in the
+         * read done-path and (b) on main BEFORE the IDLE release above. */
+        if (c->owner_tid == 0) trimClientQueryBuffer(c);
     }
     /* Handle async frees */
     /* Note: this doesn't make the server.clients_to_close list redundant because of
@@ -3925,15 +3933,32 @@ static void setProtocolError(const char *errstr, client *c) {
     /* D+ forensics for the B12/D6 parser-desync investigation: capture the
      * ownership/buffer context at the exact failure point regardless of
      * verbosity. shared_qb is evaluated on the CURRENT thread -- part of the
-     * suspect surface (thread-relative identity). */
-    serverLog(LL_WARNING,
-              "D+ proto-desync: err=%s id=%llu owner_tid=%d main=%d qb_pos=%zu qb_len=%zu "
-              "qb_applied=%zu shared_qb=%d read_flags=%d io_read_state=%d io_write_state=%d argc=%d multibulklen=%ld bulklen=%lld",
-              errstr, (unsigned long long)c->id, (int)c->owner_tid, inMainThread(), c->qb_pos,
-              c->querybuf ? sdslen(c->querybuf) : 0, (size_t)c->qb_applied,
-              c->querybuf && c->querybuf == thread_shared_qb, (int)c->read_flags,
-              (int)c->io_read_state, (int)c->io_write_state, c->argc, (long)c->multibulklen,
-              (long long)c->bulklen);
+     * suspect surface (thread-relative identity). NOTE: this runs at the
+     * REPORT site (main); the parse error flag may have been set on the
+     * worker -- cur_tid disambiguates only if reporting is inline. The head
+     * dump shows what the parser actually saw at qb_pos. */
+    {
+        char head[49];
+        size_t n = 0;
+        if (c->querybuf) {
+            size_t avail = sdslen(c->querybuf) - c->qb_pos;
+            n = avail < 48 ? avail : 48;
+            for (size_t i = 0; i < n; i++) {
+                char ch = c->querybuf[c->qb_pos + i];
+                head[i] = isprint(ch) ? ch : (ch == '\r' ? 'R' : (ch == '\n' ? 'N' : '.'));
+            }
+        }
+        head[n] = '\0';
+        serverLog(LL_WARNING,
+                  "D+ proto-desync: err=%s id=%llu owner_tid=%d main=%d cur_tid=%d qb_pos=%zu qb_len=%zu "
+                  "qb_applied=%zu shared_qb=%d read_flags=%d io_read_state=%d io_write_state=%d argc=%d "
+                  "multibulklen=%ld bulklen=%lld head48='%s'",
+                  errstr, (unsigned long long)c->id, (int)c->owner_tid, inMainThread(), getCurTid(), c->qb_pos,
+                  c->querybuf ? sdslen(c->querybuf) : 0, (size_t)c->qb_applied,
+                  c->querybuf && c->querybuf == thread_shared_qb, (int)c->read_flags,
+                  (int)c->io_read_state, (int)c->io_write_state, c->argc, (long)c->multibulklen,
+                  (long long)c->bulklen, head);
+    }
 #endif
     c->flag.close_after_reply = 1;
     c->flag.protocol_error = 1;
