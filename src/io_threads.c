@@ -157,10 +157,26 @@ int clientHasPendingIO(client *c) {
     return c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE;
 }
 
+static void ringWorkerWakePipe(int tid); /* fwd (defined with the F13a machinery) */
+
 /* Wait until the IO-thread is done with the client */
 void waitForClientIO(client *c) {
     /* No need to wait if the client was not offloaded to the IO thread. */
     if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE) return;
+
+    /* Door-2 ownership (B13): a staged owner-write may still be UNCOMMITTED
+     * in the owner's SPSC (F12-B batches commits until drain end), and at
+     * high load the F13a-v3 policy deliberately skips the wake ring -- while
+     * the classic obuf scenario means the client's fd produces no activity
+     * (it stopped reading). A waiter that just spins can therefore never be
+     * satisfied: parked worker + invisible job = 5s panic. Make the wait
+     * self-sufficient: publish any staged jobs for this owner and ring its
+     * wake pipe unconditionally (rare inspection/teardown path; the ring's
+     * amortization cost is irrelevant here). */
+    if (c->owner_tid != 0) {
+        spscCommit(&io_private_inbox[c->owner_tid]);
+        ringWorkerWakePipe(c->owner_tid);
+    }
 
     /* Wait for read operation to complete if pending. */
     {
