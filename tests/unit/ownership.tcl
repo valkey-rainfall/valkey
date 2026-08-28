@@ -672,3 +672,48 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         $rd_sg close
     }
 }
+
+start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership yes save {}}} {
+
+    test {OWNERSHIP B11: runtime io-threads resize under owned traffic delivers all replies} {
+        # Regression for both B11 defects: (1) shrink SIGSEGV -- workers were
+        # cancelled while owning client fds (sec-14 sequence); (2) lost-reply
+        # wedge -- a client disowned mid-execution (the CONFIG SET issuer)
+        # stuck at CLIENT_COMPLETED_IO with its reply buffered forever.
+        r set b11:key b11:val
+        set clients {}
+        for {set i 0} {$i < 4} {incr i} { lappend clients [valkey_deferring_client] }
+        foreach n {3 5 2 6 1 5} {
+            # In-flight pipelined batches while the resize lands.
+            foreach c $clients { for {set j 0} {$j < 32} {incr j} { $c get b11:key } }
+            # The issuer itself is the lost-reply victim shape when its own
+            # worker is removed (n=1 removes ALL workers): this reply arriving
+            # at all is the defect-2 assertion.
+            r config set io-threads $n
+            foreach c $clients { for {set j 0} {$j < 32} {incr j} { assert_equal "b11:val" [$c read] } }
+            assert_equal PONG [r ping]
+        }
+        foreach c $clients { $c close }
+        assert_equal "b11:val" [r get b11:key]
+    }
+
+    test {OWNERSHIP B12: giant multibulk under concurrent load parses exactly} {
+        # Tripwire for the parser-desync (lost chunk) class: a ~1MB SADD
+        # spanning many reads must parse exactly while noise batches keep the
+        # workers and main contended. Pre-fix rate was ~0.5%/iteration under
+        # 8-loop noise; 30 iterations here is a regression tripwire, not a
+        # proof -- the authoritative hammer lives in utils/reproducers/.
+        r set noise:k v
+        set noise {}
+        for {set i 0} {$i < 4} {incr i} { lappend noise [valkey_deferring_client] }
+        set args {}
+        for {set i 0} {$i < 100000} {incr i} { lappend args m$i }
+        for {set it 0} {$it < 30} {incr it} {
+            foreach c $noise { for {set j 0} {$j < 16} {incr j} { $c get noise:k } }
+            assert_equal 100000 [r sadd b12:myset {*}$args]
+            assert_equal 1 [r unlink b12:myset]
+            foreach c $noise { for {set j 0} {$j < 16} {incr j} { assert_equal "v" [$c read] } }
+        }
+        foreach c $noise { $c close }
+    }
+}
