@@ -192,7 +192,24 @@ void waitForClientIO(client *c) {
         monotime _w2 = getMonotonicUs();
         while (c->io_write_state == CLIENT_PENDING_IO) {
             atomic_thread_fence(memory_order_acquire);
-            if (getMonotonicUs() - _w2 > 5000000) serverPanic("waitForClientIO WRITE spin timeout");
+            if (getMonotonicUs() - _w2 > 5000000) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                serverLog(LL_WARNING,
+                          "D+ B13 forensics: id=%llu owner_tid=%d write_flags=%d bufpos=%d reply_len=%llu "
+                          "io_last_bufpos=%llu buf_encoded=%d close_asap=%d parked=%d pending_write_flag=%d "
+                          "spsc_head=%llu spsc_tail=%llu spsc_tail_local=%llu",
+                          (unsigned long long)c->id, (int)c->owner_tid, (int)c->write_flags, (int)c->bufpos,
+                          (unsigned long long)listLength(c->reply), (unsigned long long)c->io_last_bufpos,
+                          (int)c->flag.buf_encoded, (int)c->flag.close_asap,
+                          c->owner_tid ? (int)atomic_load_explicit(&io_private_inbox[c->owner_tid].consumer_parked,
+                                                                   memory_order_acquire) : -1,
+                          (int)c->flag.pending_write,
+                          (unsigned long long)(c->owner_tid ? atomic_load_explicit(&io_private_inbox[c->owner_tid].head, memory_order_acquire) : 0),
+                          (unsigned long long)(c->owner_tid ? atomic_load_explicit(&io_private_inbox[c->owner_tid].tail, memory_order_acquire) : 0),
+                          (unsigned long long)(c->owner_tid ? io_private_inbox[c->owner_tid].tail_local : 0));
+#endif
+                serverPanic("waitForClientIO WRITE spin timeout");
+            }
         }
     }
 
