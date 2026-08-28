@@ -683,6 +683,11 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
         r set b11:key b11:val
         set clients {}
         for {set i 0} {$i < 4} {incr i} { lappend clients [valkey_deferring_client] }
+        # Soak knob: B11_CYCLES repeats the whole transition sequence
+        # (default 1 = suite tripwire; crank for revalidation, e.g.
+        # B11_CYCLES=50 ./runtest --single unit/ownership --only '/B11').
+        set cycles [expr {[info exists ::env(B11_CYCLES)] ? $::env(B11_CYCLES) : 1}]
+        for {set cyc 0} {$cyc < $cycles} {incr cyc} {
         foreach n {3 5 2 6 1 5} {
             # In-flight pipelined batches while the resize lands.
             foreach c $clients { for {set j 0} {$j < 32} {incr j} { $c get b11:key } }
@@ -693,6 +698,7 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
             foreach c $clients { for {set j 0} {$j < 32} {incr j} { assert_equal "b11:val" [$c read] } }
             assert_equal PONG [r ping]
         }
+        }
         foreach c $clients { $c close }
         assert_equal "b11:val" [r get b11:key]
     }
@@ -700,15 +706,18 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
     test {OWNERSHIP B12: giant multibulk under concurrent load parses exactly} {
         # Tripwire for the parser-desync (lost chunk) class: a ~1MB SADD
         # spanning many reads must parse exactly while noise batches keep the
-        # workers and main contended. Pre-fix rate was ~0.5%/iteration under
-        # 8-loop noise; 30 iterations here is a regression tripwire, not a
-        # proof -- the authoritative hammer lives in utils/reproducers/.
+        # workers and main contended. Default 30 iterations = suite tripwire.
+        # Soak knob: this test IS the statistical hammer when cranked --
+        # pre-fix rate was ~0.5%/iteration, so use e.g.
+        # B12_ITERATIONS=4000 ./runtest --single unit/ownership --only '/B12'
+        # for a closure-bound revalidation after read-path changes.
+        set iters [expr {[info exists ::env(B12_ITERATIONS)] ? $::env(B12_ITERATIONS) : 30}]
         r set noise:k v
         set noise {}
         for {set i 0} {$i < 4} {incr i} { lappend noise [valkey_deferring_client] }
         set args {}
         for {set i 0} {$i < 100000} {incr i} { lappend args m$i }
-        for {set it 0} {$it < 30} {incr it} {
+        for {set it 0} {$it < $iters} {incr it} {
             foreach c $noise { for {set j 0} {$j < 16} {incr j} { $c get noise:k } }
             assert_equal 100000 [r sadd b12:myset {*}$args]
             assert_equal 1 [r unlink b12:myset]
