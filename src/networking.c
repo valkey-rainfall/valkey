@@ -2474,6 +2474,17 @@ void beforeNextClient(client *c) {
             ioSubmitOwnerWrite(c); /* F12-B: enqueue is now commit=false;
                                      * batched commitIOJobs at drain end. */
         }
+        /* B12/D6 FIX: trim the query buffer BEFORE publishing IDLE. IDLE is
+         * the owner worker's green light to read again -- its next read
+         * appends to (and may realloc) this same sds. The legacy order
+         * (release here, trim at the bottom of this function) let main's
+         * sdsrange memmove race the worker's append: bidirectional parser
+         * offset desync on multi-read commands (giant multibulk), seen as
+         * "expected '$', got <payload byte>" / invalid CRLF at ~0.5% per
+         * 1MB-command iteration under load. Trimming here is safe: the
+         * worker still defers on io_read_state != IDLE. The trim at the
+         * bottom then no-ops for this path (qb_pos == 0). */
+        if (!isReplicatedClient(c)) trimClientQueryBuffer(c);
         atomic_thread_fence(memory_order_release);
         c->io_read_state = CLIENT_IDLE;
     }
@@ -3910,6 +3921,20 @@ static void setProtocolError(const char *errstr, client *c) {
         serverLog(loglevel, "Protocol error (%s) from client: %s. Query buffer: %s", errstr, client, buf);
         sdsfree(client);
     }
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    /* D+ forensics for the B12/D6 parser-desync investigation: capture the
+     * ownership/buffer context at the exact failure point regardless of
+     * verbosity. shared_qb is evaluated on the CURRENT thread -- part of the
+     * suspect surface (thread-relative identity). */
+    serverLog(LL_WARNING,
+              "D+ proto-desync: err=%s id=%llu owner_tid=%d main=%d qb_pos=%zu qb_len=%zu "
+              "qb_applied=%zu shared_qb=%d read_flags=%d io_read_state=%d io_write_state=%d argc=%d multibulklen=%ld bulklen=%lld",
+              errstr, (unsigned long long)c->id, (int)c->owner_tid, inMainThread(), c->qb_pos,
+              c->querybuf ? sdslen(c->querybuf) : 0, (size_t)c->qb_applied,
+              c->querybuf && c->querybuf == thread_shared_qb, (int)c->read_flags,
+              (int)c->io_read_state, (int)c->io_write_state, c->argc, (long)c->multibulklen,
+              (long long)c->bulklen);
+#endif
     c->flag.close_after_reply = 1;
     c->flag.protocol_error = 1;
 }
