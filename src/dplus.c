@@ -9,6 +9,37 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+/* Diagnostic-only observability cost matrix (default compiles to nothing):
+ *   0 = baseline
+ *   1 = one rolling clock read + default SLOWLOG threshold branch / GET
+ *   2 = one private HDR update with representative constant duration / GET
+ *   3 = rolling clock + threshold branch + private HDR update / GET
+ * Used only by the g4bench F3/F4 cost cells; not product configuration. */
+#ifndef DPLUS_OBS_COST_MODE
+#define DPLUS_OBS_COST_MODE 0
+#endif
+#if DPLUS_OBS_COST_MODE < 0 || DPLUS_OBS_COST_MODE > 3
+#error "DPLUS_OBS_COST_MODE must be 0..3"
+#endif
+#if DPLUS_OBS_COST_MODE == 2 || DPLUS_OBS_COST_MODE == 3
+#include "hdr_histogram.h"
+static struct hdr_histogram *dplus_obs_cost_hist[DPLUS_MAX_IO_THREADS];
+static inline void dplusObsCostRecord(int tid, int64_t duration_ns) {
+    struct hdr_histogram **h = &dplus_obs_cost_hist[tid];
+    if (unlikely(*h == NULL)) {
+        int rc = hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE,
+                          LATENCY_HISTOGRAM_PRECISION, h);
+        serverAssert(rc == 0 && *h != NULL);
+    }
+    if (duration_ns < LATENCY_HISTOGRAM_MIN_VALUE) duration_ns = LATENCY_HISTOGRAM_MIN_VALUE;
+    if (duration_ns > LATENCY_HISTOGRAM_MAX_VALUE) duration_ns = LATENCY_HISTOGRAM_MAX_VALUE;
+    hdr_record_value(*h, duration_ns);
+}
+#endif
+#if DPLUS_OBS_COST_MODE == 1 || DPLUS_OBS_COST_MODE == 3
+static volatile uint64_t dplus_obs_cost_slow_sink[DPLUS_MAX_IO_THREADS];
+#endif
+
 /* --- Component 4: Exclusive mode and epoch reader state --- */
 _Atomic(int) dplus_exclusive_mode = 0;
 static _Atomic(uint64_t) dplus_reclaim_epoch = 1;
@@ -573,6 +604,9 @@ int dplusSpeculateBatch(client *c, int tid) {
      * so their duration must be accumulated per-thread and folded into the
      * GET command's microseconds by dplusAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
+#if DPLUS_OBS_COST_MODE == 1 || DPLUS_OBS_COST_MODE == 3
+    monotime obs_command_start = spec_start;
+#endif
 
     /* --- Phase 1: Collect eligible prefix keys into batch --- */
     serverDb *db = c->db;
@@ -715,6 +749,17 @@ int dplusSpeculateBatch(client *c, int tid) {
                 } else {
                     queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
                 }
+#if DPLUS_OBS_COST_MODE == 1 || DPLUS_OBS_COST_MODE == 3
+                monotime obs_command_end = getMonotonicUs();
+                monotime obs_command_us = obs_command_end - obs_command_start;
+                if (unlikely(obs_command_us >= 10000)) dplus_obs_cost_slow_sink[tid]++;
+                obs_command_start = obs_command_end;
+#endif
+#if DPLUS_OBS_COST_MODE == 2
+                dplusObsCostRecord(tid, 1000); /* representative 1-us sample */
+#elif DPLUS_OBS_COST_MODE == 3
+                dplusObsCostRecord(tid, (int64_t)obs_command_us * 1000);
+#endif
                 speculated++;
                 head++;
             } else {
