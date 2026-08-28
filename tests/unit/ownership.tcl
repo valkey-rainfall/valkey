@@ -725,4 +725,26 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
         }
         foreach c $noise { $c close }
     }
+
+    test {OWNERSHIP E4: speculative miss punts so keyspace miss stats fire exactly} {
+        # Regression: the worker served nil directly on a speculative miss,
+        # silently dropping the keymiss notification AND the stat_keyspace_misses
+        # counter (both only happen in main's lookupKey). Fix (E4): punt on miss
+        # so main takes the normal path and updates both exactly.
+        # stat_keyspace_misses is the robust tripwire here: a worker serving nil
+        # never increments it, so N missing GETs must advance it by exactly N.
+        # (keymiss keyevent delivery is proven separately in experiment-log.md.)
+        r flushall
+        # Warm the ownership/speculation read path with real hits.
+        r set e4:hit v
+        for {set i 0} {$i < 30} {incr i} { assert_equal "v" [r get e4:hit] }
+        set before_miss [s keyspace_misses]
+        for {set i 0} {$i < 25} {incr i} { assert_equal "" [r get e4:absent:$i] }
+        # Every miss must have reached main's lookupKey (a worker serving nil
+        # would leave this counter untouched).
+        assert_equal [expr {$before_miss + 25}] [s keyspace_misses]
+        # A subsequent present-key read must not be miscounted as a miss.
+        assert_equal "v" [r get e4:hit]
+        assert_equal [expr {$before_miss + 25}] [s keyspace_misses]
+    }
 }

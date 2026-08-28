@@ -128,6 +128,7 @@ typedef struct {
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
     _Atomic(uint64_t) intra_batch_write_punts;
+    _Atomic(uint64_t) miss_punts;
 } dplusStats;
 
 extern dplusStats dplus_stats;

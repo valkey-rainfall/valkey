@@ -240,25 +240,6 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
     return (int)total;
 }
 
-/* Format a RESP nil reply directly into the client's output buffer. */
-static int dplusWriteNilReply(client *c, int resp) {
-    const char *nil_resp;
-    size_t nil_len;
-    if (resp >= 3) {
-        nil_resp = "_\r\n";
-        nil_len = 3;
-    } else {
-        nil_resp = "$-1\r\n";
-        nil_len = 5;
-    }
-    size_t available = c->buf_usable_size - c->bufpos;
-    if (nil_len > available) return 0;
-    memcpy(c->buf + c->bufpos, nil_resp, nil_len);
-    c->bufpos += nil_len;
-    if (c->buf_peak < c->bufpos) c->buf_peak = c->bufpos;
-    return (int)nil_len;
-}
-
 /* --- Component 2: Core speculative GET execution --- */
 
 /* Execute a speculative GET for the given key on the IO thread.
@@ -273,12 +254,17 @@ static int dplusWriteNilReply(client *c, int resp) {
 int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     serverDb *db = c->db;
     int dict_index = 0; /* Non-cluster: always slot 0. */
+    (void)resp; /* GET bulk reply is RESP-version-agnostic; misses now punt (E4). */
 
     /* Get the hashtable for the keys kvstore. */
     hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
     if (!ht) {
-        /* Empty database — reply nil. */
-        return dplusWriteNilReply(c, resp) > 0 ? 1 : 0;
+        /* Empty database — the key cannot exist. Punt so main fires the
+         * keymiss notification and increments stat_keyspace_misses exactly (E4). */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
+#endif
+        return 0;
     }
 
     /* Compute hash, determine shard. */
@@ -297,19 +283,15 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
     bool found = hashtableFindReadOnly(ht, key_sds, &entry);
 
     if (!found) {
-        /* Key not found. Validate version. */
-        uint64_t v_after = dplusVersionRead(va, shard);
-        if (v_before != v_after) {
+        /* Key not found — punt on miss so main fires the keymiss notification
+         * and increments stat_keyspace_misses exactly (E4). Serving nil from the
+         * worker would silently drop the single keymiss event and the miss stat.
+         * Exact-punt-on-miss is the approved initial policy; optimize only with
+         * measured need (misses are rare in hit-heavy workloads). */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
 #endif
-            return 0; /* Version mismatch — punt */
-        }
-        /* Valid nil — write nil reply. */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
-#endif
-        return dplusWriteNilReply(c, resp) > 0 ? 1 : 0;
+        return 0;
     }
 
     /* Found an entry. It's an robj*. */
@@ -394,24 +376,19 @@ typedef struct dplusBatchEntry {
  * Returns 1 on success (reply written), 0 on punt. */
 static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, int resp) {
     dplusVersionArray *va = hashtableGetVersionArray(ht);
+    (void)resp; /* GET bulk reply is RESP-version-agnostic; misses now punt (E4). */
 
     /* Get the find result — entry is now in cache from prefetch. */
     void *entry = NULL;
     bool found = hashtableIncrementalFindGetResult(&e->find_state, &entry);
 
     if (!found) {
-        /* Key not found. Validate version. */
-        uint64_t v_after = dplusVersionRead(va, e->shard);
-        if (e->v_before != v_after) {
+        /* Key not found — punt on miss (E4): main fires the keymiss notification
+         * and increments stat_keyspace_misses exactly. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
 #endif
-            return 0;
-        }
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
-#endif
-        return dplusWriteNilReply(c, resp) > 0 ? 1 : 0;
+        return 0;
     }
 
     /* Found an entry. It's an robj*. */
@@ -1397,14 +1374,16 @@ sds dplusInfoString(sds info) {
         "dplus_exclusive_punts:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
-        "dplus_intra_batch_write_punts:%llu\r\n",
+        "dplus_intra_batch_write_punts:%llu\r\n"
+        "dplus_miss_punts:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed));
+        (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.miss_punts, memory_order_relaxed));
 #endif
     return info;
 }
