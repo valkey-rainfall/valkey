@@ -792,6 +792,10 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
 
     /* Accumulate into per-IO-thread counter (no shared-line write). */
     dplus_thread_stats[tid].commands_processed += consumed;
+    /* E3: every consumed speculation is a GET keyspace HIT (valid-nil misses now
+     * punt to main via E4; large/expired/torn also punt). Count them per-thread
+     * so main can fold into stat_keyspace_hits, which the worker path bypasses. */
+    dplus_thread_stats[tid].keyspace_hits += consumed;
 }
 
 /* Aggregate per-IO-thread command counters into server.stat_numcommands.
@@ -826,6 +830,7 @@ void dplusAggregateStats(void) {
     static long long seen_usec[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_writes[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_net_bytes[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_hits[DPLUS_MAX_IO_THREADS] = {0};
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
@@ -835,6 +840,15 @@ void dplusAggregateStats(void) {
             seen_calls[i] = n;
             server.stat_numcommands += delta;
             if (get_cmd) get_cmd->calls += delta;
+        }
+        /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
+         * bypasses main's lookupKey where this is normally incremented). Same
+         * monotonic-delta scheme: workers only grow their slot, main folds the
+         * delta since its last snapshot; a racy read only under-reads, never loses. */
+        long long h = dplus_thread_stats[i].keyspace_hits;
+        if (h > seen_hits[i]) {
+            server.stat_keyspace_hits += h - seen_hits[i];
+            seen_hits[i] = h;
         }
         long long us = dplus_thread_stats[i].usec;
         if (us > seen_usec[i]) {

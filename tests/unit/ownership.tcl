@@ -747,4 +747,18 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
         assert_equal "v" [r get e4:hit]
         assert_equal [expr {$before_miss + 25}] [s keyspace_misses]
     }
+
+    test {OWNERSHIP E3: speculative hits advance keyspace_hits exactly} {
+        # Regression: speculative GET hits are served worker-side and bypass
+        # main's lookupKey, where stat_keyspace_hits is incremented -- so hits
+        # were silently uncounted. Fix (E3): a distinct per-thread keyspace_hits
+        # counter is folded into stat_keyspace_hits by dplusAggregateStats.
+        r flushall
+        r set e3:k v
+        set before_hits [s keyspace_hits]
+        for {set i 0} {$i < 100} {incr i} { assert_equal "v" [r get e3:k] }
+        # Fold has bounded (one event-loop) lag; a following round-trip settles it.
+        r ping
+        assert_equal [expr {$before_hits + 100}] [s keyspace_hits]
+    }
 }
