@@ -639,6 +639,9 @@ static void createIOThread(int id) {
         serverLog(LL_WARNING, "Fatal: Can't create event loop for IO thread %d", id);
         exit(1);
     }
+    /* DIAG (pollbatch-cap): in ownership mode client fds live on the worker
+     * loops, so the anti-lockstep cap must apply here too. */
+    aeSetPollBatchSize(worker_el[id], AE_SERVER_POLL_BATCH_SIZE);
     /* Enable poll protection so aeCreateFileEvent/aeDeleteFileEvent from main
      * thread serialize against the worker's aeProcessEvents via poll_mutex.
      * This is belt-and-suspenders: for NEW fd registration from main, the fd

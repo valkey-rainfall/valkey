@@ -84,6 +84,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->fired = zmalloc(sizeof(aeFiredEvent) * setsize);
     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
     eventLoop->setsize = setsize;
+    eventLoop->poll_batch_size = setsize; /* default: no cap; override via aeSetPollBatchSize */
     eventLoop->timeEventHead = NULL;
     eventLoop->timeEventNextId = 1;
     eventLoop->stop = 0;
@@ -143,6 +144,14 @@ void aeSetDontWait(aeEventLoop *eventLoop, int noWait) {
  * performed at all.
  *
  * Otherwise AE_OK is returned and the operation is successful. */
+/* Cap the number of events handled per poll call. Draining every ready fd in
+ * one sweep makes all clients receive replies (and send their next request)
+ * in lockstep; a cap staggers them. Clamped to setsize. */
+void aeSetPollBatchSize(aeEventLoop *eventLoop, int size) {
+    if (size <= 0 || size > eventLoop->setsize) size = eventLoop->setsize;
+    eventLoop->poll_batch_size = size;
+}
+
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize) {
     AE_LOCK(eventLoop);
     int ret = AE_OK;
@@ -155,6 +164,7 @@ int aeResizeSetSize(aeEventLoop *eventLoop, int setsize) {
     eventLoop->events = zrealloc(eventLoop->events, sizeof(aeFileEvent) * setsize);
     eventLoop->fired = zrealloc(eventLoop->fired, sizeof(aeFiredEvent) * setsize);
     eventLoop->setsize = setsize;
+    if (eventLoop->poll_batch_size > setsize) eventLoop->poll_batch_size = setsize;
 
     /* Make sure that if we created new slots, they are initialized with
      * an AE_NONE mask. */

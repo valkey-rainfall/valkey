@@ -225,6 +225,11 @@ typedef enum {
  * in order to make sure of not over provisioning more than 128 fds. */
 #define CONFIG_FDSET_INCR (CONFIG_MIN_RESERVED_FDS + 96)
 
+/* DIAG (pollbatch-cap): max events processed per epoll_wait drain. Draining
+ * every ready fd per sweep synchronizes clients into reply/request lockstep
+ * bursts; capping staggers arrivals. Idea from valkey-io/valkey PR #2976. */
+#define AE_SERVER_POLL_BATCH_SIZE 200
+
 /* OOM Score Adjustment classes. */
 #define CONFIG_OOM_PRIMARY 0
 #define CONFIG_OOM_REPLICA 1
