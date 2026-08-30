@@ -638,10 +638,6 @@ hashtableType zsetHashtableType = {
     .keyCompare = dictSdsKeyCompare,
 };
 
-uint64_t hashtableSdsHash(const void *key) {
-    return hashtableGenHashFunction((const char *)key, sdslen((char *)key));
-}
-
 const void *hashtableObjectGetKey(const void *entry) {
     return objectGetKey(entry);
 }
