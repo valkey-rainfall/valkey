@@ -1056,6 +1056,7 @@ static void dplusForceRetirePressure(void) {
     dplusExclusiveLeave();
 }
 
+static uint64_t dplus_diag_retire_off_hits = 0; /* DIAG engagement counter (main-thread only) */
 static int dplusAppendRetired(void *ptr, int route) {
     /* No configured workers means no speculative pointer can exist. */
     if (server.io_threads_num <= 1) return 0;
@@ -1074,6 +1075,19 @@ static int dplusAppendRetired(void *ptr, int route) {
         }
     }
 #endif
+    /* ===== DIAG: epoch-residue attribution (diag/door2-epoch-residue-off) =====
+     * Skip ALL retirement machinery: every retired object frees immediately,
+     * exactly like stock. UNSAFE under concurrent speculative readers (UAF
+     * window identical to C1 limbo-off) -- benchmark instrument only, never
+     * merge. Placed AFTER the io_threads guard and the exclusive-mode guard:
+     * exclusive-mode immediate-free is correctness-load-bearing (RENAME/MOVE
+     * refcount re-embedding) and must keep its own path.
+     * Engagement proof: dplus_retired_entries can never rise; verified live
+     * via INFO dplus on a flagged build (flagless conductress builds carry
+     * the same unconditional compile-time return). */
+    dplus_diag_retire_off_hits++;
+    if (1) return 0;
+    /* ===== END DIAG ===== */
     /* Reclaim only entries from completed mutation frames. The current pointer
      * has not been appended yet, so its caller may still finish safely after
      * this function returns. */
