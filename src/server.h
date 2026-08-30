@@ -3047,6 +3047,7 @@ void adjustThreadedIOIfNeeded(void);
 int clientHasPendingReplies(client *c);
 int updateClientMemUsageAndBucket(client *c);
 void removeClientFromMemUsageBucket(client *c, int allow_eviction);
+void clientsCronRefreshOwnedMemUsage(client *c); /* D5: owner-lock-safe accounting refresh */
 void unlinkClient(client *c);
 void removeFromServerClientList(client *c);
 int writeToClient(client *c);

@@ -141,6 +141,10 @@ typedef struct {
 extern dplusStats dplus_stats;
 #endif
 
+/* D5: owned-client over-limit signal (correctness machinery — present in
+ * flagless builds, NOT gated on IO_LOOKUP_OFFLOAD_STATS). */
+extern _Atomic int dplus_client_mem_pressure;
+
 /* --- API declarations --- */
 
 /* Component 1: Version manipulation (implemented in hashtable.c) */

@@ -434,6 +434,17 @@ void aeReleaseLock(aeEventLoop *eventLoop) {
     AE_UNLOCK(eventLoop);
 }
 
+/* Non-blocking variant of aeAcquireLock. Returns 1 with the lock held, 0 if
+ * the loop's owner is inside poll/dispatch (or another quiescer holds it).
+ * For best-effort maintenance passes (memory-accounting refresh) that must
+ * NEVER block main on a worker: a worker parked inside its dispatch (e.g.
+ * the C4 debug-reader hold, or a long write) would deadlock a blocking
+ * acquire against main -- and main may be the only thread able to unpark it. */
+int aeTryAcquireLock(aeEventLoop *eventLoop) {
+    if (!(eventLoop->flags & AE_PROTECT_POLL)) return 1;
+    return pthread_mutex_trylock(&eventLoop->poll_mutex) == 0;
+}
+
 /* Lock-covered variant of aeProcessEvents for worker loops: the poll_mutex
  * is held across poll AND event dispatch, so aeAcquireLock from another
  * thread synchronizes with in-flight callbacks (not just registration).

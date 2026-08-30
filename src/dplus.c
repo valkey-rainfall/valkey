@@ -49,6 +49,12 @@ dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
 /* --- Write-tax gate (per-IO-thread) --- */
 dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS] = {{.history = ~(uint64_t)0}}; /* Start optimistic (all-ones = all speculated) */
 
+/* D5: worker -> main signal that some owned client's output has crossed
+ * maxmemory-clients while no completion is flowing (WAITING_WRITABLE hog).
+ * Consumed (exchange 0) by evictClients on main. NOT stats -- must exist
+ * in flagless builds (correctness machinery, not diagnostics). */
+_Atomic int dplus_client_mem_pressure = 0;
+
 /* --- Component 6: Stats --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 dplusStats dplus_stats = {0};
@@ -818,6 +824,21 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
      * punt to main via E4; large/expired/torn also punt). Count them per-thread
      * so main can fold into stat_keyspace_hits, which the worker path bypasses. */
     dplus_thread_stats[tid].keyspace_hits += consumed;
+
+    /* D5: a WAITING_WRITABLE client keeps speculating reads (B13) while its
+     * peer refuses to drain the socket, so its output grows with NO completion
+     * ever reaching main — main's eviction sums stay stale for a full cron
+     * period while CLIENT LIST reads fresh memory, and a hog can be observed
+     * over maxmemory-clients without being evicted. If this client's output
+     * alone exceeds the whole budget, raise the pressure flag; evictClients
+     * (per-command + per-drain on main) refreshes owned accounting when set.
+     * Racy config read + relaxed flag: established pattern, main re-verifies. */
+    if (consumed > 0 && server.maxmemory_clients != 0) {
+        size_t out = atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed) +
+                     c->reply_bytes + (size_t)c->bufpos;
+        if (out > (size_t)server.maxmemory_clients)
+            atomic_store_explicit(&dplus_client_mem_pressure, 1, memory_order_release);
+    }
 }
 
 /* Aggregate per-IO-thread command counters into server.stat_numcommands.

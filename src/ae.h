@@ -140,6 +140,7 @@ void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep);
 void aeSetCustomPollProc(aeEventLoop *eventLoop, aeCustomPollProc *custompoll);
 void aeSetPollProtect(aeEventLoop *eventLoop, int protect);
 void aeAcquireLock(aeEventLoop *eventLoop);
+int aeTryAcquireLock(aeEventLoop *eventLoop);
 void aeReleaseLock(aeEventLoop *eventLoop);
 int aeProcessEventsProtected(aeEventLoop *eventLoop, int flags);
 int aePollDirect(aeEventLoop *eventLoop, struct timeval *tvp);

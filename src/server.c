@@ -1194,6 +1194,31 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
  * very fast. Sometimes the server has tens of thousands of connected clients, and all
  * of them need to be processed every second.
  */
+
+/* D5: refresh an OWNED client's memory accounting from main, under the
+ * owner-loop lock so field reads (querybuf, reply list, argv) cannot race
+ * the worker's IO pump — the same synchronization CLIENT LIST uses (B13).
+ * Bucket list manipulation itself is main-only state and needs no lock.
+ * Without this, owned clients whose completions stop flowing through main
+ * (WAITING_WRITABLE hogs, querybuf growers) have stale/absent bucket
+ * entries and maxmemory-clients eviction selects the wrong victims. */
+void clientsCronRefreshOwnedMemUsage(client *c) {
+    if (c->owner_tid == 0) {
+        if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
+        return;
+    }
+    /* TRYLOCK, never block: the owner may be parked INSIDE its dispatch
+     * (C4 debug-reader hold, slow peer) holding the loop lock -- and main
+     * may be the only thread able to unpark it (deadlock observed as the
+     * dplus.c:624 release timeout in the hard-pressure ownership test).
+     * On contention skip this refresh; accounting stays stale one tick and
+     * the next cron/pressure pass retries. */
+    aeEventLoop *owner_loop = ioGetWorkerEventLoop(c->owner_tid);
+    if (owner_loop && !aeTryAcquireLock(owner_loop)) return;
+    if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
+    if (owner_loop) aeReleaseLock(owner_loop);
+}
+
 static void clientsCron(int clients_this_cycle) {
     /* for debug purposes: skip actual cron work if pause_cron is on */
     if (server.pause_cron) return;
@@ -1230,14 +1255,24 @@ static void clientsCron(int clients_this_cycle) {
          * hard/soft output-limit enforcement, especially the second soft-limit
          * time check. closeClient... formats under the owner-loop lock. */
         if (clientWriteIsWaiting(c)) {
+            clientsCronRefreshOwnedMemUsage(c);
             closeClientOnOutputBufferLimitReached(c, 1);
             continue;
         }
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
         /* Door-2: skip worker-owned clients — their timeout/resize logic
          * will be handled by the worker in a future slice. For now, they
-         * are immune to clientsCron eviction to prevent races. */
-        if (c->owner_tid != 0) continue;
+         * are immune to clientsCron buffer maintenance to prevent races.
+         * They are NOT immune to memory accounting (D5): without a periodic
+         * bucket refresh an owned client whose completions stop flowing
+         * through main (e.g. a WAITING_WRITABLE hog, or one growing its
+         * querybuf without completing) is invisible to maxmemory-clients
+         * eviction, so eviction kills innocents instead. Refresh under the
+         * owner-loop lock (the B13 CLIENT LIST pattern). */
+        if (c->owner_tid != 0) {
+            clientsCronRefreshOwnedMemUsage(c);
+            continue;
+        }
 
         /* The following functions do different service checks on the client.
          * The protocol is that they return non-zero if the client was
@@ -1914,6 +1949,17 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     dplusReclaimRetired();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
+
+    /* D5: with client eviction active, act on the just-drained completions'
+     * accounting NOW rather than waiting for the next command or cron tick.
+     * Owned clients grow their output (io_tracked_reply_len) on workers, so
+     * without this the window between a hog crossing maxmemory-clients and
+     * eviction spans a full cron period; upstream's single-threaded flow
+     * evicts before any other command can observe the over-limit client,
+     * and this restores that promptness to within one event-loop drain. */
+    if (server.maxmemory_clients != 0 &&
+        (io_responses > 0 || atomic_load_explicit(&dplus_client_mem_pressure, memory_order_acquire)))
+        evictClients();
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();

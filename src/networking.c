@@ -424,6 +424,18 @@ static void b13CancelOwnerWriteHandler(client *c);
 static void b13ReleaseOrRearmAfterRead(client *c);
 
 void putClientInPendingWriteQueue(client *c) {
+    /* Door-2 B13/D5: an owned client in WAITING_WRITABLE must NEVER be linked
+     * into clients_pending_write. Its delivery is owned by the f7 owner-write
+     * handler (worker event), and the b13 rearm at read handoffs refreshes the
+     * write snapshot to cover replies appended meanwhile — so the bytes queued
+     * in c->buf/reply here are picked up when the socket drains. Linking it
+     * instead creates a deadlock: handleClientsWithPendingWrites skips WAITING
+     * clients (leaving pending_write set), and the owner worker's read gate
+     * defers ALL reads while pending_write is set — reads wedge forever, the
+     * worker hot-spins on the level-triggered fd, output stops growing, and a
+     * maxmemory-clients hog becomes immortal (D5: observed over-limit client
+     * never evicted; found by client-eviction.tcl 'evicted due to output buf'). */
+    if (c->owner_tid != 0 && clientWriteIsWaiting(c)) return;
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
      * writes at this stage. */
@@ -2419,6 +2431,21 @@ void beforeNextClient(client *c) {
      * local-write path) — DISOWN it first: permanently migrate it back to
      * main's loop as a legacy client. Simple request/response clients (the
      * hot path) stay owned. */
+    /* D5: a client condemned by evictClients/CLIENT KILL mid-batch was
+     * disowned by freeClient's entry block (owner_tid zeroed, read event
+     * deleted under the worker-loop lock) BEFORE this release could run.
+     * The owned-release below gates on owner_tid != 0 and would silently
+     * no-op (the B11 disown-path lesson), leaving io_read_state stuck at
+     * COMPLETED_IO forever: clientHasPendingIO() never clears and the
+     * async free re-defers infinitely -- an immortal over-limit zombie
+     * that CLIENT LIST keeps reporting. pending_read == 0 proves the MPSC
+     * handoff was already drained (processClientIOReadsDone ran), so no
+     * done-handler will come to assert on -- or heal -- this state. */
+    if (c->owner_tid == 0 && c->flag.close_asap && !c->flag.pending_read &&
+        c->io_read_state == CLIENT_COMPLETED_IO) {
+        atomic_thread_fence(memory_order_release);
+        c->io_read_state = CLIENT_IDLE;
+    }
     if (c->owner_tid != 0 && c->io_read_state == CLIENT_COMPLETED_IO) {
         if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
             c->flag.monitor || c->flag.replica || c->flag.primary ||
@@ -2587,6 +2614,17 @@ int freeClientsInAsyncFreeQueue(void) {
             c->flag.protected_rdb_channel = 0;
         }
 
+        /* D5 backstop: same orphaned-read-state heal as beforeNextClient,
+         * for condemnation paths whose batch never reaches beforeNextClient
+         * (e.g. the condemned client had no command in the executing batch).
+         * Safe here: beforeSleep context, no batch executing, worker
+         * detached at disown, and pending_read == 0 proves the done-handler
+         * already drained the handoff and skipped its gated release. */
+        if (c->owner_tid == 0 && !c->flag.pending_read &&
+            c->io_read_state == CLIENT_COMPLETED_IO) {
+            atomic_thread_fence(memory_order_release);
+            c->io_read_state = CLIENT_IDLE;
+        }
         if (c->flag.protected || clientHasPendingIO(c)) continue;
 
         c->flag.close_asap = 0;
@@ -3695,7 +3733,16 @@ int handleClientsWithPendingWrites(void) {
         if (c->flag.close_asap) continue;
 
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
-        if (clientWriteIsWaiting(c)) continue;
+        /* Door-2 B13/D5: a WAITING_WRITABLE client's delivery belongs to the
+         * f7 owner handler — it must not be RETAINED here with pending_write
+         * set (the owner worker's read gate defers on that flag; see
+         * putClientInPendingWriteQueue). The ingress gate makes this state
+         * near-unreachable; heal defensively rather than wedge. */
+        if (clientWriteIsWaiting(c)) {
+            c->flag.pending_write = 0;
+            listUnlinkNode(server.clients_pending_write, ln);
+            continue;
+        }
 
         /* Door-2 ownership: main flushing an owned client's replies races the
          * owner worker's dispatch (speculation writes into c->buf; the worker's
@@ -7254,6 +7301,22 @@ size_t getClientEvictionLimit(void) {
 
 void evictClients(void) {
     if (!server.client_mem_usage_buckets) return;
+    /* D5: if a worker signalled that an owned client's output crossed the
+     * budget (WAITING_WRITABLE hog with no completions flowing), refresh
+     * owned clients' accounting under their owner-loop locks BEFORE walking
+     * the buckets — the sums/buckets are otherwise up to a cron period
+     * stale for exactly these clients. O(clients) only under pressure. */
+    if (server.maxmemory_clients != 0 &&
+        atomic_exchange_explicit(&dplus_client_mem_pressure, 0, memory_order_acq_rel)) {
+        listIter li;
+        listNode *ln_all;
+        listRewind(server.clients, &li);
+        while ((ln_all = listNext(&li)) != NULL) {
+            client *oc = listNodeValue(ln_all);
+            if (oc->owner_tid == 0 || oc->flag.close_asap) continue;
+            clientsCronRefreshOwnedMemUsage(oc);
+        }
+    }
     /* Start eviction from topmost bucket (largest clients) */
     int curr_bucket = CLIENT_MEM_USAGE_BUCKETS - 1;
     listIter bucket_iter;
@@ -7269,7 +7332,25 @@ void evictClients(void) {
             client *c = ln->value;
             sds ci = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
             serverLog(LL_NOTICE, "Evicting client: %s", ci);
-            if (freeClient(c)) server.stat_evictedclients++;
+            if (freeClient(c)) {
+                server.stat_evictedclients++;
+            } else if (c->flag.close_asap) {
+                /* D5: the free was DEFERRED (freeClientAsync) — for door-2
+                 * owned clients with in-flight worker IO this is the common
+                 * case, not the rare protected-client path. The client is
+                 * condemned but its memory is still counted and it is still
+                 * linked in this bucket, so without settling the accounting
+                 * here the loop condition never progresses and the walk
+                 * cascade-evicts every remaining evictable client (observed:
+                 * 13 victims incl. 17KB control connections while one pubsub
+                 * hog held megabytes). Deduct its usage from the type sums
+                 * and unlink it from the bucket NOW; zero last_memory_usage
+                 * so the eventual async teardown deduction is a no-op. */
+                server.stat_clients_type_memory[c->last_memory_type] -= c->last_memory_usage;
+                removeClientFromMemUsageBucket(c, 0);
+                c->last_memory_usage = 0;
+                server.stat_evictedclients++;
+            }
             sdsfree(ci);
         } else {
             curr_bucket--;
@@ -7419,7 +7500,13 @@ void ioThreadWriteToClient(client *c) {
      *   handoff (rare paths keep the battle-tested protocol). */
     if ((c->write_flags & WRITE_FLAGS_OWNED_LOCAL) && c->nwritten > 0 &&
         !(c->write_flags & WRITE_FLAGS_WRITE_ERROR) &&
-        (size_t)c->nwritten == c->io_last_bufpos && c->bufpos == c->io_last_bufpos) {
+        (size_t)c->nwritten == c->io_last_bufpos && c->bufpos == c->io_last_bufpos &&
+        server.maxmemory_clients == 0 /* D5: when client eviction is active,
+        every completion must run the full main done-handler so buckets and
+        type sums stay per-completion fresh (same policy as the per-command
+        call in processCommandAndResetClient) — otherwise main's per-command
+        evictClients() trigger works from stale sums and a speculating hog
+        is invisible until cron. Racy config read: established pattern. */) {
         int tid = getCurTid();
         dplus_thread_stats[tid].owned_writes++;
         dplus_thread_stats[tid].owned_net_bytes += c->nwritten;
