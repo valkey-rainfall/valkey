@@ -48,7 +48,7 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
 static keyStatus expireIfNeeded(serverDb *db, robj *key, robj *val, int flags);
 static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, const uint64_t *key_hash);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
 
@@ -204,9 +204,10 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
     void **oldref = NULL;
     if (update_if_existing) {
-        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
+        uint64_t key_hash;
+        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &key_hash);
         if (oldref != NULL) {
-            dbSetValue(db, key, valref, 1, oldref);
+            dbSetValue(db, key, valref, 1, oldref, &key_hash);
             return;
         }
     } else {
@@ -317,11 +318,13 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * value should be stored.
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, const uint64_t *key_hash) {
     robj *val = *valref;
+    uint64_t computed_hash;
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
+        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &computed_hash);
+        if (oldref != NULL) key_hash = &computed_hash;
     }
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
@@ -393,7 +396,17 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
         if (ht) {
             dplusVersionArray *va = hashtableGetVersionArray(ht);
-            if (va) dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(hashtableSdsHash(objectGetVal(key))));
+            if (va) {
+                /* Reuse the hash computed by the entry lookup. It MUST come
+                 * from the table's own hash function (configurable seed):
+                 * speculative readers derive their shard index from
+                 * hashtableHashKey, and a bump computed with a different
+                 * seed lands on an uncorrelated shard (missed
+                 * invalidation). hashtableSdsHash (internal random seed)
+                 * was wrong here whenever hash-seed is configured. */
+                uint64_t h = key_hash ? *key_hash : hashtableHashKey(ht, objectGetVal(key));
+                dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(h));
+            }
         }
     }
 
@@ -417,7 +430,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
 void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
-    dbSetValue(db, key, valref, 0, NULL);
+    dbSetValue(db, key, valref, 0, NULL, NULL);
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -450,7 +463,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else if (keyfound < 0) {
         dbAddInternal(db, key, valref, 1);
     } else {
-        dbSetValue(db, key, valref, 1, NULL);
+        dbSetValue(db, key, valref, 1, NULL, NULL);
     }
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);

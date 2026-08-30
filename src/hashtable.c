@@ -1782,6 +1782,23 @@ void **hashtableFindRef(hashtable *ht, const void *key) {
     return b ? &b->entries[pos_in_bucket] : NULL;
 }
 
+/* Like hashtableFindRef, but also exposes the hash computed with THIS table's
+ * hash function via *hash_out (valid only when the return value is non-NULL).
+ * Callers that need the entry's hash after a lookup (e.g. the D+ shard
+ * version bump on value replacement) MUST reuse this value instead of
+ * recomputing with a hardcoded hash function: the table's hashFunction may
+ * use the configurable seed (hash-seed config), and speculative readers
+ * validate shard indices derived from the table's own function -- a bump
+ * computed with a different seed lands on an uncorrelated shard. */
+void **hashtableFindRefWithHash(hashtable *ht, const void *key, uint64_t *hash_out) {
+    if (hashtableSize(ht) == 0) return NULL;
+    uint64_t hash = hashKey(ht, key);
+    int pos_in_bucket = 0;
+    bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
+    if (b && hash_out) *hash_out = hash;
+    return b ? &b->entries[pos_in_bucket] : NULL;
+}
+
 /* Adds an entry. Returns true on success. Returns false if there was already an entry
  * with the same key. */
 bool hashtableAdd(hashtable *ht, void *entry) {
