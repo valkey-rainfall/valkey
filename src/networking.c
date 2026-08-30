@@ -38,6 +38,7 @@
 #include "fmtargs.h"
 #include "io_threads.h"
 #include "module.h"
+#include "argparse_accounting.h"
 #include "connection.h"
 #include "zmalloc.h"
 #include <strings.h>
@@ -3570,6 +3571,7 @@ void parseInlineBuffer(client *c) {
         c->argv_len = argc;
         c->argv = zmalloc(sizeof(robj *) * c->argv_len);
         c->argv_len_sum = 0;
+        APA_ARGV_ALLOC(c->argv_len);
     }
 
     /* Create an Object for all arguments. */
@@ -3579,6 +3581,7 @@ void parseInlineBuffer(client *c) {
         c->argv[c->argc] = createObject(OBJ_STRING, argv[j]);
         c->argc++;
         c->argv_len_sum += sdslen(argv[j]);
+        APA_ARG_INLINE(sdslen(argv[j]), j);
     }
     zfree(argv);
 
@@ -3597,6 +3600,7 @@ void parseInlineBuffer(client *c) {
      * */
     c->net_input_bytes_curr_cmd = (c->argv_len_sum + (c->argc - 1) + 2);
     c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
+    APA_COMMAND_DONE();
     /* Record qb_pos so commandProcessed() can update reploff precisely. */
     c->qb_applied = c->qb_pos;
     c->reqtype = 0;
@@ -3680,6 +3684,7 @@ void parseMultibulkBuffer(client *c) {
                 break; /* Limit the length of the command queue. */
             }
             queue->cmds = zrealloc(queue->cmds, queue->cap * sizeof(parsedCommand));
+            APA_CMD_QUEUE_ALLOC(queue->cap);
         }
         parsedCommand *p = &queue->cmds[queue->len++];
         memset(p, 0, sizeof(*p));
@@ -3762,6 +3767,7 @@ static int parseMultibulk(client *c,
         *argv_len = min(c->multibulklen, 1024);
         *argv = zmalloc(sizeof(robj *) * *argv_len);
         *argv_len_sum = 0;
+        APA_ARGV_ALLOC(*argv_len);
 
         /* Per-slot network bytes-in calculation.
          *
@@ -3875,6 +3881,7 @@ static int parseMultibulk(client *c,
                 *argv_len = min(*argv_len < INT_MAX / 2 ? (*argv_len) * 2 : INT_MAX,
                                 *argc + c->multibulklen);
                 *argv = zrealloc(*argv, sizeof(robj *) * (*argv_len));
+                APA_ARGV_GROW(*argv_len);
             }
 
             /* Check that what follows argv is a real \r\n */
@@ -3895,10 +3902,12 @@ static int parseMultibulk(client *c,
                  * likely... */
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
+                APA_ARG_ADOPTED(c->bulklen, *argc - 1);
             } else {
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
+                APA_ARG_COPIED(c->bulklen, *argc - 1);
             }
             c->bulklen = -1;
             c->multibulklen--;
@@ -3910,6 +3919,7 @@ static int parseMultibulk(client *c,
         /* Per-slot network bytes-in calculation, 3rd and 4th components. */
         *net_input_bytes_curr_cmd += (*argv_len_sum + (*argc * 2));
         c->reqtype = 0;
+        APA_COMMAND_DONE();
         return READ_FLAGS_PARSING_COMPLETED;
     }
     return 0;

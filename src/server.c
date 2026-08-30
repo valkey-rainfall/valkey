@@ -53,6 +53,7 @@
 #include "module.h"
 #include "scripting_engine.h"
 #include "util.h"
+#include "argparse_accounting.h"
 
 #include "eval.h"
 
@@ -6864,6 +6865,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                                   0, /* not a crash report */
                                   sections);
     }
+
+    /* Argparse accounting -- diagnostic only, compiled behind ARGPARSE_ACCOUNTING flag. */
+#ifdef ARGPARSE_ACCOUNTING
+    if (dictFind(section_dict, "argparse_accounting") != NULL) {
+        if (sections++) info = sdscat(info, "\r\n");
+        argparseAccountingGenInfo(&info);
+    }
+#endif
 
     if (dictFind(section_dict, "debug") != NULL) {
         if (sections++) info = sdscat(info, "\r\n");

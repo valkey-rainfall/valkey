@@ -477,6 +477,7 @@ ENGINE_SERVER_OBJ = \
     allocator_defrag.o \
     anet.o \
     aof.o \
+    argparse_accounting.o \
     bio.o \
     bitops.o \
     blocked.o \
