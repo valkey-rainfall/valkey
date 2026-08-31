@@ -20,6 +20,7 @@ static _Thread_local mpscTicket io_thread_ticket = {0};
  * iteration (owned client still waiting on main). Pump reads+resets to
  * decide backoff. Thread-local: each worker counts only its own fires. */
 static _Thread_local int io_worker_useless_fires = 0;
+static _Thread_local int io_worker_all_useless_sweep = 0; /* J1 park-not-spin state */
 /* Backlog of responses when io_shared_outbox is full. Should be rare. */
 static _Thread_local list *pending_io_responses = NULL;
 static pthread_t io_threads[IO_THREADS_MAX_NUM] = {0};
@@ -547,6 +548,17 @@ static void *IOThreadMain(void *myid) {
             io_worker_useless_fires = 0;
             int ev_processed = aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
             if (ev_processed > io_worker_useless_fires) processed += ev_processed - io_worker_useless_fires;
+            /* J1 park-not-spin: remember whether this sweep fired ONLY
+             * deferred (useless) events. In that state the loop contains a
+             * permanently-ready fd we refuse to dispatch (its client's
+             * io_read_state is held by main -- e.g. mid-busy-script), so
+             * sleeping in our own epoll below returns instantly and the
+             * park burns a core (observed: 96% spin for 810s while a busy
+             * Lua script ran, starving main of AE_LOCK on this loop and
+             * blocking kill delivery). */
+            io_worker_all_useless_sweep = (ev_processed > 0 && io_worker_useless_fires >= ev_processed);
+        } else {
+            io_worker_all_useless_sweep = 0;
         }
 
         /* If both queues were empty (no processing done), wait for signal. */
@@ -571,6 +583,23 @@ static void *IOThreadMain(void *myid) {
                      * is seen by the next sweep within ~1µs. */
                     struct timeval tv0 = {0, 0};
                     aePollDirect(worker_el[id], &tv0);
+                } else if (io_worker_all_useless_sweep) {
+                    /* J1 park-not-spin: the loop holds at least one
+                     * permanently-ready deferred fd, so an epoll park would
+                     * return immediately (level-triggered) -- sleep OUTSIDE
+                     * the event loop instead. Same 2ms bound and parked-bit/
+                     * SPSC re-check protocol as the epoll park below; wake
+                     * latency for the deferred client is bounded by main's
+                     * release + next sweep, identical to the epoll path.
+                     * Trade-off: a NEW event on a healthy fd of this loop
+                     * also waits up to 2ms in this state -- acceptable, the
+                     * state only exists while main withholds a release
+                     * (busy script / in-flight handoff). */
+                    atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
+                    if (spscIsEmpty(&io_private_inbox[id])) {
+                        usleep(2000);
+                    }
+                    atomic_store_explicit(&io_private_inbox[id].consumer_parked, 0, memory_order_relaxed);
                 } else {
                     struct timeval tv = {0, 2000};
                     /* F13a park protocol: publish parked, then RE-CHECK the SPSC
