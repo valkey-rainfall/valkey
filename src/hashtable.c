@@ -366,6 +366,32 @@ typedef struct {
 static_assert(sizeof(hashtableIncrementalFindState) >= sizeof(incrementalFind),
               "Opaque incremental find state size");
 
+/* State for heterogeneous incremental find — one word larger to carry the
+ * custom comparator without enlarging the existing incrementalFind / opaque
+ * hashtableIncrementalFindState used by all production callers. */
+typedef struct {
+    /* First 7 fields are identical layout to incrementalFind so the shared
+     * Step/GetResult functions work on both via the same offset cast.
+     * Enum values must match HASHTABLE_CHECK_ENTRY etc. exactly. */
+    enum {
+        HETERO_CHECK_ENTRY = 0,
+        HETERO_NEXT_ENTRY = 1,
+        HETERO_NEXT_BUCKET = 2,
+        HETERO_FOUND = 3,
+        HETERO_NOT_FOUND = 4
+    } state;
+    short table;
+    short pos;
+    hashtable *hashtable;
+    bucket *bucket;
+    const void *key;
+    uint64_t hash;
+    hashtableKeyCompareFn custom_cmp;
+} heteroIncrementalFind;
+
+static_assert(sizeof(hashtableHeteroFindState) >= sizeof(heteroIncrementalFind),
+              "Opaque hetero incremental find state size");
+
 /* Struct used for stats functions. */
 struct hashtableStats {
     int table_index;                /* 0 or 1 (old or new while rehashing). */
@@ -941,6 +967,106 @@ static bucket *findBucket(hashtable *ht, uint64_t hash, const void *key, int *po
     return NULL;
 }
 
+/* Like checkCandidateInBucket, but uses a caller-provided comparator and opaque
+ * search key instead of the hashtable's registered keyCompare callback.  The
+ * comparator receives (entry_key, search_key) and returns non-zero on match.
+ * entry_key is obtained via the registered entryGetKey (or the entry pointer
+ * itself when entryGetKey is NULL). */
+static inline int checkCandidateGeneric(hashtable *ht, bucket *b, int pos, const void *search_key,
+                                        hashtableKeyCompareFn cmp, int table, int *pos_in_bucket, int *table_index) {
+    void *entry = b->entries[pos];
+    const void *elem_key = entryGetKey(ht, entry);
+    if (cmp(elem_key, search_key)) {
+        assert(pos_in_bucket != NULL);
+        if (!validateElementIfNeeded(ht, entry)) {
+            return 0;
+        }
+        *pos_in_bucket = pos;
+        if (table_index) *table_index = table;
+        return 1;
+    }
+    return 0;
+}
+
+/* Like findBucket, but accepts a precomputed hash and a custom comparator
+ * instead of relying on the hashtable's hashFunction and keyCompare.  This
+ * enables heterogeneous lookup where the search key type differs from the
+ * stored entry key type. */
+
+#if HAVE_X86_SIMD
+ATTRIBUTE_TARGET_SSE2
+static int findKeyInBucketSSE2Generic(hashtable *ht, bucket *b, uint8_t h2, const void *search_key,
+                                      hashtableKeyCompareFn cmp, int table, int *pos_in_bucket, int *table_index) {
+    BUCKET_BITS_TYPE presence_mask = b->presence & ((1 << ENTRIES_PER_BUCKET) - 1);
+    __m128i hash_vector = _mm_loadu_si128((__m128i *)b->hashes);
+    __m128i h2_vector = _mm_set1_epi8(h2);
+    __m128i result = _mm_cmpeq_epi8(hash_vector, h2_vector);
+    BUCKET_BITS_TYPE newmask = _mm_movemask_epi8(result);
+    newmask &= presence_mask;
+    while (newmask > 0) {
+        int pos = __builtin_ctz(newmask);
+        if (checkCandidateGeneric(ht, b, pos, search_key, cmp, table, pos_in_bucket, table_index)) return 1;
+        newmask &= ~(1 << pos);
+    }
+    return 0;
+}
+#endif
+
+#if HAVE_ARM_NEON && ENTRIES_PER_BUCKET <= 8
+static int findKeyInBucketNeonGeneric(hashtable *ht, bucket *b, uint8_t h2, const void *search_key,
+                                      hashtableKeyCompareFn cmp, int table, int *pos_in_bucket, int *table_index) {
+    const uint8x8_t hash_vector = vld1_u8(b->hashes);
+    const uint8x8_t h2_vector = vdup_n_u8(h2);
+    const uint8x8_t equal_mask = vceq_u8(hash_vector, h2_vector);
+    uint64_t matches = vget_lane_u64(vreinterpret_u64_u8(equal_mask), 0);
+
+    const uint64_t valid_entry_mask = (1ul << (ENTRIES_PER_BUCKET << 3)) - 1ul;
+    matches = matches & 0x8080808080808080ul & valid_entry_mask;
+
+    while (matches) {
+        int pos = popMatchBitmask(&matches);
+        if ((b->presence & (1 << pos)) &&
+            checkCandidateGeneric(ht, b, pos, search_key, cmp, table, pos_in_bucket, table_index))
+            return 1;
+    }
+    return 0;
+}
+#endif
+
+static bucket *findBucketGeneric(hashtable *ht, uint64_t hash, const void *search_key,
+                                 hashtableKeyCompareFn cmp, int *pos_in_bucket, int *table_index) {
+    if (hashtableSize(ht) == 0) return 0;
+    uint8_t h2 = highBits(hash);
+    int table;
+
+    rehashStepOnReadIfNeeded(ht);
+
+    for (table = 0; table <= 1; table++) {
+        if (ht->used[table] == 0) continue;
+        size_t mask = expToMask(ht->bucket_exp[table]);
+        size_t bucket_idx = hash & mask;
+        if (table == 0 && ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx) {
+            continue;
+        }
+        bucket *b = &ht->tables[table][bucket_idx];
+        do {
+#if HAVE_X86_SIMD
+            if (findKeyInBucketSSE2Generic(ht, b, h2, search_key, cmp, table, pos_in_bucket, table_index)) return b;
+#elif HAVE_ARM_NEON && ENTRIES_PER_BUCKET <= 8
+            if (findKeyInBucketNeonGeneric(ht, b, h2, search_key, cmp, table, pos_in_bucket, table_index)) return b;
+#else
+            for (int pos = 0; pos < numBucketPositions(b); pos++) {
+                if (isPositionFilled(b, pos) && b->hashes[pos] == h2 &&
+                    checkCandidateGeneric(ht, b, pos, search_key, cmp, table, pos_in_bucket, table_index))
+                    return b;
+            }
+#endif
+            b = getChildBucket(b);
+        } while (b != NULL);
+    }
+    return NULL;
+}
+
 /* Move an entry from one bucket to another. */
 static void moveEntry(bucket *bucket_to, int pos_to, bucket *bucket_from, int pos_from) {
     assert(!isPositionFilled(bucket_to, pos_to));
@@ -1153,6 +1279,11 @@ static inline position *positionFromOpaque(hashtablePosition *p) {
 /* Conversion from user-facing opaque type to internal struct. */
 static inline incrementalFind *incrementalFindFromOpaque(hashtableIncrementalFindState *state) {
     return (incrementalFind *)(void *)state;
+}
+
+/* Conversion from user-facing hetero opaque type to internal struct. */
+static inline heteroIncrementalFind *heteroFindFromOpaque(hashtableHeteroFindState *state) {
+    return (heteroIncrementalFind *)(void *)state;
 }
 
 /* Prefetches all filled entries in the given bucket to optimize future memory access. */
@@ -1986,6 +2117,144 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
         return true;
     } else {
         assert(data->state == HASHTABLE_NOT_FOUND);
+        return false;
+    }
+}
+
+/* --- Heterogeneous lookup --- */
+
+/* Like hashtableFind, but accepts a precomputed hash, an opaque search key (of
+ * any type), and a custom comparator.  The comparator receives (entry_key,
+ * search_key) where entry_key is obtained from the stored entry via the
+ * registered entryGetKey callback.  Returns true and points *found to the entry
+ * if a match is found.  This API never mutates the hashtable's type, stored
+ * entries, or any insertion/rehash state beyond the usual read-side rehash
+ * step.  The comparator must not be NULL. */
+bool hashtableFindWithHashAndCompare(hashtable *ht, uint64_t hash, const void *search_key,
+                          hashtableKeyCompareFn cmp, void **found) {
+    assert(cmp != NULL);
+    if (hashtableSize(ht) == 0) return false;
+    int pos_in_bucket = 0;
+    bucket *b = findBucketGeneric(ht, hash, search_key, cmp, &pos_in_bucket, NULL);
+    if (b) {
+        if (found) *found = b->entries[pos_in_bucket];
+        return true;
+    }
+    return false;
+}
+
+/* Like hashtableFindRef, but accepts a precomputed hash, an opaque search key,
+ * and a custom comparator.  Returns a pointer to the entry slot within the
+ * hashtable, or NULL if not found.  The returned pointer is subject to the same
+ * invalidation caveats as hashtableFindRef.  The comparator must not be NULL. */
+void **hashtableFindRefWithHashAndCompare(hashtable *ht, uint64_t hash, const void *search_key,
+                               hashtableKeyCompareFn cmp) {
+    assert(cmp != NULL);
+    if (hashtableSize(ht) == 0) return NULL;
+    int pos_in_bucket = 0;
+    bucket *b = findBucketGeneric(ht, hash, search_key, cmp, &pos_in_bucket, NULL);
+    return b ? &b->entries[pos_in_bucket] : NULL;
+}
+
+/* Initializes the state for a heterogeneous incremental find. Uses the
+ * separate hashtableHeteroFindState (6 words) so the existing 5-word
+ * hashtableIncrementalFindState and all production prefetch callers are
+ * unchanged. Drive the lookup with hashtableHeteroFindStep and retrieve the
+ * result with hashtableHeteroFindGetResult. The comparator must not be NULL. */
+void hashtableHeteroFindInit(hashtableHeteroFindState *state, hashtable *ht, uint64_t hash,
+                             const void *search_key, hashtableKeyCompareFn cmp) {
+    assert(cmp != NULL);
+    heteroIncrementalFind *data = heteroFindFromOpaque(state);
+    if (hashtableSize(ht) == 0) {
+        data->state = HETERO_NOT_FOUND;
+    } else {
+        data->state = HETERO_NEXT_BUCKET;
+        data->bucket = NULL;
+        data->hashtable = ht;
+        data->key = search_key;
+        data->hash = hash;
+        data->custom_cmp = cmp;
+    }
+}
+
+/* Step function for heterogeneous incremental find.  Mirrors
+ * hashtableIncrementalFindStep but dispatches through the stored custom
+ * comparator instead of the type's keyCompare. */
+bool hashtableHeteroFindStep(hashtableHeteroFindState *state) {
+    heteroIncrementalFind *data = heteroFindFromOpaque(state);
+    switch (data->state) {
+    case HETERO_CHECK_ENTRY:
+        {
+            hashtable *ht = data->hashtable;
+            void *entry = data->bucket->entries[data->pos];
+            const void *elem_key = entryGetKey(ht, entry);
+            if (data->custom_cmp(elem_key, data->key)) {
+                data->state = HETERO_FOUND;
+                return false;
+            }
+            data->pos++;
+        }
+        /* fall through */
+    case HETERO_NEXT_ENTRY:
+        if (data->bucket->presence != 0 && data->pos < numBucketPositions(data->bucket)) {
+            bucket *b = data->bucket;
+            uint8_t h2 = highBits(data->hash);
+            for (int pos = data->pos; pos < numBucketPositions(b); pos++) {
+                if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
+                    valkey_prefetch(b->entries[pos]);
+                    data->pos = pos;
+                    data->state = HETERO_CHECK_ENTRY;
+                    return true;
+                }
+            }
+        }
+        /* fall through */
+    case HETERO_NEXT_BUCKET:
+        {
+            hashtable *ht = data->hashtable;
+            if (data->bucket == NULL) {
+                data->table = 0;
+                size_t mask = expToMask(ht->bucket_exp[0]);
+                size_t bucket_idx = data->hash & mask;
+                if (ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx) {
+                    data->table = 1;
+                    mask = expToMask(ht->bucket_exp[1]);
+                    bucket_idx = data->hash & mask;
+                }
+                data->bucket = &ht->tables[data->table][bucket_idx];
+            } else if (getChildBucket(data->bucket) != NULL) {
+                data->bucket = getChildBucket(data->bucket);
+            } else if (data->table == 0 && ht->rehash_idx >= 0) {
+                data->table = 1;
+                size_t mask = expToMask(ht->bucket_exp[1]);
+                size_t bucket_idx = data->hash & mask;
+                data->bucket = &ht->tables[data->table][bucket_idx];
+            } else {
+                data->state = HETERO_NOT_FOUND;
+                return false;
+            }
+            valkey_prefetch(data->bucket);
+            data->state = HETERO_NEXT_ENTRY;
+            data->pos = 0;
+        }
+        return true;
+    case HETERO_FOUND:
+        return false;
+    case HETERO_NOT_FOUND:
+        return false;
+    }
+    assert(0);
+}
+
+/* Retrieve result of a heterogeneous incremental find.  Call only after
+ * hashtableHeteroFindStep returns false. */
+bool hashtableHeteroFindGetResult(hashtableHeteroFindState *state, void **found) {
+    heteroIncrementalFind *data = heteroFindFromOpaque(state);
+    if (data->state == HETERO_FOUND) {
+        if (found) *found = data->bucket->entries[data->pos];
+        return true;
+    } else {
+        assert(data->state == HETERO_NOT_FOUND);
         return false;
     }
 }

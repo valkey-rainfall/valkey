@@ -3770,6 +3770,7 @@ robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyReadWithFlags(serverDb *db, robj *key, int flags);
 robj *lookupKeyWriteWithFlags(serverDb *db, robj *key, int flags);
+robj *lookupKeyWriteForBasicSet(serverDb *db, robj *key);
 robj *objectCommandLookup(client *c, robj *key);
 robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply);
 int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);
@@ -3945,6 +3946,8 @@ void startEvictionTimeProc(void);
 
 /* Keys hashing/comparison functions for dict.c and hashtable.c hash tables. */
 uint8_t *getConfigurableHashSeed(void);
+uint64_t genHashFunctionConfigurableSeed(const char *buf, size_t len);
+uint64_t sdsHashConfigurableSeed(const void *key);
 uint64_t dictSdsHash(const void *key);
 uint64_t dictSdsCaseHash(const void *key);
 uint64_t dictCStrHash(const void *key);

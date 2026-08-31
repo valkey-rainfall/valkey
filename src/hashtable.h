@@ -42,6 +42,7 @@ typedef struct hashtableStats hashtableStats;
 typedef uint64_t hashtableIterator[6];
 typedef uint64_t hashtablePosition[2];
 typedef uint64_t hashtableIncrementalFindState[5];
+typedef uint64_t hashtableHeteroFindState[6];
 
 /* --- Non-opaque types --- */
 
@@ -157,6 +158,31 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key);
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
+
+/* Heterogeneous lookup: find entries using a precomputed hash, an opaque
+ * search key of arbitrary type, and a custom equality comparator. The compare
+ * function receives (entry_key, search_key) and returns non-zero on match.
+ * This argument order is intentionally the reverse of hashtableType.keyCompare,
+ * which receives (search_key, stored_key). entry_key is obtained from the
+ * stored entry via the registered entryGetKey callback (or the entry pointer
+ * itself when entryGetKey is NULL). These APIs never allocate, never
+ * modify hashtableType, and leave all existing callers unchanged.
+ *
+ * The comparator must not be NULL — callers that want the type's default
+ * keyCompare should use the standard hashtableFind / FindRef / IncrementalFind
+ * APIs instead.
+ *
+ * The incremental variant uses a separate opaque state type
+ * (hashtableHeteroFindState) that is one word larger than
+ * hashtableIncrementalFindState, so existing prefetch callers are unaffected.
+ * The hetero incremental find has its own Init/Step/GetResult functions. */
+typedef int (*hashtableKeyCompareFn)(const void *entry_key, const void *search_key);
+bool hashtableFindWithHashAndCompare(hashtable *ht, uint64_t hash, const void *search_key, hashtableKeyCompareFn cmp, void **found);
+void **hashtableFindRefWithHashAndCompare(hashtable *ht, uint64_t hash, const void *search_key, hashtableKeyCompareFn cmp);
+void hashtableHeteroFindInit(hashtableHeteroFindState *state, hashtable *ht, uint64_t hash,
+                             const void *search_key, hashtableKeyCompareFn cmp);
+bool hashtableHeteroFindStep(hashtableHeteroFindState *state);
+bool hashtableHeteroFindGetResult(hashtableHeteroFindState *state, void **found);
 
 /* Iteration & scan */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);
