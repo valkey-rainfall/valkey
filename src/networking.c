@@ -158,6 +158,10 @@ static int parseMultibulk(client *c,
                           unsigned long long *net_input_bytes_curr_cmd);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
+/* DIAG R2 engagement counters (main-thread only, plain). */
+uint64_t dplus_diag_r2_attempts = 0;
+uint64_t dplus_diag_r2_main_writes = 0;
+uint64_t dplus_diag_r2_fallbacks = 0;
 _Thread_local sds thread_shared_qb = NULL;
 
 typedef enum {
@@ -2491,18 +2495,53 @@ void beforeNextClient(client *c) {
             connSetPostponeUpdateState(c->conn, 1);
             c->write_flags = (!c->flag.buf_encoded && c->io_last_reply_block == NULL)
                                  ? WRITE_FLAGS_OWNED_LOCAL : 0;
+            /* ===== DIAG R2 (diag/door2-r2-mainwrites): main-writes-replies =====
+             * Price the return leg: main writes the reply inline instead of
+             * handing it to the owner via SPSC. Runs BEFORE io_write_state is
+             * published as PENDING_IO -- the socket.c ownership invariant
+             * forbids main socket ops in that state (first build tripped it).
+             * In this window main still holds the client exclusively (read
+             * state unreleased until beforeNextClient), so the inline write
+             * races nothing. Mirrors ioThreadWriteToClient's fix-#2 clean-
+             * completion tail; falls back to the normal owner leg on replica,
+             * non-OWNED_LOCAL, partial write, or error (bookmark resume,
+             * identical to an owner retry). Every 64th attempt punts to the
+             * owner leg so the full main done-handler bounds bucket staleness.
+             * NEVER MERGE. */
+            if (!(c->write_flags & WRITE_FLAGS_IS_REPLICA) &&
+                (c->write_flags & WRITE_FLAGS_OWNED_LOCAL) &&
+                server.maxmemory_clients == 0 &&
+                ((dplus_diag_r2_attempts++ & 63) != 63)) {
+                c->nwritten = 0;
+                _writeToClient(c);
+                if (c->nwritten > 0 && !(c->write_flags & WRITE_FLAGS_WRITE_ERROR) &&
+                    (size_t)c->nwritten == c->io_last_bufpos && c->bufpos == c->io_last_bufpos) {
+                    dplus_diag_r2_main_writes++;
+                    c->net_output_bytes += c->nwritten;
+                    c->last_interaction = server.unixtime;
+                    connSetPostponeUpdateState(c->conn, 0);
+                    connUpdateState(c->conn);
+                    c->bufpos = 0;
+                    c->last_header = NULL;
+                    resetLastWrittenBuf(c);
+                    c->io_last_reply_block = NULL;
+                    c->io_last_bufpos = 0;
+                    c->nwritten = 0;
+                    /* io_write_state never left IDLE; release-publish for
+                     * main's own later acquire-side observers is a no-op
+                     * here, but keep the fence for store ordering of the
+                     * resets above against the owner's next read dispatch. */
+                    atomic_thread_fence(memory_order_release);
+                    goto r2_write_done;
+                }
+                /* Partial/error: owner leg resumes from bookmarks. */
+                dplus_diag_r2_fallbacks++;
+            }
             if (c->write_flags == 0) server.stat_io_writes_pending++;
             c->io_write_state = CLIENT_PENDING_IO;
-            /* F8b: hand the write to the owner via its lock-free private SPSC
-             * (uncommitted — batched; committed once at end of drain like the
-             * FREE_ARGV pattern). The gauge falsified event-registration here:
-             * connSetWriteHandler takes the owner's poll mutex, and mid-drain
-             * that serializes main against now-busy workers (rt/s 38.6K→13K,
-             * per-job drain cost 59→330µs). SPSC enqueue is wait-free for
-             * main; the worker's PRIORITY-1 dequeue picks it up next sweep
-             * iteration without waking machinery. */
             ioSubmitOwnerWrite(c); /* F12-B: enqueue is now commit=false;
                                      * batched commitIOJobs at drain end. */
+        r2_write_done:;
         }
         /* B12/D6 FIX: trim the query buffer BEFORE publishing IDLE. IDLE is
          * the owner worker's green light to read again -- its next read

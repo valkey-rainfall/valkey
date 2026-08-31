@@ -6937,6 +6937,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     /* D+ epoch engagement and lifecycle gauges are always available. Detailed
      * speculative counters are appended when IO_LOOKUP_OFFLOAD_STATS is set. */
     if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
+        extern uint64_t dplus_diag_r2_attempts, dplus_diag_r2_main_writes, dplus_diag_r2_fallbacks;
+        info = sdscatprintf(info, "diag_r2_attempts:%llu\r\ndiag_r2_main_writes:%llu\r\ndiag_r2_fallbacks:%llu\r\n",
+            (unsigned long long)dplus_diag_r2_attempts, (unsigned long long)dplus_diag_r2_main_writes, (unsigned long long)dplus_diag_r2_fallbacks);
         if (sections++) info = sdscat(info, "\r\n");
         info = dplusInfoString(info);
     }
