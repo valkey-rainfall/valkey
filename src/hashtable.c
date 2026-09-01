@@ -1746,6 +1746,23 @@ bool hashtableFind(hashtable *ht, const void *key, void **found) {
     return false;
 }
 
+/* Like hashtableFind, but accepts a caller-provided hash instead of computing
+ * it from the key via the registered hashFunction callback.  The key must be
+ * of the SAME TYPE as the stored entry keys — the standard type's keyCompare,
+ * entryGetKey, and SIMD findBucket traversal are used.  This isolates the
+ * effect of external hash computation while retaining the identical comparison
+ * and bucket-traversal hot path as hashtableFind. */
+bool hashtableFindWithHash(hashtable *ht, uint64_t hash, const void *key, void **found) {
+    if (hashtableSize(ht) == 0) return false;
+    int pos_in_bucket = 0;
+    bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
+    if (b) {
+        if (found) *found = b->entries[pos_in_bucket];
+        return true;
+    }
+    return false;
+}
+
 /* Returns a pointer to where an entry is stored within the hash table, or
  * NULL if not found. To get the entry, dereference the returned pointer. The
  * pointer can be used to replace the entry with an equivalent entry (same

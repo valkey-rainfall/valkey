@@ -169,26 +169,31 @@ robj *lookupKeyWrite(serverDb *db, robj *key) {
 
 /* --- SET-specific prehashed lookup (value-gate experiment) ---
  *
- * Uses the narrow heterogeneous lookup API (hashtableFindWithHashAndCompare)
- * with a stack-local stringRef over the existing key SDS bytes.  The hash is
- * computed once from the raw key bytes using genHashFunctionConfigurableSeed —
- * byte-identical to what the hashtable's sdsHashConfigurableSeed computes
- * internally.
+ * Uses the specialized hashtableFindWithHash API that accepts a
+ * caller-provided hash but otherwise uses the EXISTING stored-key type's
+ * keyCompare, entryGetKey, and SIMD findBucket traversal — identical to the
+ * standard hashtableFind hot path.  The key is passed as SDS directly (the
+ * same type as the stored entry keys), so no stringRef wrapper, no custom
+ * comparator, and no findBucketGeneric traversal are involved.
+ *
+ * The hash is computed once from the raw key bytes using
+ * genHashFunctionConfigurableSeed — byte-identical to what the hashtable's
+ * sdsHashConfigurableSeed computes internally.
  *
  * This is an API-overhead / compatibility gate: the prefetch hash is discarded
  * before the synchronous lookup, so this path moves — rather than eliminates —
- * the hash computation.  Neutral throughput within 1% proves the API is safe
- * for the hot path; value comes later when parser/prefetch hash provenance is
- * retained.
- *
- * The comparator matches an SDS entry key (obtained from the stored robj via
- * entryGetKey → objectGetKey) against a stringRef search key.  Argument order
- * is (entry_key, search_key), matching the heterogeneous API contract. */
+ * the hash computation.  This variant isolates the cost of external hash +
+ * post-find split from the generic custom-traversal/comparator overhead
+ * present in the hashtableFindWithHashAndCompare path. */
+
+/* (The generic hetero API — setLookupCompare, stringRef, findBucketGeneric —
+ * remains compiled below for equivalence testing but is dead in the SET
+ * command call path.) */
 
 /* Comparator: entry_key is SDS (from stored robj), search_key is stringRef*.
- * Returns non-zero on match. */
+ * Returns non-zero on match.  DEAD in the SET call path — kept for tests. */
 static int setLookupCompare(const void *entry_key, const void *search_key) {
-    const sds stored = (const sds)entry_key;
+    const sds stored = (sds)entry_key;
     const stringRef *ref = (const stringRef *)search_key;
     size_t stored_len = sdslen(stored);
     if (stored_len != ref->len) return 0;
@@ -204,20 +209,14 @@ static int setLookupCompare(const void *entry_key, const void *search_key) {
 static unsigned long long stat_hetero_set_lookups = 0;
 #endif
 
-/* Lookup a key for a basic SET write operation using the prehashed
- * heterogeneous lookup API.  Preserves all lookupKey semantics (expiration,
- * LRU touch, stats, cluster slot, keyspace notifications) by delegating
- * to the shared lookupKeyPostFind helper.
+/* Lookup a key for a basic SET write operation using the specialized
+ * prehashed lookup API (hashtableFindWithHash).  The key is passed as SDS
+ * directly — same type as stored entry keys — so the standard keyCompare,
+ * entryGetKey, and SIMD findBucket traversal are used unchanged.
  *
- * Call path:
- *   setGenericCommand → lookupKeyWriteForBasicSet
- *     → sds key_bytes = objectGetVal(key)
- *     → dict_index = getKVStoreIndexUsingCachedSlot(key_bytes)
- *     → hash = genHashFunctionConfigurableSeed(key_bytes, sdslen(key_bytes))
- *     → stringRef ref = {key_bytes, sdslen(key_bytes)}
- *     → ht = kvstoreGetHashtable(db->keys, dict_index)
- *     → hashtableFindWithHashAndCompare(ht, hash, &ref, setLookupCompare, &existing)
- *     → lookupKeyPostFind(db, key, existing, LOOKUP_WRITE, dict_index) */
+ * Preserves all lookupKey semantics (expiration, LRU touch, stats, cluster
+ * slot, keyspace notifications) by delegating to the shared
+ * lookupKeyPostFind helper. */
 robj *lookupKeyWriteForBasicSet(serverDb *db, robj *key) {
     sds key_sds = objectGetVal(key);
     int dict_index = getKVStoreIndexUsingCachedSlot(key_sds);
@@ -228,14 +227,11 @@ robj *lookupKeyWriteForBasicSet(serverDb *db, robj *key) {
      * computes inside hashtableFind. */
     uint64_t hash = genHashFunctionConfigurableSeed(key_sds, key_len);
 
-    /* Stack-local view — no allocation, no lifetime extension. */
-    stringRef ref = {key_sds, key_len};
-
     robj *val = NULL;
     hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
     if (ht) {
         void *existing = NULL;
-        hashtableFindWithHashAndCompare(ht, hash, &ref, setLookupCompare, &existing);
+        hashtableFindWithHash(ht, hash, key_sds, &existing);
         val = existing;
     }
 

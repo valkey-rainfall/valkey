@@ -145,6 +145,7 @@ void hashtableSetCanAbortShrink(bool can_abort);
 
 /* Entries */
 bool hashtableFind(hashtable *ht, const void *key, void **found);
+bool hashtableFindWithHash(hashtable *ht, uint64_t hash, const void *key, void **found);
 void **hashtableFindRef(hashtable *ht, const void *key);
 bool hashtableAdd(hashtable *ht, void *entry);
 bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing);
