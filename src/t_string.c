@@ -95,9 +95,7 @@ void setGenericCommand(client *c,
         if (getGenericCommand(c) == C_ERR) goto cleanup;
     }
 
-    robj *existing_value = (c->cmd->proc == setCommand && c->argc == 3)
-        ? lookupKeyWriteForBasicSet(c->db, key)
-        : lookupKeyWrite(c->db, key);
+    robj *existing_value = lookupKeyWrite(c->db, key);
     found = existing_value != NULL;
 
     /* Handle the IFEQ conditional check */

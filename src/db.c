@@ -79,10 +79,9 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * Even if the key expiry is primary-driven, we can correctly report a key is
  * expired on replicas even if the primary is lagging expiring our key via DELs
  * in the replication link. */
-/* Post-find semantic processing shared by all lookupKey variants.
- * Handles expiry, LRU touch, stats, and keyspace notifications.
- * val may be NULL (key not found) or non-NULL (found — check expiry). */
-static robj *lookupKeyPostFind(serverDb *db, robj *key, robj *val, int flags, int dict_index) {
+robj *lookupKey(serverDb *db, robj *key, int flags) {
+    int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
+    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the primary. We forbid it on readonly replicas, but
@@ -127,12 +126,6 @@ static robj *lookupKeyPostFind(serverDb *db, robj *key, robj *val, int flags, in
     return val;
 }
 
-robj *lookupKey(serverDb *db, robj *key, int flags) {
-    int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
-    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
-    return lookupKeyPostFind(db, key, val, flags, dict_index);
-}
-
 /* Lookup a key for read operations, or return NULL if the key is not found
  * in the specified DB.
  *
@@ -165,85 +158,6 @@ robj *lookupKeyWriteWithFlags(serverDb *db, robj *key, int flags) {
 
 robj *lookupKeyWrite(serverDb *db, robj *key) {
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NONE);
-}
-
-/* --- SET-specific prehashed lookup (value-gate experiment) ---
- *
- * Uses the narrow heterogeneous lookup API (hashtableFindWithHashAndCompare)
- * with a stack-local stringRef over the existing key SDS bytes.  The hash is
- * computed once from the raw key bytes using genHashFunctionConfigurableSeed —
- * byte-identical to what the hashtable's sdsHashConfigurableSeed computes
- * internally.
- *
- * This is an API-overhead / compatibility gate: the prefetch hash is discarded
- * before the synchronous lookup, so this path moves — rather than eliminates —
- * the hash computation.  Neutral throughput within 1% proves the API is safe
- * for the hot path; value comes later when parser/prefetch hash provenance is
- * retained.
- *
- * The comparator matches an SDS entry key (obtained from the stored robj via
- * entryGetKey → objectGetKey) against a stringRef search key.  Argument order
- * is (entry_key, search_key), matching the heterogeneous API contract. */
-
-/* Comparator: entry_key is SDS (from stored robj), search_key is stringRef*.
- * Returns non-zero on match. */
-static int setLookupCompare(const void *entry_key, const void *search_key) {
-    const sds stored = (const sds)entry_key;
-    const stringRef *ref = (const stringRef *)search_key;
-    size_t stored_len = sdslen(stored);
-    if (stored_len != ref->len) return 0;
-    return memcmp(stored, ref->buf, stored_len) == 0;
-}
-
-#ifdef VALKEY_HETERO_LOOKUP_ENGAGEMENT
-/* Engagement counter: incremented each time the prehashed path fires.
- * Written only by the main thread; zero cross-thread overhead.
- * Gated behind an explicit compile-time macro so the timing build has
- * zero counter/branch overhead. In a diagnostic build, read the static symbol
- * from the live process with GDB after issuing a known number of plain SETs. */
-static unsigned long long stat_hetero_set_lookups = 0;
-#endif
-
-/* Lookup a key for a basic SET write operation using the prehashed
- * heterogeneous lookup API.  Preserves all lookupKey semantics (expiration,
- * LRU touch, stats, cluster slot, keyspace notifications) by delegating
- * to the shared lookupKeyPostFind helper.
- *
- * Call path:
- *   setGenericCommand → lookupKeyWriteForBasicSet
- *     → sds key_bytes = objectGetVal(key)
- *     → dict_index = getKVStoreIndexUsingCachedSlot(key_bytes)
- *     → hash = genHashFunctionConfigurableSeed(key_bytes, sdslen(key_bytes))
- *     → stringRef ref = {key_bytes, sdslen(key_bytes)}
- *     → ht = kvstoreGetHashtable(db->keys, dict_index)
- *     → hashtableFindWithHashAndCompare(ht, hash, &ref, setLookupCompare, &existing)
- *     → lookupKeyPostFind(db, key, existing, LOOKUP_WRITE, dict_index) */
-robj *lookupKeyWriteForBasicSet(serverDb *db, robj *key) {
-    sds key_sds = objectGetVal(key);
-    int dict_index = getKVStoreIndexUsingCachedSlot(key_sds);
-    size_t key_len = sdslen(key_sds);
-
-    /* Compute the configurable-seed hash once from the raw key bytes.
-     * This is byte-identical to what sdsHashConfigurableSeed(key_sds)
-     * computes inside hashtableFind. */
-    uint64_t hash = genHashFunctionConfigurableSeed(key_sds, key_len);
-
-    /* Stack-local view — no allocation, no lifetime extension. */
-    stringRef ref = {key_sds, key_len};
-
-    robj *val = NULL;
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-    if (ht) {
-        void *existing = NULL;
-        hashtableFindWithHashAndCompare(ht, hash, &ref, setLookupCompare, &existing);
-        val = existing;
-    }
-
-#ifdef VALKEY_HETERO_LOOKUP_ENGAGEMENT
-    stat_hetero_set_lookups++;
-#endif
-
-    return lookupKeyPostFind(db, key, val, LOOKUP_WRITE, dict_index);
 }
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
