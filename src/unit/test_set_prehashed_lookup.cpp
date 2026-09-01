@@ -133,7 +133,7 @@ class CompareEquivalenceTest : public ::testing::Test {
     /* Matches setLookupCompare in db.c exactly: (entry_key=SDS, search_key=stringRef*).
      * Returns non-zero on match. */
     static int stringref_sds_compare(const void *entry_key, const void *search_key) {
-        const sds stored = (const sds)entry_key;
+        sds stored = (sds)entry_key;
         const stringRef *ref = (const stringRef *)search_key;
         size_t stored_len = sdslen(stored);
         if (stored_len != ref->len) return 0;
@@ -284,7 +284,9 @@ TEST_F(CompareEquivalenceTest, ActiveRehashEquivalence) {
                                                           stringref_sds_compare, &hetero_found);
 
         ASSERT_EQ(homo_hit, hetero_hit);
-        if (homo_hit) ASSERT_EQ(homo_found, hetero_found);
+        if (homo_hit) {
+            ASSERT_EQ(homo_found, hetero_found);
+        }
 
         sdsfree(probe);
     }

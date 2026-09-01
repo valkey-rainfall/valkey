@@ -79,10 +79,9 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * Even if the key expiry is primary-driven, we can correctly report a key is
  * expired on replicas even if the primary is lagging expiring our key via DELs
  * in the replication link. */
-/* Post-find semantic processing shared by all lookupKey variants.
- * Handles expiry, LRU touch, stats, and keyspace notifications.
- * val may be NULL (key not found) or non-NULL (found — check expiry). */
-static robj *lookupKeyPostFind(serverDb *db, robj *key, robj *val, int flags, int dict_index) {
+robj *lookupKey(serverDb *db, robj *key, int flags) {
+    int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
+    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the primary. We forbid it on readonly replicas, but
@@ -125,12 +124,6 @@ static robj *lookupKeyPostFind(serverDb *db, robj *key, robj *val, int flags, in
     }
 
     return val;
-}
-
-robj *lookupKey(serverDb *db, robj *key, int flags) {
-    int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
-    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
-    return lookupKeyPostFind(db, key, val, flags, dict_index);
 }
 
 /* Lookup a key for read operations, or return NULL if the key is not found
@@ -243,7 +236,38 @@ robj *lookupKeyWriteForBasicSet(serverDb *db, robj *key) {
     stat_hetero_set_lookups++;
 #endif
 
-    return lookupKeyPostFind(db, key, val, LOOKUP_WRITE, dict_index);
+    /* --- Inline post-find: expiry, LRU touch, stats, notifications ---
+     * This is an exact duplicate of the logic in lookupKey's post-find path,
+     * specialized for LOOKUP_WRITE.  The duplication is intentional in this
+     * diagnostic build to eliminate the lookupKeyPostFind call boundary. */
+    int flags = LOOKUP_WRITE;
+
+    if (val) {
+        int is_ro_replica = server.primary_host && server.repl_replica_ro;
+        int expire_flags = 0;
+        if (!is_ro_replica) expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
+        if (expireIfNeededWithDictIndex(db, key, val, expire_flags, dict_index) != KEY_VALID) {
+            val = NULL;
+        }
+    }
+
+    if (val) {
+        /* Update the access time for the ageing algorithm.
+         * Don't do it if we have a saving child, as this will trigger
+         * a copy on write madness. */
+        if (server.current_client && server.current_client->flag.no_touch &&
+            server.executing_client && server.executing_client->cmd->proc != touchCommand) {
+            /* LOOKUP_WRITE with NOTOUCH: skip LRU update */
+        } else if (!hasActiveChildProcess()) {
+            serverAssert(val->refcount != OBJ_SHARED_REFCOUNT);
+            val->lru = lrulfu_touch(val->lru);
+        }
+        /* LOOKUP_WRITE: stat_keyspace_hits not incremented (matches baseline) */
+    } else {
+        /* LOOKUP_WRITE: keymiss notification and stat_keyspace_misses not fired (matches baseline) */
+    }
+
+    return val;
 }
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
