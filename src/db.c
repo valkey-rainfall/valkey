@@ -1974,7 +1974,16 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     val = *valref;
     long long old_when = objectGetExpire(val);
 
-    robj *newval = objectSetExpire(val, when);
+    robj *retired = NULL;
+    /* D+ (S1.2a): first-time expire REALLOCATES the shell of a published,
+     * reader-reachable object. The pre-fix code freed the old shell
+     * immediately (and cleared its val_ptr) — a confirmed UAF / NULL-deref
+     * against in-flight speculative readers
+     * (sharded-version-safety-audit-sep4.md, defect 1). The Ex variant keeps
+     * the displaced shell fully intact and hands it back for shell-only
+     * retirement past reader quiescence. */
+    robj *newval = objectSetExpireEx(val, when, &retired);
+    serverAssert(retired == NULL || newval != val);
     if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */
         int dict_index = getKVStoreIndexForKey(objectGetKey(newval));
@@ -1991,7 +2000,30 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
         /* No old expire. Update the pointer in the keys hashtable, if needed,
          * and add it to the expires hashtable. */
         if (newval != val) {
+            /* Publish the replacement (single pointer store — a concurrent
+             * reader sees either shell; both are dereferenceable), then bump
+             * the shard so in-flight readers of the old shell fail
+             * validation, then retire the displaced shell. Pre-fix this path
+             * had NO bump: a reader could validate successfully against the
+             * freed shell. */
             val = *valref = newval;
+            hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+            if (ht) {
+                dplusVersionArray *va = hashtableGetVersionArray(ht);
+                if (va) {
+                    uint64_t h = hashtableHashKey(ht, objectGetVal(key));
+                    dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(h));
+                }
+            }
+            if (retired) {
+                /* Shell-only free: val_ptr ownership transferred to newval
+                 * (or the value is inline in the shell allocation). RAW
+                 * route = zfree at quiescence flush; fallback zfree is safe
+                 * only because no reader can hold this shell when the defer
+                 * machinery is inactive. */
+                if (!dplusDeferFreeRaw(retired)) zfree(retired);
+                retired = NULL;
+            }
         }
         bool added = kvstoreHashtableAdd(db->expires, dict_index, newval);
         serverAssert(added);
