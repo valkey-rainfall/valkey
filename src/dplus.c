@@ -81,6 +81,13 @@ void dplusReaderWorkerOffline(int tid) {
     atomic_fetch_and_explicit(&dplus_reader_online[tid / 64], ~(UINT64_C(1) << (tid % 64)), memory_order_seq_cst);
 }
 
+/* D+ (S1.5): see dplus.h. Called at worker park points. */
+void dplusReaderAssertParkSafe(int tid) {
+    if (tid <= 0 || tid >= DPLUS_MAX_IO_THREADS) return;
+    debugServerAssert(atomic_load_explicit(&dplus_reader_slots[tid].state, memory_order_seq_cst) == DPLUS_READER_QUIESCENT ||
+                      atomic_load_explicit(&dplus_reader_slots[tid].state, memory_order_seq_cst) == DPLUS_READER_OFFLINE);
+}
+
 /* Publish ACTIVE(epoch), then check exclusion and re-read the epoch before the
  * first pointer load. The second epoch read closes the late-announcement race:
  * a reader that publishes an old epoch after a collector scan retries before
@@ -262,122 +269,11 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
     return (int)total;
 }
 
-/* --- Component 2: Core speculative GET execution --- */
-
-/* Execute a speculative GET for the given key on the IO thread.
- *
- * Returns 1 on success (reply written to c->buf), 0 on punt (main thread
- * must execute). The caller must have already set dplus_in_speculative_read
- * for the thread and verified !exclusive_mode.
- *
- * key_sds: the SDS key string (objectGetVal(argv[1]))
- * resp: client RESP version (2 or 3)
- */
-int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
-    serverDb *db = c->db;
-    int dict_index = 0; /* Non-cluster: always slot 0. */
-    (void)resp; /* GET bulk reply is RESP-version-agnostic; misses now punt (E4). */
-
-    /* Get the hashtable for the keys kvstore. */
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-    if (!ht) {
-        /* Empty database — the key cannot exist. Punt so main fires the
-         * keymiss notification and increments stat_keyspace_misses exactly (E4). */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
-#endif
-        return 0;
-    }
-
-    /* Compute hash, determine shard. */
-    uint64_t hash = hashtableHashKey(ht, key_sds);
-    unsigned shard = DPLUS_SHARD_INDEX(hash);
-
-    /* Get the version array from the hashtable. */
-    dplusVersionArray *va = hashtableGetVersionArray(ht);
-    if (!va) return 0; /* No version array — punt */
-
-    /* Read shard version (acquire). */
-    uint64_t v_before = dplusVersionRead(va, shard);
-
-    /* Speculative lookup — read-only, no rehash step. */
-    void *entry = NULL;
-    bool found = hashtableFindReadOnly(ht, key_sds, &entry);
-
-    if (!found) {
-        /* Key not found — punt on miss so main fires the keymiss notification
-         * and increments stat_keyspace_misses exactly (E4). Serving nil from the
-         * worker would silently drop the single keymiss event and the miss stat.
-         * Exact-punt-on-miss is the approved initial policy; optimize only with
-         * measured need (misses are rare in hit-heavy workloads). */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
-#endif
-        return 0;
-    }
-
-    /* Found an entry. It's an robj*. */
-    robj *o = (robj *)entry;
-
-    /* Type check: must be OBJ_STRING. Non-string → punt. */
-    if (objectGetType(o) != OBJ_STRING) return 0;
-
-    /* Expiry check: read embedded expiry from the robj (no separate lookup).
-     * We do NOT call expireIfNeeded (that mutates) — just check timestamp. */
-    if (o->hasexpire) {
-        mstime_t when = objectGetExpire(o);
-        if (when >= 0 && mstime() >= when) {
-            /* Logically expired — punt to main for lazy-delete + notifications. */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.expired_replies, 1, memory_order_relaxed);
-#endif
-            return 0;
-        }
-    }
-
-    /* Value extraction: copy value bytes BEFORE validation re-read.
-     * Only handle embstr and int encodings (small values).
-     * RAW encoding with len > threshold → punt. */
-    char valbuf[DPLUS_MAX_SPECULATIVE_VALUE_LEN + 21]; /* extra for int formatting */
-    size_t vallen;
-    int encoding = objectGetEncoding(o);
-
-    if (encoding == OBJ_ENCODING_INT) {
-        long long intval = (long long)(long)objectGetVal(o);
-        vallen = ll2string(valbuf, sizeof(valbuf), intval);
-    } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
-        sds s = objectGetVal(o);
-        vallen = sdslen(s);
-        if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.large_value_punts, 1, memory_order_relaxed);
-#endif
-            return 0; /* Large value — punt */
-        }
-        memcpy(valbuf, s, vallen);
-    } else {
-        return 0; /* Unknown encoding — punt */
-    }
-
-    /* VALIDATION RE-READ: fenced check that shard version is unchanged.
-     * dplusVersionValidate issues the acquire fence that orders the value
-     * copy above before the version re-read. */
-    if (!dplusVersionValidate(va, shard, v_before)) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
-#endif
-        return 0; /* Torn read — punt, no reply written */
-    }
-
-    /* Version valid — write reply. */
-    int written = dplusWriteBulkReply(c, valbuf, vallen);
-    if (written <= 0) return 0; /* Buffer full — punt */
-
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
-#endif
-    return 1; /* Success — reply in buffer, skip main-thread execution */
-}
+/* D+ (S1.5): the single-GET speculative path (dplusSpeculativeGet) was
+ * removed as dead code -- it had NO epoch reader-slot bracketing
+ * (dplusReaderEnter/Quiescent), so any future caller would dereference
+ * published objects with no lifetime protection. The batch path
+ * (dplusSpeculateBatch) is the only speculation entry point.  */
 
 /* --- Component 2/5: IO-thread batch speculation with batched prefetch --- */
 

@@ -595,6 +595,7 @@ static void *IOThreadMain(void *myid) {
                      * also waits up to 2ms in this state -- acceptable, the
                      * state only exists while main withholds a release
                      * (busy script / in-flight handoff). */
+                    dplusReaderAssertParkSafe(id); /* D+ S1.5: no ACTIVE pin across a park */
                     atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
                     if (spscIsEmpty(&io_private_inbox[id])) {
                         usleep(2000);
@@ -609,6 +610,7 @@ static void *IOThreadMain(void *myid) {
                      * (cf. ringMainDoorbell) a lost ring remains theoretically
                      * possible; the 2ms timeout bounds it — the ring is a latency
                      * accelerator, never a liveness requirement. */
+                    dplusReaderAssertParkSafe(id); /* D+ S1.5: no ACTIVE pin across a park */
                     atomic_store_explicit(&io_private_inbox[id].consumer_parked, 1, memory_order_release);
                     if (spscIsEmpty(&io_private_inbox[id])) {
                         aePollDirect(worker_el[id], &tv);

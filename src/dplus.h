@@ -220,7 +220,16 @@ void dplusOnMonitorsChanged(void);
 
 /* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
 struct client;
-int dplusSpeculativeGet(struct client *c, void *key_sds, int resp);
+
+/* D+ (S1.5): OOM-pinning invariant. A worker's reader slot must be QUIESCENT
+ * or OFFLINE whenever the worker parks/sleeps -- an ACTIVE(epoch) slot held
+ * across a park pins retirement segments (memory grows unboundedly) and
+ * stalls every exclusive-gate entrant up to the 5s panic bound. All
+ * speculation exit paths publish quiescence (dplusSpeculateBatch 'out:',
+ * ReaderEnter punt paths, thread cancellation cleanup); this assert catches
+ * any future path that forgets. Debug builds only -- reads a seq_cst slot
+ * the worker itself owns, so it is race-free by the single-writer rule. */
+void dplusReaderAssertParkSafe(int tid);
 
 /* Component 2/5: IO-thread batch speculation (implemented in dplus.c).
  * Called from ioThreadReadQueryFromClient. Returns count of commands
