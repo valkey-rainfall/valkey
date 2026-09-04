@@ -535,6 +535,7 @@ int dplusSpeculateBatch(client *c, int tid) {
         e->hash = hashtableHashKey(ht, e->key_sds);
         e->shard = DPLUS_SHARD_INDEX(e->hash);
         e->v_before = dplusVersionRead(va, e->shard);
+        if (e->v_before & 1) goto out; /* S2.2a: writer bracket open -- punt to main */
         e->is_first_cmd = 1;
         e->queue_idx = -1;
         batch_count++;
@@ -591,6 +592,7 @@ int dplusSpeculateBatch(client *c, int tid) {
             e->hash = hashtableHashKey(ht, e->key_sds);
             e->shard = DPLUS_SHARD_INDEX(e->hash);
             e->v_before = dplusVersionRead(va, e->shard);
+            if (e->v_before & 1) continue; /* S2.2a: writer bracket open -- refuse at entry */
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
             hashtableIncrementalFindInit(&e->find_state, ht, e->key_sds);

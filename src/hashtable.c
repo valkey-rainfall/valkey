@@ -325,8 +325,11 @@ struct hashtable {
 };
 
 /* Forward declarations for dplus version bump helpers (defined below). */
-static inline void dplusBumpShard(hashtable *ht, uint64_t hash);
-static inline void dplusBumpAllShards(hashtable *ht);
+static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash);
+static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash);
+static inline void dplusBracketAllBegin(hashtable *ht);
+static inline void dplusBracketAllEnd(hashtable *ht);
+
 
 struct iter {
     hashtable *hashtable;
@@ -744,13 +747,19 @@ static void rehashStepShrink(hashtable *ht) {
  * old to the new hash table. */
 static void rehashStep(hashtable *ht) {
     assert(hashtableIsRehashing(ht));
+    /* S2.2b (rehash memo Option 3): bracket the entire step. Entry moves and
+     * in-place bucket clears were previously published by a single trailing
+     * bump-all -- a reader overlapping the step could validate against
+     * mid-move state. Odd during the step = refuse/punt; detection, not
+     * exclusion. rehashingCompleted's exclusive gate nests safely (readers
+     * punt on odd, so the drain is immediate). */
+    dplusBracketAllBegin(ht);
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
-        dplusBumpAllShards(ht);
-        return;
+    } else {
+        rehashStepExpand(ht);
     }
-    rehashStepExpand(ht);
-    dplusBumpAllShards(ht);
+    dplusBracketAllEnd(ht);
 }
 
 /* Called internally on lookup and other reads to the table. */
@@ -825,10 +834,16 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
         new_table = zcalloc(alloc_size);
     }
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, alloc_size);
+    /* S2.2 bracket: publish the new table + rehash_idx flip atomically w.r.t.
+     * validation. Completion (exclusive-gated) and instant-rehash steps
+     * (self-bracketed) stay OUTSIDE this bracket -- brackets do not nest on
+     * the same version array. */
+    dplusBracketAllBegin(ht);
     ht->bucket_exp[1] = exp;
     ht->tables[1] = new_table;
     ht->used[1] = 0;
     ht->rehash_idx = 0;
+    dplusBracketAllEnd(ht);
     if (ht->type->rehashingStarted) ht->type->rehashingStarted(ht);
 
     /* If the old table was empty, the rehashing is completed immediately. */
@@ -839,7 +854,6 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
             rehashStep(ht);
         }
     }
-    dplusBumpAllShards(ht);
     return true;
 }
 
@@ -1132,11 +1146,12 @@ static void insert(hashtable *ht, uint64_t hash, void *entry) {
     int pos_in_bucket;
     int table_index;
     bucket *b = findBucketForInsert(ht, hash, &pos_in_bucket, &table_index);
+    dplusBracketShardBegin(ht, hash);
     b->entries[pos_in_bucket] = entry;
     b->presence |= (1 << pos_in_bucket);
     b->hashes[pos_in_bucket] = highBits(hash);
     ht->used[table_index]++;
-    dplusBumpShard(ht, hash);
+    dplusBracketShardEnd(ht, hash);
 }
 
 /* A 64-bit fingerprint of some of the state of the hash table. */
@@ -1297,15 +1312,19 @@ void dplusVersionArrayInit(dplusVersionArray *va) {
     memset(va, 0, sizeof(*va));
 }
 
-/* Bump a single shard version (entry-specific mutation). */
-static inline void dplusBumpShard(hashtable *ht, uint64_t hash) {
-    unsigned shard = DPLUS_SHARD_INDEX(hash);
-    dplusVersionBumpShard(&ht->versions, shard);
+/* S2.2: odd/even bracket wrappers (replace the single-bump wrappers).
+ * Begin BEFORE the first mutating store, End AFTER the last. */
+static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash) {
+    dplusVersionBracketBegin(&ht->versions, DPLUS_SHARD_INDEX(hash));
 }
-
-/* Bump all shards (structural mutation: rehash/resize). */
-static inline void dplusBumpAllShards(hashtable *ht) {
-    dplusVersionBumpAll(&ht->versions);
+static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash) {
+    dplusVersionBracketEnd(&ht->versions, DPLUS_SHARD_INDEX(hash));
+}
+static inline void dplusBracketAllBegin(hashtable *ht) {
+    dplusVersionBracketAllBegin(&ht->versions);
+}
+static inline void dplusBracketAllEnd(hashtable *ht) {
+    dplusVersionBracketAllEnd(&ht->versions);
 }
 
 /* Public accessor for the version array pointer. */
@@ -1887,13 +1906,15 @@ void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *po
     int pos_in_bucket = p->pos_in_bucket;
     int table_index = p->table_index;
     assert(!isPositionFilled(b, pos_in_bucket));
+    /* S2.2 bracket: hash from entry key (hash bits already set by
+     * hashtableFindPositionForInsert). */
+    const void *key = entryGetKey(ht, entry);
+    uint64_t d_hash = hashKey(ht, key);
+    dplusBracketShardBegin(ht, d_hash);
     b->presence |= (1 << pos_in_bucket);
     b->entries[pos_in_bucket] = entry;
     ht->used[table_index]++;
-    /* Hash bits are already set by hashtableFindPositionForInsert. */
-    /* D+ version bump: compute hash from entry key for per-shard bump. */
-    const void *key = entryGetKey(ht, entry);
-    dplusBumpShard(ht, hashKey(ht, key));
+    dplusBracketShardEnd(ht, d_hash);
 }
 
 /* Removes the entry with the matching key and returns it. The entry
@@ -1907,6 +1928,13 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
     if (b) {
         if (popped) *popped = b->entries[pos_in_bucket];
+        /* S2.2 bracket: presence clear + chain compaction. fillBucketHole
+         * moves an entry from the chain tail into the hole; the moved
+         * entry's shard may differ from 'hash' and is NOT bracketed here.
+         * That is safe under the E4 miss-punt policy: a reader that misses
+         * the entry mid-move punts to main (never replies nil), and a reader
+         * that finds it reads the same unchanged robj pointer. */
+        dplusBracketShardBegin(ht, hash);
         b->presence &= ~(1 << pos_in_bucket);
         ht->used[table_index]--;
         if (b->chained && !hashtableIsRehashingPaused(ht)) {
@@ -1915,7 +1943,7 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
              * iterator code instead. */
             fillBucketHole(ht, b, pos_in_bucket, table_index);
         }
-        dplusBumpShard(ht, hash);
+        dplusBracketShardEnd(ht, hash);
         hashtableShrinkIfNeeded(ht);
         return true;
     }
@@ -1955,8 +1983,9 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
             for (int pos = 0; pos < numBucketPositions(b); pos++) {
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2 && b->entries[pos] == old_entry) {
                     /* It's a match. */
+                    dplusBracketShardBegin(ht, hash);
                     b->entries[pos] = new_entry;
-                    dplusBumpShard(ht, hash);
+                    dplusBracketShardEnd(ht, hash);
                     return true;
                 }
             }
@@ -2035,9 +2064,10 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
 
     /* Delete the entry and resume rehashing. */
     assert(isPositionFilled(b, pos_in_bucket));
-    /* D+ version bump: we don't have the hash readily available in the position struct,
-     * so bump all shards. This is a rare operation (two-phase delete). */
-    dplusBumpAllShards(ht);
+    /* S2.2 bracket: no hash in the position struct, so bracket all shards
+     * (rare operation). Span covers the presence clear through the chain
+     * compaction (fillBucketHole moves an entry between buckets). */
+    dplusBracketAllBegin(ht);
     b->presence &= ~(1 << pos_in_bucket);
     ht->used[table_index]--;
     /* When we resume rehashing, it may cause the bucket to be deleted due to
@@ -2051,6 +2081,7 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
          * we do the compaction in the scan and iterator code instead. */
         fillBucketHole(ht, b, pos_in_bucket, table_index);
     }
+    dplusBracketAllEnd(ht);
     hashtableResumeAutoShrink(ht);
 }
 

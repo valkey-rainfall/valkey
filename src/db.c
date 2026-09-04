@@ -345,6 +345,18 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         old = *oldref;
     }
 
+    /* S2.2 bracket: both branches below mutate the published entry (in-place
+     * ptr/type/encoding swap, or ref replacement via *oldref). Begin before
+     * the first mutating store; End after volatile-items tracking, where the
+     * single trailing bump used to be. Hash MUST come from the table's own
+     * hash function (I3). */
+    hashtable *d_ht = kvstoreGetHashtable(db->keys, getKVStoreIndexForKey(objectGetVal(key)));
+    dplusVersionArray *d_va = d_ht ? hashtableGetVersionArray(d_ht) : NULL;
+    uint64_t d_h = 0;
+    if (d_va) {
+        d_h = key_hash ? *key_hash : hashtableHashKey(d_ht, objectGetVal(key));
+        dplusVersionBracketBegin(d_va, DPLUS_SHARD_INDEX(d_h));
+    }
     if ((old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
         (val->refcount == 1 && val->encoding != OBJ_ENCODING_EMBSTR)) {
         /* Keep old object in the database. Just swap it's ptr, type and
@@ -386,29 +398,8 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* D+ entry-lifetime: bump the shard version for ref-based replacement.
-     * Both branches above mutate the entry WITHOUT touching buckets, so
-     * hashtable.c's bump sites never fire — a concurrent speculative read
-     * of this key must fail validation (the in-place branch additionally
-     * tears type/encoding/ptr across three stores). */
-    {
-        int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-        hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-        if (ht) {
-            dplusVersionArray *va = hashtableGetVersionArray(ht);
-            if (va) {
-                /* Reuse the hash computed by the entry lookup. It MUST come
-                 * from the table's own hash function (configurable seed):
-                 * speculative readers derive their shard index from
-                 * hashtableHashKey, and a bump computed with a different
-                 * seed lands on an uncorrelated shard (missed
-                 * invalidation). hashtableSdsHash (internal random seed)
-                 * was wrong here whenever hash-seed is configured. */
-                uint64_t h = key_hash ? *key_hash : hashtableHashKey(ht, objectGetVal(key));
-                dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(h));
-            }
-        }
-    }
+    /* S2.2: close the bracket opened above the swap/replace block. */
+    if (d_va) dplusVersionBracketEnd(d_va, DPLUS_SHARD_INDEX(d_h));
 
     /* D+ entry-lifetime: defer the old object's free past walk quiescence
      * (see entry-lifetime-design.md); routing recorded at defer time. */
@@ -2026,15 +2017,15 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
              * validation, then retire the displaced shell. Pre-fix this path
              * had NO bump: a reader could validate successfully against the
              * freed shell. */
-            val = *valref = newval;
             hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-            if (ht) {
-                dplusVersionArray *va = hashtableGetVersionArray(ht);
-                if (va) {
-                    uint64_t h = hashtableHashKey(ht, objectGetVal(key));
-                    dplusVersionBumpShard(va, DPLUS_SHARD_INDEX(h));
-                }
+            dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
+            uint64_t h = 0;
+            if (va) {
+                h = hashtableHashKey(ht, objectGetVal(key));
+                dplusVersionBracketBegin(va, DPLUS_SHARD_INDEX(h));
             }
+            val = *valref = newval;
+            if (va) dplusVersionBracketEnd(va, DPLUS_SHARD_INDEX(h));
             if (retired) {
                 /* Shell-only free: val_ptr ownership transferred to newval
                  * (or the value is inline in the shell allocation). RAW

@@ -24,6 +24,8 @@
  * same batch.
  */
 
+#include <assert.h> /* S2.2 bracket parity checks */
+
 #ifndef DPLUS_H
 #define DPLUS_H
 
@@ -163,7 +165,47 @@ static inline uint64_t dplusVersionRead(dplusVersionArray *va, unsigned shard) {
  * to validate. */
 static inline bool dplusVersionValidate(dplusVersionArray *va, unsigned shard, uint64_t v_before) {
     atomic_thread_fence(memory_order_acquire);
-    return dplusVersionRead(va, shard) == v_before;
+    /* S2.2a: odd v_before means the reader raced a bracket -- never valid.
+     * (Entry-side refusal should have punted already; this is the backstop.) */
+    return ((v_before & 1) == 0) && dplusVersionRead(va, shard) == v_before;
+}
+/* --- S2.2: odd/even bracket primitives (§5.2 paired protocol) ---
+ * Every main-thread mutation of reader-reachable state is bracketed:
+ * Begin makes the version ODD (new readers refuse at entry; in-flight
+ * readers will fail validation), End makes it EVEN again. Both are release
+ * stores (S1.1). Parity is a global invariant: versions are even at rest --
+ * ALL bump sites must use brackets; a lone bump leaves odd residue that
+ * permanently punts the shard. assert() (compiled out with NDEBUG) checks
+ * parity at each transition. */
+static inline void dplusVersionBracketBegin(dplusVersionArray *va, unsigned shard) {
+    _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
+    uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
+    assert((v & 1) == 0); /* even at rest */
+    atomic_store_explicit(slot, v + 1, memory_order_release);
+}
+static inline void dplusVersionBracketEnd(dplusVersionArray *va, unsigned shard) {
+    _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
+    uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
+    assert((v & 1) == 1); /* odd inside a bracket */
+    atomic_store_explicit(slot, v + 1, memory_order_release);
+}
+static inline void dplusVersionBracketAllBegin(dplusVersionArray *va) {
+    atomic_thread_fence(memory_order_release);
+    for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
+        _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
+        uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
+        assert((v & 1) == 0);
+        atomic_store_explicit(slot, v + 1, memory_order_relaxed);
+    }
+}
+static inline void dplusVersionBracketAllEnd(dplusVersionArray *va) {
+    atomic_thread_fence(memory_order_release);
+    for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
+        _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
+        uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
+        assert((v & 1) == 1);
+        atomic_store_explicit(slot, v + 1, memory_order_relaxed);
+    }
 }
 static inline void dplusVersionBumpShard(dplusVersionArray *va, unsigned shard) {
     /* Release store — single writer (main thread), so non-RMW load+store is
