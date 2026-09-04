@@ -1952,12 +1952,54 @@ void swapdbCommand(client *c) {
  * Expires API
  *----------------------------------------------------------------------------*/
 
+/* --- D+ S3 helpers: bracketing published-value mutations from command code --- */
+
+void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk) {
+    brk->va = NULL;
+    int dict_index = getKVStoreIndexForKey(objectGetVal(key));
+    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+    if (!ht) return;
+    dplusVersionArray *va = hashtableGetVersionArray(ht);
+    if (!va) return;
+    uint64_t h = hashtableHashKey(ht, objectGetVal(key));
+    brk->va = va;
+    brk->shard = DPLUS_SHARD_INDEX(h);
+    dplusVersionBracketBegin(va, brk->shard);
+}
+
+void dbKeyBracketEnd(dbKeyBracket *brk) {
+    if (!brk->va) return;
+    dplusVersionBracketEnd((dplusVersionArray *)brk->va, brk->shard);
+    brk->va = NULL;
+}
+
+sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
+    sds s = objectGetVal(o);
+    if (sdsalloc(s) >= total_len) return s; /* in-place capacity; bytes mutate under the caller's bracket */
+    /* Replacement publication: same copy a realloc move would perform. The
+     * old buffer stays intact and dereferenceable for in-flight readers and
+     * is freed at quiescence (universal deferred free -- the realloc's
+     * implicit free was the H4/H5 UAF). */
+    sds news = sdsnewlen(SDS_NOINIT, total_len);
+    memcpy(news, s, sdslen(s));
+    sdssetlen(news, sdslen(s));
+    objectSetVal(o, news);
+    if (!dplusDeferFreeRaw(sdsAllocPtr(s))) sdsfree(s);
+    return news;
+}
+
 int removeExpire(serverDb *db, robj *key) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
     void *popped;
     if (kvstoreHashtablePop(db->expires, dict_index, objectGetVal(key), &popped)) {
         robj *val = popped;
+        /* D+ S3: the embedded-expiry clear is an in-place 8-byte write on a
+         * published shell (S1.2a finding b) -- bracket it. */
+        dbKeyBracket brk;
+        dbKeyBracketBegin(db, key, &brk);
         robj *newval = objectSetExpire(val, -1);
+        dbKeyBracketEnd(&brk);
         serverAssert(newval == val);
         debugServerAssert(getExpire(db, key) == -1);
         return 1;
@@ -1993,7 +2035,14 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
      * (sharded-version-safety-audit-sep4.md, defect 1). The Ex variant keeps
      * the displaced shell fully intact and hands it back for shell-only
      * retirement past reader quiescence. */
+    /* D+ S3: when val already has an expire field, objectSetExpireEx writes
+     * the embedded 8-byte expiry IN PLACE (no realloc) -- bracket it. The
+     * realloc path's publication is bracketed separately below (S2.2). */
+    dbKeyBracket ttl_brk;
+    int ttl_inplace = val->hasexpire;
+    if (ttl_inplace) dbKeyBracketBegin(db, key, &ttl_brk);
     robj *newval = objectSetExpireEx(val, when, &retired);
+    if (ttl_inplace) dbKeyBracketEnd(&ttl_brk);
     serverAssert(retired == NULL || newval != val);
     if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */

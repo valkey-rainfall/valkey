@@ -3208,6 +3208,22 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */
+/* D+ S3: bracket a mutation of a PUBLISHED key's value from command code
+ * (t_string.c etc.) without exposing dplus internals. Begin computes the
+ * shard from the table's own hash fn; End closes the bracket. no_table=1
+ * -> End is a no-op. */
+typedef struct dbKeyBracket {
+    void *va;       /* dplusVersionArray* (opaque here) */
+    unsigned shard;
+} dbKeyBracket;
+void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk);
+void dbKeyBracketEnd(dbKeyBracket *brk);
+/* Ensure a published RAW string value has capacity for total_len bytes,
+ * safely vs speculative readers: returns unchanged sds when capacity
+ * suffices (caller mutates in place inside its bracket); otherwise builds
+ * the replacement buffer (the same copy a realloc would perform), publishes
+ * it on 'o', and defer-frees the old allocation. Call INSIDE a bracket. */
+sds dbGrowPublishedStringValue(robj *o, size_t total_len);
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
 robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired);
 robj *objectSetExpire(robj *o, long long expire);
