@@ -16,6 +16,13 @@ static _Atomic(int) dplus_reclaim_pressure_gate = 0;
 static int dplus_reclaim_gate_drained = 0; /* main-thread only */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 static _Atomic(long long) dplus_debug_reader_hold_us = 0;
+/* S5: second preemption point -- holds the reader AFTER the value copy and
+ * BEFORE validation, the window every torn-state test needs. */
+static _Atomic(long long) dplus_debug_prevalidate_hold_us = 0;
+static _Atomic(int) dplus_debug_prevalidate_bump = 0;
+static _Atomic(uint64_t) dplus_debug_prevalidate_consumed = 0;
+static char dplus_debug_pv_last_key[32] = "";      /* diagnostic only */
+static _Atomic(uint64_t) dplus_debug_pv_last_client = 0;
 static _Atomic(int) dplus_debug_reader_holding = 0;
 static _Atomic(int) dplus_debug_reader_release = 0;
 static _Atomic(int) dplus_debug_pressure_sync = 0;
@@ -348,6 +355,49 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
     } else {
         return 0;
     }
+
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    /* S5 test-only preemption point: pause between the value copy and the
+     * validation re-read. A mutation running on main during this pause MUST
+     * cause the validation below to fail (T-* torn-window battery). Reuses
+     * the holding/release handshake of the pre-lookup hold. */
+    {
+        long long pv_hold_us = atomic_exchange_explicit(&dplus_debug_prevalidate_hold_us, 0, memory_order_seq_cst);
+        if (unlikely(pv_hold_us > 0)) {
+            atomic_fetch_add_explicit(&dplus_debug_prevalidate_consumed, 1, memory_order_seq_cst);
+            {
+                size_t klen = sdslen((sds)e->key_sds);
+                if (klen > sizeof(dplus_debug_pv_last_key) - 1) klen = sizeof(dplus_debug_pv_last_key) - 1;
+                memcpy(dplus_debug_pv_last_key, e->key_sds, klen);
+                dplus_debug_pv_last_key[klen] = '\0';
+                atomic_store_explicit(&dplus_debug_pv_last_client, c->id, memory_order_seq_cst);
+            }
+            /* Plain bounded sleep -- UNLIKE the pre-lookup hold there is no
+             * release handshake: that loop is released by exclusive
+             * entrants (pressure tests), but torn-window tests mutate on
+             * main WITHOUT entering exclusive, so a wait here would spin to
+             * its panic bound. The test observes 'holding', runs its
+             * mutation (micro to milliseconds), and the reader wakes into
+             * validation on its own. */
+            atomic_store_explicit(&dplus_debug_reader_holding, 1, memory_order_seq_cst);
+            usleep((useconds_t)pv_hold_us);
+            /* Injected writer bracket (T-* torn-window battery): a LIVE
+             * mutation can never land inside this window -- the parked
+             * worker freezes main at the waitForClientIO rendezvous
+             * (verified: zero serverCron heartbeats for the full hold), so
+             * every command-driven mutation serializes after the wake.
+             * Instead, model the concurrent writer minimally: one full
+             * odd/even bracket on this entry's shard. Validation below MUST
+             * fail. Writer-side bracket coverage is proven separately by
+             * the dplus-shard-version probe tests (no timing needed). */
+            if (atomic_exchange_explicit(&dplus_debug_prevalidate_bump, 0, memory_order_seq_cst)) {
+                dplusVersionBracketBegin(va, e->shard);
+                dplusVersionBracketEnd(va, e->shard);
+            }
+            atomic_store_explicit(&dplus_debug_reader_holding, 0, memory_order_seq_cst);
+        }
+    }
+#endif
 
     /* VALIDATION RE-READ: fenced check that shard version is unchanged.
      * dplusVersionValidate issues the acquire fence that orders the value
@@ -1197,6 +1247,44 @@ int dplusDebugHoldNextReader(long long usec) {
 #endif
 }
 
+/* S5: lock-free observation of the prevalidate hold -- INFO must NOT be
+ * used to poll during a hold: its clients section acquires every worker
+ * event-loop mutex (b13 info lock), including the parked worker's, so the
+ * INFO reply is assembled mid-hold but delivered only after the hold
+ * expires -- the poller acts on stale state. This reads two atomics. */
+void dplusDebugPrevalidateState(uint64_t *holding, uint64_t *consumed) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    *holding = (uint64_t)atomic_load_explicit(&dplus_debug_reader_holding, memory_order_seq_cst);
+    *consumed = atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst);
+#else
+    *holding = 0;
+    *consumed = 0;
+#endif
+}
+
+/* S5: arm the pre-validation hold (see dplusSpeculateBatch). Overwrite
+ * semantics: a previously armed-but-unconsumed hold (the reader punted
+ * before validation) is replaced, not an error -- tests retry arming and a
+ * stale arm must never poison the next attempt. Also reset the release
+ * flag: an exclusive entrant (eviction, defrag duty cycle, FLUSH) may have
+ * left it set, which would make the hold a no-op. */
+void dplusDebugPrevalidateBump(void) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    atomic_store_explicit(&dplus_debug_prevalidate_bump, 1, memory_order_seq_cst);
+#endif
+}
+
+int dplusDebugHoldPrevalidate(long long usec) {
+#ifndef IO_LOOKUP_OFFLOAD_STATS
+    (void)usec;
+    return C_ERR;
+#else
+    if (usec <= 0 || usec > 5000000) return C_ERR;
+    atomic_store_explicit(&dplus_debug_prevalidate_hold_us, usec, memory_order_seq_cst);
+    return C_OK;
+#endif
+}
+
 /* Deterministic test hook: pin an otherwise unused slot in the current epoch.
  * This is reachable only through DEBUG and refuses to overlap a real worker. */
 int dplusDebugPinReader(uint64_t *epoch) {
@@ -1342,6 +1430,9 @@ sds dplusInfoString(sds info) {
         "dplus_validation_misses:%llu\r\n"
         "dplus_exclusive_punts:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
+        "dplus_prevalidate_consumed:%llu\r\n"
+        "dplus_pv_last_key:%s\r\n"
+        "dplus_pv_last_client:%llu\r\n"
         "dplus_bracket_entry_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
         "dplus_intra_batch_write_punts:%llu\r\n"
@@ -1358,6 +1449,9 @@ sds dplusInfoString(sds info) {
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
+        dplus_debug_pv_last_key,
+        (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
         (unsigned long long)atomic_load_explicit(&dplus_stats.bracket_entry_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),

@@ -39,6 +39,7 @@
  */
 
 #include "server.h"
+#include "dplus.h" /* S1.2b exclusive gate */
 #include "hashtable.h"
 #include "eval.h"
 #include "script.h"
