@@ -359,9 +359,10 @@ int dplusSpeculativeGet(client *c, void *key_sds, int resp) {
         return 0; /* Unknown encoding — punt */
     }
 
-    /* VALIDATION RE-READ: check shard version after value copy. */
-    uint64_t v_after = dplusVersionRead(va, shard);
-    if (v_before != v_after) {
+    /* VALIDATION RE-READ: fenced check that shard version is unchanged.
+     * dplusVersionValidate issues the acquire fence that orders the value
+     * copy above before the version re-read. */
+    if (!dplusVersionValidate(va, shard, v_before)) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
 #endif
@@ -452,9 +453,10 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         return 0;
     }
 
-    /* VALIDATION RE-READ: check shard version after value copy. */
-    uint64_t v_after = dplusVersionRead(va, e->shard);
-    if (e->v_before != v_after) {
+    /* VALIDATION RE-READ: fenced check that shard version is unchanged.
+     * dplusVersionValidate issues the acquire fence that orders the value
+     * copy above before the version re-read. */
+    if (!dplusVersionValidate(va, e->shard, e->v_before)) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
 #endif
