@@ -39,6 +39,20 @@ race:processClientIOWriteDone
 race:ioThreadWriteToClient
 
 # ---------------------------------------------------------------------------
+# Class 4: per-thread memory accounting aggregate (UPSTREAM DESIGN).
+# zmalloc maintains a plain size_t counter per thread (used_memory_thread[i],
+# each written only by its owning thread) and zmalloc_used_memory() sums all
+# slots with plain reads from whichever thread asks (main via INFO/maxmemory,
+# BIO via lazyfree accounting). The aggregate is intentionally imprecise --
+# a torn/stale read changes a statistic, never control flow correctness, and
+# aligned 8-byte loads don't tear on supported targets. This is inherited
+# upstream valkey design (predates door-2), reproduced on the unmodified
+# base commit 89e774674 under unit/lazyfree; converting the array to relaxed
+# atomics is an upstream conversation, not a D+ fix. Root-caused Sep 4 2026
+# (Phase 1 S1.6 sanitizer leg).
+race:zmalloc_used_memory
+
+# ---------------------------------------------------------------------------
 # Class 3: crash-report path (best-effort by intent).
 # The sigsegv handler's crash dump calls signal-unsafe logging on purpose
 # (last-gasp diagnostics). These reports only appear once the process is

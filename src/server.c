@@ -1591,12 +1591,12 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
         trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
                                  server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
                                  factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes, current_time,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed), current_time,
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT_REPLICATION, server.stat_net_repl_output_bytes, current_time,
                                  factor);
@@ -2927,7 +2927,7 @@ void resetServerStats(void) {
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
     server.stat_net_repl_input_bytes = 0;
-    server.bio_stat_net_repl_input_bytes = 0;
+    atomic_store_explicit(&server.bio_stat_net_repl_input_bytes, 0, memory_order_relaxed);
     server.stat_net_repl_output_bytes = 0;
     server.stat_net_cluster_slot_export_bytes = 0;
     server.stat_net_cluster_slot_import_bytes = 0;
@@ -6611,9 +6611,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
-                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
-                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes,
+                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed),
                 "total_net_repl_output_bytes:%lld\r\n", server.stat_net_repl_output_bytes,
                 "total_net_cluster_slot_import_bytes:%lld\r\n", server.stat_net_cluster_slot_import_bytes,
                 "total_net_cluster_slot_export_bytes:%lld\r\n", server.stat_net_cluster_slot_export_bytes,

@@ -2140,7 +2140,10 @@ struct valkeyServer {
                                                  * RDB save to disk has completed, or failed */
     _Atomic(bool) replica_bio_abort_save;       /* Flag set by main thread, used to signal to replica's
                                                  * disk-saving bio thread to abort the save */
-    long long bio_stat_net_repl_input_bytes;    /* Used to calculate stat_net_repl_input_bytes on the
+    _Atomic(long long) bio_stat_net_repl_input_bytes; /* Written by the BIO RDB-load thread, read by main
+                                                 * (cron metrics, INFO). Relaxed atomics -- stats only.
+                                                 * D+ S1.6: was a plain long long (TSan-confirmed race).
+                                                 * Used to calculate stat_net_repl_input_bytes on the
                                                  * replica's bio thread without touching main thread vars */
     off_t bio_repl_transfer_size;               /* Used to calculate bio_repl_transfer_size on the
                                                  * replica's bio thread without touching main thread vars */
