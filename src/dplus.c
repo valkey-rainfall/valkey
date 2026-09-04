@@ -535,7 +535,13 @@ int dplusSpeculateBatch(client *c, int tid) {
         e->hash = hashtableHashKey(ht, e->key_sds);
         e->shard = DPLUS_SHARD_INDEX(e->hash);
         e->v_before = dplusVersionRead(va, e->shard);
-        if (e->v_before & 1) goto out; /* S2.2a: writer bracket open -- punt to main */
+        if (e->v_before & 1) {
+            /* S2.2a: writer bracket open -- punt to main */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.bracket_entry_punts, 1, memory_order_relaxed);
+#endif
+            goto out;
+        }
         e->is_first_cmd = 1;
         e->queue_idx = -1;
         batch_count++;
@@ -592,7 +598,13 @@ int dplusSpeculateBatch(client *c, int tid) {
             e->hash = hashtableHashKey(ht, e->key_sds);
             e->shard = DPLUS_SHARD_INDEX(e->hash);
             e->v_before = dplusVersionRead(va, e->shard);
-            if (e->v_before & 1) continue; /* S2.2a: writer bracket open -- refuse at entry */
+            if (e->v_before & 1) {
+                /* S2.2a: writer bracket open -- refuse at entry */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                atomic_fetch_add_explicit(&dplus_stats.bracket_entry_punts, 1, memory_order_relaxed);
+#endif
+                continue;
+            }
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
             hashtableIncrementalFindInit(&e->find_state, ht, e->key_sds);
@@ -1330,6 +1342,7 @@ sds dplusInfoString(sds info) {
         "dplus_validation_misses:%llu\r\n"
         "dplus_exclusive_punts:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
+        "dplus_bracket_entry_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
         "dplus_intra_batch_write_punts:%llu\r\n"
         "dplus_miss_punts:%llu\r\n"
@@ -1345,6 +1358,7 @@ sds dplusInfoString(sds info) {
         (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.bracket_entry_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.miss_punts, memory_order_relaxed),

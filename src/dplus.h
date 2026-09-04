@@ -130,6 +130,10 @@ typedef struct {
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
     _Atomic(uint64_t) intra_batch_write_punts;
+    _Atomic(uint64_t) bracket_entry_punts; /* S2.3: odd-version refusals at batch entry --
+                                            * the rehash-memo Option-2 discriminator (high
+                                            * sustained rate during rehash windows would be
+                                            * the evidence RCU chains need) */
     _Atomic(uint64_t) miss_punts;
     _Atomic(uint64_t) b13_waiting_transitions;
     _Atomic(uint64_t) b13_handler_fires;
