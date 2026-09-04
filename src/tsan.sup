@@ -53,11 +53,84 @@ race:ioThreadWriteToClient
 race:zmalloc_used_memory
 
 # ---------------------------------------------------------------------------
+# Class 5: owned-client read-handshake surface (PRE-EXISTING REPORT STORM --
+# REAL CLASS, DEDICATED AUDIT PENDING, NOT ALL BENIGN). Under the
+# instrumented ownership suite, TSan reports 22 distinct race locations on
+# the UNMODIFIED base commit 89e774674 (evidence: /tmp/base-races.txt sweep
+# Sep 4 2026): cross-thread fd registration vs the F13 unlocked sweep
+# (aeCreateFileEvent/connSocketSetReadHandler/connIncrRefs), SPSC
+# inbox/outbox accessors (spscEnqueue/IsEmpty/IsFull), query-buffer handoff
+# (readToQueryBuf/parseMultibulk/readQueryFromClient), and D+ stats
+# aggregation. This is the same fence-ordered surface Class 2 documents as
+# TSan-unmodellable, PLUS genuinely unlocked windows that need their own
+# audit -- tracked as the Phase 1 follow-up 'owned-client handshake TSan
+# audit' in the lane tasks. Suppressed as a class so NEW keyspace-protocol
+# races (the Phase 1 surface, verified TSan-clean on expire/string/keyspace/
+# lazyfree suites) stay actionable. aePoll/clientsCron/sdsIncrLen appear
+# only under the battery's parked-reader scenarios (hooks absent on base --
+# provenance unverifiable) and are provisionally classed here.
+race:aeCreateFileEvent
+race:aeDeleteFileEvent
+race:aePoll
+race:aeSetDontWait
+race:beforeNextClient
+race:clientsCron
+race:connIncrRefs
+race:connSocketEventHandler
+race:connSocketRead
+race:connSocketSetReadHandler
+race:connSocketSetWriteHandler
+race:dplusAggregateStats
+race:dplusConsumeSpeculated
+race:dplusDoorbellRings
+race:dplusInfoString
+race:invoke_callback
+race:ioThreadReadQueryFromClient
+race:parseMultibulk
+race:readQueryFromClient
+race:readToQueryBuf
+race:sdsIncrLen
+race:spscEnqueue
+race:spscIsEmpty
+race:spscIsFull
+race:trySendReadToIOThreads
+
+# ---------------------------------------------------------------------------
+# Class 6: module-GIL vs io_threads_mutex order inversion (UPSTREAM DESIGN).
+# Init acquires GIL -> per-thread mutex (createIOThread); the event loop
+# acquires per-thread mutex (held across sleep for inactive threads) -> GIL
+# (afterSleep). Formal cycle, but both edges are main-thread-only: IO
+# threads never take the GIL, so the cycle cannot close across threads.
+# Reproduced 6x on unmodified base (Sep 4 2026). Upstream lineage
+# (io-threads pause/resume + module GIL both predate door-2).
+deadlock:createIOThread
+deadlock:moduleAcquireGIL
+
+# ---------------------------------------------------------------------------
+# Class 7: io-threads runtime shrink double-unlock (PRE-EXISTING UPSTREAM
+# BUG, FIX PENDING). shutdownIOThread guards its unlock with
+# 'id >= server.active_io_threads_num', but on the CONFIG SET io-threads
+# shrink path the count is updated BEFORE the removed (previously ACTIVE,
+# hence already-unlocked) thread is shut down -- the guard passes and the
+# mutex is unlocked twice. Code byte-identical to base 89e774674 (zero diff
+# on updateIOThreads/shutdownIOThread); base TSan runs simply aborted
+# before ownership.tcl's resize tests. Tracked as lane follow-up; candidate
+# fix: capture the pre-resize active count and guard on membership in the
+# removed range's prior state.
+mutex:shutdownIOThread
+
+# ---------------------------------------------------------------------------
 # Class 3: crash-report path (best-effort by intent).
 # The sigsegv handler's crash dump calls signal-unsafe logging on purpose
 # (last-gasp diagnostics). These reports only appear once the process is
 # already crashing — the crash itself is the actionable signal.
 signal:sigsegvHandler
+# DEBUG STACKTRACES / watchdog stack collection: threads_mngr delivers a
+# signal to every thread and the handler walks/symbolizes stacks (malloc in
+# dl machinery) -- deliberately best-effort diagnostics, upstream lineage.
+signal:collect_stacktrace_data
+signal:invoke_callback
+signal:writeStacktraces
 signal:printCrashReport
 signal:serverLogRaw
 signal:logServerInfo
