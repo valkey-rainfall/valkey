@@ -507,6 +507,9 @@ robj *dbRandomKey(serverDb *db) {
 }
 
 int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index) {
+    /* D+ (S1.4): keyspace deletes must run on main -- IO threads punt.
+     * See expireIfNeededWithDictIndex for the rationale. */
+    debugServerAssert(inMainThread());
     hashtablePosition pos;
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
@@ -2269,6 +2272,12 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
 
+    /* D+ (S1.4): expiry deletion mutates the keyspace and MUST run on main.
+     * Speculative readers check embedded expiry and punt the whole command
+     * to main (dplus.c) -- they must never reach this point. Checked
+     * invariant so any future IO-thread path that forgets the punt rule
+     * trips immediately in debug builds instead of corrupting silently. */
+    debugServerAssert(inMainThread());
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;
     if (static_key) {
