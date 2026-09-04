@@ -1835,6 +1835,14 @@ int dbSwapDatabases(int id1, int id2) {
     scanDatabaseForDeletedKeys(db1, db2);
     scanDatabaseForDeletedKeys(db2, db1);
 
+    /* D+ (S1.3): the table-pointer swap yanks db->keys out from under
+     * speculative readers -- a reader that resolved the old kvstore may
+     * compute a reply from a table that no longer belongs to its db
+     * (linearization violation even when nothing is freed). Drain in-flight
+     * walks and punt new ones for the duration of the swap; SWAPDB is rare
+     * and the drain is bounded by one in-flight read. */
+    dplusExclusiveEnter();
+
     /* Swap hash tables. Note that we don't swap blocking_keys,
      * ready_keys and watched_keys, since we want clients to
      * remain in the same DB they were. */
@@ -1848,6 +1856,8 @@ int dbSwapDatabases(int id1, int id2) {
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
     copyDbExpiry(db2, &aux);
+
+    dplusExclusiveLeave();
 
     /* Now we need to handle clients blocked on lists: as an effect
      * of swapping the two DBs, a client that was waiting for list
@@ -1881,6 +1891,11 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         /* Try to unblock any XREADGROUP clients if the key no longer exists. */
         scanDatabaseForDeletedKeys(activedb, newdb);
 
+        /* D+ (S1.3): same table-pointer-swap hazard as dbSwapDatabases,
+         * plus the displaced tables are freed shortly after this returns
+         * (old main db discarded post-replication-load). Gate the swap. */
+        dplusExclusiveEnter();
+
         /* Swap hash tables. Note that we don't swap blocking_keys,
          * ready_keys and watched_keys, since clients
          * remain in the same DB they were. */
@@ -1893,6 +1908,8 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         newdb->expires = aux.expires;
         newdb->keys_with_volatile_items = aux.keys_with_volatile_items;
         copyDbExpiry(newdb, &aux);
+
+        dplusExclusiveLeave();
 
         /* Now we need to handle clients blocked on lists: as an effect
          * of swapping the two DBs, a client that was waiting for list
