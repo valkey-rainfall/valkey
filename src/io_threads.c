@@ -845,8 +845,13 @@ int updateIOThreads(const char **err) {
         initIOThreads(prev_threads_num);
     } else {
         for (int i = prev_threads_num - 1; i >= server.io_threads_num; i--) {
-            /* Unblock inactive thread. */
-            pthread_mutex_unlock(&io_threads_mutex[i]);
+            /* F/U-2 double-unlock fix: shutdownIOThread already unlocks this
+             * thread's mutex (its guard 'id >= active_io_threads_num' is
+             * true here -- active was just set to 1, and the loop above
+             * locked every previously-active mutex). The extra unlock that
+             * used to live here unlocked the same mutex twice -- formal UB,
+             * TSan-confirmed ('unlock of an unlocked mutex') via the
+             * ownership suite's CONFIG SET io-threads tests. */
             shutdownIOThread(i);
             io_threads[i] = 0;
         }

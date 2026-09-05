@@ -107,18 +107,6 @@ deadlock:createIOThread
 deadlock:moduleAcquireGIL
 
 # ---------------------------------------------------------------------------
-# Class 7: io-threads runtime shrink double-unlock (PRE-EXISTING UPSTREAM
-# BUG, FIX PENDING). shutdownIOThread guards its unlock with
-# 'id >= server.active_io_threads_num', but on the CONFIG SET io-threads
-# shrink path the count is updated BEFORE the removed (previously ACTIVE,
-# hence already-unlocked) thread is shut down -- the guard passes and the
-# mutex is unlocked twice. Code byte-identical to base 89e774674 (zero diff
-# on updateIOThreads/shutdownIOThread); base TSan runs simply aborted
-# before ownership.tcl's resize tests. Tracked as lane follow-up; candidate
-# fix: capture the pre-resize active count and guard on membership in the
-# removed range's prior state.
-mutex:shutdownIOThread
-
 # ---------------------------------------------------------------------------
 # Class 3: crash-report path (best-effort by intent).
 # The sigsegv handler's crash dump calls signal-unsafe logging on purpose
