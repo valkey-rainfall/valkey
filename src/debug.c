@@ -616,6 +616,16 @@ void debugCommand(client *c) {
             addReplyLongLong(c, (long long)shard);
             addReplyLongLong(c, (long long)dplusVersionRead(va, shard));
         }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-mget-force-validation-miss") && c->argc == 2) {
+        if (dplusDebugForceNextMgetValidationMiss() != C_OK)
+            addReplyError(c, "D+ MGET validation miss requires an instrumented build or is already armed");
+        else
+            addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-skip-next-multikey-exclusive") && c->argc == 2) {
+        if (dplusDebugArmSkipMultiKeyExclusive() != C_OK)
+            addReplyError(c, "D+ multi-key exclusive bypass requires an instrumented build or is already armed");
+        else
+            addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") && c->argc == 2) {
         uint64_t epoch;
         if (dplusDebugPinReader(&epoch) != C_OK)

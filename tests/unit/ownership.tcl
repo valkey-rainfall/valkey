@@ -332,6 +332,7 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         foreach candidate $spare_writers { $candidate close }
         for {set i 0} {$i < 64} {incr i} { $rd get epoch:held }
         for {set i 0} {$i < 64} {incr i} { assert_equal "epoch:value" [$rd read] }
+        assert_equal OK [r debug dplus-skip-next-multikey-exclusive]
         assert_equal OK [r debug dplus-epoch-hold 200]
         for {set i 0} {$i < 64} {incr i} { $rd get epoch:held }
 

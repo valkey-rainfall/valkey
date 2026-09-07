@@ -4036,10 +4036,26 @@ void call(client *c, int flags) {
                                      (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
                                       !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
                                       !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
+        /* Atomic multi-key writes (MSET-like) must drain readers around the
+         * WHOLE command: per-shard version validation alone cannot tell a
+         * stable intermediate state (some keys written, some not) from a
+         * final state, so a speculative MGET could observe -- and validate --
+         * a torn multi-key write. Single-key writes stay on the cheap
+         * per-shard version bump. */
+        int dplus_multi_key_write = 0;
+        if (c->cmd->flags & CMD_WRITE) {
+            getKeysResult keys;
+            initGetKeysResult(&keys);
+            dplus_multi_key_write = getKeysFromCommand(c->cmd, c->argv, c->argc, &keys) > 1;
+            getKeysFreeResult(&keys);
+            if (dplus_multi_key_write && dplusDebugConsumeSkipMultiKeyExclusive())
+                dplus_multi_key_write = 0;
+        }
         if (proc == evalCommand || proc == evalShaCommand ||
             proc == fcallCommand || proc == execCommand ||
             proc == keysCommand || proc == flushdbCommand ||
-            proc == flushallCommand || (proc == debugCommand && !dplus_epoch_debug_hook)) {
+            proc == flushallCommand || dplus_multi_key_write ||
+            (proc == debugCommand && !dplus_epoch_debug_hook)) {
             dplusExclusiveEnter();
             dplus_exclusive = 1;
         }

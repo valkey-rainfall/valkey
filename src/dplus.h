@@ -88,13 +88,16 @@ void dplusReaderWorkerOffline(int tid);
  * beforeSleep — a per-LOOP touch, not per-command. */
 typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
-    long long usec;               /* wall time spent executing them (for commandstats) */
+    long long get_commands;       /* speculated GET commands (commandstats attribution) */
+    long long mget_commands;      /* speculated MGET commands (commandstats attribution) */
+    long long usec;               /* wall time spent executing GET (for commandstats) */
+    long long mget_usec;          /* wall time spent executing MGET (for commandstats) */
     long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
     long long owned_net_bytes;    /* bytes written by those completions */
     long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
     long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
-    long long keyspace_hits;      /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
+    long long keyspace_hits;      /* E3: speculative read hits (bypass main's stat_keyspace_hits) */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -126,6 +129,9 @@ typedef struct {
     _Atomic(uint64_t) speculative_attempts;
     _Atomic(uint64_t) speculative_hits;
     _Atomic(uint64_t) validation_misses;
+    _Atomic(uint64_t) mget_speculative_attempts; /* MGET subset of speculative_attempts */
+    _Atomic(uint64_t) mget_speculative_hits;     /* MGET subset of speculative_hits */
+    _Atomic(uint64_t) mget_validation_misses;    /* MGET subset of validation_misses */
     _Atomic(uint64_t) exclusive_punts;
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
@@ -294,6 +300,9 @@ int dplusDebugHoldNextReader(long long usec);
 int dplusDebugHoldPrevalidate(long long usec);
 void dplusDebugPrevalidateState(uint64_t *holding, uint64_t *consumed);
 void dplusDebugPrevalidateBump(void);
+int dplusDebugForceNextMgetValidationMiss(void);
+int dplusDebugArmSkipMultiKeyExclusive(void);
+int dplusDebugConsumeSkipMultiKeyExclusive(void);
 int dplusDebugPinReader(uint64_t *epoch);
 int dplusDebugUnpinReader(void);
 void dplusDebugEpochStats(uint64_t stats[8]);

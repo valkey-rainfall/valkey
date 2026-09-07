@@ -1365,6 +1365,7 @@ typedef struct client {
                                            * unrestricted key read access, so workers may speculate.
                                            * Written ONLY on the main thread at auth-state changes
                                            * (clientSetUser, SELECT, ACL admin ops); read by workers. */
+    _Atomic(uint8_t) spec_mget_acl_ok;    /* D+ ACL gate for MGET; published alongside spec_acl_ok. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -2917,6 +2918,8 @@ void dictVanillaFree(void *val);
                                             * owned event path (no reads_pending    \
                                             * increment at submit). Stable across   \
                                             * disown/detach, unlike owner_tid. */
+#define READ_FLAGS_DPLUS_MGET (1 << 25)    /* D+: this command was a speculatively \
+                                            * executed MGET (dplusSpeculativeMget). */
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
