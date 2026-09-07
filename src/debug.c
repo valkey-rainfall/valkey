@@ -621,6 +621,11 @@ void debugCommand(client *c) {
             addReplyError(c, "D+ MGET validation miss requires an instrumented build or is already armed");
         else
             addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-scan-force-validation-miss") && c->argc == 2) {
+        if (dplusDebugForceNextScanValidationMiss() != C_OK)
+            addReplyError(c, "D+ SCAN validation miss requires an instrumented build or is already armed");
+        else
+            addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-skip-next-multikey-exclusive") && c->argc == 2) {
         if (dplusDebugArmSkipMultiKeyExclusive() != C_OK)
             addReplyError(c, "D+ multi-key exclusive bypass requires an instrumented build or is already armed");

@@ -90,8 +90,10 @@ typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
     long long get_commands;       /* speculated GET commands (commandstats attribution) */
     long long mget_commands;      /* speculated MGET commands (commandstats attribution) */
+    long long scan_commands;      /* speculated SCAN commands (commandstats attribution) */
     long long usec;               /* wall time spent executing GET (for commandstats) */
     long long mget_usec;          /* wall time spent executing MGET (for commandstats) */
+    long long scan_usec;          /* wall time spent executing SCAN (for commandstats) */
     long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
     long long owned_net_bytes;    /* bytes written by those completions */
     long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
@@ -132,6 +134,9 @@ typedef struct {
     _Atomic(uint64_t) mget_speculative_attempts; /* MGET subset of speculative_attempts */
     _Atomic(uint64_t) mget_speculative_hits;     /* MGET subset of speculative_hits */
     _Atomic(uint64_t) mget_validation_misses;    /* MGET subset of validation_misses */
+    _Atomic(uint64_t) scan_speculative_attempts; /* SCAN subset of speculative_attempts */
+    _Atomic(uint64_t) scan_speculative_hits;     /* SCAN subset of speculative_hits */
+    _Atomic(uint64_t) scan_validation_misses;    /* SCAN subset of validation_misses */
     _Atomic(uint64_t) exclusive_punts;
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
@@ -301,6 +306,7 @@ int dplusDebugHoldPrevalidate(long long usec);
 void dplusDebugPrevalidateState(uint64_t *holding, uint64_t *consumed);
 void dplusDebugPrevalidateBump(void);
 int dplusDebugForceNextMgetValidationMiss(void);
+int dplusDebugForceNextScanValidationMiss(void);
 int dplusDebugArmSkipMultiKeyExclusive(void);
 int dplusDebugConsumeSkipMultiKeyExclusive(void);
 int dplusDebugPinReader(uint64_t *epoch);

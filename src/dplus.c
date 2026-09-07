@@ -27,6 +27,7 @@ static _Atomic(int) dplus_debug_reader_holding = 0;
 static _Atomic(int) dplus_debug_reader_release = 0;
 static _Atomic(int) dplus_debug_pressure_sync = 0;
 static _Atomic(int) dplus_debug_mget_force_validation_miss = 0;
+static _Atomic(int) dplus_debug_scan_force_validation_miss = 0;
 static _Atomic(int) dplus_debug_skip_multikey_exclusive = 0;
 #endif
 
@@ -195,11 +196,13 @@ static uint8_t dplusAclAllowsCommand(client *c, const char *name) {
 void dplusRecomputeSpecAclOk(client *c) {
     uint8_t get_ok = 0;
     uint8_t mget_ok = 0;
+    uint8_t scan_ok = 0;
     if (c->flag.authenticated) {
         if (c->user == NULL) {
             /* No associated user = unrestricted context (stock semantics). */
             get_ok = 1;
             mget_ok = 1;
+            scan_ok = 1;
         } else {
             /* Synthetic argv: the helper only needs command identity + dbid for
              * the command/db checks; the ALLKEYS-or-%R~* requirement is what
@@ -207,10 +210,12 @@ void dplusRecomputeSpecAclOk(client *c) {
              * a (safe) conservative punt, never a false allow. */
             get_ok = dplusAclAllowsCommand(c, "get");
             mget_ok = dplusAclAllowsCommand(c, "mget");
+            scan_ok = dplusAclAllowsCommand(c, "scan");
         }
     }
     atomic_store_explicit(&c->spec_acl_ok, get_ok, memory_order_release);
     atomic_store_explicit(&c->spec_mget_acl_ok, mget_ok, memory_order_release);
+    atomic_store_explicit(&c->spec_scan_acl_ok, scan_ok, memory_order_release);
 }
 
 /* ACL rules changed (ACL SETUSER/DELUSER/LOAD, module SetUserACL).
@@ -599,14 +604,159 @@ static int dplusSpeculativeMget(client *c, robj **argv, int argc) {
     return 1;
 }
 
-/* Continuation dispatch for MGET (and any trailing GET the ring below did
- * not consume -- e.g. the ring never ran because the FIRST command was MGET,
- * not GET). One key/entry lookup at a time; no prefetch overlap. Loops until
- * the first ineligible command or the first validation failure, so a run of
- * MGET, MGET, GET all dispatch here in one call -- this is NOT limited to
- * "the first command after the ring." SCAN dispatch lands separately once
- * its read-only bucket-iteration primitives are ported and audited against
- * the S2.2b bracket-based rehash step. */
+/* Plain keyspace SCAN staging. COUNT/MATCH/TYPE intentionally punt until the
+ * plain cursor path and option-specific filtering are independently audited. */
+#define DPLUS_SCAN_MAX_KEYS 256
+#define DPLUS_SCAN_STAGE_BYTES PROTO_REPLY_CHUNK_BYTES
+
+typedef struct dplusScanEntry {
+    unsigned shard;
+    uint64_t v_before;
+    uint32_t offset;
+    uint32_t len;
+} dplusScanEntry;
+
+typedef struct dplusScanStage {
+    dplusScanEntry entries[DPLUS_SCAN_MAX_KEYS];
+    char values[DPLUS_SCAN_STAGE_BYTES];
+    size_t used;
+    long sampled;
+    int count;
+    int punt;
+} dplusScanStage;
+
+typedef struct dplusScanCallbackData {
+    hashtable *ht;
+    dplusVersionArray *versions;
+    dplusScanStage *stage;
+} dplusScanCallbackData;
+
+static _Thread_local dplusScanStage dplus_scan_stage;
+
+static void dplusScanKeyCallback(void *privdata, void *entry) {
+    dplusScanCallbackData *data = privdata;
+    dplusScanStage *stage = data->stage;
+    stage->sampled++;
+    if (stage->punt) return;
+
+    robj *o = entry;
+    if (o->hasexpire) {
+        mstime_t when = objectGetExpire(o);
+        if (when >= 0 && mstime() >= when) {
+            stage->punt = 1; /* Main performs expiry, propagation and compaction. */
+            return;
+        }
+    }
+
+    sds key = objectGetKey(o);
+    size_t len = sdslen(key);
+    if (stage->count >= DPLUS_SCAN_MAX_KEYS || len > DPLUS_SCAN_STAGE_BYTES - stage->used) {
+        stage->punt = 1;
+        return;
+    }
+
+    uint64_t hash = hashtableHashKey(data->ht, key);
+    dplusScanEntry *e = &stage->entries[stage->count++];
+    e->shard = DPLUS_SHARD_INDEX(hash);
+    e->v_before = dplusVersionRead(data->versions, e->shard);
+    e->offset = (uint32_t)stage->used;
+    e->len = (uint32_t)len;
+    memcpy(stage->values + stage->used, key, len);
+    stage->used += len;
+}
+
+static size_t dplusArrayReplySize(int elements) {
+    char buf[32];
+    int numlen = ll2string(buf, sizeof(buf), elements);
+    return 1 + numlen + 2;
+}
+
+/* Execute one plain standalone SCAN invocation as a staged point-in-time
+ * cursor-plus-elements batch. No state survives this call -- the returned
+ * cursor is an opaque bucket-iteration position, not a snapshot handle;
+ * successive SCAN calls do not share any state, matching stock semantics. */
+static int dplusSpeculativeScan(client *c, robj **argv, int argc) {
+    if (argc != 2) return 0;
+    unsigned long long parsed_cursor;
+    sds cursor_arg = objectGetVal(argv[1]);
+    if (!string2ull(cursor_arg, sdslen(cursor_arg), &parsed_cursor)) return 0;
+
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, 0);
+    dplusScanStage *stage = &dplus_scan_stage;
+    stage->used = 0;
+    stage->sampled = 0;
+    stage->count = 0;
+    stage->punt = 0;
+    size_t cursor = (size_t)parsed_cursor;
+
+    if (ht) {
+        uint64_t structure_before = hashtableGetStructuralVersion(ht);
+        if (structure_before & 1) return 0;
+        dplusVersionArray *versions = hashtableGetVersionArray(ht);
+        if (!versions) return 0;
+        dplusScanCallbackData data = {.ht = ht, .versions = versions, .stage = stage};
+        unsigned long maxiterations = 100; /* DEFAULT_SCAN_COMMAND_COUNT * 10 */
+        do {
+            cursor = hashtableScanReadOnly(ht, cursor, dplusScanKeyCallback, &data);
+        } while (cursor && maxiterations-- && stage->sampled < 10);
+        if (stage->punt) return 0;
+
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        if (unlikely(atomic_exchange_explicit(&dplus_debug_scan_force_validation_miss, 0, memory_order_seq_cst)))
+            structure_before ^= 2;
+#endif
+        uint64_t structure_after = hashtableGetStructuralVersion(ht);
+        if ((structure_after & 1) || structure_before != structure_after) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&dplus_stats.scan_validation_misses, 1, memory_order_relaxed);
+#endif
+            return 0;
+        }
+        for (int i = 0; i < stage->count; i++) {
+            dplusScanEntry *e = &stage->entries[i];
+            /* dplusVersionValidate's acquire fence orders the staged key
+             * copies above before this re-read; see the MGET comment above
+             * for why a plain dplusVersionRead comparison is vacuous here. */
+            if (!dplusVersionValidate(versions, e->shard, e->v_before)) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&dplus_stats.scan_validation_misses, 1, memory_order_relaxed);
+#endif
+                return 0;
+            }
+        }
+    } else {
+        cursor = 0;
+    }
+
+    char cursorbuf[32];
+    int cursorlen = ull2string(cursorbuf, sizeof(cursorbuf), (unsigned long long)cursor);
+    size_t total = dplusArrayReplySize(2) + dplusBulkReplySize(cursorlen) +
+                   dplusArrayReplySize(stage->count);
+    for (int i = 0; i < stage->count; i++) total += dplusBulkReplySize(stage->entries[i].len);
+    if (total > c->buf_usable_size - c->bufpos) return 0;
+
+    serverAssert(dplusWriteArrayHeader(c, 2) > 0);
+    serverAssert(dplusWriteBulkReply(c, cursorbuf, cursorlen) > 0);
+    serverAssert(dplusWriteArrayHeader(c, stage->count) > 0);
+    for (int i = 0; i < stage->count; i++) {
+        dplusScanEntry *e = &stage->entries[i];
+        serverAssert(dplusWriteBulkReply(c, stage->values + e->offset, e->len) > 0);
+    }
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dplus_stats.scan_speculative_hits, 1, memory_order_relaxed);
+#endif
+    return 1;
+}
+
+/* Continuation dispatch for MGET/SCAN (and any trailing GET the ring below
+ * did not consume -- e.g. the ring never ran because the FIRST command was
+ * MGET/SCAN, not GET). One key/entry lookup at a time; no prefetch overlap.
+ * Loops until the first ineligible command or the first validation failure,
+ * so a run of MGET, SCAN, GET all dispatch here in one call -- this is NOT
+ * limited to "the first command after the ring." */
 static int dplusSpeculativeGetSequential(client *c, void *key_sds, hashtable *ht, int resp) {
     dplusVersionArray *va = hashtableGetVersionArray(ht);
     if (!va) return 0;
@@ -634,7 +784,8 @@ static int dplusSpeculateSequentialQueue(client *c,
                                          int queue_pos,
                                          int tid,
                                          struct serverCommand *get_cmd,
-                                         struct serverCommand *mget_cmd) {
+                                         struct serverCommand *mget_cmd,
+                                         struct serverCommand *scan_cmd) {
     cmdQueue *queue = &c->cmd_queue;
     int speculated = 0;
     hashtable *ht = kvstoreGetHashtable(c->db->keys, 0);
@@ -646,14 +797,18 @@ static int dplusSpeculateSequentialQueue(client *c,
                      (p->cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST);
         int is_mget = p->cmd == mget_cmd && p->argc >= 2 &&
                       (p->cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST);
-        if (!is_get && !is_mget) break;
+        int is_scan = p->cmd == scan_cmd && p->argc == 2 && (p->cmd->flags & CMD_READONLY);
+        if (!is_get && !is_mget && !is_scan) break;
         if (is_get && !atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) break;
         if (is_mget && !atomic_load_explicit(&c->spec_mget_acl_ok, memory_order_acquire)) break;
+        if (is_scan && !atomic_load_explicit(&c->spec_scan_acl_ok, memory_order_acquire)) break;
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
         if (is_mget)
             atomic_fetch_add_explicit(&dplus_stats.mget_speculative_attempts, 1, memory_order_relaxed);
+        if (is_scan)
+            atomic_fetch_add_explicit(&dplus_stats.scan_speculative_attempts, 1, memory_order_relaxed);
 #endif
         /* Per-command wall time feeds each command's OWN commandstats
          * microseconds via dplusAggregateStats (an MGET's time folded into
@@ -662,14 +817,19 @@ static int dplusSpeculateSequentialQueue(client *c,
         int succeeded;
         if (is_get)
             succeeded = dplusSpeculativeGetSequential(c, objectGetVal(p->argv[1]), ht, c->resp);
-        else
+        else if (is_mget)
             succeeded = dplusSpeculativeMget(c, p->argv, p->argc);
+        else
+            succeeded = dplusSpeculativeScan(c, p->argv, p->argc);
         if (!succeeded) break;
 
         long long elapsed = (long long)(getMonotonicUs() - command_start);
         if (is_mget) {
             p->read_flags |= READ_FLAGS_DPLUS_MGET;
             dplus_thread_stats[tid].mget_usec += elapsed;
+        } else if (is_scan) {
+            p->read_flags |= READ_FLAGS_DPLUS_SCAN;
+            dplus_thread_stats[tid].scan_usec += elapsed;
         } else {
             dplus_thread_stats[tid].usec += elapsed;
         }
@@ -750,43 +910,58 @@ int dplusSpeculateBatch(client *c, int tid) {
     if (server.active_defrag_cpu_percent > 0) return 0;
 
     /* ZERO-COST WRITE-BATCH EXIT: if the first command isn't even a
-     * GET/MGET, return before touching any atomics or gate state.
+     * GET/MGET/SCAN, return before touching any atomics or gate state.
      * Eliminates the r100 write-tax (2 seq_cst ops + gate history shift cost
      * on pure-write batches). Uses lazily-cached command pointers (static,
-     * idempotent init) -- the MGET pointer is cached here too since this
-     * exit must recognize it to route a first-command MGET straight to the
-     * sequential dispatcher below (the streaming ring only handles GET; see
-     * its own comment for why). Hoisted to function scope: reused both by
-     * the fast-exit check and by the ring's own later GET matching. */
+     * idempotent init) -- MGET/SCAN pointers are cached here too since this
+     * exit must recognize them to route a first-command MGET/SCAN straight
+     * to the sequential dispatcher below (the streaming ring only handles
+     * GET; see its own comment for why). Hoisted to function scope: reused
+     * both by the fast-exit check and by the ring's own later GET matching. */
     static struct serverCommand *dplus_get_cmd_fast = NULL;
     if (!dplus_get_cmd_fast) dplus_get_cmd_fast = lookupCommandByCString("get");
     static struct serverCommand *dplus_mget_cmd_fast = NULL;
     if (!dplus_mget_cmd_fast) dplus_mget_cmd_fast = lookupCommandByCString("mget");
+    static struct serverCommand *dplus_scan_cmd_fast = NULL;
+    if (!dplus_scan_cmd_fast) dplus_scan_cmd_fast = lookupCommandByCString("scan");
     {
         int first_is_get = c->argc == 2 && c->parsed_cmd == dplus_get_cmd_fast;
         int first_is_mget = c->argc >= 2 && c->parsed_cmd == dplus_mget_cmd_fast;
-        if (!first_is_get && !first_is_mget) return 0;
+        int first_is_scan = c->argc == 2 && c->parsed_cmd == dplus_scan_cmd_fast;
+        if (!first_is_get && !first_is_mget && !first_is_scan) return 0;
 
-        /* A first-command MGET never enters the streaming ring (it has no
-         * single key to seed hashtableIncrementalFindInit with). The first
+        /* A first-command MGET/SCAN never enters the streaming ring (it has
+         * no single key to seed hashtableIncrementalFindInit with). The first
          * command lives on the client (c->argv / c->parsed_cmd), NOT in
          * cmd_queue -- execute it directly here, then let the sequential
          * queue helper consume any eligible queued continuations. */
-        if (first_is_mget) {
-            if (!atomic_load_explicit(&c->spec_mget_acl_ok, memory_order_acquire)) return 0;
+        if (first_is_mget || first_is_scan) {
+            if (first_is_mget && !atomic_load_explicit(&c->spec_mget_acl_ok, memory_order_acquire)) return 0;
+            if (first_is_scan && !atomic_load_explicit(&c->spec_scan_acl_ok, memory_order_acquire)) return 0;
             if (!dplusReaderEnter(tid)) return 0;
-            monotime mget_start = getMonotonicUs();
+            monotime first_start = getMonotonicUs();
             int n = 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&dplus_stats.mget_speculative_attempts, 1, memory_order_relaxed);
+            if (first_is_mget)
+                atomic_fetch_add_explicit(&dplus_stats.mget_speculative_attempts, 1, memory_order_relaxed);
+            else
+                atomic_fetch_add_explicit(&dplus_stats.scan_speculative_attempts, 1, memory_order_relaxed);
 #endif
-            if (dplusSpeculativeMget(c, c->argv, c->argc)) {
-                c->read_flags |= READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_MGET;
-                dplus_thread_stats[tid].mget_usec += (long long)(getMonotonicUs() - mget_start);
+            int first_ok = first_is_mget ? dplusSpeculativeMget(c, c->argv, c->argc)
+                                         : dplusSpeculativeScan(c, c->argv, c->argc);
+            if (first_ok) {
+                long long first_elapsed = (long long)(getMonotonicUs() - first_start);
+                if (first_is_mget) {
+                    c->read_flags |= READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_MGET;
+                    dplus_thread_stats[tid].mget_usec += first_elapsed;
+                } else {
+                    c->read_flags |= READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_SCAN;
+                    dplus_thread_stats[tid].scan_usec += first_elapsed;
+                }
                 n = 1;
                 n += dplusSpeculateSequentialQueue(c, c->cmd_queue.off, tid, dplus_get_cmd_fast,
-                                                   dplus_mget_cmd_fast);
+                                                   dplus_mget_cmd_fast, dplus_scan_cmd_fast);
             }
             dplusReaderWorkerQuiescent(tid);
             return n;
@@ -1013,7 +1188,8 @@ int dplusSpeculateBatch(client *c, int tid) {
      * rule is global, so speculation must not resume past a failure point
      * even though queue_pos may still name an eligible command. */
     if (!ring_validation_failed) {
-        speculated += dplusSpeculateSequentialQueue(c, queue_pos, tid, dplus_get_cmd_fast, dplus_mget_cmd_fast);
+        speculated += dplusSpeculateSequentialQueue(c, queue_pos, tid, dplus_get_cmd_fast, dplus_mget_cmd_fast,
+                                                    dplus_scan_cmd_fast);
     }
 
 out:
@@ -1046,18 +1222,21 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     int consumed = 0;
     int get_consumed = 0;
     int mget_consumed = 0;
+    int scan_consumed = 0;
     int keyspace_hits = 0;
 
     /* --- First command (c->argv / c->parsed_cmd case) --- */
     if (count > 0 && (c->read_flags & READ_FLAGS_DPLUS_SPECULATED)) {
-        if (c->read_flags & READ_FLAGS_DPLUS_MGET) {
+        if (c->read_flags & READ_FLAGS_DPLUS_SCAN) {
+            scan_consumed++;
+        } else if (c->read_flags & READ_FLAGS_DPLUS_MGET) {
             mget_consumed++;
             keyspace_hits += c->argc - 1;
         } else {
             get_consumed++;
             keyspace_hits++;
         }
-        c->read_flags &= ~(READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_MGET);
+        c->read_flags &= ~(READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_MGET | READ_FLAGS_DPLUS_SCAN);
         /* CRITICAL: clear pending_command — the parse path set it, and without
          * clearing it here the main thread's processPendingCommandAndInputBuffer
          * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
@@ -1088,14 +1267,16 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     while (consumed < count && queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off];
         if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
-        if (p->read_flags & READ_FLAGS_DPLUS_MGET) {
+        if (p->read_flags & READ_FLAGS_DPLUS_SCAN) {
+            scan_consumed++;
+        } else if (p->read_flags & READ_FLAGS_DPLUS_MGET) {
             mget_consumed++;
             keyspace_hits += p->argc - 1;
         } else {
             get_consumed++;
             keyspace_hits++;
         }
-        p->read_flags &= ~(READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_MGET);
+        p->read_flags &= ~(READ_FLAGS_DPLUS_SPECULATED | READ_FLAGS_DPLUS_MGET | READ_FLAGS_DPLUS_SCAN);
         queue->off++;
         /* Free argv for the consumed command. */
         for (int j = 0; j < p->argc; j++) {
@@ -1117,10 +1298,12 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     dplus_thread_stats[tid].commands_processed += consumed;
     dplus_thread_stats[tid].get_commands += get_consumed;
     dplus_thread_stats[tid].mget_commands += mget_consumed;
+    dplus_thread_stats[tid].scan_commands += scan_consumed;
     /* E3: every consumed speculative KEY is a hit (valid-nil misses punt to
      * main via E4; large/expired/torn also punt) -- an MGET contributes one
-     * hit per key. Count per-thread so main can fold into stat_keyspace_hits,
-     * which the worker path bypasses. */
+     * hit per key; SCAN returns keys, not values, and contributes none.
+     * Count per-thread so main can fold into stat_keyspace_hits, which the
+     * worker path bypasses. */
     dplus_thread_stats[tid].keyspace_hits += keyspace_hits;
 
     /* D5: a WAITING_WRITABLE client keeps speculating reads (B13) while its
@@ -1169,8 +1352,10 @@ void dplusAggregateStats(void) {
     static long long seen_calls[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_get_calls[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_mget_calls[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_scan_calls[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_usec[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_mget_usec[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_scan_usec[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_writes[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_net_bytes[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_hits[DPLUS_MAX_IO_THREADS] = {0};
@@ -1178,6 +1363,8 @@ void dplusAggregateStats(void) {
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     static struct serverCommand *mget_cmd = NULL;
     if (!mget_cmd) mget_cmd = lookupCommandByCString("mget");
+    static struct serverCommand *scan_cmd = NULL;
+    if (!scan_cmd) scan_cmd = lookupCommandByCString("scan");
     for (int i = 0; i < server.io_threads_num; i++) {
         long long n = dplus_thread_stats[i].commands_processed;
         if (n > seen_calls[i]) {
@@ -1200,6 +1387,12 @@ void dplusAggregateStats(void) {
             seen_mget_calls[i] = m;
             if (mget_cmd) mget_cmd->calls += delta;
         }
+        long long s = dplus_thread_stats[i].scan_commands;
+        if (s > seen_scan_calls[i]) {
+            long long delta = s - seen_scan_calls[i];
+            seen_scan_calls[i] = s;
+            if (scan_cmd) scan_cmd->calls += delta;
+        }
         /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
          * bypasses main's lookupKey where this is normally incremented). Same
          * monotonic-delta scheme: workers only grow their slot, main folds the
@@ -1220,6 +1413,12 @@ void dplusAggregateStats(void) {
             long long delta = mus - seen_mget_usec[i];
             seen_mget_usec[i] = mus;
             if (mget_cmd) mget_cmd->microseconds += delta;
+        }
+        long long sus = dplus_thread_stats[i].scan_usec;
+        if (sus > seen_scan_usec[i]) {
+            long long delta = sus - seen_scan_usec[i];
+            seen_scan_usec[i] = sus;
+            if (scan_cmd) scan_cmd->microseconds += delta;
         }
         /* Fix #2 (main-free completion): fold worker-side write completions
          * into the global write stats. Same monotonic-delta scheme. */
@@ -1659,6 +1858,20 @@ int dplusDebugForceNextMgetValidationMiss(void) {
 #endif
 }
 
+/* Instrumented-build test hook: force the next otherwise-valid SCAN to fail
+ * structural validation after staging, proving atomic fallback. */
+int dplusDebugForceNextScanValidationMiss(void) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    int expected = 0;
+    return atomic_compare_exchange_strong_explicit(&dplus_debug_scan_force_validation_miss, &expected, 1,
+                                                   memory_order_seq_cst, memory_order_seq_cst)
+               ? C_OK
+               : C_ERR;
+#else
+    return C_ERR;
+#endif
+}
+
 /* Instrumented-build test hook: let the retirement-pressure test run one
  * intentionally non-exclusive multi-key write to accumulate a full backlog. */
 int dplusDebugArmSkipMultiKeyExclusive(void) {
@@ -1827,6 +2040,9 @@ sds dplusInfoString(sds info) {
         "dplus_mget_speculative_attempts:%llu\r\n"
         "dplus_mget_speculative_hits:%llu\r\n"
         "dplus_mget_validation_misses:%llu\r\n"
+        "dplus_scan_speculative_attempts:%llu\r\n"
+        "dplus_scan_speculative_hits:%llu\r\n"
+        "dplus_scan_validation_misses:%llu\r\n"
         "dplus_exclusive_punts:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
         "dplus_prevalidate_consumed:%llu\r\n"
@@ -1849,6 +2065,9 @@ sds dplusInfoString(sds info) {
         (unsigned long long)atomic_load_explicit(&dplus_stats.mget_speculative_attempts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.mget_speculative_hits, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.mget_validation_misses, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.scan_speculative_attempts, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.scan_speculative_hits, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&dplus_stats.scan_validation_misses, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
         (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),

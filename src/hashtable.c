@@ -316,6 +316,16 @@ struct hashtable {
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
+    /* D+ structural sequence for speculative SCAN walks: odd while ANY
+     * entry-relocating mutation is in flight (rehash step, expand, chain
+     * conversion, hole fill, chain compaction), incremented twice around
+     * each. Per-key version validation cannot catch a key the walk MISSED
+     * (nothing staged = nothing to validate); an unchanged even sequence
+     * across the whole walk is the only omission evidence. Main is the sole
+     * writer (depth-counted for nesting); workers load-acquire. Speculative
+     * GET does not read this -- misses already punt (E4). */
+    _Atomic(uint64_t) dplus_structure_seq;
+    uint32_t dplus_structure_write_depth;
     /* D+ sharded version array: 256 shards, 8 per cache line = 2KB.
      * Isolated from the read-hot header fields above (offsetof >= 128).
      * IO threads read with acquire; main thread bumps with relaxed stores.
@@ -329,6 +339,8 @@ static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash);
 static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash);
 static inline void dplusBracketAllBegin(hashtable *ht);
 static inline void dplusBracketAllEnd(hashtable *ht);
+static inline void dplusStructureWriteBegin(hashtable *ht);
+static inline void dplusStructureWriteEnd(hashtable *ht);
 
 
 struct iter {
@@ -754,11 +766,13 @@ static void rehashStep(hashtable *ht) {
      * exclusion. rehashingCompleted's exclusive gate nests safely (readers
      * punt on odd, so the drain is immediate). */
     dplusBracketAllBegin(ht);
+    dplusStructureWriteBegin(ht);
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
     } else {
         rehashStepExpand(ht);
     }
+    dplusStructureWriteEnd(ht);
     dplusBracketAllEnd(ht);
 }
 
@@ -837,12 +851,15 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
     /* S2.2 bracket: publish the new table + rehash_idx flip atomically w.r.t.
      * validation. Completion (exclusive-gated) and instant-rehash steps
      * (self-bracketed) stay OUTSIDE this bracket -- brackets do not nest on
-     * the same version array. */
+     * the same version array. Structural seq covers the same window for
+     * speculative SCAN walks (table flip changes the walk's bucket map). */
     dplusBracketAllBegin(ht);
+    dplusStructureWriteBegin(ht);
     ht->bucket_exp[1] = exp;
     ht->tables[1] = new_table;
     ht->used[1] = 0;
     ht->rehash_idx = 0;
+    dplusStructureWriteEnd(ht);
     dplusBracketAllEnd(ht);
     if (ht->type->rehashingStarted) ht->type->rehashingStarted(ht);
 
@@ -1006,9 +1023,16 @@ static void bucketConvertToChained(hashtable *ht, bucket *b) {
     assert(isPositionFilled(b, pos));
     bucket *child = zcalloc(sizeof(bucket));
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, sizeof(bucket));
+    /* D+ structural seq: this relocates an EXISTING entry (whose shard is
+     * unrelated to the key being inserted -- the insert-path shard bracket
+     * does not cover it). A speculative SCAN walking this chain could
+     * otherwise miss the moved entry with no version evidence anywhere.
+     * Speculative GET is unaffected (miss punts, E4). */
+    dplusStructureWriteBegin(ht);
     moveEntry(child, 0, b, pos);
     b->chained = 1;
     b->entries[pos] = child;
+    dplusStructureWriteEnd(ht);
 }
 
 /* Converts a bucket with a next-bucket pointer to one without one. */
@@ -1050,6 +1074,12 @@ static void pruneLastBucket(hashtable *ht, bucket *before_last, bucket *last, in
  * last bucket in the chain. */
 static void fillBucketHole(hashtable *ht, bucket *b, int pos_in_bucket, int table_index) {
     assert(b->chained && !isPositionFilled(b, pos_in_bucket));
+    /* D+ structural seq: the chain-tail entry moved into the hole belongs to
+     * an arbitrary shard the caller's per-shard bracket does not cover. Safe
+     * for speculative GET (miss punts, E4) but a speculative SCAN could
+     * silently omit the moved entry -- publish the relocation window. Nests
+     * under compactBucketChain's bracket via the depth counter. */
+    dplusStructureWriteBegin(ht);
     /* Find the last bucket */
     bucket *before_last = b;
     bucket *last = getChildBucket(b);
@@ -1068,6 +1098,7 @@ static void fillBucketHole(hashtable *ht, bucket *b, int pos_in_bucket, int tabl
     if (last->presence == 0 || __builtin_popcount(last->presence) == 1) {
         pruneLastBucket(ht, before_last, last, table_index);
     }
+    dplusStructureWriteEnd(ht);
 }
 
 /* When entries are deleted while rehashing is paused, they leave empty holes in
@@ -1076,13 +1107,21 @@ static void fillBucketHole(hashtable *ht, bucket *b, int pos_in_bucket, int tabl
  * the end of the chain. */
 static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_index) {
     bucket *b = &ht->tables[table_index][bucket_index];
+    /* D+ structural seq: chain compaction unlinks and frees buckets and
+     * relocates entries -- one odd window over the whole pass (inner
+     * fillBucketHole brackets nest via the depth counter). */
+    dplusStructureWriteBegin(ht);
     while (b->chained) {
         bucket *next = getChildBucket(b);
         if (next->chained && next->presence == 0) {
             /* Empty bucket in the middle of the chain. Remove it from the chain. */
             bucket *next_next = getChildBucket(next);
             b->entries[ENTRIES_PER_BUCKET - 1] = next_next;
-            zfree(next);
+            /* D+ entry-lifetime: a speculative walk may hold this chain
+             * bucket -- defer the free past walk quiescence, exactly like
+             * pruneLastBucket does (this plain zfree predated the limbo
+             * mechanism; same UAF class as the pruneLastBucket site). */
+            if (!dplusDeferFreeRaw(next)) zfree(next);
             if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
             ht->child_buckets[table_index]--;
             continue;
@@ -1092,7 +1131,7 @@ static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_ind
             /* Next is the last bucket and it's empty or has only one entry.
              * Delete it and turn b into an "unchained" bucket. */
             pruneLastBucket(ht, b, next, table_index);
-            return;
+            goto done;
         }
 
         if (__builtin_popcount(b->presence) < ENTRIES_PER_BUCKET - 1) {
@@ -1100,7 +1139,7 @@ static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_ind
             for (int pos = 0; pos < ENTRIES_PER_BUCKET - 1; pos++) {
                 if (!isPositionFilled(b, pos)) {
                     fillBucketHole(ht, b, pos, table_index);
-                    if (!b->chained) return;
+                    if (!b->chained) goto done;
                 }
             }
         }
@@ -1108,6 +1147,8 @@ static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_ind
         /* Bucket is full. Move forward to next bucket. */
         b = next;
     }
+done:
+    dplusStructureWriteEnd(ht);
 }
 
 /* Find an empty position in the table for inserting an entry with the given hash. */
@@ -1327,6 +1368,27 @@ static inline void dplusBracketAllEnd(hashtable *ht) {
     dplusVersionBracketAllEnd(&ht->versions);
 }
 
+/* --- D+ structural sequence (speculative-SCAN omission evidence) ---
+ * Odd from before the first entry-relocating store until after the last.
+ * Depth-counted: nested relocations (compactBucketChain -> fillBucketHole ->
+ * pruneLastBucket, rehashStep -> bucket moves) publish ONE odd window. Main
+ * is the only writer, so plain depth arithmetic + atomic seq stores suffice.
+ * seq_cst on the transitions keeps the store ordered against the relocation
+ * stores it publishes (matching the worker's acquire loads + fence). */
+static inline void dplusStructureWriteBegin(hashtable *ht) {
+    if (ht->dplus_structure_write_depth++ == 0)
+        atomic_fetch_add_explicit(&ht->dplus_structure_seq, 1, memory_order_seq_cst);
+}
+static inline void dplusStructureWriteEnd(hashtable *ht) {
+    assert(ht->dplus_structure_write_depth > 0);
+    if (--ht->dplus_structure_write_depth == 0)
+        atomic_fetch_add_explicit(&ht->dplus_structure_seq, 1, memory_order_seq_cst);
+}
+
+uint64_t hashtableGetStructuralVersion(hashtable *ht) {
+    return atomic_load_explicit(&ht->dplus_structure_seq, memory_order_acquire);
+}
+
 /* Public accessor for the version array pointer. */
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht) {
     return &ht->versions;
@@ -1435,6 +1497,8 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_auto_shrink = 0;
     ht->safe_iterators = NULL;
     dplusVersionArrayInit(&ht->versions);
+    atomic_init(&ht->dplus_structure_seq, 0);
+    ht->dplus_structure_write_depth = 0;
     resetTable(ht, 0);
     resetTable(ht, 1);
     if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size);
@@ -2259,6 +2323,83 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
  */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata) {
     return hashtableScanDefrag(ht, cursor, fn, privdata, NULL, 0);
+}
+
+/* Read-only cursor traversal for optimistic worker scans. Unlike
+ * hashtableScanDefrag, this function never pauses/resumes rehashing, triggers a
+ * rehash step, compacts chains, shrinks, or mutates iterator state. The caller
+ * must hold D+ epoch protection (bucket frees are limbo-deferred past walk
+ * quiescence) and validate an unchanged EVEN hashtableGetStructuralVersion
+ * across the whole call: per-key version validation cannot detect a key this
+ * walk MISSED because a concurrent relocation (rehash step, chain conversion,
+ * hole fill, compaction) moved it across already-visited positions -- the
+ * structural seq is the only omission evidence. */
+size_t hashtableScanReadOnly(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata) {
+    if (hashtableSize(ht) == 0) return 0;
+
+    if (!hashtableIsRehashing(ht)) {
+        size_t mask = expToMask(ht->bucket_exp[0]);
+        size_t idx = cursor & mask;
+        bucket *b = &ht->tables[0][idx];
+        do {
+            if (fn && b->presence != 0) {
+                for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
+                    void *entry = b->entries[pos];
+                    if (isPositionFilled(b, pos) && entry && validateElementIfNeeded(ht, entry))
+                        fn(privdata, entry);
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+        return nextCursor(cursor, mask);
+    }
+
+    int table_small, table_large;
+    if (ht->bucket_exp[0] <= ht->bucket_exp[1]) {
+        table_small = 0;
+        table_large = 1;
+    } else {
+        table_small = 1;
+        table_large = 0;
+    }
+
+    size_t mask_small = expToMask(ht->bucket_exp[table_small]);
+    size_t mask_large = expToMask(ht->bucket_exp[table_large]);
+    size_t idx = cursor & mask_small;
+
+    if (table_small == 1 || ht->rehash_idx == -1 || idx >= (size_t)ht->rehash_idx) {
+        bucket *b = &ht->tables[table_small][idx];
+        do {
+            if (fn && b->presence != 0) {
+                for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
+                    void *entry = b->entries[pos];
+                    if (isPositionFilled(b, pos) && entry && validateElementIfNeeded(ht, entry))
+                        fn(privdata, entry);
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+    }
+
+    do {
+        idx = cursor & mask_large;
+        if (table_large == 1 || ht->rehash_idx == -1 || idx >= (size_t)ht->rehash_idx) {
+            bucket *b = &ht->tables[table_large][idx];
+            do {
+                if (fn && b->presence != 0) {
+                    for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
+                        void *entry = b->entries[pos];
+                        if (isPositionFilled(b, pos) && entry && validateElementIfNeeded(ht, entry))
+                            fn(privdata, entry);
+                    }
+                }
+                b = getChildBucket(b);
+            } while (b != NULL);
+        }
+        cursor = nextCursor(cursor, mask_large);
+    } while (cursor & (mask_small ^ mask_large));
+
+    return cursor;
 }
 
 /* Given a scan cursor, determines whether a key's hashtable position has
