@@ -57,7 +57,10 @@ static_assert(sizeof(dplusEpochThreadStats) == DPLUS_CACHELINE, "epoch reader st
 dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
 
 /* --- Write-tax gate (per-IO-thread) --- */
-dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS] = {{.history = ~(uint64_t)0}}; /* Start optimistic (all-ones = all speculated) */
+/* NOTE: this initializer only covers element [0] (C zero-fills the rest);
+ * every thread's gate is reset to all-ones in dplusReaderWorkerOnline before
+ * that thread can process a batch. Do not rely on the initializer alone. */
+dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS] = {{.history = ~(uint64_t)0}};
 
 /* D5: worker -> main signal that some owned client's output has crossed
  * maxmemory-clients while no completion is flowing (WAITING_WRITABLE hog).
@@ -76,6 +79,14 @@ dplusStats dplus_stats = {0};
  * excluded only after join, preventing slot-reuse ABA during runtime resize. */
 void dplusReaderWorkerOnline(int tid) {
     serverAssert(tid > 0 && tid < DPLUS_MAX_IO_THREADS);
+    /* Write-tax gate starts optimistic (all-ones = all speculated). The
+     * static initializer `{{.history = ~0}}` only covers element [0] (C
+     * zero-fills the rest), so threads 1..N were born with history=0 -- a
+     * CLOSED gate (popcount 0 < threshold) that needed 8 gated batches per
+     * thread to creep open. Found by TSan runs shifting client->thread
+     * assignment: the engagement test landed on a cold gate and every GET
+     * punted. Reset here, before this thread can see its first batch. */
+    dplus_write_tax[tid].history = ~(uint64_t)0;
     atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_QUIESCENT, memory_order_seq_cst);
     atomic_fetch_or_explicit(&dplus_reader_online[tid / 64], UINT64_C(1) << (tid % 64), memory_order_seq_cst);
 }
@@ -1586,12 +1597,17 @@ static int dplusAppendRetired(void *ptr, int route) {
     serverAssert(inMainThread());
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     /* Deterministic test handshake: do not begin the armed pressure command
-     * until the target real reader reaches the worst preemption point. */
+     * until the target real reader reaches the worst preemption point.
+     * usleep in the wait loop: a hot spin on main can starve the IO thread
+     * it is waiting FOR under serialized schedulers (TSan's runtime lock
+     * turns the spin into a livelock -> spurious 5s panic); yielding costs
+     * nothing on a debug-only path. */
     if (atomic_exchange_explicit(&dplus_debug_pressure_sync, 0, memory_order_seq_cst)) {
         monotime start = getMonotonicUs();
         while (!atomic_load_explicit(&dplus_debug_reader_holding, memory_order_seq_cst)) {
             if (getMonotonicUs() - start > 5000000)
                 serverPanic("timed out waiting for D+ debug reader hold");
+            usleep(100);
         }
     }
 #endif
