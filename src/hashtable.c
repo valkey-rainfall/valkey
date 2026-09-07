@@ -316,6 +316,11 @@ struct hashtable {
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
+    /* D+ structural 2PL publication. Main is the only writer. Odd sequence
+     * values mean resize/rehash structure is being mutated; optimistic readers
+     * accept only an unchanged even value. Depth permits nested instant rehash. */
+    _Atomic uint64_t dplus_structure_seq;
+    uint32_t dplus_structure_write_depth;
     /* D+ sharded version array: 256 shards, 8 per cache line = 2KB.
      * Isolated from the read-hot header fields above (offsetof >= 128).
      * IO threads read with acquire; main thread bumps with relaxed stores.
@@ -327,6 +332,8 @@ struct hashtable {
 /* Forward declarations for dplus version bump helpers (defined below). */
 static inline void dplusBumpShard(hashtable *ht, uint64_t hash);
 static inline void dplusBumpAllShards(hashtable *ht);
+static inline void dplusStructureWriteBegin(hashtable *ht);
+static inline void dplusStructureWriteEnd(hashtable *ht);
 
 struct iter {
     hashtable *hashtable;
@@ -744,13 +751,14 @@ static void rehashStepShrink(hashtable *ht) {
  * old to the new hash table. */
 static void rehashStep(hashtable *ht) {
     assert(hashtableIsRehashing(ht));
+    dplusStructureWriteBegin(ht);
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
-        dplusBumpAllShards(ht);
-        return;
+    } else {
+        rehashStepExpand(ht);
     }
-    rehashStepExpand(ht);
     dplusBumpAllShards(ht);
+    dplusStructureWriteEnd(ht);
 }
 
 /* Called internally on lookup and other reads to the table. */
@@ -825,6 +833,7 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
         new_table = zcalloc(alloc_size);
     }
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, alloc_size);
+    dplusStructureWriteBegin(ht);
     ht->bucket_exp[1] = exp;
     ht->tables[1] = new_table;
     ht->used[1] = 0;
@@ -840,6 +849,7 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
         }
     }
     dplusBumpAllShards(ht);
+    dplusStructureWriteEnd(ht);
     return true;
 }
 
@@ -1068,7 +1078,7 @@ static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_ind
             /* Empty bucket in the middle of the chain. Remove it from the chain. */
             bucket *next_next = getChildBucket(next);
             b->entries[ENTRIES_PER_BUCKET - 1] = next_next;
-            zfree(next);
+            if (!dplusDeferFreeRaw(next)) zfree(next);
             if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
             ht->child_buckets[table_index]--;
             continue;
@@ -1308,9 +1318,27 @@ static inline void dplusBumpAllShards(hashtable *ht) {
     dplusVersionBumpAll(&ht->versions);
 }
 
-/* Public accessor for the version array pointer. */
+/* Structural write publication for optimistic readers. The sequence is odd
+ * from before the first table-shape mutation until all nested work and final
+ * version publication complete. Main is the only writer, so no CAS is needed. */
+static inline void dplusStructureWriteBegin(hashtable *ht) {
+    if (ht->dplus_structure_write_depth++ == 0)
+        atomic_fetch_add_explicit(&ht->dplus_structure_seq, 1, memory_order_seq_cst);
+}
+
+static inline void dplusStructureWriteEnd(hashtable *ht) {
+    assert(ht->dplus_structure_write_depth > 0);
+    if (--ht->dplus_structure_write_depth == 0)
+        atomic_fetch_add_explicit(&ht->dplus_structure_seq, 1, memory_order_seq_cst);
+}
+
+/* Public accessors for optimistic readers. */
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht) {
     return &ht->versions;
+}
+
+uint64_t hashtableGetStructuralVersion(hashtable *ht) {
+    return atomic_load_explicit(&ht->dplus_structure_seq, memory_order_acquire);
 }
 
 /* Read-only find: same bucket walk as hashtableFind but does NOT call
@@ -1415,6 +1443,8 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
     ht->safe_iterators = NULL;
+    atomic_init(&ht->dplus_structure_seq, 0);
+    ht->dplus_structure_write_depth = 0;
     dplusVersionArrayInit(&ht->versions);
     resetTable(ht, 0);
     resetTable(ht, 1);
@@ -2228,6 +2258,79 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
  */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata) {
     return hashtableScanDefrag(ht, cursor, fn, privdata, NULL, 0);
+}
+
+/* Read-only cursor traversal for optimistic worker scans. Unlike
+ * hashtableScanDefrag, this function never pauses/resumes rehashing, triggers a
+ * rehash step, compacts chains, shrinks, or mutates iterator state. The caller
+ * must hold D+ epoch protection and validate an unchanged even structural
+ * version after copying callback data. */
+size_t hashtableScanReadOnly(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata) {
+    if (hashtableSize(ht) == 0) return 0;
+
+    if (!hashtableIsRehashing(ht)) {
+        size_t mask = expToMask(ht->bucket_exp[0]);
+        size_t idx = cursor & mask;
+        bucket *b = &ht->tables[0][idx];
+        do {
+            if (fn && b->presence != 0) {
+                for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
+                    void *entry = b->entries[pos];
+                    if (isPositionFilled(b, pos) && entry && validateElementIfNeeded(ht, entry))
+                        fn(privdata, entry);
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+        return nextCursor(cursor, mask);
+    }
+
+    int table_small, table_large;
+    if (ht->bucket_exp[0] <= ht->bucket_exp[1]) {
+        table_small = 0;
+        table_large = 1;
+    } else {
+        table_small = 1;
+        table_large = 0;
+    }
+
+    size_t mask_small = expToMask(ht->bucket_exp[table_small]);
+    size_t mask_large = expToMask(ht->bucket_exp[table_large]);
+    size_t idx = cursor & mask_small;
+
+    if (table_small == 1 || ht->rehash_idx == -1 || idx >= (size_t)ht->rehash_idx) {
+        bucket *b = &ht->tables[table_small][idx];
+        do {
+            if (fn && b->presence != 0) {
+                for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
+                    void *entry = b->entries[pos];
+                    if (isPositionFilled(b, pos) && entry && validateElementIfNeeded(ht, entry))
+                        fn(privdata, entry);
+                }
+            }
+            b = getChildBucket(b);
+        } while (b != NULL);
+    }
+
+    do {
+        idx = cursor & mask_large;
+        if (table_large == 1 || ht->rehash_idx == -1 || idx >= (size_t)ht->rehash_idx) {
+            bucket *b = &ht->tables[table_large][idx];
+            do {
+                if (fn && b->presence != 0) {
+                    for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
+                        void *entry = b->entries[pos];
+                        if (isPositionFilled(b, pos) && entry && validateElementIfNeeded(ht, entry))
+                            fn(privdata, entry);
+                    }
+                }
+                b = getChildBucket(b);
+            } while (b != NULL);
+        }
+        cursor = nextCursor(cursor, mask_large);
+    } while (cursor & (mask_small ^ mask_large));
+
+    return cursor;
 }
 
 /* Given a scan cursor, determines whether a key's hashtable position has

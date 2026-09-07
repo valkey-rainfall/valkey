@@ -1357,7 +1357,7 @@ typedef struct client {
     slotMigrationJob *slot_migration_job; /* Pointer to the slot migration job, or NULL. */
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
-    _Atomic uint8_t io_write_state;      /* Cross-thread client write state; use atomic predicates/publication. */
+    _Atomic(uint8_t) io_write_state;      /* Cross-thread client write state; use atomic predicates/publication. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t owner_tid;                    /* Stable owner thread ID (door-2). 0 = legacy/writer-owned. */
@@ -1365,6 +1365,8 @@ typedef struct client {
                                            * unrestricted key read access, so workers may speculate.
                                            * Written ONLY on the main thread at auth-state changes
                                            * (clientSetUser, SELECT, ACL admin ops); read by workers. */
+    _Atomic(uint8_t) spec_mget_acl_ok;    /* D+ ACL gate for MGET; published alongside spec_acl_ok. */
+    _Atomic(uint8_t) spec_scan_acl_ok;    /* D+ ACL gate for keyspace SCAN. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -2914,6 +2916,8 @@ void dictVanillaFree(void *val);
                                             * owned event path (no reads_pending    \
                                             * increment at submit). Stable across   \
                                             * disown/detach, unlike owner_tid. */
+#define READ_FLAGS_DPLUS_MGET (1 << 25) /* Speculated command is MGET, for worker accounting. */
+#define READ_FLAGS_DPLUS_SCAN (1 << 26) /* Speculated command is SCAN, for worker accounting. */
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)

@@ -164,10 +164,12 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
 struct dplusVersionArray;
 typedef struct dplusVersionArray dplusVersionArray;
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
+uint64_t hashtableGetStructuralVersion(hashtable *ht);
 uint64_t hashtableHashKey(hashtable *ht, const void *key);
 
 /* Iteration & scan */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);
+size_t hashtableScanReadOnly(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);
 size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata, void *(*defragfn)(void *), int flags);
 bool hashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cursor);
 void hashtableInitIterator(hashtableIterator *iter, hashtable *ht, uint8_t flags);

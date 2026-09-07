@@ -1,15 +1,18 @@
-/* D+ Read-Side Prototype — Speculative GET execution on IO threads.
+/* D+ Read-Side Prototype — speculative string reads on IO threads.
  *
- * GET-shaped commands execute entirely on the IO thread that parsed them:
- * optimistic lookup validated by a sharded seqlock, reply written into the
- * client's output buffer by the same thread. The main thread never sees a
- * successful speculative GET. Mutations, validation misses, and everything
- * non-GET-shaped punt to the main thread via today's parsed-command queue.
+ * GET and bounded all-hit MGET commands may execute entirely on the IO thread
+ * that parsed them: optimistic lookup validated by sharded versions, with the
+ * reply written into the client's output buffer by the same thread. The main
+ * thread never sees a successful speculative command. Mutations, validation
+ * misses, and ineligible command shapes punt through today's parsed-command
+ * queue without changing public semantics.
  *
  * REPLY-BUFFER ORDERING GUARANTEE:
  * The "contiguous prefix" rule is the key invariant. The IO thread writes
- * speculative replies for a contiguous prefix of GET commands in the batch.
- * As soon as a non-speculative command is encountered (write, non-GET,
+ * speculative replies for a contiguous prefix of eligible commands. GET may
+ * fill the existing prefix pipeline; MGET is currently eligible only at the
+ * head and emits its complete array atomically. As soon as an ineligible
+ * command is encountered (write, unsupported read shape,
  * validation fail, exclusive mode), ALL remaining commands in that client's
  * batch are punted to main-thread processing.
  * Since:
@@ -86,7 +89,12 @@ void dplusReaderWorkerOffline(int tid);
  * beforeSleep — a per-LOOP touch, not per-command. */
 typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
-    long long usec;               /* wall time spent executing them (for commandstats) */
+    long long get_commands;       /* speculated GET commands */
+    long long mget_commands;      /* speculated MGET commands */
+    long long scan_commands;      /* speculated SCAN commands */
+    long long usec;               /* wall time spent executing GET (for commandstats) */
+    long long mget_usec;          /* wall time spent executing MGET (for commandstats) */
+    long long scan_usec;          /* wall time spent executing SCAN (for commandstats) */
     long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
     long long owned_net_bytes;    /* bytes written by those completions */
     long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
@@ -124,6 +132,12 @@ typedef struct {
     _Atomic(uint64_t) speculative_attempts;
     _Atomic(uint64_t) speculative_hits;
     _Atomic(uint64_t) validation_misses;
+    _Atomic(uint64_t) mget_speculative_attempts;
+    _Atomic(uint64_t) mget_speculative_hits;
+    _Atomic(uint64_t) mget_validation_misses;
+    _Atomic(uint64_t) scan_speculative_attempts;
+    _Atomic(uint64_t) scan_speculative_hits;
+    _Atomic(uint64_t) scan_validation_misses;
     _Atomic(uint64_t) exclusive_punts;
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
@@ -185,8 +199,8 @@ dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 void dplusExclusiveEnter(void);  /* Main thread: set exclusive + spin-wait */
 void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
 
-/* ACL/AUTH gate for speculation (main-thread writers; workers read the
- * per-client spec_acl_ok byte inside dplusSpeculateBatch). */
+/* ACL/AUTH gates for speculation (main-thread writers; workers read the
+ * per-client GET/MGET bytes inside dplusSpeculateBatch). */
 void dplusRecomputeSpecAclOk(struct client *c);
 void dplusOnAclRulesChanged(void);
 /* F6: called when module command-result SUCCESS listener count transitions. */
@@ -211,6 +225,10 @@ void dplusReclaimRetired(void);
 void dplusForceReclaimAll(void);
 size_t dplusLimboPeak(void);
 int dplusDebugHoldNextReader(long long usec);
+int dplusDebugForceNextMgetValidationMiss(void);
+int dplusDebugForceNextScanValidationMiss(void);
+int dplusDebugArmSkipMultiKeyExclusive(void);
+int dplusDebugConsumeSkipMultiKeyExclusive(void);
 int dplusDebugPinReader(uint64_t *epoch);
 int dplusDebugUnpinReader(void);
 void dplusDebugEpochStats(uint64_t stats[8]);

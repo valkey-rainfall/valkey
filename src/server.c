@@ -4015,10 +4015,12 @@ void call(client *c, int flags) {
     }
 
     /* D+ Read-Side: Exclusive mode for commands that require full atomicity.
-     * Normal writes (SET/DEL/EXPIRE) are safe — the sharded version bump
-     * invalidates concurrent speculative reads. Exclusive mode is only for
-     * multi-key atomic operations (EVAL/EXEC/KEYS/FLUSH/DEBUG) where a
-     * partial read mid-operation could observe inconsistent cross-key state.
+     * Single-key writes are safe — the sharded version bump invalidates a
+     * concurrent speculative read. Every top-level write command declaring
+     * multiple keys must drain readers around the whole command; per-shard
+     * validation alone cannot distinguish a stable intermediate state inside
+     * an atomic MSET-like operation. EVAL/EXEC and global operations retain
+     * their explicit gates because their key set may be dynamic or implicit.
      *
      * We check nesting depth (server.execution_nesting) to avoid redundant
      * enter/leave for commands called from within EVAL/EXEC (they're already
@@ -4036,10 +4038,20 @@ void call(client *c, int flags) {
                                      (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
                                       !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
                                       !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
+        int dplus_multi_key_write = 0;
+        if (c->cmd->flags & CMD_WRITE) {
+            getKeysResult keys;
+            initGetKeysResult(&keys);
+            dplus_multi_key_write = getKeysFromCommand(c->cmd, c->argv, c->argc, &keys) > 1;
+            getKeysFreeResult(&keys);
+            if (dplus_multi_key_write && dplusDebugConsumeSkipMultiKeyExclusive())
+                dplus_multi_key_write = 0;
+        }
         if (proc == evalCommand || proc == evalShaCommand ||
             proc == fcallCommand || proc == execCommand ||
             proc == keysCommand || proc == flushdbCommand ||
-            proc == flushallCommand || (proc == debugCommand && !dplus_epoch_debug_hook)) {
+            proc == flushallCommand || dplus_multi_key_write ||
+            (proc == debugCommand && !dplus_epoch_debug_hook)) {
             dplusExclusiveEnter();
             dplus_exclusive = 1;
         }
