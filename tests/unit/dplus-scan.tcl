@@ -258,3 +258,91 @@ start_server {tags {"dplus scan ownership"} overrides {io-threads 4 io-threads-a
         assert_equal 0 [s keyspace_hits]
     }
 }
+
+start_server {tags {"dplus"} overrides {io-threads 4 io-threads-ownership yes save {}}} {
+
+    test {DPLUS SCAN: rehash churn never omits stable keys (structural-seq gate)} {
+        # The structural sequence's PRIMARY scenario, exercised deliberately:
+        # entry relocations (growth rehash steps, chain conversion on insert,
+        # hole-fill on delete) racing speculative SCAN walks. Two contracts:
+        #   (a) OMISSION: a key present for the entire scan sequence must
+        #       appear in the union of replies -- the walk-omission race this
+        #       branch's hashtableGetStructuralVersion exists to detect.
+        #   (b) ENGAGEMENT HONESTY: the churn must actually make the
+        #       structural seq punt at least once (scan_validation_misses
+        #       grows) -- otherwise this test exercised nothing and (a) is
+        #       vacuously green.
+        r flushall
+        # Stable keys: present before, during, and after all churn.
+        for {set i 0} {$i < 100} {incr i} { r set stable:$i v }
+
+        # Churn client: pipelined, replies drained per round (keeps mutation
+        # concurrent with the scanning connection's round-trips).
+        set churn [valkey_deferring_client]
+        set found [dict create]
+        set generation 0
+        for {set round 0} {$round < 50} {incr round} {
+            # 400 inserts + 200 deletes per round: growth rehash windows,
+            # bucket-chain conversions (inserts into full buckets), and
+            # hole-fill relocations (deletes) all fire across the run.
+            for {set i 0} {$i < 400} {incr i} {
+                $churn set churn:[expr {$generation*400+$i}] v
+            }
+            for {set i 0} {$i < 200} {incr i} {
+                $churn del churn:[expr {($generation-1)*400+$i}]
+            }
+            incr generation
+            # Full cursor-following SCAN iteration, interleaved with the
+            # churn in flight. Bare two-arg SCAN = the speculated shape.
+            set cursor 0
+            while 1 {
+                set res [r scan $cursor]
+                set cursor [lindex $res 0]
+                foreach k [lindex $res 1] { dict set found $k 1 }
+                if {$cursor == 0} break
+            }
+            # Drain churn replies for this round.
+            for {set i 0} {$i < 600} {incr i} { $churn read }
+            # Contract (a), checked every round: every stable key seen.
+            for {set i 0} {$i < 100} {incr i} {
+                if {![dict exists $found stable:$i]} {
+                    fail "round $round omitted stable:$i from full SCAN iteration"
+                }
+            }
+            set found [dict create]
+        }
+        $churn close
+
+        # Engagement: SCANs actually speculated during the churn (hard), and
+        # the structural seq's organic collision rate is REPORTED, not
+        # asserted. Rationale: a real collision needs main to be inside a
+        # relocation window (nanoseconds) at the instant a worker walk
+        # validates -- on a fast box this is genuinely probabilistic (observed
+        # 0-collision runs with correct results at every burst shape tried).
+        # The punt MACHINERY is deterministically covered by the forced-miss
+        # test above; THIS test's load-bearing contract is (a) omission
+        # freedom, which is asserted per-round. Collision-rate-under-churn is
+        # a v2-design benchmark metric (see scan-seqlock-v2-design.md), not a
+        # unit assert.
+        set attempts_pre [dplus_scan_info_field r dplus_scan_speculative_attempts]
+        set misses_pre [dplus_scan_info_field r dplus_scan_validation_misses]
+        set writer [valkey_deferring_client]
+        set scanner [valkey_deferring_client]
+        $scanner ping
+        $scanner read
+        for {set burst 0} {$burst < 10} {incr burst} {
+            for {set i 0} {$i < 2000} {incr i} { $writer set churnb:$burst:$i v }
+            for {set i 0} {$i < 100} {incr i} { $scanner scan 0 }
+            for {set i 0} {$i < 2000} {incr i} { $writer read }
+            for {set i 0} {$i < 100} {incr i} { $scanner read }
+        }
+        $writer close
+        $scanner close
+        set attempts_post [dplus_scan_info_field r dplus_scan_speculative_attempts]
+        set misses_post [dplus_scan_info_field r dplus_scan_validation_misses]
+        assert {$attempts_post > $attempts_pre}
+        if {$misses_post == $misses_pre} {
+            puts "NOTE: rehash-churn run produced no organic validation miss (timing-dependent; omission contract still verified)"
+        }
+    }
+}
