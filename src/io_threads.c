@@ -828,8 +828,50 @@ int updateIOThreads(const char **err) {
                      * non-idle -- the reply wedges forever (B11 lost-reply).
                      * Mirror that release here. Workers for these slots are
                      * quiesced under exclusive mode, so a plain store is
-                     * sufficient. */
-                    if (c->io_read_state == CLIENT_COMPLETED_IO) c->io_read_state = CLIENT_IDLE;
+                     * sufficient.
+                     *
+                     * pending_read gate: COMPLETED_IO can ALSO mean a fresh
+                     * owned handoff whose JOB_RES is still queued in main's
+                     * MPSC (a readable can fire between waitForClientIO and
+                     * disownClient's lock acquire -- same window as the
+                     * disownClient assert race, found by TSan). That handoff
+                     * still has pending_read=1 (cleared only when main
+                     * consumes it in processClientIOReadsDone); resetting it
+                     * here would drop the parsed batch and fail the consume
+                     * assert. The mid-execution case has pending_read=0. */
+                    /* pending_read gate: COMPLETED_IO can ALSO mean a fresh
+                     * owned handoff whose JOB_RES is still queued in main's
+                     * MPSC (a readable can fire between waitForClientIO and
+                     * disownClient's lock acquire -- same window as the
+                     * disownClient assert race, found by TSan). That handoff
+                     * still has pending_read=1 (cleared only when main
+                     * consumes it in processClientIOReadsDone); resetting it
+                     * here would drop the parsed batch and fail the dequeue
+                     * assert (io_threads.c JOB_RES_READ_CLIENT expects
+                     * COMPLETED_IO -- observed exactly so when this gate was
+                     * experimentally reverted under TSan). The mid-execution
+                     * case has pending_read=0. */
+                    if (c->io_read_state == CLIENT_COMPLETED_IO && !c->flag.pending_read)
+                        c->io_read_state = CLIENT_IDLE;
+                    /* ORPHANED-BUFFER FLUSH (B11 wedge #3, found by TSan
+                     * soak): an owned client whose replies sit in c->buf
+                     * when its worker is removed can end up with BOTH IO
+                     * states quiescent and NO write path armed -- disown
+                     * only re-arms a writer for the WAITING_WRITABLE case,
+                     * worker-side delivery died with the worker, and a peer
+                     * that sends nothing more never generates an event. The
+                     * bytes sit forever (observed live: obl>0, events=r,
+                     * idle=1010s). Queue it for main's pending-write pass.
+                     * Excluded on purpose: COMPLETED_IO write (its queued
+                     * JOB_RES reaches processClientIOWriteDone, which
+                     * delivers via the legacy path now that owner_tid==0)
+                     * and an already-armed main write handler (the
+                     * had_waiting_output install above). */
+                    if (c->conn && clientHasPendingReplies(c) &&
+                        c->io_write_state == CLIENT_IDLE &&
+                        !c->flag.pending_write && !connHasWriteHandler(c->conn)) {
+                        putClientInPendingWriteQueue(c);
+                    }
                 }
             }
         }

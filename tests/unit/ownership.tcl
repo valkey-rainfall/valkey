@@ -634,12 +634,14 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
             [dplus_info_field r dplus_retired_entries] == 0 &&
             [dplus_info_field r dplus_epoch_debug_reader_holding] == 0
         } else { fail "eviction pass left retirement backlog: [r info dplus]" }
-        # Eviction is incremental (time-budgeted passes driven by command
-        # processing), so convergence to the cap is asynchronous -- poll
-        # instead of asserting the instantaneous value. Found under TSan
-        # (~10x slowdown): the pass had reclaimed the whole backlog
-        # (retired==0) but was still ~2.5MB above the cap at this line.
+        # Eviction is incremental (time-budgeted passes driven by COMMAND
+        # processing), so convergence to the cap is asynchronous AND needs
+        # traffic to drive it -- INFO polling alone can stall ~2KB above the
+        # cap indefinitely (observed under TSan; the pass had reclaimed the
+        # whole backlog but nothing re-triggered performEvictions). Poll with
+        # a tiny probe write, the way production traffic drives eviction.
         wait_for_condition 100 100 {
+            [r set c8:probe x] eq "OK" &&
             [s used_memory] <= [expr {10*1024*1024}]
         } else { fail "eviction never converged below maxmemory: [s used_memory] bytes" }
         assert {![string match "*errorstat_OOM*" [r info errorstats]]}

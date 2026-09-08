@@ -7147,17 +7147,32 @@ int postponeClientRead(client *c) {
  * worker cannot be inside any callback for this (or any) client on that
  * loop. The worker may still hold the client via a QUEUED cross-thread job
  * (io_read_state/io_write_state PENDING_IO) — callers must have waited for
- * IDLE/COMPLETED first (we assert). */
+ * IDLE/COMPLETED first. The assert enforcing this runs UNDER the loop lock:
+ * before the lock, a live pump can transiently set PENDING_IO (owned inline
+ * read mid-callback) even after the caller's quiesce, and that transient is
+ * legal — the lock is what separates it from a genuinely queued job. */
 void disownClient(client *c) {
     if (c->owner_tid == 0) return;
     serverAssert(inMainThread());
     int had_waiting_output = clientWriteIsWaiting(c) && clientHasPendingReplies(c);
     if (clientWriteIsWaiting(c)) b13CancelOwnerWriteHandler(c);
-    serverAssert(c->io_read_state != CLIENT_PENDING_IO && c->io_write_state != CLIENT_PENDING_IO);
 
     aeEventLoop *worker_loop = ioGetWorkerEventLoop(c->owner_tid);
     serverAssert(worker_loop != NULL);
     aeAcquireLock(worker_loop);
+    /* State check UNDER the lock -- not before it. The worker's pump stays
+     * live right up to this acquire, so a readable can fire on this client's
+     * fd between any caller-side quiesce (waitForClientIO) and here, putting
+     * io_read_state at PENDING_IO transiently (the owned inline read is
+     * mid-callback) -- checking before the lock races that window (found by
+     * TSan in the CONFIG SET io-threads shrink path, B11). Acquiring the
+     * lock excludes mid-callback: the pump holds it across poll+dispatch.
+     * The states that legally survive into here are IDLE and COMPLETED_IO
+     * (a queued owned handoff publishes COMPLETED_IO before enqueueing --
+     * see ioThreadReadQueryFromClient's done path); PENDING_IO under the
+     * lock means a cross-thread job is still queued for a worker, and
+     * moving the fd now would let that job race main's ownership. */
+    serverAssert(c->io_read_state != CLIENT_PENDING_IO && c->io_write_state != CLIENT_PENDING_IO);
     /* Under the lock: the worker is not dispatching. Move the fd. */
     if (c->conn && connHasReadHandler(c->conn)) {
         connSetReadHandler(c->conn, NULL); /* deletes from worker_loop (conn->el) */
@@ -7211,7 +7226,23 @@ void processClientIOReadsDone(client *c) {
             (cl)->io_read_state = CLIENT_IDLE;                              \
         }                                                                   \
     } while (0)
-    if (c->owner_tid == 0) c->io_read_state = CLIENT_IDLE;
+    if (c->owner_tid == 0) {
+        c->io_read_state = CLIENT_IDLE;
+        /* B11 wedge #3 (disowned-orphan flush): a handoff whose batch was
+         * FULLY consumed speculatively on the worker arrives here with the
+         * replies already written into c->buf and ZERO commands left for
+         * main -- nothing below will call addReply, so nothing schedules
+         * delivery. While owned, the owner's event loop delivered such
+         * bytes; if the client was disowned while this handoff sat queued
+         * (runtime io-threads shrink), the owner is gone and the bytes
+         * orphan forever (observed live: obl>0, both IO states idle, no
+         * write handler, peer idle -- reply never arrives). Schedule main
+         * delivery exactly like addReply's first-reply edge would. */
+        if (clientHasPendingReplies(c) && !c->flag.pending_write &&
+            c->io_write_state == CLIENT_IDLE && c->conn && !connHasWriteHandler(c->conn)) {
+            putClientInPendingWriteQueue(c);
+        }
+    }
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) {
