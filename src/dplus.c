@@ -867,8 +867,10 @@ static int dplusSpeculateSequentialQueue(client *c,
 int dplusSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
-    /* Early exit: speculation disabled (single-threaded or cluster mode). */
-    if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
+    /* Early exit: speculation disabled (single-threaded, cluster mode, or
+     * the io-threads-speculation sizing knob — the knob isolates ownership's
+     * event-loop contribution from speculative execution in benchmarks). */
+    if (server.io_threads_num <= 1 || server.cluster_enabled || !server.io_threads_speculation) return 0;
 
     /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
      * execute only at EXEC — speculating a GET here would execute it early
