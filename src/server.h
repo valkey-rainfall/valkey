@@ -727,6 +727,12 @@ typedef enum {
                                                  * LATENCY_HISTOGRAM_MAX_VALUE range. Value quantization within the range will thus be no larger than 1/100th \
                                                  * (or 1%) of any value. The total size per histogram should sit around 40 KiB Bytes. */
 
+/* Pipeline depth histogram: number of commands a client sent in a single
+ * read event. A single process-wide histogram (not per-client). */
+#define PIPELINE_DEPTH_HISTOGRAM_MIN_VALUE 1L
+#define PIPELINE_DEPTH_HISTOGRAM_MAX_VALUE 1000000L /* Deeper batches are recorded as the max. */
+#define PIPELINE_DEPTH_HISTOGRAM_PRECISION 2
+
 /* Busy module flags, see busy_module_yield_flags */
 #define BUSY_MODULE_YIELD_NONE (0)
 #define BUSY_MODULE_YIELD_EVENTS (1 << 0)
@@ -1984,6 +1990,9 @@ struct valkeyServer {
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */
+    struct hdr_histogram *pipeline_depth_histogram;    /* Distribution of commands per client read event. */
+    long long pipeline_depth_current;                  /* Commands dispatched so far in the read event being drained.
+                                                        * Main thread only; saved/restored around nested drains. */
     long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
     long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
@@ -3016,6 +3025,7 @@ void setDeferredSetLen(client *c, void *node, long length);
 void setDeferredAttributeLen(client *c, void *node, long length);
 void setDeferredPushLen(client *c, void *node, long length);
 int processInputBuffer(client *c);
+int processReadEventInputBuffer(client *c);
 void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip);
 void readQueryFromClient(connection *conn);
 int prepareClientToWrite(client *c);
@@ -3617,6 +3627,9 @@ void bytesToHuman(char *s, size_t size, unsigned long long n);
 void enterExecutionUnit(int update_cached_time, long long us);
 void exitExecutionUnit(void);
 void resetServerStats(void);
+void initPipelineDepthHistogram(void);
+void resetPipelineDepthHistogram(void);
+sds fillPercentileDistributionPipelineDepth(sds info);
 void monitorActiveDefrag(void);
 void defragWhileBlocked(void);
 const char *evictPolicyToString(void);

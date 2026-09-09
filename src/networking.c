@@ -43,6 +43,7 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "hdr_histogram.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -3993,6 +3994,9 @@ int processCommandAndResetClient(client *c) {
     int deadclient = 0;
     client *old_client = server.current_client;
     server.current_client = c;
+    /* Counts top-level commands only: nested calls made by scripts and modules
+     * go through call() directly and never reach here. */
+    server.pipeline_depth_current++;
     if (processCommand(c) == C_OK) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
@@ -4015,6 +4019,40 @@ int processCommandAndResetClient(client *c) {
     return deadclient ? C_ERR : C_OK;
 }
 
+/* Pipeline depth = number of top-level commands dispatched while draining the
+ * input a single read event delivered. Bracket a drain with these two calls.
+ * Main thread only. The counter is saved and restored so a nested drain
+ * (processEventsWhileBlocked during a slow command) records its own depth
+ * without disturbing the outer one. Reads that complete no command (a partial
+ * command spanning reads) record nothing: that is a bytes-per-command signal,
+ * not a depth signal. */
+static inline long long pipelineDepthBegin(void) {
+    long long saved = server.pipeline_depth_current;
+    server.pipeline_depth_current = 0;
+    return saved;
+}
+
+static inline void pipelineDepthEnd(int is_primary, long long saved) {
+    long long depth = server.pipeline_depth_current;
+    server.pipeline_depth_current = saved;
+    /* The replication stream is not a client pipeline. */
+    if (depth <= 0 || is_primary) return;
+    if (depth > PIPELINE_DEPTH_HISTOGRAM_MAX_VALUE) depth = PIPELINE_DEPTH_HISTOGRAM_MAX_VALUE;
+    hdr_record_value(server.pipeline_depth_histogram, depth);
+}
+
+/* processPendingCommandAndInputBuffer() for a client whose read event just
+ * completed, recording the read's pipeline depth. Not used for resumed
+ * blocked clients: their commands were already counted when first read.
+ * The client may have been freed when this returns C_ERR, so nothing about it
+ * is read after the drain. */
+int processReadEventInputBuffer(client *c) {
+    int is_primary = c->flag.primary;
+    long long saved = pipelineDepthBegin();
+    int ret = processPendingCommandAndInputBuffer(c);
+    pipelineDepthEnd(is_primary, saved);
+    return ret;
+}
 
 /* This function will execute any fully parsed commands pending on
  * the client. Returns C_ERR if the client is no longer valid after executing
@@ -4432,10 +4470,14 @@ void readQueryFromClient(connection *conn) {
 
     bool repeat = false;
     int iter = 0;
+    int is_primary = c->flag.primary;
     do {
         bool full_read = readToQueryBuf(c);
         if (handleReadResult(c) == C_OK) {
-            if (processInputBuffer(c) == C_ERR) return;
+            long long saved = pipelineDepthBegin();
+            int ret = processInputBuffer(c);
+            pipelineDepthEnd(is_primary, saved);
+            if (ret == C_ERR) return;
             trimCommandQueue(c);
         }
         repeat = (c->flag.primary &&
@@ -6658,7 +6700,7 @@ int processClientIOReadsDone(client *c) {
     int ret = addCommandToBatchAndProcessIfFull(c);
     /* If the command was not added to the commands batch, process it immediately */
     if (ret == C_ERR) {
-        if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
+        if (processReadEventInputBuffer(c) == C_OK) beforeNextClient(c);
     }
     return needs_post_read_update;
 }

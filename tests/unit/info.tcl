@@ -41,6 +41,68 @@ start_server {tags {"info" "external:skip" "debug_defrag:skip"}} {
             assert_match {} [latency_percentiles_usec set]
         }
 
+        test {pipeline depth: single commands record depth 1} {
+            r config resetstat
+            r CONFIG SET latency-tracking-info-percentiles "0.0 50.0 100.0"
+            # Every command so far was sent on its own, including the INFO
+            # that reads the field, so every recorded read has depth 1.
+            r set a b
+            r get a
+            assert_match {*p0=1,p50=1,p100=1*} [s pipeline_depth_percentiles]
+        }
+
+        test {pipeline depth: a pipelined batch records its depth} {
+            r config resetstat
+            r CONFIG SET latency-tracking-info-percentiles "0.0 50.0 100.0"
+            set rd [valkey_deferring_client]
+            set depth 100
+            # Write the whole batch with one write so the server sees it in as
+            # few reads as the kernel delivers. The exact split is not
+            # deterministic, so assert bounds on the max rather than equality.
+            set buf ""
+            for {set i 0} {$i < $depth} {incr i} {
+                append buf "*2\r\n\$4\r\nINCR\r\n\$1\r\nx\r\n"
+            }
+            $rd write $buf
+            $rd flush
+            for {set i 0} {$i < $depth} {incr i} {
+                $rd read
+            }
+            regexp {p100=(\d+)} [s pipeline_depth_percentiles] -> max
+            assert {$max >= 2}
+            assert {$max <= $depth}
+            $rd close
+        }
+
+        test {pipeline depth: nested calls do not count} {
+            r config resetstat
+            r CONFIG SET latency-tracking-info-percentiles "0.0 50.0 100.0"
+            # One EVAL doing 100 inner calls is one command in one read.
+            r eval {for i=1,100 do redis.call('incr', 'x') end return 1} 0
+            assert_match {*p0=1,p50=1,p100=1*} [s pipeline_depth_percentiles]
+        }
+
+        test {pipeline depth: reset by CONFIG RESETSTAT} {
+            r CONFIG SET latency-tracking-info-percentiles "0.0 50.0 100.0"
+            set rd [valkey_deferring_client]
+            set buf ""
+            for {set i 0} {$i < 50} {incr i} {
+                append buf "*1\r\n\$4\r\nPING\r\n"
+            }
+            $rd write $buf
+            $rd flush
+            for {set i 0} {$i < 50} {incr i} {
+                $rd read
+            }
+            $rd close
+            regexp {p100=(\d+)} [s pipeline_depth_percentiles] -> max
+            assert {$max >= 2}
+            r config resetstat
+            # Only the INFO that reads the field has been recorded since.
+            assert_match {*p0=1,p50=1,p100=1*} [s pipeline_depth_percentiles]
+            r CONFIG SET latency-tracking-info-percentiles "50.0 99.0 99.9"
+        }
+
         test {latencystats: bad configure percentiles} {
             r config resetstat
             set configlatencyline [r config get latency-tracking-info-percentiles]

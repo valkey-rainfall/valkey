@@ -2910,6 +2910,7 @@ void resetServerStats(void) {
     server.stat_io_reads_processed = 0;
     server.stat_total_reads_processed = 0;
     server.stat_io_writes_processed = 0;
+    resetPipelineDepthHistogram();
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
     server.stat_poll_processed_by_io_threads = 0;
@@ -3031,6 +3032,7 @@ void initServer(void) {
     server.current_client = NULL;
     server.errors = raxNew();
     server.execution_nesting = 0;
+    initPipelineDepthHistogram();
     server.clients = listCreate();
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
@@ -6104,6 +6106,34 @@ sds fillPercentileDistributionLatencies(sds info, const char *histogram_name, st
     return info;
 }
 
+void initPipelineDepthHistogram(void) {
+    if (server.pipeline_depth_histogram) return;
+    hdr_init(PIPELINE_DEPTH_HISTOGRAM_MIN_VALUE, PIPELINE_DEPTH_HISTOGRAM_MAX_VALUE, PIPELINE_DEPTH_HISTOGRAM_PRECISION,
+             &server.pipeline_depth_histogram);
+    server.pipeline_depth_current = 0;
+}
+
+void resetPipelineDepthHistogram(void) {
+    if (server.pipeline_depth_histogram) hdr_reset(server.pipeline_depth_histogram);
+}
+
+/* Fill the percentile distribution of commands per read event. Reuses the
+ * latency-tracking-info-percentiles list; values are command counts. */
+sds fillPercentileDistributionPipelineDepth(sds info) {
+    info = sdscatfmt(info, "pipeline_depth_percentiles:");
+    for (int j = 0; j < server.latency_tracking_info_percentiles_len; j++) {
+        char fbuf[128];
+        size_t len = snprintf(fbuf, sizeof(fbuf), "%f", server.latency_tracking_info_percentiles[j]);
+        trimDoubleString(fbuf, len);
+        info = sdscatprintf(info, "p%s=%lld", fbuf,
+                            (long long)hdr_value_at_percentile(server.pipeline_depth_histogram,
+                                                               server.latency_tracking_info_percentiles[j]));
+        if (j != server.latency_tracking_info_percentiles_len - 1) info = sdscatlen(info, ",", 1);
+    }
+    info = sdscatprintf(info, "\r\n");
+    return info;
+}
+
 const char *replstateToString(int replstate) {
     switch (replstate) {
     case REPLICA_STATE_WAIT_BGSAVE_START:
@@ -6787,6 +6817,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,
                 "instantaneous_eventloop_cycles_per_sec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_CYCLE),
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION)));
+        info = fillPercentileDistributionPipelineDepth(info);
         info = genValkeyInfoStringACLStats(info);
     }
 
