@@ -1918,6 +1918,10 @@ extern int ProcessingEventsWhileBlocked;
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* Leaving the command-processing part of the iteration: whatever follows
+     * (the poll wait, cron, time events) is not charged to a command. */
+    invalidateCommandClockChain();
+
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
@@ -2141,8 +2145,10 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
             latencyAddSampleIfNeeded("module-acquire-GIL", latency);
             latencyTraceIfNeeded(server, module_acquire_gil, latency);
         }
-        /* Set the eventloop start time. */
+        /* Set the eventloop start time. The same sample starts the clock for
+         * the first command of this iteration. */
         server.el_start = getMonotonicUs();
+        seedCommandClockChain(server.el_start);
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
@@ -4052,6 +4058,37 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
  * preventCommandReplication(client *c);
  *
  */
+
+/* Chained command clock.
+ *
+ * A command's duration is the main-thread time from the end of the previous
+ * top-level command in this event-loop iteration to the end of this one.
+ * Everything main does on a command's behalf between those two points is
+ * part of it: reading and parsing its request, prefetching its keys,
+ * evicting to make room for it, the replication and stats bookkeeping of
+ * the command before it, and the dispatch preamble that admits it. The
+ * clock is therefore sampled once per command: the sample that ends command
+ * N is the start of command N+1.
+ *
+ * The chain is seeded from the sample afterSleep() already takes when the
+ * event loop wakes, and invalidated when the loop is about to leave the
+ * command-processing part of an iteration (beforeSleep(), before the poll
+ * wait and before cron/time events run), so that time spent waiting for
+ * events or in periodic work is never charged to a command. Nested calls
+ * (scripts, MULTI/EXEC bodies) and fake clients never use or refresh the
+ * chain; they keep their own two reads. */
+static monotime chained_call_end = 0;
+static int chained_call_valid = 0;
+
+void invalidateCommandClockChain(void) {
+    chained_call_valid = 0;
+}
+
+void seedCommandClockChain(monotime now) {
+    chained_call_end = now;
+    chained_call_valid = 1;
+}
+
 void call(client *c, int flags) {
     if (bgIteration_blockClientIfRequired(c)) return;
 
@@ -4104,16 +4141,26 @@ void call(client *c, int flags) {
      * UNIX time snapshot for the execution unit) is derived from the same
      * monotonic sample used to measure the command's duration, instead of
      * being a separate clock read. The two values are identical to what two
-     * back-to-back reads would have produced. */
+     * back-to-back reads would have produced.
+     *
+     * A top-level command from a real client starts where the previous
+     * top-level command of this event-loop iteration ended (see the chained
+     * command clock comment above). */
     const int hw_clock = (monotonicGetType() == MONOTONIC_CLOCK_HW);
+    const int chain_eligible = (server.execution_nesting == 0) && !c->flag.fake;
     monotime monotonic_start = 0;
     ustime_t call_timer;
     if (hw_clock) {
-        monotonic_start = getMonotonicUs();
+        if (chain_eligible && chained_call_valid)
+            monotonic_start = chained_call_end;
+        else
+            monotonic_start = getMonotonicUs();
         call_timer = ustimeFromMonotonic(monotonic_start);
     } else {
         call_timer = ustime();
     }
+    /* Consumed (or stale). Nested calls made by this command never chain. */
+    chained_call_valid = 0;
     enterExecutionUnit(1, call_timer);
 
     /* setting the CLIENT_EXECUTING_COMMAND flag so we will avoid
@@ -4173,12 +4220,19 @@ void call(client *c, int flags) {
     if (!c->flag.blocked) c->flag.executing_command = 0;
 
     /* Measure the duration with the monotonic clock when it is a cheap hardware
-     * clock, falling back to the non-monotonic time of day otherwise. */
+     * clock, falling back to the non-monotonic time of day otherwise. The end
+     * sample becomes the start of the next command in this run. */
     ustime_t duration;
-    if (hw_clock)
-        duration = getMonotonicUs() - monotonic_start;
-    else
+    if (hw_clock) {
+        monotime monotonic_end = getMonotonicUs();
+        duration = monotonic_end - monotonic_start;
+        if (chain_eligible) {
+            chained_call_end = monotonic_end;
+            chained_call_valid = 1;
+        }
+    } else {
         duration = ustime() - call_timer;
+    }
 
     valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
     c->duration += duration;
