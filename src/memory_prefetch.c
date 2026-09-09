@@ -324,6 +324,9 @@ static void prefetchCommands(void) {
 void processClientsCommandsBatch(void) {
     if (!batch || batch->client_count == 0) return;
 
+    /* The I/O handoff and the batch prefetch precede the first command of this run. */
+    invalidateCommandClockChain();
+
     /* If executed_commands is not 0,
      * it means that we are in the middle of processing a batch and this is a recursive call */
     if (batch->executed_commands == 0) {

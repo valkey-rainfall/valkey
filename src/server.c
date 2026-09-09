@@ -1918,6 +1918,9 @@ extern int ProcessingEventsWhileBlocked;
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* An event-loop iteration boundary is never "just the next command". */
+    invalidateCommandClockChain();
+
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
@@ -4052,6 +4055,33 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
  * preventCommandReplication(client *c);
  *
  */
+
+/* Chained command clock.
+ *
+ * When the main thread executes a run of top-level commands back to back
+ * (a pipelined client's parsed queue, or a prefetch batch), the clock sample
+ * that ends one command's duration is reused as the start of the next
+ * command's duration, so each command in the run costs one clock read
+ * instead of two. The bookkeeping between the two commands (reply
+ * accounting, client reset, popping the next parsed command, the
+ * processCommand() preamble) is thereby attributed to the following
+ * command's duration instead of to nobody.
+ *
+ * The chain is only valid while nothing but that per-command bookkeeping
+ * has happened since the sample was taken. Every code path that can do
+ * more than that between two commands (a read(2), an event-loop iteration,
+ * eviction, serving blocked clients, a per-client key prefetch pass, a
+ * large-argument parse, the between-clients hook) calls
+ * invalidateCommandClockChain() so the next command takes a fresh sample.
+ * Nested calls (scripts, MULTI/EXEC bodies) and fake clients never use or
+ * refresh the chain. */
+static monotime chained_call_end = 0;
+static int chained_call_valid = 0;
+
+void invalidateCommandClockChain(void) {
+    chained_call_valid = 0;
+}
+
 void call(client *c, int flags) {
     if (bgIteration_blockClientIfRequired(c)) return;
 
@@ -4104,16 +4134,26 @@ void call(client *c, int flags) {
      * UNIX time snapshot for the execution unit) is derived from the same
      * monotonic sample used to measure the command's duration, instead of
      * being a separate clock read. The two values are identical to what two
-     * back-to-back reads would have produced. */
+     * back-to-back reads would have produced.
+     *
+     * A top-level command from a real client reuses the sample that ended the
+     * previous command of the current run when the chain is still valid (see
+     * the chained command clock comment above). */
     const int hw_clock = (monotonicGetType() == MONOTONIC_CLOCK_HW);
+    const int chain_eligible = (server.execution_nesting == 0) && !c->flag.fake;
     monotime monotonic_start = 0;
     ustime_t call_timer;
     if (hw_clock) {
-        monotonic_start = getMonotonicUs();
+        if (chain_eligible && chained_call_valid)
+            monotonic_start = chained_call_end;
+        else
+            monotonic_start = getMonotonicUs();
         call_timer = ustimeFromMonotonic(monotonic_start);
     } else {
         call_timer = ustime();
     }
+    /* Consumed (or stale). Nested calls made by this command never chain. */
+    chained_call_valid = 0;
     enterExecutionUnit(1, call_timer);
 
     /* setting the CLIENT_EXECUTING_COMMAND flag so we will avoid
@@ -4173,12 +4213,19 @@ void call(client *c, int flags) {
     if (!c->flag.blocked) c->flag.executing_command = 0;
 
     /* Measure the duration with the monotonic clock when it is a cheap hardware
-     * clock, falling back to the non-monotonic time of day otherwise. */
+     * clock, falling back to the non-monotonic time of day otherwise. The end
+     * sample becomes the start of the next command in this run. */
     ustime_t duration;
-    if (hw_clock)
-        duration = getMonotonicUs() - monotonic_start;
-    else
+    if (hw_clock) {
+        monotime monotonic_end = getMonotonicUs();
+        duration = monotonic_end - monotonic_start;
+        if (chain_eligible) {
+            chained_call_end = monotonic_end;
+            chained_call_valid = 1;
+        }
+    } else {
         duration = ustime() - call_timer;
+    }
 
     valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
     c->duration += duration;

@@ -405,6 +405,9 @@ void handleClientsBlockedOnKeys(void) {
     if (in_handling_blocked_clients) return;
     in_handling_blocked_clients = 1;
 
+    /* Serving blocked clients is not per-command bookkeeping. */
+    invalidateCommandClockChain();
+
     /* This function is called only when also_propagate is in its basic state
      * (i.e. not from call(), module context, etc.) */
     serverAssert(server.also_propagate.numops == 0);

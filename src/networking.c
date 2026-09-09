@@ -2379,6 +2379,9 @@ void beforeNextClient(client *c) {
      * So whenever we change the code here we need to consider if we need this change on module
      * blocked client as well */
 
+    /* Query buffer trimming and write handoff sit between two clients' runs. */
+    invalidateCommandClockChain();
+
     /* Trim the query buffer to the current position. */
     if (isReplicatedClient(c)) {
         /* If the client is replicated, trim the querybuf to repl_applied,
@@ -4251,6 +4254,9 @@ static void prefetchCommandQueueKeys(client *c) {
     }
     if (num_keys <= 1) return; /* No point to prefetch a single key */
 
+    /* A batch of memory-bound lookups is about to run before the next command. */
+    invalidateCommandClockChain();
+
     /* Batch-lookup the keys. */
     int not_complete_count;
     do {
@@ -4322,6 +4328,8 @@ int processInputBuffer(client *c) {
 
         /* We are finally ready to execute the command. */
         c->flag.pending_command = 1;
+        /* Parsing or copying a large argument on this thread is not per-command bookkeeping. */
+        if (c->argv_len_sum >= PROTO_MBULK_BIG_ARG) invalidateCommandClockChain();
         if (processCommandAndResetClient(c) == C_ERR) {
             /* If the client is no longer valid, we avoid exiting this
              * loop and trimming the client buffer later. So we return
@@ -4435,6 +4443,8 @@ void readQueryFromClient(connection *conn) {
     do {
         bool full_read = readToQueryBuf(c);
         if (handleReadResult(c) == C_OK) {
+            /* A read(2) just happened; the next command starts from a fresh sample. */
+            invalidateCommandClockChain();
             if (processInputBuffer(c) == C_ERR) return;
             trimCommandQueue(c);
         }

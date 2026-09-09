@@ -465,6 +465,9 @@ int performEvictions(void) {
 
     unsigned long eviction_time_limit_us = evictionTimeLimitUs();
 
+    /* Eviction time must not be attributed to the command that follows it. */
+    invalidateCommandClockChain();
+
     latencyStartMonitor(latency);
 
     monotime evictionTimer;
