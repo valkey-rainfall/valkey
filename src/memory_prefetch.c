@@ -12,6 +12,8 @@
 #include "server.h"
 #include "io_threads.h"
 
+extern int ProcessingEventsWhileBlocked;
+
 typedef enum {
     PREFETCH_ENTRY,        /* Initial state, prefetch entries associated with the given key's hash */
     PREFETCH_VALUE,        /* prefetch the value object of the entry found in the previous step */
@@ -285,7 +287,7 @@ static void resetCommandsBatch(void) {
 /* Prefetch command-related data:
  * 1. Prefetch the command arguments allocated by the I/O thread to bring them closer to the L1 cache.
  * 2. Prefetch the keys and values for all commands in the current batch from the main hashtable. */
-static void prefetchCommands(void) {
+static void prefetchArgvs(void) {
     /* Prefetch argv's for all clients */
     for (size_t i = 0; i < batch->client_count; i++) {
         client *c = batch->clients[i];
@@ -306,6 +308,10 @@ static void prefetchCommands(void) {
             }
         }
     }
+}
+
+static void prefetchCommands(void) {
+    prefetchArgvs();
 
     /* Get the keys ptrs - we do it here after the key obj was prefetched. */
     for (size_t i = 0; i < batch->key_count; i++) {
@@ -320,6 +326,338 @@ static void prefetchCommands(void) {
     }
 }
 
+/* ---- Streaming prefetch ring (main thread) --------------------------------
+ *
+ * Alternative to the fill-then-drain batch above, enabled by the hidden config
+ * `prefetch-ring`. Instead of prefetching all keys of a batch and then executing
+ * all its commands, the ring keeps up to `prefetch-batch-max-size` key lookups
+ * in flight *across* command execution: each command executed on main advances
+ * every in-flight lookup by one stage and admits the next command from the
+ * execution order (the batch's clients in order, each client's pending command
+ * then its command queue). Memory-level parallelism therefore never drops to
+ * zero between batches, and the prefetch distance is bounded by the ring depth
+ * regardless of how deep a client's pipeline is.
+ *
+ * Safety: a slot holds only (db, kvstore index, hash, stage). It never holds a
+ * pointer into the hashtable (the restart-safe stages in hashtable.c re-derive
+ * the bucket from the live table on every call) and never dereferences client
+ * memory after admission (`c` and `argv` are used purely as identity tokens to
+ * match the executing command). Execution of arbitrary commands between stages
+ * is therefore safe by construction; it can only make a prefetch useless. */
+
+typedef struct ringSlot {
+    client *c;     /* identity only, never dereferenced */
+    robj **argv;   /* identity only, never dereferenced */
+    serverDb *db;
+    int kvslot;
+    uint64_t hash;
+    uint8_t stage; /* 0 = bucket, 1 = candidates, 2 = values, 3 = done */
+} ringSlot;
+
+static struct {
+    ringSlot *slots;
+    int cap;
+    int head;
+    int count;
+    int first_live; /* offset from head of the first slot that may still need a step */
+    /* Admission cursor: the next command in execution order. */
+    client *cur_c;
+    int cur_queue_idx; /* -1 = cur_c's pending (already parsed) command; else index into cmd_queue */
+    int cur_batch_idx; /* index into batch->clients, or -1 when not walking a batch */
+    int cur_waiting;   /* cur_c's queue is exhausted but its querybuf still holds unparsed
+                        * commands (e.g. inline protocol): hold position, do not skip ahead */
+} ring;
+
+/* Index of the batch client currently being executed by processClientsCommandsBatch,
+ * so the ring can resynchronise its cursor when it loses track. */
+static int batch_exec_idx = -1;
+
+static inline ringSlot *ringSlotAt(int i) {
+    int idx = ring.head + i;
+    if (idx >= ring.cap) idx -= ring.cap;
+    return &ring.slots[idx];
+}
+#define RING_SLOT(i) (*ringSlotAt(i))
+
+static void ringReset(void) {
+    ring.head = 0;
+    ring.count = 0;
+    ring.first_live = 0;
+    ring.cur_c = NULL;
+    ring.cur_queue_idx = 0;
+    ring.cur_batch_idx = -1;
+    ring.cur_waiting = 0;
+}
+
+static void ringEnsureInit(void) {
+    int cap = server.prefetch_batch_max_size;
+    if (cap < 2) cap = 2;
+    if (ring.slots != NULL && ring.cap == cap) return;
+    if (ring.slots != NULL && ring.count > 0) return; /* resize once drained */
+    zfree(ring.slots);
+    ring.slots = zcalloc(sizeof(ringSlot) * cap);
+    ring.cap = cap;
+    ringReset();
+}
+
+/* Advance one slot by one stage. */
+static inline void ringStepSlot(ringSlot *s) {
+    if (s->stage >= 3) return;
+    hashtable *ht = kvstoreGetHashtable(s->db->keys, s->kvslot);
+    if (ht == NULL || hashtableSize(ht) == 0) {
+        s->stage = 3;
+        return;
+    }
+    switch (s->stage) {
+    case 0:
+        hashtablePrefetchBucketForHash(ht, s->hash);
+        s->stage = 1;
+        break;
+    case 1:
+        if (hashtablePrefetchCandidatesForHash(ht, s->hash) == 0) {
+            s->stage = 3;
+        } else if (server.io_threads_num >= server.min_io_threads_copy_avoid) {
+            /* Copy avoidance: main never reads the value bytes, so the entry
+             * prefetch is the last useful stage (same policy as the batch). */
+            server.stat_total_prefetch_entries++;
+            s->stage = 3;
+        } else {
+            s->stage = 2;
+        }
+        break;
+    case 2: {
+        /* Value prefetch, same policy as the batch: only when main will read
+         * the value bytes itself (no copy avoidance). */
+        if (server.io_threads_num < server.min_io_threads_copy_avoid) {
+            void *cands[4];
+            int n = hashtableGetCandidatesForHash(ht, s->hash, cands, 4);
+            for (int i = 0; i < n; i++) {
+                robj *val = cands[i];
+                if (val->encoding == OBJ_ENCODING_RAW && val->type == OBJ_STRING) valkey_prefetch(objectGetVal(val));
+            }
+        }
+        server.stat_total_prefetch_entries++;
+        s->stage = 3;
+        break;
+    }
+    default: break;
+    }
+}
+
+static inline void ringStepAll(void) {
+    for (int i = ring.first_live; i < ring.count; i++) ringStepSlot(ringSlotAt(i));
+    while (ring.first_live < ring.count && ringSlotAt(ring.first_live)->stage >= 3) ring.first_live++;
+}
+
+/* Fetch the command the cursor points at. Returns 0 if the cursor is exhausted. */
+static inline int ringCursorCommand(struct serverCommand **cmd, robj ***argv, int *argc, int *bad, int *slot) {
+    client *c = ring.cur_c;
+    if (c == NULL) return 0;
+    if (ring.cur_queue_idx < 0) {
+        *cmd = c->parsed_cmd;
+        *argv = c->argv;
+        *argc = c->argc;
+        *bad = (c->read_flags & READ_FLAGS_BAD_ARITY) != 0;
+        *slot = c->slot;
+        return 1;
+    }
+    cmdQueue *q = &c->cmd_queue;
+    if (ring.cur_queue_idx < q->off || ring.cur_queue_idx >= q->len) return 0;
+    parsedCommand *p = &q->cmds[ring.cur_queue_idx];
+    *cmd = p->cmd;
+    *argv = p->argv;
+    *argc = p->argc;
+    *bad = (p->read_flags & READ_FLAGS_BAD_ARITY) != 0;
+    *slot = p->slot;
+    return 1;
+}
+
+/* Move the cursor to the next client of the batch, or park it (cur_c = NULL). */
+static void ringCursorNextClient(void) {
+    ring.cur_c = NULL;
+    ring.cur_waiting = 0;
+    if (ring.cur_batch_idx < 0 || batch == NULL) return;
+    for (size_t i = ring.cur_batch_idx + 1; i < batch->client_count; i++) {
+        client *n = batch->clients[i];
+        if (n == NULL) continue;
+        ring.cur_batch_idx = i;
+        ring.cur_c = n;
+        ring.cur_queue_idx = n->flag.pending_command ? -1 : n->cmd_queue.off;
+        return;
+    }
+    ring.cur_batch_idx = -1;
+}
+
+/* Move the cursor to the next command in execution order. */
+static void ringCursorAdvance(void) {
+    client *c = ring.cur_c;
+    if (c == NULL) return;
+    if (ring.cur_queue_idx < 0) {
+        ring.cur_queue_idx = c->cmd_queue.off;
+    } else {
+        ring.cur_queue_idx++;
+    }
+    if (ring.cur_queue_idx < c->cmd_queue.len) return;
+
+    /* Queue exhausted but more commands will be parsed from querybuf later:
+     * hold here rather than admitting a later client out of order. */
+    if (c->querybuf != NULL && c->qb_pos < sdslen(c->querybuf)) {
+        ring.cur_waiting = 1;
+        return;
+    }
+
+    ringCursorNextClient();
+}
+
+/* Admit commands from the cursor until the ring is full or the cursor is exhausted. */
+static void ringAdmit(void) {
+    while (ring.count < ring.cap) {
+        struct serverCommand *cmd;
+        robj **argv;
+        int argc, bad, slot;
+        if (!ringCursorCommand(&cmd, &argv, &argc, &bad, &slot)) {
+            if (ring.cur_waiting) return;
+            ringCursorAdvance();
+            if (ring.cur_c == NULL || ring.cur_waiting) return;
+            continue;
+        }
+        client *c = ring.cur_c;
+        int kvslot = (server.cluster_enabled && slot >= 0) ? slot : 0;
+        int free_slots = ring.cap - ring.count;
+        int admitted = 0;
+
+        if (cmd != NULL && !bad) {
+            getKeysResult result;
+            initGetKeysResult(&result);
+            int num_keys = getKeysFromCommand(cmd, argv, argc, &result);
+            if (num_keys > free_slots && ring.count > 0) {
+                /* Wait for room so a multi-key command is admitted whole. */
+                getKeysFreeResult(&result);
+                return;
+            }
+            hashtable *ht = kvstoreGetHashtable(c->db->keys, kvslot);
+            for (int i = 0; i < num_keys && ring.count < ring.cap; i++) {
+                ringSlot *s = &RING_SLOT(ring.count);
+                s->c = c;
+                s->argv = argv;
+                s->db = c->db;
+                s->kvslot = kvslot;
+                if (ht != NULL && hashtableSize(ht) > 0) {
+                    s->hash = hashtableHashKey(ht, objectGetVal(argv[result.keys[i].pos]));
+                    s->stage = 0;
+                } else {
+                    s->hash = 0;
+                    s->stage = 3;
+                }
+                ring.count++;
+                admitted++;
+            }
+            getKeysFreeResult(&result);
+        }
+        if (admitted == 0) {
+            /* Keyless (or unparseable) command: one done slot keeps the FIFO aligned. */
+            ringSlot *s = &RING_SLOT(ring.count);
+            s->c = c;
+            s->argv = argv;
+            s->db = c->db;
+            s->kvslot = 0;
+            s->hash = 0;
+            s->stage = 3;
+            ring.count++;
+        }
+        ringCursorAdvance();
+    }
+}
+
+/* A client joined the batch: start its lookups now, so they are in flight while
+ * the remaining read completions are processed and before execution begins. */
+static void ringOnClientAdded(client *c, int batch_idx) {
+    ringEnsureInit();
+    if (ring.cur_c == NULL) {
+        ring.cur_batch_idx = batch_idx;
+        ring.cur_c = c;
+        ring.cur_queue_idx = c->flag.pending_command ? -1 : c->cmd_queue.off;
+    }
+    ringAdmit();
+    ringStepAll();
+}
+
+/* Batch execution is starting. Every client was already admitted when it joined
+ * (ringOnClientAdded), so only advance the in-flight lookups one more stage. */
+static void ringStartBatch(void) {
+    ringEnsureInit();
+    ringAdmit();
+    ringStepAll();
+}
+
+/* Called on the main thread immediately before a command in c->argv executes. */
+void prefetchRingBeforeExecute(client *c) {
+    if (!server.prefetch_ring) return;
+    if (ProcessingEventsWhileBlocked) {
+        /* Nested processing breaks execution order; drop everything and let
+         * the outer drain resynchronise. */
+        if (ring.slots) ringReset();
+        return;
+    }
+    ringEnsureInit();
+
+    /* Anything ahead of this command in the ring belongs to commands that did
+     * not execute in the expected order (blocked client, skipped client...). */
+    while (ring.count > 0 && !(RING_SLOT(0).c == c && RING_SLOT(0).argv == c->argv)) {
+        ring.head = (ring.head + 1) % ring.cap;
+        ring.count--;
+        if (ring.first_live > 0) ring.first_live--;
+    }
+
+    if (ring.count == 0) {
+        /* This command was never admitted: resynchronise the cursor to what
+         * executes after it. From the pending position (-1), advance() lands on
+         * cmd_queue.off, which is the next command whether the current one was
+         * the pending command or was just popped from the queue. */
+        ring.cur_c = c;
+        ring.cur_queue_idx = -1;
+        ring.cur_batch_idx = (batch != NULL && batch->executed_commands > 0) ? batch_exec_idx : -1;
+        ringCursorAdvance();
+    } else {
+        /* Head-ready policy: make sure this command's own lookups are done,
+         * advancing every in-flight lookup while we wait. Bounded: each slot
+         * needs at most 3 steps. */
+        for (int round = 0; round < 3; round++) {
+            int pending = 0;
+            for (int i = ring.first_live; i < ring.count; i++) {
+                ringSlot *s = ringSlotAt(i);
+                if (s->c != c || s->argv != c->argv) break;
+                if (s->stage < 3) pending = 1;
+            }
+            if (!pending) break;
+            ringStepAll();
+        }
+        /* Retire this command's slots. */
+        while (ring.count > 0 && RING_SLOT(0).c == c && RING_SLOT(0).argv == c->argv) {
+            ring.head = (ring.head + 1) % ring.cap;
+            ring.count--;
+            if (ring.first_live > 0) ring.first_live--;
+        }
+    }
+
+    if (ring.cur_waiting && ring.cur_c == c) {
+        /* The command that just executed came from the querybuf; the queue may
+         * have been refilled behind it. Re-seed from the current position. */
+        ring.cur_waiting = 0;
+        ring.cur_queue_idx = -1;
+        ringCursorAdvance();
+    }
+    ringAdmit();
+    ringStepAll();
+}
+
+/* The client is going away (or leaving the batch): make sure the cursor never
+ * dereferences it again. Slots are identity-only and need no cleanup. */
+void prefetchRingClientGone(client *c) {
+    if (ring.slots == NULL) return;
+    if (ring.cur_c == c) ringCursorNextClient();
+}
+
 /* Processes all the prefetched commands in the current batch. */
 void processClientsCommandsBatch(void) {
     if (!batch || batch->client_count == 0) return;
@@ -327,7 +665,20 @@ void processClientsCommandsBatch(void) {
     /* If executed_commands is not 0,
      * it means that we are in the middle of processing a batch and this is a recursive call */
     if (batch->executed_commands == 0) {
-        prefetchCommands();
+        if (server.prefetch_ring) {
+            prefetchArgvs();
+            /* Same accounting as batch mode: a batch counts when it carries more
+             * than one key to look up. */
+            int multi = batch->client_count > 1;
+            if (!multi) {
+                client *c0 = batch->clients[0];
+                multi = c0 != NULL && c0->cmd_queue.len - c0->cmd_queue.off >= 1;
+            }
+            if (multi) server.stat_total_prefetch_batches++;
+            ringStartBatch();
+        } else {
+            prefetchCommands();
+        }
     }
 
     /* Process the commands */
@@ -338,8 +689,10 @@ void processClientsCommandsBatch(void) {
         /* Set the client to null immediately to avoid accessing it again recursively when ProcessingEventsWhileBlocked */
         batch->clients[i] = NULL;
         batch->executed_commands++;
+        batch_exec_idx = i;
         if (processPendingCommandAndInputBuffer(c) != C_ERR) beforeNextClient(c);
     }
+    batch_exec_idx = -1;
 
     resetCommandsBatch();
 
@@ -376,6 +729,13 @@ int addCommandToBatchAndProcessIfFull(client *c) {
 
     batch->clients[batch->client_count++] = c;
 
+    if (server.prefetch_ring) {
+        /* The ring does its own key extraction in execution order. */
+        ringOnClientAdded(c, batch->client_count - 1);
+        if (batch->client_count == batch->max_prefetch_size) processClientsCommandsBatch();
+        return C_OK;
+    }
+
     /* Client's next command */
     if (c->parsed_cmd && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
         c->read_flags |= READ_FLAGS_PREFETCHED;
@@ -404,6 +764,7 @@ int addCommandToBatchAndProcessIfFull(client *c) {
 
 /* Removes the given client from the pending prefetch batch, if present. */
 void removeClientFromPendingCommandsBatch(client *c) {
+    prefetchRingClientGone(c);
     if (!batch) return;
 
     for (size_t i = 0; i < batch->client_count; i++) {

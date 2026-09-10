@@ -292,6 +292,50 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
             assert_equal $prefetch_entries $new_prefetch_entries
       }
 
+        test {prefetch ring streams pipelined lookups and returns correct results} {
+            r config set prefetch-batch-max-size 16
+            r config set prefetch-ring yes
+            for {set i 0} {$i < 64} {incr i} { r set rk:$i v$i }
+            r config resetstat
+
+            # One deep pipeline from one client: the ring must prefetch every key
+            # (not only the first 16) while keeping per-client order.
+            set rd [valkey_deferring_client]
+            for {set i 0} {$i < 64} {incr i} { $rd get rk:$i }
+            $rd flush
+            for {set i 0} {$i < 64} {incr i} { assert_equal "v$i" [$rd read] }
+            $rd close
+
+            set info [r info stats]
+            set prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+            assert_range $prefetch_entries 48 70; # ~one per GET; a few may execute before their stage completes
+
+            # Mutations between lookups (DEL, MSET, FLUSHDB) must not disturb correctness.
+            set rd [valkey_deferring_client]
+            for {set i 0} {$i < 32} {incr i} {
+                $rd get rk:$i
+                $rd del rk:[expr {$i + 32}]
+                $rd get rk:[expr {$i + 32}]
+            }
+            $rd mset rk:0 x rk:1 y
+            $rd get rk:0
+            $rd flushdb
+            $rd get rk:1
+            $rd flush
+            for {set i 0} {$i < 32} {incr i} {
+                assert_equal "v$i" [$rd read]
+                assert_equal 1 [$rd read]
+                assert_equal {} [$rd read]
+            }
+            assert_equal {OK} [$rd read]
+            assert_equal {x} [$rd read]
+            assert_equal {OK} [$rd read]
+            assert_equal {} [$rd read]
+            $rd close
+
+            r config set prefetch-ring no
+        }
+
       start_server {} {
             test {replicas writes are offloaded to IO threads} {
                 set primary [srv -1 client]

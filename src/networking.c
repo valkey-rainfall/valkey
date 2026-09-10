@@ -4030,6 +4030,7 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.close_asap) return C_ERR;
     if (c->flag.pending_command) {
+        prefetchRingBeforeExecute(c);
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
@@ -4295,8 +4296,9 @@ int processInputBuffer(client *c) {
             popped_from_queue = true;
         }
 
-        /* Prefetch keys for the next commands in queue, if not already done. */
-        prefetchCommandQueueKeys(c);
+        /* Prefetch keys for the next commands in queue, if not already done.
+         * (In ring mode the streaming ring does this just before execution.) */
+        if (!server.prefetch_ring) prefetchCommandQueueKeys(c);
 
         parseResult res = handleParseResults(c);
         if (res == PARSE_NEEDMORE && popped_from_queue) {
@@ -4322,6 +4324,7 @@ int processInputBuffer(client *c) {
 
         /* We are finally ready to execute the command. */
         c->flag.pending_command = 1;
+        prefetchRingBeforeExecute(c);
         if (processCommandAndResetClient(c) == C_ERR) {
             /* If the client is no longer valid, we avoid exiting this
              * loop and trimming the client buffer later. So we return

@@ -162,6 +162,13 @@ void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtabl
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
 
+/* Restart-safe prefetch stages: no table pointers are held between calls, so
+ * arbitrary mutations may happen between stages. See hashtable.c. */
+uint64_t hashtableHashKey(hashtable *ht, const void *key);
+void hashtablePrefetchBucketForHash(hashtable *ht, uint64_t hash);
+int hashtablePrefetchCandidatesForHash(hashtable *ht, uint64_t hash);
+int hashtableGetCandidatesForHash(hashtable *ht, uint64_t hash, void **out, int max);
+
 /* Iteration & scan */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);
 size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata, void *(*defragfn)(void *), int flags);

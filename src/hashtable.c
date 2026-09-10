@@ -1990,6 +1990,103 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
     }
 }
 
+/* --- Restart-safe prefetch stages -----------------------------------------
+ *
+ * Unlike the incremental find above, these stages hold NO pointers into the
+ * table between calls: the caller keeps only the key and its hash, and every
+ * stage re-derives the bucket from the live table. That makes them safe to
+ * interleave with arbitrary mutations of the same table (inserts, deletes,
+ * rehash steps, resizes) between stages, at the cost of re-reading a bucket
+ * that is expected to be cache-resident by then. Used by the main-thread
+ * streaming prefetch ring, where command execution happens between stages. */
+
+uint64_t hashtableHashKey(hashtable *ht, const void *key) {
+    return hashKey(ht, key);
+}
+
+/* Top-level bucket for 'hash' in table 'table_idx', or NULL if that table
+ * does not exist. */
+static inline bucket *bucketForHash(hashtable *ht, int table_idx, uint64_t hash) {
+    if (ht->tables[table_idx] == NULL) return NULL;
+    size_t mask = expToMask(ht->bucket_exp[table_idx]);
+    return &ht->tables[table_idx][hash & mask];
+}
+
+/* Stage 0: prefetch the top-level bucket(s) the key may live in. */
+void hashtablePrefetchBucketForHash(hashtable *ht, uint64_t hash) {
+    if (hashtableSize(ht) == 0) return;
+    bucket *b0 = bucketForHash(ht, 0, hash);
+    if (b0 != NULL) {
+        size_t mask = expToMask(ht->bucket_exp[0]);
+        /* Skip table 0 if this bucket has already been rehashed away. */
+        if (!(ht->rehash_idx >= 0 && (hash & mask) < (size_t)ht->rehash_idx)) valkey_prefetch(b0);
+    }
+    if (ht->rehash_idx >= 0) {
+        bucket *b1 = bucketForHash(ht, 1, hash);
+        if (b1 != NULL) valkey_prefetch(b1);
+    }
+}
+
+/* Stage 1: the bucket(s) are expected to be cache-resident now. Prefetch every
+ * candidate entry (hash-byte match) in the chain, and the next chained bucket.
+ * Returns the number of prefetches issued; 0 means the key cannot be present
+ * and later stages may be skipped. */
+int hashtablePrefetchCandidatesForHash(hashtable *ht, uint64_t hash) {
+    if (hashtableSize(ht) == 0) return 0;
+    uint8_t h2 = highBits(hash);
+    int issued = 0;
+    for (int table_idx = 0; table_idx < 2; table_idx++) {
+        if (table_idx == 0 && ht->rehash_idx >= 0) {
+            size_t mask = expToMask(ht->bucket_exp[0]);
+            if ((hash & mask) < (size_t)ht->rehash_idx) continue;
+        }
+        if (table_idx == 1 && ht->rehash_idx < 0) break;
+        bucket *b = bucketForHash(ht, table_idx, hash);
+        if (b == NULL) continue;
+        for (int pos = 0; pos < numBucketPositions(b); pos++) {
+            if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
+                valkey_prefetch(b->entries[pos]);
+                issued++;
+            }
+        }
+        bucket *child = getChildBucket(b);
+        if (child != NULL) {
+            valkey_prefetch(child);
+            issued++;
+        }
+    }
+    return issued;
+}
+
+/* Stage 2: candidates are expected to be cache-resident now. Collect up to
+ * 'max' entries in the chain whose stored hash byte matches, without comparing
+ * keys (the caller may not hold the key any more; a hash-byte false positive
+ * only costs one useless value prefetch). Returns the number collected. Has no
+ * side effects, unlike hashtableFind(). */
+int hashtableGetCandidatesForHash(hashtable *ht, uint64_t hash, void **out, int max) {
+    if (hashtableSize(ht) == 0 || max <= 0) return 0;
+    uint8_t h2 = highBits(hash);
+    int n = 0;
+    for (int table_idx = 0; table_idx < 2; table_idx++) {
+        if (table_idx == 0 && ht->rehash_idx >= 0) {
+            size_t mask = expToMask(ht->bucket_exp[0]);
+            if ((hash & mask) < (size_t)ht->rehash_idx) continue;
+        }
+        if (table_idx == 1 && ht->rehash_idx < 0) break;
+        bucket *b = bucketForHash(ht, table_idx, hash);
+        while (b != NULL) {
+            for (int pos = 0; pos < numBucketPositions(b); pos++) {
+                if (isPositionFilled(b, pos) && b->hashes[pos] == h2) {
+                    out[n++] = b->entries[pos];
+                    if (n == max) return n;
+                }
+            }
+            b = getChildBucket(b);
+        }
+    }
+    return n;
+}
+
 /* Provides batch lookup. Compared with serial single-key lookups, it can improve
  * performance by parallelizing memory accesses. Each bit in the returned bitmap
  * indicates whether the key at the same index was found. */
