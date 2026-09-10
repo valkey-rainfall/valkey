@@ -519,17 +519,21 @@ void ACLFreeUserAndKillClients(user *u) {
 /* Copy the user ACL rules from the source user 'src' to the destination
  * user 'dst' so that at the end of the process they'll have exactly the
  * same rules (but the names will continue to be the original ones). */
-static void ACLCopyUser(user *dst, user *src) {
+static void ACLCopyUser(user *dst, user *src, int dst_is_live) {
     listRelease(dst->passwords);
     dst->passwords = listDup(src->passwords);
-    /* acl-offload: IO threads may be reading dst->selectors. Publish the new
-     * list by pointer swap (never mutate the live list), make every pending
-     * verdict stale, then free the old list only once no IO job is in flight. */
+    /* acl-offload: if dst is a published user, IO threads may be reading
+     * dst->selectors. Publish the new list by pointer swap (never mutate the
+     * live list), make every pending verdict stale, then free the old list
+     * only once no IO job is in flight. A staging copy (dst_is_live == 0) is
+     * unreachable from IO threads and needs none of this. */
     list *old_selectors = dst->selectors;
     list *new_selectors = listDup(src->selectors);
     atomic_store_explicit((_Atomic(list *) *)&dst->selectors, new_selectors, memory_order_release);
-    aclOffloadBumpEpoch();
-    aclOffloadQuiesce();
+    if (dst_is_live) {
+        aclOffloadBumpEpoch();
+        aclOffloadQuiesce();
+    }
     listRelease(old_selectors);
     dst->flags = src->flags;
     if (dst->acl_string) {
@@ -2160,8 +2164,15 @@ void aclOffloadBumpEpoch(void) {
  * IO thread may be reading (selectors lists, user objects). Cheap when idle;
  * on the rare ACL-mutation path only. */
 void aclOffloadQuiesce(void) {
-    if (!inMainThread() || server.io_threads_num <= 1) return;
+    /* Only needed when IO threads may hold rule-set pointers, i.e. when they
+     * evaluate ACLs. With the feature off, mutation is stock in-place-safe. */
+    if (!server.acl_offload || !inMainThread() || server.io_threads_num <= 1) return;
+    monotime start = getMonotonicUs();
     drainIOThreadsQueue();
+    long long us = (long long)(getMonotonicUs() - start);
+    server.stat_acl_offload_quiesce_count++;
+    server.stat_acl_offload_quiesce_total_us += us;
+    if (us > server.stat_acl_offload_quiesce_max_us) server.stat_acl_offload_quiesce_max_us = us;
 }
 
 /* Commands after which a worker must stop tagging for the rest of the batch:
@@ -2429,7 +2440,7 @@ sds ACLStringSetUser(user *u, sds username, sds *argv, int argc) {
      * If there are any errors then none of the changes will be applied. */
     user *tempu = ACLCreateUnlinkedUser();
     if (u) {
-        ACLCopyUser(tempu, u);
+        ACLCopyUser(tempu, u, 0);
     }
 
     for (int j = 0; j < merged_argc; j++) {
@@ -2452,7 +2463,7 @@ sds ACLStringSetUser(user *u, sds username, sds *argv, int argc) {
     }
     serverAssert(u != NULL);
 
-    ACLCopyUser(u, tempu);
+    ACLCopyUser(u, tempu, 1);
 
 cleanup:
     ACLFreeUser(tempu);
@@ -2736,7 +2747,7 @@ static sds ACLLoadFromFile(const char *filename) {
             new_default = ACLCreateDefaultUser();
         }
 
-        ACLCopyUser(DefaultUser, new_default);
+        ACLCopyUser(DefaultUser, new_default, 1);
         ACLFreeUser(new_default);
         raxInsert(Users, (unsigned char *)"default", 7, DefaultUser, NULL);
         raxRemove(old_users, (unsigned char *)"default", 7, NULL);

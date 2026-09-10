@@ -2889,6 +2889,9 @@ void resetServerStats(void) {
     server.stat_total_error_replies = 0;
     server.stat_acl_offload_hits = 0;
     server.stat_acl_offload_punts = 0;
+    server.stat_acl_offload_quiesce_count = 0;
+    server.stat_acl_offload_quiesce_total_us = 0;
+    server.stat_acl_offload_quiesce_max_us = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
@@ -6576,6 +6579,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "evicted_clients:%lld\r\n", server.stat_evictedclients,
                 "acl_offload_hits:%lld\r\n", server.stat_acl_offload_hits,
                 "acl_offload_punts:%lld\r\n", server.stat_acl_offload_punts,
+                "acl_offload_quiesce_count:%lld\r\n", server.stat_acl_offload_quiesce_count,
+                "acl_offload_quiesce_total_us:%lld\r\n", server.stat_acl_offload_quiesce_total_us,
+                "acl_offload_quiesce_max_us:%lld\r\n", server.stat_acl_offload_quiesce_max_us,
                 "evicted_scripts:%lld\r\n", server.stat_evictedscripts,
                 "total_eviction_exceeded_time:%lld\r\n", (server.stat_total_eviction_exceeded_time + current_eviction_exceeded_time) / 1000,
                 "current_eviction_exceeded_time:%lld\r\n", current_eviction_exceeded_time / 1000,

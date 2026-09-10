@@ -1954,6 +1954,9 @@ struct valkeyServer {
     long long stat_io_reads_pending;                   /* Number of read events pending in IO threads */
     long long stat_acl_offload_hits;                   /* acl-offload: verdicts consumed without main-thread evaluation */
     long long stat_acl_offload_punts;                  /* acl-offload: tagged verdicts rejected (epoch mismatch), re-evaluated on main */
+    long long stat_acl_offload_quiesce_count;          /* acl-offload: waits for in-flight IO jobs before freeing ACL memory */
+    long long stat_acl_offload_quiesce_total_us;       /* acl-offload: total time spent in those waits */
+    long long stat_acl_offload_quiesce_max_us;         /* acl-offload: longest single wait */
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
