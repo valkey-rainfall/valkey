@@ -1990,9 +1990,6 @@ struct valkeyServer {
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */
-    struct hdr_histogram *pipeline_depth_histogram;    /* Distribution of commands per client read event. */
-    long long pipeline_depth_current;                  /* Commands dispatched so far in the read event being drained.
-                                                        * Main thread only; saved/restored around nested drains. */
     long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
     long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
@@ -2057,6 +2054,9 @@ struct valkeyServer {
     int latency_tracking_enabled;              /* 1 if extended latency tracking is enabled, 0 otherwise. */
     double *latency_tracking_info_percentiles; /* Extended latency tracking info output percentile list configuration. */
     int latency_tracking_info_percentiles_len;
+    /* Commands per read event, one histogram per parsing thread (index 0 = main).
+     * Written only by the owning thread, read by the main thread for INFO. */
+    struct hdr_histogram *pipeline_depth_histogram[IO_THREADS_MAX_NUM];
     unsigned int max_new_tls_conns_per_cycle; /* The maximum number of tls connections that will be accepted during each
                                                  invocation of the event loop. */
     unsigned int max_new_conns_per_cycle;     /* The maximum number of tcp connections that will be accepted during each
@@ -3025,7 +3025,6 @@ void setDeferredSetLen(client *c, void *node, long length);
 void setDeferredAttributeLen(client *c, void *node, long length);
 void setDeferredPushLen(client *c, void *node, long length);
 int processInputBuffer(client *c);
-int processReadEventInputBuffer(client *c);
 void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip);
 void readQueryFromClient(connection *conn);
 int prepareClientToWrite(client *c);
@@ -3627,8 +3626,8 @@ void bytesToHuman(char *s, size_t size, unsigned long long n);
 void enterExecutionUnit(int update_cached_time, long long us);
 void exitExecutionUnit(void);
 void resetServerStats(void);
-void initPipelineDepthHistogram(void);
-void resetPipelineDepthHistogram(void);
+void initPipelineDepthHistogram(int tid);
+void resetPipelineDepthHistograms(void);
 sds fillPercentileDistributionPipelineDepth(sds info);
 void monitorActiveDefrag(void);
 void defragWhileBlocked(void);

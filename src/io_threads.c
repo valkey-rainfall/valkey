@@ -390,6 +390,9 @@ static void createIOThread(int id) {
     /* Initialize the private SPSC queue for this thread */
     spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
 
+    /* Per-thread statistics the thread will record into, published before it starts. */
+    initPipelineDepthHistogram(id);
+
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
