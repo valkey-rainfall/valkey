@@ -1121,6 +1121,76 @@ int dplusSpeculateBatch(client *c, int tid) {
     tail = 1;
     (void)batch_count;
 
+    if (server.io_threads_speculation_chunked) {
+        /* A/B ARM (exp/dplus-chunked-ab): the pre-#1b CHUNKED shape. Fill up
+         * to DPLUS_BATCH_DEPTH finds, step them all round-robin to completion,
+         * then validate+reply the chunk in order; repeat. Every chunk boundary
+         * is a bubble (next chunk starts cold). Same eligibility, same
+         * validation, same contiguous-prefix rule as the ring below. Slot 0 of
+         * the first chunk is the already-initialised first command. */
+        for (;;) {
+            unsigned n = tail - head; /* finds initialised in this chunk (starts at 1) */
+            /* Fill the chunk. */
+            while (prefix_open && n < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {
+                parsedCommand *p = &queue->cmds[queue_pos];
+                if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
+                    !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd_fast) {
+                    prefix_open = 0;
+                    break;
+                }
+                dplusBatchEntry *e = &batch[n];
+                e->key_sds = objectGetVal(p->argv[1]);
+                e->hash = hashtableHashKey(ht, e->key_sds);
+                e->shard = DPLUS_SHARD_INDEX(e->hash);
+                e->v_before = dplusVersionRead(va, e->shard);
+                if (e->v_before & 1) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                    atomic_fetch_add_explicit(&dplus_stats.bracket_entry_punts, 1, memory_order_relaxed);
+#endif
+                    continue;
+                }
+                e->is_first_cmd = 0;
+                e->queue_idx = queue_pos;
+                hashtableIncrementalFindInit(&e->find_state, ht, e->key_sds);
+                n++;
+                queue_pos++;
+            }
+            if (queue_pos >= queue->len) prefix_open = 0;
+            if (n == 0) break;
+
+            /* Step all finds in the chunk to completion (round-robin). */
+            unsigned incomplete;
+            do {
+                incomplete = 0;
+                for (unsigned i = 0; i < n; i++) incomplete += hashtableIncrementalFindStep(&batch[i].find_state);
+            } while (incomplete != 0);
+
+            /* Validate + reply the chunk in command order. */
+            unsigned i;
+            for (i = 0; i < n; i++) {
+                dplusBatchEntry *e = &batch[i];
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+                atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
+#endif
+                if (dplusValidateAndReply(c, e, ht, c->resp)) {
+                    if (e->is_first_cmd) {
+                        c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                    } else {
+                        queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                    }
+                    speculated++;
+                } else {
+                    prefix_open = 0;
+                    ring_validation_failed = 1;
+                    break;
+                }
+            }
+            if (ring_validation_failed || !prefix_open) break;
+            head = tail = 0; /* next chunk starts empty */
+        }
+        head = tail; /* nothing left in flight for the drain below */
+    }
+
     while (head < tail || prefix_open) {
         /* Fill: top the window up from the queue. */
         while (prefix_open && tail - head < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {

@@ -1851,6 +1851,7 @@ struct valkeyServer {
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int io_threads_ownership;                 /* Enable per-worker fd ownership (door-2, EXPERIMENTAL). */
+    int io_threads_speculation_chunked;       /* A/B: chunked fill-then-drain speculation instead of the streaming ring. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */

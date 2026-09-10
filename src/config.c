@@ -3392,6 +3392,7 @@ standardConfig static_configs[] = {
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
     createBoolConfig("io-threads-ownership", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_ownership, 0, NULL, NULL),
+    createBoolConfig("io-threads-speculation-chunked", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_chunked, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
