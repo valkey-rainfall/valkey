@@ -1993,6 +1993,8 @@ struct valkeyServer {
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
+    long long stat_io_sticky_hits;                     /* [diag] Reads routed to the client's last-serving IO thread's private inbox */
+    long long stat_io_sticky_fallbacks;                /* [diag] Reads that fell through to the shared inbox (no sticky thread, or its private inbox was full) */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */

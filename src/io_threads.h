@@ -12,6 +12,11 @@
 typedef enum {
     JOB_SPSC_FREE_ARGV = 0,
     JOB_SPSC_POLL = 1,
+    /* [diag/sticky-client-owner] Client read sticky-routed to this thread's
+     * private inbox instead of the shared SPMC queue. Handled identically to
+     * JOB_REQ_READ_CLIENT; kept as a distinct tag because the SPSC and SPMC
+     * tag namespaces are independent and both already define value 0. */
+    JOB_SPSC_READ_CLIENT = 2,
 } JobRequestSPSC;
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */

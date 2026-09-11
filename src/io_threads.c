@@ -327,6 +327,12 @@ static void *IOThreadMain(void *myid) {
                 case JOB_SPSC_POLL:
                     ioThreadPoll((aeEventLoop *)data);
                     break;
+                case JOB_SPSC_READ_CLIENT:
+                    /* [diag/sticky-client-owner] Sticky-routed read landed in this
+                     * thread's private inbox instead of the shared SPMC queue; handle
+                     * it identically to the shared-inbox JOB_REQ_READ_CLIENT case. */
+                    ioThreadReadQueryFromClient((client *)data);
+                    break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
@@ -590,11 +596,26 @@ int trySendReadToIOThreads(client *c) {
     c->io_read_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, clientConnPostponeMaskFromIOState(c));
 
-    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(c, JOB_REQ_READ_CLIENT)) == false)) {
-        c->read_flags = 0;
-        c->io_read_state = CLIENT_IDLE;
-        connSetPostponeUpdateState(c->conn, 0);
-        return C_ERR;
+    /* [diag/sticky-client-owner] Prefer routing this read to the IO thread that last
+     * served this client (c->cur_tid, stamped by the main thread after the previous
+     * read completed). Keeping a client pinned to one thread should keep its
+     * per-client state (query buffer, argv, etc.) cache-resident on that core instead
+     * of bouncing across whichever thread happened to steal the job from the shared
+     * SPMC queue. Falls back to the existing shared-inbox path when there is no
+     * sticky thread yet (c->cur_tid == 0, e.g. this client's first read) or the
+     * sticky thread's private inbox is full. */
+    int sticky_tid = c->cur_tid;
+    if (sticky_tid >= 1 && sticky_tid < server.active_io_threads_num && !spscIsFull(&io_private_inbox[sticky_tid])) {
+        spscEnqueue(&io_private_inbox[sticky_tid], tagJob(c, JOB_SPSC_READ_CLIENT), false);
+        server.stat_io_sticky_hits++;
+    } else {
+        server.stat_io_sticky_fallbacks++;
+        if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(c, JOB_REQ_READ_CLIENT)) == false)) {
+            c->read_flags = 0;
+            c->io_read_state = CLIENT_IDLE;
+            connSetPostponeUpdateState(c->conn, 0);
+            return C_ERR;
+        }
     }
 
     io_jobs_submitted++;
