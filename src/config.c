@@ -3495,6 +3495,11 @@ standardConfig static_configs[] = {
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, updateIOThreads), /* Single threaded by default */
     createIntConfig("min-io-threads-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_io_threads_copy_avoid, 7, INTEGER_CONFIG, NULL, NULL),
+    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): cross-core handoff round-trip
+     * probe, startup-only. Remove with the rest of the probe when the
+     * diagnostic is retired. */
+    createIntConfig("handoff-probe-every", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.handoff_probe_every, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("handoff-probe-thread", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 1, IO_THREADS_MAX_NUM - 1, server.handoff_probe_thread, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),

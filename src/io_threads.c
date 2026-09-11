@@ -13,6 +13,7 @@
 #include "queues.h"
 #include "server.h"
 #include <sys/resource.h>
+#include <sched.h> /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): sched_yield() */
 
 #define IO_MPSC_QUEUE_SIZE 16384
 #define IO_SPMC_QUEUE_SIZE 4096
@@ -58,6 +59,9 @@ void ioThreadWriteToClient(client *c);
 void ioThreadFreeArgv(robj **argv);
 void ioThreadPoll(aeEventLoop *el);
 static void ioThreadAccept(client *c);
+/* DIAGNOSTIC ONLY (diag/handoff-roundtrip): see handoffProbe in io_threads.h. */
+static void ioThreadHandoffProbe(handoffProbe *probe);
+void handoffProbeMaybeFire(int commands_drained);
 
 int inMainThread(void) {
     return thread_id == 0;
@@ -326,6 +330,10 @@ static void *IOThreadMain(void *myid) {
                     break;
                 case JOB_SPSC_POLL:
                     ioThreadPoll((aeEventLoop *)data);
+                    break;
+                case JOB_SPSC_PROBE:
+                    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip). */
+                    ioThreadHandoffProbe((handoffProbe *)data);
                     break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
@@ -866,6 +874,90 @@ void ioThreadFreeArgv(robj **argv) {
     }
 
     zfree(argv);
+}
+
+/* DIAGNOSTIC ONLY (diag/handoff-roundtrip): I/O-thread-side handler for the
+ * probe job. Marks the probe done with a release store; the main thread
+ * observes it via an acquire load in handoffProbeMaybeFire(). This mirrors
+ * how JOB_SPSC_FREE_ARGV/JOB_SPSC_POLL jobs are "finished" (no response is
+ * sent back through the MPSC outbox -- the main thread polls the flag
+ * directly, since it is the one waiting synchronously). */
+static void ioThreadHandoffProbe(handoffProbe *probe) {
+    atomic_store_explicit(&probe->done, 1, memory_order_release);
+}
+
+/* DIAGNOSTIC ONLY (diag/handoff-roundtrip): fires a synchronous cross-core
+ * round trip every `server.handoff_probe_every` commands drained on the
+ * main-thread command-execution path (called from the exit of
+ * processClientsCommandsBatch() in memory_prefetch.c, the single funnel for
+ * all main-thread command drains: I/O-thread read completions, main-thread
+ * reads, and batch-full flushes).
+ *
+ * Deliberately measures the REALISTIC grant latency: if the target I/O
+ * thread is mid-batch on its private inbox or busy on the shared inbox, the
+ * probe waits behind that work like any other private-inbox job would.
+ * This is a probe of "how long would main wait to hand off N commands
+ * *right now*", not an isolated micro-benchmark of the queue primitives.
+ *
+ * N==0 (the default) must cost one predictable branch: the caller checks
+ * server.handoff_probe_every > 0 before calling. */
+void handoffProbeMaybeFire(int commands_drained) {
+    static long long probe_counter = 0;
+
+    int every = server.handoff_probe_every;
+    if (every <= 0) return; /* Disabled. Fast path already taken above via the caller's own branch. */
+
+    probe_counter += commands_drained;
+    if (probe_counter < every) return;
+    probe_counter = 0;
+
+    int tid = server.handoff_probe_thread;
+    if (tid < 1 || tid >= server.active_io_threads_num) {
+        /* Target thread doesn't exist or is parked (auto-scaled down).
+         * Don't fabricate a number for a handoff that couldn't happen. */
+        return;
+    }
+
+    handoffProbe probe;
+    atomic_init(&probe.done, 0);
+
+    monotime start_us = getMonotonicUs();
+
+    void *job = tagJob(&probe, JOB_SPSC_PROBE);
+    /* commit=true: this is a single synchronous job, not part of a batch to
+     * be coalesced later (unlike FREE_ARGV's deferred-commit pattern via
+     * commitIOJobs()). We need the target thread to see it immediately. */
+    spscEnqueue(&io_private_inbox[tid], job, true);
+    io_jobs_submitted++;
+
+    /* No explicit wake needed: the guard above (tid < active_io_threads_num)
+     * guarantees the target thread is "active", and an active thread's park
+     * mutex (io_threads_mutex[tid]) is unlocked by construction (see
+     * createIOThread()/IOThreadsAfterSleep()) -- the thread is spinning in
+     * IOThreadMain()'s loop, not blocked on that mutex. If it is momentarily
+     * idle it will observe the enqueued job on its very next iteration of
+     * "PRIORITY 1: Drain Private SPSC Queue". If it is instead blocked
+     * finishing a read/write job from the shared inbox, this probe queues
+     * up behind that -- which is exactly the realistic grant latency being
+     * measured, not an artifact to work around. */
+
+    /* Bounded spin, then yield -- avoid burning a full core on a probe that
+     * is waiting behind real work (the thread finishing its current read
+     * job IS the realistic grant latency this probe is measuring). */
+    int spins = 0;
+    while (!atomic_load_explicit(&probe.done, memory_order_acquire)) {
+        if (++spins > 10000) {
+            sched_yield();
+        }
+    }
+
+    monotime elapsed_us = getMonotonicUs() - start_us;
+
+    server.stat_handoff_probe_count++;
+    server.stat_handoff_probe_total_us += (long long)elapsed_us;
+    if ((long long)elapsed_us > server.stat_handoff_probe_max_us) {
+        server.stat_handoff_probe_max_us = (long long)elapsed_us;
+    }
 }
 
 /* This function attempts to offload the client's argv to an IO thread.

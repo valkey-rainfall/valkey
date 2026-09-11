@@ -1902,6 +1902,11 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): cross-core handoff round-trip
+     * probe. See io_threads.c handoffProbeMaybeFire(). Remove with the rest
+     * of the probe when the diagnostic is retired. */
+    int handoff_probe_every;                  /* Fire the probe every N drained commands. 0 = off (default). */
+    int handoff_probe_thread;                 /* Target I/O thread id for the probe. Default 1. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
@@ -1994,6 +1999,12 @@ struct valkeyServer {
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
+    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): cross-core handoff round-trip
+     * probe counters, exposed in INFO debug section. Remove with the rest of
+     * the probe when the diagnostic is retired. */
+    long long stat_handoff_probe_count;                /* Number of probe round trips completed. */
+    long long stat_handoff_probe_total_us;             /* Sum of round-trip latencies (main-thread wall clock), microseconds. */
+    long long stat_handoff_probe_max_us;               /* Max single round-trip latency observed, microseconds. */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */
     long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */

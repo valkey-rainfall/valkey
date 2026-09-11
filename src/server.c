@@ -7093,7 +7093,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].max,
                 "eventloop_cmd_per_cycle_max:%lld\r\n", server.el_cmd_cnt_max,
                 "io_threaded_reads_pending:%lld\r\n", server.stat_io_reads_pending,
-                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending));
+                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending,
+                /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): remove these
+                 * three fields with the rest of the probe when retired. */
+                "handoff_probe_count:%lld\r\n", server.stat_handoff_probe_count,
+                "handoff_probe_total_us:%lld\r\n", server.stat_handoff_probe_total_us,
+                "handoff_probe_max_us:%lld\r\n", server.stat_handoff_probe_max_us));
 
         info = forkless_catDebugInfo(info);
         info = throttleRepl_sdscatInfoDebugMetrics(info);

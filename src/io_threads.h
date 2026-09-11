@@ -12,7 +12,32 @@
 typedef enum {
     JOB_SPSC_FREE_ARGV = 0,
     JOB_SPSC_POLL = 1,
+    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): tags 2-7 are free in this
+     * enum as of da91ccd12f. JOB_SPSC_PROBE picks the next free slot; no
+     * reuse/sentinel trick was needed. Remove this tag along with the rest
+     * of the probe when the diagnostic is retired. */
+    JOB_SPSC_PROBE = 2,
 } JobRequestSPSC;
+
+/* DIAGNOSTIC ONLY (diag/handoff-roundtrip): a single-shot cross-core
+ * round-trip probe. Main enqueues one of these to a specific I/O thread's
+ * private inbox, spins/yields on `done`, and times the interval. See
+ * handoffProbeMaybeFire() in io_threads.c for the trigger site and
+ * ioThreadHandoffProbe() for the I/O-thread-side handler.
+ * Tagged pointers require 8-byte-aligned pointers (3 free low bits) --
+ * _Alignas(8) forces that on a struct whose natural alignment would
+ * otherwise be 4 (a lone _Atomic int), since a stack local only guarantees
+ * its own natural alignment, not the queue's tagging requirement. Without
+ * this, an unlucky stack address silently corrupts the tag (observed as
+ * "Invalid SPSC job type: 6" during smoke testing -- the low bits of an
+ * unaligned &probe bled into the JOB_SPSC_PROBE=2 tag). */
+typedef struct {
+    _Alignas(8) _Atomic int done;
+} handoffProbe;
+
+/* DIAGNOSTIC ONLY (diag/handoff-roundtrip): main-thread trigger, called
+ * from processClientsCommandsBatch() with the number of commands drained. */
+void handoffProbeMaybeFire(int commands_drained);
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */
 typedef enum {

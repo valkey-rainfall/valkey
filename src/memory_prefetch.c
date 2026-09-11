@@ -324,6 +324,14 @@ static void prefetchCommands(void) {
 void processClientsCommandsBatch(void) {
     if (!batch || batch->client_count == 0) return;
 
+    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip): this function is the single
+     * funnel for all three main-thread drain sites (handleReadJobs, the
+     * main-thread read path, and the batch-full path above), and it can
+     * re-enter via processEventsWhileBlocked. Count commands across the
+     * OUTERMOST invocation only and fire the probe once on its exit. */
+    int probe_outermost = (batch->executed_commands == 0);
+    long long probe_numcommands_before = server.stat_numcommands;
+
     /* If executed_commands is not 0,
      * it means that we are in the middle of processing a batch and this is a recursive call */
     if (batch->executed_commands == 0) {
@@ -346,6 +354,11 @@ void processClientsCommandsBatch(void) {
     /* Handle the case where the max prefetch size has been changed. */
     if (batch->max_prefetch_size != (size_t)server.prefetch_batch_max_size) {
         onMaxBatchSizeChange(NULL);
+    }
+
+    /* DIAGNOSTIC ONLY (diag/handoff-roundtrip). */
+    if (probe_outermost && server.handoff_probe_every > 0) {
+        handoffProbeMaybeFire((int)(server.stat_numcommands - probe_numcommands_before));
     }
 }
 
