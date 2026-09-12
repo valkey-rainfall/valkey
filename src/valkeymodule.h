@@ -2201,13 +2201,13 @@ VALKEYMODULE_API int (*ValkeyModule_ACLCheckPermissions)(ValkeyModuleUser *user,
                                                          int dbid,
                                                          ValkeyModuleACLLogEntryReason *denial_reason) VALKEYMODULE_ATTR;
 VALKEYMODULE_API int (*ValkeyModule_ACLAddLogEntry)(ValkeyModuleCtx *ctx,
-                                                     ValkeyModuleUser *user,
-                                                     ValkeyModuleString *object,
-                                                     ValkeyModuleACLLogEntryReason reason) VALKEYMODULE_ATTR;
+                                                    ValkeyModuleUser *user,
+                                                    ValkeyModuleString *object,
+                                                    ValkeyModuleACLLogEntryReason reason) VALKEYMODULE_ATTR;
 VALKEYMODULE_API int (*ValkeyModule_ACLAddLogEntryByUserName)(ValkeyModuleCtx *ctx,
-                                                               ValkeyModuleString *user,
-                                                               ValkeyModuleString *object,
-                                                               ValkeyModuleACLLogEntryReason reason) VALKEYMODULE_ATTR;
+                                                              ValkeyModuleString *user,
+                                                              ValkeyModuleString *object,
+                                                              ValkeyModuleACLLogEntryReason reason) VALKEYMODULE_ATTR;
 VALKEYMODULE_API int (*ValkeyModule_AuthenticateClientWithACLUser)(ValkeyModuleCtx *ctx,
                                                                    const char *name,
                                                                    size_t len,
