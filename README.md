@@ -6,3 +6,5 @@ deployable bundle; `valkey-server.wasm` / `.mjs` are build outputs of that branc
 
 - `tryme.html` -- the sign-on animation, handing off to the terminal
 - `index.html` -- the plain terminal
+
+Published from 9499fd8bc.
