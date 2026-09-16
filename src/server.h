@@ -1851,6 +1851,10 @@ struct valkeyServer {
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int io_threads_ownership;                 /* Enable per-worker fd ownership (door-2, EXPERIMENTAL). */
+    int dplus_reclaim_budget_entries;         /* Max retired entries freed per beforeSleep reclaim pass. */
+    int dplus_reclaim_budget_us;              /* Max microseconds per beforeSleep reclaim pass. */
+    int dplus_reclaim_soft_entries;           /* Retired-entry backlog that closes the speculation gate. */
+    int dplus_reclaim_hard_entries;           /* Retired-entry backlog that forces an exclusive drain. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */

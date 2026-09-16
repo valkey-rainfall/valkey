@@ -1458,10 +1458,6 @@ void dplusAggregateStats(void) {
  * reclamation without moving the remaining entries. */
 
 #define DPLUS_RETIRE_CHUNK_ENTRIES 128
-#define DPLUS_RECLAIM_BUDGET_ENTRIES 1024
-#define DPLUS_RECLAIM_BUDGET_US 50
-#define DPLUS_RECLAIM_SOFT_ENTRIES 16384
-#define DPLUS_RECLAIM_HARD_ENTRIES 32768
 #define DPLUS_TEST_READER_SLOT (DPLUS_MAX_IO_THREADS - 1)
 
 typedef struct dplusRetireEntry {
@@ -1614,7 +1610,7 @@ static int dplusAppendRetired(void *ptr, int route) {
     /* Reclaim only entries from completed mutation frames. The current pointer
      * has not been appended yet, so its caller may still finish safely after
      * this function returns. */
-    if (dplus_retired_entries >= DPLUS_RECLAIM_HARD_ENTRIES && !dplus_reclaim_gate_drained)
+    if (dplus_retired_entries >= (size_t)server.dplus_reclaim_hard_entries && !dplus_reclaim_gate_drained)
         dplusForceRetirePressure();
     /* Once the pressure gate has drained old readers, no new reader can acquire
      * a pointer. Preserve stock immediate reclamation until backlog reaches 0. */
@@ -1641,7 +1637,7 @@ static int dplusAppendRetired(void *ptr, int route) {
     dplus_retired_entries++;
     dplus_retired_bytes_lower_bound += entry->bytes_lower_bound;
     if (dplus_retired_entries > dplus_retired_peak) dplus_retired_peak = dplus_retired_entries;
-    if (dplus_retired_entries >= DPLUS_RECLAIM_SOFT_ENTRIES &&
+    if (dplus_retired_entries >= (size_t)server.dplus_reclaim_soft_entries &&
         !atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed)) {
         dplusActivatePressureGate();
     } else if (atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed) &&
@@ -1723,8 +1719,8 @@ static int dplusReclaimSealed(int force) {
 
         while (segment->head) {
             if (!force && processed > 0 &&
-                (processed >= DPLUS_RECLAIM_BUDGET_ENTRIES ||
-                 ((processed & 31) == 0 && getMonotonicUs() - start >= DPLUS_RECLAIM_BUDGET_US))) {
+                (processed >= (size_t)server.dplus_reclaim_budget_entries ||
+                 ((processed & 31) == 0 && getMonotonicUs() - start >= (monotime)server.dplus_reclaim_budget_us))) {
                 dplus_reclaim_budget_exhaustions++;
                 return 0;
             }
@@ -1757,7 +1753,7 @@ static void dplusManageRetirePressure(void) {
     if (!atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed)) return;
     if (!dplus_reclaim_gate_drained) dplusActivatePressureGate();
 
-    if (dplus_retired_entries >= DPLUS_RECLAIM_HARD_ENTRIES) {
+    if (dplus_retired_entries >= (size_t)server.dplus_reclaim_hard_entries) {
         /* Hard pressure retains the proven fallback. The pressure gate is
          * already closed, so this wait covers only readers admitted earlier. */
         dplusForceRetirePressure();
