@@ -152,6 +152,11 @@ typedef struct iouThread {
 
 static _Thread_local iouThread *T = NULL;
 
+static void flushReads(void (*tail)(iouSlot *));
+static void flushWrites(void (*tail)(client *));
+static void finishReadIOThread(iouSlot *s);
+static void finishWriteIOThread(client *c);
+
 #define STATS (stats_per_thread[T->tid])
 
 static sds qbPoolTake(void) {
@@ -359,6 +364,9 @@ int ioUringBatchQueueRead(client *c) {
 }
 
 int ioUringBatchQueueIOThreadRead(client *c) {
+    /* Reads and writes interleave in the SPMC queue; flushing the pending
+     * writes here is cheaper than refusing the read. */
+    if (T && T->nwrites) flushWrites(finishWriteIOThread);
     if (batchableConn(c) && queueRecv(c)) return 1;
     if (T) STATS.fallback_reads++;
     return 0;
@@ -528,6 +536,7 @@ int ioUringBatchQueueWrite(client *c) {
 }
 
 int ioUringBatchQueueIOThreadWrite(client *c) {
+    if (T && T->nreads) flushReads(finishReadIOThread);
     if (batchableConn(c) && !(c->write_flags & WRITE_FLAGS_IS_REPLICA) && queueSend(c)) return 1;
     if (T) STATS.fallback_writes++;
     return 0;
