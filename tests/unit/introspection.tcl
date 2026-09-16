@@ -1309,6 +1309,7 @@ start_server {tags {"introspection"}} {
         # Skip immutable configs, one with no get, and other complicated configs
         set skip_configs {
             rdbchecksum
+            io-uring
             daemonize
             tcp-backlog
             mptcp
