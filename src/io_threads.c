@@ -13,6 +13,8 @@
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
+#include "cluster_slot_stats.h"
+#include "cmd_offload.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -52,6 +54,20 @@ static _Atomic(size_t) io_jobs_finished;
 static size_t cluster_io_pending_responses;
 static int io_threads_initialized = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
+
+/* Statistics Publishing Arrays (Index corresponds to thread ID) */
+atomic_int io_threads_stat_cmd_cpu[IO_THREADS_MAX_NUM] = {0};
+atomic_int io_threads_stat_io_cpu[IO_THREADS_MAX_NUM] = {0};
+/* Flag to indicate if a thread is skipping IO due to high CPU usage */
+atomic_int io_threads_io_skipped[IO_THREADS_MAX_NUM] = {0};
+
+/* IO thread throttling thresholds for skip logic in updateIoStats() */
+#define IO_SKIP_CMD_RATIO 3.0      /* Skip if cmd_pct > avg_other_cmd * this ratio */
+#define IO_SKIP_MY_TOTAL_MIN 60    /* Skip only if my_total (cmd+io) exceeds this % */
+#define IO_SKIP_OTHER_TOTAL_MAX 80 /* Skip only if other_total is below this % */
+
+/* Minimum commands to use prefetch batching in IO threads (overhead not worth it for fewer) */
+#define CMD_PREFETCH_MIN_BATCH 4
 
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
@@ -100,7 +116,8 @@ static size_t getPendingIOThreadsJobs(void) {
 
 /* Read/write jobs awaiting response from IO threads. */
 static size_t getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + server.stat_io_commands_pending +
+           cluster_io_pending_responses;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -115,13 +132,15 @@ void drainIOThreadsQueue(void) {
 
 /* Returns if there is an IO operation in progress for the given client. */
 int clientHasPendingIO(client *c) {
-    return c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE;
+    return c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE || c->io_command_state != CLIENT_IDLE;
 }
 
 /* Wait until the IO-thread is done with the client */
 void waitForClientIO(client *c) {
     /* No need to wait if the client was not offloaded to the IO thread. */
-    if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE) return;
+    if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE && c->io_command_state == CLIENT_IDLE) {
+        return;
+    }
 
     /* Wait for read operation to complete if pending. */
     while (c->io_read_state == CLIENT_PENDING_IO) {
@@ -130,6 +149,11 @@ void waitForClientIO(client *c) {
 
     /* Wait for write operation to complete if pending. */
     while (c->io_write_state == CLIENT_PENDING_IO) {
+        atomic_thread_fence(memory_order_acquire);
+    }
+
+    /* Wait for command operation to complete if pending. */
+    while (c->io_command_state == CLIENT_PENDING_IO) {
         atomic_thread_fence(memory_order_acquire);
     }
 
@@ -172,6 +196,45 @@ void IOThreadsBeforeSleep(long long current_time) {
  * starting too many threads unnecessarily to avoid contention. */
 #define IO_IGNITION_MAIN_THREAD_ACTIVE_PERCENT 30
 #define BATCH_SIZE 32
+#define IO_HIGH_LOAD_THRESHOLD 80 /* Avg IO pct to trigger scale up */
+
+static inline void activateIOThread(int id) {
+    atomic_store_explicit(&io_threads_stat_cmd_cpu[id], 0, memory_order_relaxed);
+    atomic_store_explicit(&io_threads_stat_io_cpu[id], 0, memory_order_relaxed);
+    atomic_store_explicit(&io_threads_io_skipped[id], 0, memory_order_relaxed);
+    pthread_mutex_unlock(&io_threads_mutex[id]);
+    server.active_io_threads_num++;
+}
+
+int getAverageThreadStat(_Atomic int *stats_array, int active_threads) {
+    if (active_threads <= 1) return 0;
+
+    long total = 0;
+    for (int i = 1; i < active_threads; i++) {
+        total += atomic_load_explicit(&stats_array[i], memory_order_relaxed);
+    }
+    return (int)(total / (active_threads - 1));
+}
+
+static size_t calculateTargetThreadCount(size_t active, size_t max, size_t avg_q_size, long long now, long long last_scale_time) {
+    size_t target = active;
+
+    /* Condition: Queue building up */
+    if (avg_q_size > 1 && active < max) {
+        target++;
+    }
+    /* Condition: Saturated and High CPU Load */
+    else if (server.io_threads_saturated && active > 1 && active < max) {
+        int avg_io_pct = getAverageThreadStat(io_threads_stat_io_cpu, (int)active);
+        if (avg_io_pct > IO_HIGH_LOAD_THRESHOLD) target++;
+    }
+    /* Condition: Idle Queue (Cooldown check) */
+    else if (avg_q_size == 0 && (now - last_scale_time > IO_COOLDOWN_MS)) {
+        if (target > 1) target--;
+    }
+
+    return target;
+}
 
 void IOThreadsAfterSleep(int numevents) {
     if (server.io_threads_num == 1) return;
@@ -180,9 +243,8 @@ void IOThreadsAfterSleep(int numevents) {
     if (server.io_threads_always_active) {
         if (numevents > 0 && server.active_io_threads_num < server.io_threads_num) {
             for (int i = server.active_io_threads_num; i < server.io_threads_num; i++) {
-                pthread_mutex_unlock(&io_threads_mutex[i]);
+                activateIOThread(i);
             }
-            server.active_io_threads_num = server.io_threads_num;
         }
         return;
     }
@@ -197,8 +259,7 @@ void IOThreadsAfterSleep(int numevents) {
         /* Ignite IO threads when main-thread active time exceeds the threshold (30%) */
         should_ignite = (main_thread_active_time > (float)IO_IGNITION_MAIN_THREAD_ACTIVE_PERCENT);
         if (should_ignite) {
-            pthread_mutex_unlock(&io_threads_mutex[1]);
-            server.active_io_threads_num++;
+            activateIOThread(1);
             last_scale_time = now;
             serverLog(LL_DEBUG, "IO threads ignition: increased to %d", server.active_io_threads_num);
         }
@@ -209,10 +270,13 @@ void IOThreadsAfterSleep(int numevents) {
     static size_t spmc_size_sum = 0;
     static size_t sample_count = 0;
 
-    /* Scaling Up/Down Policy */
     if (now - last_sample_time < IO_SAMPLE_RATE_MS) return;
     last_sample_time = now;
 
+    updateOffloadingSaturation();
+    updateOffloadingThrottle();
+
+    /* Scaling Up/Down Policy */
     spmc_size_sum += spmcSize(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
     spmc_size_sum += spmcSize(&io_shared_inbox[JOB_PRIORITY_HIGH]);
     sample_count++;
@@ -224,22 +288,14 @@ void IOThreadsAfterSleep(int numevents) {
 
     size_t avg_q_size = getInstantaneousMetric(STATS_METRIC_IO_WAIT);
     size_t active = server.active_io_threads_num;
-    size_t target = active;
-
-    /* Calculate Target */
-    if (avg_q_size > 1 && active < (size_t)server.io_threads_num) {
-        target++;
-    } else if (avg_q_size == 0 && (now - last_scale_time > IO_COOLDOWN_MS)) {
-        if (target > 1) target--;
-    }
+    size_t target = calculateTargetThreadCount(active, server.io_threads_num, avg_q_size, now, last_scale_time);
 
     /* Scale Up */
     if (target > active) {
         for (size_t i = active; i < target; i++) {
-            pthread_mutex_unlock(&io_threads_mutex[i]);
+            activateIOThread(i);
         }
         last_scale_time = now;
-        server.active_io_threads_num = target;
         serverLog(LL_DEBUG, "IO threads increased from %zu to %zu", active, target);
     }
     /* Scale Down*/
@@ -306,12 +362,72 @@ void cleanupThreadResources(void *dummy) {
 
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
-
-    /* Free the shared query buffer */
+    freeThreadDeferredJobs();
     freeSharedQueryBuf();
+    current_client = NULL;
+    executing_client = NULL;
 }
 
-static inline void processTaggedSPMCJob(void *tagged_job) {
+static void updateIoStats(long tid, long long *cmd_time, long long *io_time) {
+    static _Thread_local long long start_time = 0;
+    const long long STAT_PERIOD_US = 100000; /* 100 ms */
+    long long now = getMonotonicUs();
+    long long total_time = now - start_time;
+    if (total_time < STAT_PERIOD_US) return;
+
+    int cmd_pct = (int)((*cmd_time * 100) / total_time);
+    int io_pct = (int)((*io_time * 100) / total_time);
+    *cmd_time = 0;
+    *io_time = 0;
+    /* Publish to global atomic arrays */
+    atomic_store_explicit(&io_threads_stat_cmd_cpu[tid], cmd_pct, memory_order_relaxed);
+    atomic_store_explicit(&io_threads_stat_io_cpu[tid], io_pct, memory_order_relaxed);
+    start_time = now;
+
+    /* Return if cmd pct is less than 1% - no need to skip IO */
+    if (cmd_pct <= 1) return;
+
+    /* Return in case of single IO thread + main-thread. */
+    if (server.active_io_threads_num <= 2) return;
+
+    /* Throttling Logic: Check if we should skip IO */
+    long long other_cmd_sum = 0;
+    long long other_io_sum = 0;
+    int other_count = 0;
+
+    /* We perform a relaxed check on other threads. */
+    for (int i = 1; i < server.active_io_threads_num; i++) {
+        if (i == tid) continue;
+        int other_cmd = atomic_load_explicit(&io_threads_stat_cmd_cpu[i], memory_order_relaxed);
+        int other_io = atomic_load_explicit(&io_threads_stat_io_cpu[i], memory_order_relaxed);
+        if (other_cmd > 0 || other_io > 0) {
+            other_cmd_sum += other_cmd;
+            other_io_sum += other_io;
+            other_count++;
+        }
+    }
+    /* Return if other threads haven't published stats yet */
+    if (other_count == 0) return;
+
+    int skip_next = 0;
+    double avg_other_cmd = (double)other_cmd_sum / other_count;
+    double avg_other_io = (double)other_io_sum / other_count;
+    int my_total = cmd_pct + io_pct;
+    int other_total = (int)(avg_other_cmd + avg_other_io);
+    /* Skip if: cmd_pct significantly higher than avg AND saturated AND others have capacity */
+    if ((double)cmd_pct > (avg_other_cmd * IO_SKIP_CMD_RATIO) &&
+        my_total > IO_SKIP_MY_TOTAL_MIN && other_total < IO_SKIP_OTHER_TOTAL_MAX) {
+        skip_next = 1;
+    }
+    int current = atomic_load_explicit(&io_threads_io_skipped[tid], memory_order_relaxed);
+    if (current != skip_next) {
+        atomic_store_explicit(&io_threads_io_skipped[tid], skip_next, memory_order_relaxed);
+    }
+}
+
+/* Returns 1 if the job was an I/O operation (counted toward the thread's I/O time),
+ * 0 for pure compute jobs such as object freeing. */
+static inline int processTaggedSPMCJob(void *tagged_job) {
     void *data;
     int type;
     untagJob(tagged_job, &data, &type);
@@ -325,7 +441,7 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
         break;
     case JOB_REQ_FREE_OBJ:
         decrRefCount(data);
-        break;
+        return 0;
     case JOB_REQ_ACCEPT:
         ioThreadAccept((client *)data);
         break;
@@ -344,6 +460,7 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
     default:
         serverPanic("Invalid SPMC job type: %d", type);
     }
+    return 1;
 }
 
 static void *IOThreadMain(void *myid) {
@@ -355,12 +472,18 @@ static void *IOThreadMain(void *myid) {
     valkey_set_thread_title(thdname);
     serverSetCpuAffinity(server.server_cpulist);
     initSharedQueryBuf();
+    initThreadDeferredJobs();
+    current_client = NULL;
+    executing_client = NULL;
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
+    long long total_cmd_time = 0;
+    long long total_io_time = 0;
+
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
@@ -374,37 +497,82 @@ static void *IOThreadMain(void *myid) {
         }
         processed = 0;
         /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
+        client *clients[BATCH_SIZE];
+        int cmd_count = 0;
+
+        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE - cmd_count)) > 0) {
             for (size_t i = 0; i < batch_count; i++) {
                 void *data;
                 int type;
                 untagJob(batch_jobs[i], &data, &type);
 
                 switch (type) {
+                case JOB_SPSC_COMMAND:
+                    clients[cmd_count++] = (client *)data;
+                    break;
                 case JOB_SPSC_FREE_ARGV:
                     ioThreadFreeArgv((robj **)data);
                     break;
-                case JOB_SPSC_POLL:
+                case JOB_SPSC_POLL: {
+                    monotime io_start = getMonotonicUs();
                     ioThreadPoll((aeEventLoop *)data);
+                    total_io_time += getMonotonicUs() - io_start;
                     break;
+                }
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
                 }
             }
             processed += batch_count;
+            if (cmd_count >= BATCH_SIZE) break;
+        }
+        int skip_io = atomic_load_explicit(&io_threads_io_skipped[id], memory_order_relaxed);
+
+        /* Process Commands */
+        if (cmd_count > 0) {
+            monotime cmd_start = getMonotonicUs();
+            /* Use prefetch batching only when we have enough commands to benefit from it */
+            if (cmd_count >= CMD_PREFETCH_MIN_BATCH) {
+                processIOThreadClients(clients, cmd_count);
+            } else {
+                for (int i = 0; i < cmd_count; i++) {
+                    ioThreadCallCommand(clients[i]);
+                }
+            }
+            total_cmd_time += getMonotonicUs() - cmd_start;
+
+            /* Skip IO write if flagged by throttling logic */
+            if (skip_io) {
+                for (int i = 0; i < cmd_count; i++) {
+                    clients[i]->io_write_state = CLIENT_COMPLETED_IO;
+                    sendCommandResultToMain(clients[i]);
+                }
+            } else {
+                monotime io_start = getMonotonicUs();
+                for (int i = 0; i < cmd_count; i++) {
+                    ioThreadWriteAfterCmd(clients[i]);
+                    sendCommandResultToMain(clients[i]);
+                }
+                total_io_time += getMonotonicUs() - io_start;
+            }
         }
 
         /* PRIORITY 2: Shared Global Queue (SPMC)
-         * Only checked after SPSC is drained. */
-        void *tagged_job;
-        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH])) != NULL) {
-            processTaggedSPMCJob(tagged_job);
-            processed++;
-        }
+         * Only checked after SPSC is drained. Skipped while this thread is flagged as
+         * saturated by command work so peers absorb the network I/O instead. */
+        if (!skip_io) {
+            void *tagged_job;
+            if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH])) != NULL) {
+                monotime io_start = getMonotonicUs();
+                if (processTaggedSPMCJob(tagged_job)) total_io_time += getMonotonicUs() - io_start;
+                processed++;
+            }
 
-        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL])) != NULL) {
-            processTaggedSPMCJob(tagged_job);
-            processed++;
+            if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL])) != NULL) {
+                monotime io_start = getMonotonicUs();
+                if (processTaggedSPMCJob(tagged_job)) total_io_time += getMonotonicUs() - io_start;
+                processed++;
+            }
         }
 
         if (processed) {
@@ -413,6 +581,7 @@ static void *IOThreadMain(void *myid) {
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
+            updateIoStats(id, &total_cmd_time, &total_io_time);
             int has_pending = 0;
             for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
                 if (pending_io_responses[p]) has_pending = 1;
@@ -556,6 +725,7 @@ void initIOThreads(int prev_threads_num) {
         atomic_init(&io_jobs_finished, 0);
         cluster_io_pending_responses = 0;
         prefetchCommandsBatchInit();
+        initSlotQueues();
         io_threads_initialized = 1;
     }
 
@@ -613,6 +783,54 @@ size_t testOnlyGetClusterIOPendingResponses(void) {
     return cluster_io_pending_responses;
 }
 
+int tryOffloadCommandToIOThreads(client *c) {
+    if (!canCommandBeOffloaded(c->slot, c->cmd)) {
+        return C_ERR;
+    }
+
+    server.stat_offload_attempts++;
+    if (server.offload_throttle_pct < 100 && (rand() % 100) >= server.offload_throttle_pct && !server.io_threads_always_active) {
+        /* Skip offloading due to throttle */
+        return yieldForBusySlot(c) ? C_OK : C_ERR;
+    }
+
+    if (c->io_read_state != CLIENT_IDLE || c->io_command_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) {
+        return yieldForBusySlot(c) ? C_OK : C_ERR;
+    }
+
+    /* Do not offload if the client uses pipeline commands */
+    if (c->cmd_queue.len) {
+        return yieldForBusySlot(c) ? C_OK : C_ERR;
+    }
+
+    /* Do not offload if it is possible the main-thread will write at the same time to the client's COB */
+    if (getClientType(c) != CLIENT_TYPE_NORMAL) {
+        return yieldForBusySlot(c) ? C_OK : C_ERR;
+    }
+
+    /* Find the IO thread that is responsible for the slot. */
+    int tid = getSlotThreadId(c->slot);
+    if (tid == -1 || tid >= server.active_io_threads_num) {
+        tid = (c->slot % (server.active_io_threads_num - 1)) + 1;
+        setSlotThreadId(c->slot, tid);
+    }
+
+    if (spscIsFull(&io_private_inbox[tid])) return yieldForBusySlot(c) ? C_OK : C_ERR;
+
+    c->io_command_state = CLIENT_PENDING_IO;
+    c->io_write_state = CLIENT_PENDING_IO; /* The thread may write the command's result */
+    slotQueueIncRef(c->slot);
+    exclusiveQueueIncRef();
+    /* Setting current client to NULL to avoid accessing it after it was sent to IO */
+    current_client = NULL;
+    executing_client = NULL;
+    spscEnqueue(&io_private_inbox[tid], tagJob(c, JOB_SPSC_COMMAND), true);
+    io_jobs_submitted++;
+
+    server.stat_io_commands_pending++;
+    return C_OK;
+}
+
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     /* Fake/teardown clients may have no connection; never offload those. */
@@ -662,8 +880,12 @@ int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     if (!c->conn) return C_ERR;
     /* The I/O thread is already writing for this client. */
-    if (c->io_write_state != CLIENT_IDLE) return C_OK;
-    if (c->io_read_state == CLIENT_PENDING_IO) return C_ERR;
+    if (c->io_write_state != CLIENT_IDLE) {
+        return C_OK;
+    }
+    if (c->io_read_state == CLIENT_PENDING_IO) {
+        return C_ERR;
+    }
     /* Nothing to write */
     if (!clientHasPendingReplies(c)) return C_ERR;
     /* For simplicity, avoid offloading non-online replicas */
@@ -978,7 +1200,8 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
  * Returns C_OK if the object was successfully offloaded to an IO thread,
  * C_ERR otherwise.*/
 int tryOffloadFreeObjToIOThreads(robj *obj) {
-    if (server.active_io_threads_num <= 1) {
+    /* Requires at least 3 threads: with 2, main handles cmds and IO thread handles IO */
+    if (server.active_io_threads_num <= 2) {
         return C_ERR;
     }
 
@@ -1040,7 +1263,13 @@ void trySendPollJobToIOThreads(void) {
             return;
         }
     } else {
-        cur_epoll_thread = ((cur_epoll_thread) % (server.active_io_threads_num - 1)) + 1;
+        /* Try to find a thread that isn't skipping IO */
+        int attempts = server.active_io_threads_num;
+        do {
+            cur_epoll_thread = ((cur_epoll_thread) % (server.active_io_threads_num - 1)) + 1;
+            attempts--;
+        } while (atomic_load_explicit(&io_threads_io_skipped[cur_epoll_thread], memory_order_relaxed) && attempts > 0);
+
         if (unlikely(spscIsFull(&io_private_inbox[cur_epoll_thread]))) {
             server.io_poll_state = AE_IO_STATE_NONE;
             aeSetPollProtect(server.el, 0);
@@ -1142,6 +1371,17 @@ static void handleReadJobs(client **read_jobs, int read_count) {
     serverAssert(server.stat_io_reads_pending >= 0);
     uint64_t read_client_ids[JOB_BATCH_SIZE];
     int id_count = 0;
+
+    /* First pass: prefetch cluster slot ownership and slot-queue state for all clients.
+     * (The original also prefetched migrating/importing slot entries; upstream has since
+     * turned those into hashtables, so there is no per-slot cache line to prefetch.) */
+    for (int i = 0; i < read_count; i++) {
+        client *c = read_jobs[i];
+        if (c->slot == -1) continue;
+        valkey_prefetch(&(server.cluster->slots[c->slot]));
+        prefetchSlotQueueInfo(c->slot);
+    }
+
     /* process each client */
     for (int i = 0; i < read_count; i++) {
         client *c = read_jobs[i];
@@ -1177,7 +1417,6 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 
     for (int i = 0; i < write_count; i++) {
         client *c = write_jobs[i];
-        server.stat_io_writes_processed++;
         processClientIOWriteDone(c);
     }
 }
@@ -1186,9 +1425,11 @@ static int processOutboxBatch(mpscQueue *outbox) {
     void *jobs[JOB_BATCH_SIZE];
     client *read_jobs[JOB_BATCH_SIZE];
     client *write_jobs[JOB_BATCH_SIZE];
+    client *command_jobs[JOB_BATCH_SIZE];
     int received_responses = 0;
     int read_count = 0;
     int write_count = 0;
+    int command_count = 0;
 
     /* Try to dequeue JOB_BATCH_SIZE */
     while (received_responses < JOB_BATCH_SIZE) {
@@ -1211,6 +1452,14 @@ static int processOutboxBatch(mpscQueue *outbox) {
                 client *c = (client *)data;
                 serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                 write_jobs[write_count++] = c;
+            } else if (job_type == JOB_RES_COMMAND) {
+                client *c = (client *)data;
+                serverAssert(c->io_command_state == CLIENT_COMPLETED_IO);
+                command_jobs[command_count++] = c;
+            } else if (job_type == JOB_RES_JOBLIST) {
+                /* Deferred side effects of offloaded commands (expired keys, rehash
+                 * completion, error stats); always precedes its command result. */
+                dispatchSlotQueueJobs((list *)data);
             } else if (job_type == JOB_RES_CLUSTER_READ) {
                 serverAssert(cluster_io_pending_responses > 0);
                 cluster_io_pending_responses--;
@@ -1234,6 +1483,7 @@ static int processOutboxBatch(mpscQueue *outbox) {
 
     if (read_count) handleReadJobs(read_jobs, read_count);
     if (write_count) handleWriteJobs(write_jobs, write_count);
+    if (command_count) handleCommandJobs(command_jobs, command_count);
     return received_responses;
 }
 

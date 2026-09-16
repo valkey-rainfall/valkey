@@ -92,6 +92,8 @@ void initClientBlockingState(client *c) {
     c->bstate->generic_blocked_list_node = NULL;
     c->bstate->module_blocked_handle = NULL;
     c->bstate->async_rm_call_handle = NULL;
+    c->bstate->slot_pending_list = NULL;
+    listInitNode(&c->bstate->pending_client_node, c);
 }
 
 void freeClientBlockingState(client *c) {
@@ -237,6 +239,7 @@ void unblockClient(client *c, int queue_for_reprocessing) {
         c->bstate->postponed_list_node = NULL;
         break;
     case BLOCKED_SHUTDOWN:
+    case BLOCKED_SLOT:
         /* No special cleanup. */
         break;
     case BLOCKED_INUSE:
@@ -350,7 +353,7 @@ void disconnectOrRedirectAllBlockedClients(void) {
              * command processing will start from scratch, and the command will
              * be either executed or rejected. (unlike LIST blocked clients for
              * which the command is already in progress in a way. */
-            if (c->bstate->btype == BLOCKED_POSTPONE) continue;
+            if (c->bstate->btype == BLOCKED_POSTPONE || c->bstate->btype == BLOCKED_SLOT) continue;
 
             /* BLOCKED_INUSE clients will reprocess their command when unblocked
              * by the caller. Sending error replies here would be incorrect. */
@@ -747,13 +750,13 @@ static void unblockClientOnKey(client *c, robj *key) {
          * running the command, and exit the execution unit after calling the unblock handler (if exists).
          * Notice that we also must set the current client so it will be available
          * when we will try to send the client side caching notification (done on 'afterCommand'). */
-        client *old_client = server.current_client;
-        server.current_client = c;
+        client *old_client = current_client;
+        current_client = c;
         enterExecutionUnit(1, 0);
         if (processCommandAndResetClient(c) == C_ERR) {
             /* Client was freed during command processing, exit immediately */
             exitExecutionUnit();
-            server.current_client = old_client;
+            current_client = old_client;
             return;
         }
 
@@ -768,7 +771,7 @@ static void unblockClientOnKey(client *c, robj *key) {
         afterCommand(c);
         /* Clear the reexecuting_command flag after the proc is executed. */
         c->flag.reexecuting_command = 0;
-        server.current_client = old_client;
+        current_client = old_client;
     }
 }
 
@@ -778,8 +781,8 @@ static void unblockClientOnKey(client *c, robj *key) {
  * be processed in moduleHandleBlockedClients. */
 static void moduleUnblockClientOnKey(client *c, robj *key) {
     long long prev_error_replies = server.stat_total_error_replies;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    client *old_client = current_client;
+    current_client = c;
     monotime replyTimer;
     elapsedStart(&replyTimer);
 
@@ -792,7 +795,7 @@ static void moduleUnblockClientOnKey(client *c, robj *key) {
      * in order to propagate any changes that could have been done inside
      * moduleTryServeClientBlockedOnKey */
     afterCommand(c);
-    server.current_client = old_client;
+    current_client = old_client;
 }
 
 /* Unblock a client which is currently Blocked on and provided a timeout.

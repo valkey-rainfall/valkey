@@ -90,6 +90,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->fired = zmalloc(sizeof(aeFiredEvent) * setsize);
     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
     eventLoop->setsize = setsize;
+    eventLoop->poll_batch_size = setsize; /* Default to setsize, can be overridden */
     eventLoop->timeEventHead = NULL;
     eventLoop->timeEventNextId = 1;
     eventLoop->stop = 0;
@@ -140,6 +141,10 @@ void aeSetDontWait(aeEventLoop *eventLoop, int noWait) {
         eventLoop->flags |= AE_DONT_WAIT;
     else
         eventLoop->flags &= ~AE_DONT_WAIT;
+}
+
+void aeSetPollBatchSize(aeEventLoop *eventLoop, int size) {
+    eventLoop->poll_batch_size = size;
 }
 
 /* Resize the maximum set size of the event loop.
@@ -444,7 +449,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     AE_LOCK(eventLoop);
 
-    int ret = aeApiPoll(eventLoop->apidata, eventLoop->fired, eventLoop->events, eventLoop->setsize, eventLoop->maxfd, tvp);
+    int ret = aeApiPoll(eventLoop->apidata, eventLoop->fired, eventLoop->events, MIN(eventLoop->setsize, eventLoop->poll_batch_size), eventLoop->maxfd, tvp);
 
     AE_UNLOCK(eventLoop);
     return ret;
@@ -595,7 +600,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
             }
             /* Call the multiplexing API, will return only on timeout or when
              * some event fires. */
-            numevents = aeApiPoll(eventLoop->apidata, eventLoop->fired, eventLoop->events, eventLoop->setsize, eventLoop->maxfd, tvp);
+            numevents = aeApiPoll(eventLoop->apidata, eventLoop->fired, eventLoop->events, MIN(eventLoop->setsize, eventLoop->poll_batch_size), eventLoop->maxfd, tvp);
         }
 
         /* Don't process file events if not requested. */

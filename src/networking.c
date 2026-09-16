@@ -43,6 +43,7 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "cmd_offload.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -290,8 +291,8 @@ int cmdHasPushAsReply(struct serverCommand *cmd) {
 
 /* Publish-to-self push must wait until after the command reply. */
 static int shouldDeferPushMessage(client *c) {
-    return c->flag.pushing && c == server.current_client && server.executing_client &&
-           !cmdHasPushAsReply(server.executing_client->cmd);
+    return c->flag.pushing && c == current_client && executing_client &&
+           !cmdHasPushAsReply(executing_client->cmd);
 }
 
 /* Decides if copy avoidance is preferred according to client type, number of I/O threads, object size
@@ -302,6 +303,8 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (c->flag.fake || isDeferredReplyEnabled(c)) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
+
+    if (!inMainThread()) return 0;
 
     int type = getClientType(c);
     if (type != CLIENT_TYPE_NORMAL && type != CLIENT_TYPE_PUBSUB) return 0;
@@ -407,6 +410,7 @@ client *createClient(connection *conn) {
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
+    c->io_command_state = CLIENT_IDLE;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -465,8 +469,10 @@ void putClientInPendingWriteQueue(client *c) {
          * loop, we can try to directly write to the client sockets avoiding
          * a system call. We'll only really install the write handler if
          * we'll not be able to write the whole reply at once. */
-        c->flag.pending_write = 1;
-        listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
+        if (inMainThread()) {
+            c->flag.pending_write = 1;
+            listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
+        }
     }
 }
 /* This function is called every time we are going to transmit new data
@@ -677,7 +683,7 @@ static size_t _addBulkStrRefToBuffer(client *c, const void *payload, size_t len)
     if (!c->flag.buf_encoded) {
         /* If buffer is plain and not empty then can't add bulk string reference to it */
         if (c->bufpos) return 0;
-        c->flag.buf_encoded = 1;
+        if (inMainThread()) c->flag.buf_encoded = 1;
     }
     return _addReplyPayloadToBuffer(c, payload, len, BULK_STR_REF);
 }
@@ -880,24 +886,9 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
     addReplyProto(c, "\r\n", 2);
 }
 
-/* Do some actions after an error reply was sent (Log if needed, updates stats, etc.)
- * Possible flags:
- * * ERR_REPLY_FLAG_NO_STATS_UPDATE - indicate not to update any error stats. */
-void afterErrorReply(client *c, const char *s, size_t len, int flags) {
-    /* Module clients fall into two categories:
-     * Calls to RM_Call, in which case the error isn't being returned to a client, so should not be counted.
-     * Module thread safe context calls to RM_ReplyWithError, which will be added to a real client by the main thread
-     * later. */
-    if (c->flag.module) {
-        if (!c->deferred_reply_errors) {
-            c->deferred_reply_errors = listCreate();
-            listSetFreeMethod(c->deferred_reply_errors, sdsfreeVoid);
-        }
-        listAddNodeTail(c->deferred_reply_errors, sdsnewlen(s, len));
-        return;
-    }
-
-    commitDeferredReplyBuffer(c, 1);
+/* Updates some global error stats. This function is called
+ * from afterErrorReply and afterErrorReplyDelayed */
+void afterErrorReplyStatsUpdate(client *c, const char *s, size_t len, int flags) {
     if (!(flags & ERR_REPLY_FLAG_NO_STATS_UPDATE)) {
         /* Increment the global error counter */
         server.stat_total_error_replies++;
@@ -930,6 +921,52 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
          * case c->cmd was changed (like in GEOADD). */
         c->realcmd->failed_calls++;
     }
+}
+
+/* Context needed for IO thread to push error stats update job to Main thread */
+typedef struct {
+    client *c;
+    const sds s;
+    size_t len;
+    int flags;
+} delayedErrorStatsUpdateCtx;
+
+/* Delayed version of 'afterErrorReply' that is pushed by IO threads
+ * to the queue for main thread to update the error stats of an
+ * offloaded command */
+void afterErrorReplyDelayed(void *data) {
+    delayedErrorStatsUpdateCtx *ctx = data;
+    afterErrorReplyStatsUpdate(ctx->c, ctx->s, ctx->len, ctx->flags);
+    incrCommandStatsOnError(ctx->c->cmd, ERROR_COMMAND_FAILED);
+    sdsfree(ctx->s);
+}
+
+/* Do some actions after an error reply was sent (Log if needed, updates stats, etc.)
+ * Possible flags:
+ * * ERR_REPLY_FLAG_NO_STATS_UPDATE - indicate not to update any error stats. */
+void afterErrorReply(client *c, const char *s, size_t len, int flags) {
+    /* Module clients fall into two categories:
+     * Calls to RM_Call, in which case the error isn't being returned to a client, so should not be counted.
+     * Module thread safe context calls to RM_ReplyWithError, which will be added to a real client by the main thread
+     * later. */
+    if (c->flag.module) {
+        if (!c->deferred_reply_errors) {
+            c->deferred_reply_errors = listCreate();
+            listSetFreeMethod(c->deferred_reply_errors, sdsfreeVoid);
+        }
+        listAddNodeTail(c->deferred_reply_errors, sdsnewlen(s, len));
+        return;
+    }
+
+    /* Postpone error updates if called from an IO thread */
+    if (!inMainThread()) {
+        delayedErrorStatsUpdateCtx ctx = {.c = c, .s = sdsnewlen(s, len), .len = len, .flags = flags};
+        threadAddDeferredJob(-1, afterErrorReplyDelayed, sizeof(ctx), &ctx);
+        return;
+    }
+
+    commitDeferredReplyBuffer(c, 1);
+    afterErrorReplyStatsUpdate(c, s, len, flags);
 
     /* Sometimes it could be normal that a replica replies to a primary with
      * an error and this function gets called. Actually the error will never
@@ -2190,7 +2227,7 @@ void unlinkClient(client *c) {
     listNode *ln;
 
     /* If this is marked as current client unset it. */
-    if (c->conn && server.current_client == c) server.current_client = NULL;
+    if (c->conn && current_client == c) current_client = NULL;
 
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
@@ -2280,6 +2317,7 @@ void unlinkClient(client *c) {
     /* Client must not be in blocked or unblocked state at this point.
      * Guaranteed by freeClient ordering: unblockClient -> freeClientBlockingState -> unlinkClient. */
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
+    ioThreadsOnUnlinkClient(c);
 }
 
 /* Clear the client state to resemble a newly connected client. */
@@ -2412,7 +2450,6 @@ int freeClient(client *c) {
     c->duration = 0;
     if (c->flag.blocked) unblockClient(c, 0);
 
-    freeClientBlockingState(c);
     freeClientPubSubData(c);
 
     /* Free data structures. */
@@ -2450,6 +2487,7 @@ int freeClient(client *c) {
      * places where active clients may be referenced. */
     unlinkClient(c);
 
+    freeClientBlockingState(c);
     freeClientReplicationData(c);
 
     /* Remove client from memory usage buckets */
@@ -2486,7 +2524,7 @@ void freeClientAsync(client *c) {
  * assert in prepareClientToWrite() when the server tries to write the response.
  * So instead flag it for closure after the current command completes. */
 void freeClientOrCloseLater(client *c, int async) {
-    if (c == server.current_client) {
+    if (c == current_client) {
         c->flag.close_after_command = 1;
     } else {
         if (async) {
@@ -2557,6 +2595,11 @@ void trimClientQueryBuffer(client *c) {
  * wait until we're done with all clients. In other words, it can't wait until beforeSleep().
  * With IO threads enabled, this function offloads the write to the IO threads if possible. */
 void beforeNextClient(client *c) {
+    if (c->io_command_state != CLIENT_IDLE) {
+        /* If the client command was offloaded to IO threads, we need to wait for it to finish */
+        return;
+    }
+
     /* Notice, this code is also called from 'processUnblockedClients'.
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
      * So whenever we change the code here we need to consider if we need this change on module
@@ -3308,6 +3351,7 @@ int postWriteToClient(client *c) {
          * We just rely on data / pings received for timeout detection. */
         if (!isReplicatedClient(c)) c->last_interaction = server.unixtime;
     }
+    c->nwritten = 0;
     if (!clientHasPendingReplies(c)) {
         resetLastWrittenBuf(c);
         if (connHasWriteHandler(c->conn)) {
@@ -3517,6 +3561,9 @@ void processClientIOWriteDone(client *c) {
     if (c->io_write_state == CLIENT_IDLE) return; /* Already handled */
     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
     c->io_write_state = CLIENT_IDLE;
+    if (c->nwritten > 0 || c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
+        server.stat_io_writes_processed++;
+    }
 
     /* Don't post-process-writes to clients that are going to be closed anyway. */
     if (c->flag.close_asap) return;
@@ -3526,7 +3573,11 @@ void processClientIOWriteDone(client *c) {
         mask |= CONN_POSTPONE_READ;
 
     connSetPostponeUpdateState(c->conn, mask);
-    if (postWriteToClient(c) == C_ERR) return;
+    /* A write job may complete having written nothing (the reply was already flushed
+     * by the I/O thread right after an offloaded command); only post-process real writes. */
+    if (c->nwritten > 0 || c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
+        if (postWriteToClient(c) == C_ERR) return;
+    }
 
     /* connUpdateState may sync-invoke handlers for some transports (e.g. RDMA)
      * and free the client; only then re-fetch it by id after the update. */
@@ -3575,7 +3626,10 @@ int handleClientsWithPendingWrites(void) {
         /* Don't write to clients that are going to be closed anyway. */
         if (c->flag.close_asap) continue;
 
-        if (c->io_read_state == CLIENT_PENDING_IO) continue;
+        if (c->io_command_state != CLIENT_IDLE || c->io_read_state == CLIENT_PENDING_IO) {
+            /* If the client is in the middle of an I/O command, we can't write to it yet. */
+            continue;
+        }
 
         c->flag.pending_write = 0;
         listUnlinkNode(server.clients_pending_write, ln);
@@ -3586,7 +3640,9 @@ int handleClientsWithPendingWrites(void) {
         if (trySendWriteToIOThreads(c) == C_OK) continue;
 
         /* We can't write to the client while IO operation is in progress. */
-        if (c->io_write_state != CLIENT_IDLE) continue;
+        if (c->io_write_state != CLIENT_IDLE) {
+            continue;
+        }
 
         processed++;
 
@@ -4174,24 +4230,26 @@ void commandProcessed(client *c) {
  * of processing the command, otherwise C_OK is returned. */
 int processCommandAndResetClient(client *c) {
     int deadclient = 0;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    client *old_client = current_client;
+    current_client = c;
     if (processCommand(c) == C_OK) {
+        if (c->io_command_state != CLIENT_IDLE) return C_OK;
+
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
          * processed command. */
         if (c->conn) updateClientMemUsageAndBucket(c);
     }
 
-    if (server.current_client == NULL) deadclient = 1;
+    if (current_client == NULL) deadclient = 1;
     /*
      * Restore the old client, this is needed because when a script
      * times out, we will get into this code from processEventsWhileBlocked.
-     * Which will cause to set the server.current_client. If not restored
+     * Which will cause to set the current_client. If not restored
      * we will return 1 to our caller which will falsely indicate the client
      * is dead and will stop reading from its buffer.
      */
-    server.current_client = old_client;
+    current_client = old_client;
     /* performEvictions may flush replica output buffers. This may
      * result in a replica, that may be the active client, to be
      * freed. */
@@ -4675,9 +4733,9 @@ char *getClientSockname(client *c) {
 int isClientConnIpV6(client *c) {
     /* The cached client peer id is on the form "[IPv6]:port" for IPv6
      * addresses, so we just check for '[' here. */
-    if (c->flag.fake && server.current_client) {
+    if (c->flag.fake && current_client) {
         /* Fake client? Use current client instead, if we have one. */
-        c = server.current_client;
+        c = current_client;
     }
 
     if (c->flag.fake || !c->conn) {
@@ -5270,7 +5328,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->type != -1 && getClientType(client) != client_filter->type) return 0;
     if (client_filter->ids && !intsetFind(client_filter->ids, client->id)) return 0;
     if (client_filter->user && client->user != client_filter->user) return 0;
-    if (client_filter->skipme && client == server.current_client) return 0;
+    if (client_filter->skipme && client == current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
     if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
     if (client_filter->flags && clientMatchesFlagFilter(client, client_filter->flags) == 0) return 0;
@@ -6745,8 +6803,8 @@ void processEventsWhileBlocked(void) {
      * provide a fresher time than the one from when the script started (they
      * still won't get it from the call due to execution_nesting. For commands
      * during loading this doesn't matter. */
-    mstime_t prev_cmd_time_snapshot = server.cmd_time_snapshot;
-    server.cmd_time_snapshot = server.mstime;
+    mstime_t prev_cmd_time_snapshot = cmd_time_snapshot;
+    cmd_time_snapshot = server.mstime;
 
     /* Note: when we are processing events while blocked (for instance during
      * busy Lua scripts), we set a global flag. When such flag is set, we
@@ -6772,7 +6830,7 @@ void processEventsWhileBlocked(void) {
     ProcessingEventsWhileBlocked--;
     serverAssert(ProcessingEventsWhileBlocked >= 0);
 
-    server.cmd_time_snapshot = prev_cmd_time_snapshot;
+    cmd_time_snapshot = prev_cmd_time_snapshot;
 }
 
 /* Return 1 if the client read is handled using threaded I/O.

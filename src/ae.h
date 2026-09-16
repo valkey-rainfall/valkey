@@ -116,8 +116,9 @@ typedef struct aeFiredEvent {
 
 /* State of an event based program */
 typedef struct aeEventLoop {
-    int maxfd;   /* highest file descriptor currently registered */
-    int setsize; /* max number of file descriptors tracked */
+    int maxfd;           /* highest file descriptor currently registered */
+    int setsize;         /* max number of file descriptors tracked */
+    int poll_batch_size; /* max events to process per poll call */
     long long timeEventNextId;
     aeFileEvent *events; /* Registered events */
     aeFiredEvent *fired; /* Fired events */
@@ -168,6 +169,7 @@ int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);
 int aeGetSetSize(aeEventLoop *eventLoop);
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
 void aeSetDontWait(aeEventLoop *eventLoop, int noWait);
+void aeSetPollBatchSize(aeEventLoop *eventLoop, int size);
 
 /* High-priority event loop prototypes */
 int aeActuateQoSEventLoopIfSupported(aeEventLoop *eventLoop, uint64_t qosPreemptPollIntervalUs, aeQoSStatsProc *qosStatsCallback);

@@ -12,6 +12,7 @@
 typedef enum {
     JOB_SPSC_FREE_ARGV = 0,
     JOB_SPSC_POLL = 1,
+    JOB_SPSC_COMMAND = 2, /* Offloaded command execution; pinned to the slot's owning thread. */
 } JobRequestSPSC;
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */
@@ -35,17 +36,24 @@ typedef enum {
     JOB_RES_CLUSTER_READ,
     JOB_RES_CLUSTER_WRITE,
     JOB_RES_CLUSTER_ACCEPT,
+    JOB_RES_COMMAND,
+    JOB_RES_JOBLIST,
     JOB_RES_COUNT
 } JobResult;
 static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
 
 typedef void (*job_handler)(void *);
 
+/* Per IO thread stats (index = thread ID) */
+extern atomic_int io_threads_stat_cmd_cpu[IO_THREADS_MAX_NUM];
+extern atomic_int io_threads_stat_io_cpu[IO_THREADS_MAX_NUM];
+
 void initIOThreads(int prev_threads_num);
 void killIOThreads(void);
 int inMainThread(void);
 int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
+int tryOffloadCommandToIOThreads(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 void IOThreadsAfterSleep(int numevents);
@@ -67,5 +75,6 @@ int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
+int getAverageThreadStat(_Atomic int *stats_array, int active_threads);
 
 #endif /* IO_THREADS_H */
