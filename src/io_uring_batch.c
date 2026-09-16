@@ -59,6 +59,7 @@ ioUringBatchStats io_uring_batch_stats;
 
 /* networking.c internals reused by the deferred completion paths. */
 extern int ProcessingEventsWhileBlocked;
+extern _Thread_local sds thread_shared_qb;
 int handleReadResult(client *c);
 void trimCommandQueue(client *c);
 int postWriteToClient(client *c);
@@ -291,21 +292,30 @@ void ioUringBatchFlushReads(struct aeEventLoop *el) {
     for (int i = 0; i < n; i++) {
         iouSlot *s = &rslots[i];
         client *c = s->c;
-        if (!c) continue; /* cancelled by a peer's handler */
-        finishRead(s);
-        /* finishRead may have freed c synchronously -> slot cancelled. */
-        c = s->c;
-        if (!c) continue;
-        c->io_uring_slot = -1;
-        if (s->buf && c->querybuf == s->buf) {
-            if (sdslen(c->querybuf) - c->qb_pos == 0) {
-                c->querybuf = NULL;
-                c->qb_pos = 0;
-                c->qb_applied = 0;
-                qbPoolReturn(s->buf);
+        if (c) {
+            /* While this client runs, its pooled buffer plays the role of
+             * thread_shared_qb so every existing hand-back rule applies:
+             * resetSharedQueryBuf() before command execution, trimClient
+             * QueryBuffer() in beforeNextClient(), sdsclear-not-free in
+             * freeClient(). If the client keeps unconsumed bytes it takes
+             * ownership and initSharedQueryBuf() allocates a fresh buffer,
+             * which we keep for the pool. */
+            sds saved = thread_shared_qb;
+            if (s->buf) thread_shared_qb = s->buf;
+            finishRead(s);
+            if (s->buf) {
+                if (thread_shared_qb != s->buf) {
+                    qbPoolReturn(thread_shared_qb); /* fresh one from initSharedQueryBuf */
+                    s->buf = NULL;                  /* client owns the old one now */
+                } else if (s->c && s->c->querybuf == s->buf) {
+                    s->buf = NULL; /* defensive: client still holds it -> ownership */
+                }
+                thread_shared_qb = saved;
             }
-            /* else: client keeps ownership, like resetSharedQueryBuf(). */
+            if (s->c) s->c->io_uring_slot = -1;
         }
+        /* Not processed (cancelled) or processed and handed back. */
+        if (s->buf) qbPoolReturn(s->buf);
         s->c = NULL;
         s->buf = NULL;
     }
@@ -401,12 +411,10 @@ void ioUringBatchClientFreed(client *c) {
     /* The slot is in whichever batch is currently open/flushing. */
     if (idx < nreads && rslots[idx].c == c) {
         iouSlot *s = &rslots[idx];
-        if (s->buf && c->querybuf == s->buf) {
-            c->querybuf = NULL; /* keep freeClient's sdsfree off our pool buffer */
-            qbPoolReturn(s->buf);
-        }
+        /* Keep freeClient's sdsfree() off the pooled buffer; the flush loop
+         * returns it to the pool (s->buf stays set). */
+        if (s->buf && c->querybuf == s->buf) c->querybuf = NULL;
         s->c = NULL;
-        s->buf = NULL;
         return;
     }
     if (idx < nwrites && wslots[idx].c == c) {
