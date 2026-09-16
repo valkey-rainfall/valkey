@@ -2961,37 +2961,9 @@ static void writeToReplica(client *c) {
     c->nwritten = totwritten;
 }
 
-/* Bulk string reply requires 3 iov entries -
- * length prefix ($<length>\r\n), string (<data>) and suffix (\r\n) */
-#define NUM_OF_IOV_PER_BULK_STR 3
-/* Bulk string prefix max size (long + $ + \r\n) */
-#define BULK_STR_LEN_PREFIX_MAX_SIZE (LONG_STR_SIZE + 3)
-
-/* This struct is used by writevToClient to prepare iovec array for submitting to connWritev */
-typedef struct replyIOV {
-    int iovcnt;  /* number of elements in iov array */
-    int iovsize; /* capacity of iov array */
-    struct iovec *iov;
-    ssize_t iov_len_total;   /* Total length of data pointed by iov array */
-    size_t last_written_len; /* Length of data in the last written buffer
-                              * partially written in previous writevToClient invocation */
-    int limit_reached;       /* Non zero if either max iov count or NET_MAX_WRITES_PER_EVENT limit
-                              * reached during iovec array preparation  */
-    /* Auxiliary fields for scattering BUFSTR_REF chunks from encoded buffers */
-    int prfxcnt;                                    /* number of prefixes */
-    char (*prefixes)[BULK_STR_LEN_PREFIX_MAX_SIZE]; /* bulk string prefixes */
-    char *crlf;                                     /* bulk string suffix */
-} replyIOV;
-
-/*  The bufWriteMetadata struct is used by writevToClient to record metadata
- *  about scattering of reply buffer to iov array */
-typedef struct bufWriteMetadata {
-    char *buf;
-    size_t bufpos;
-    uint64_t data_len; /* Actual bytes out. Differs from bufpos if buffer encoded */
-    int complete;      /* Was the buffer completely scattered to iov or
-                          process stopped due encountered limit */
-} bufWriteMetadata;
+/* replyIOV / bufWriteMetadata and the iov size macros live in reply_iov.h so the
+ * io_uring batch path can build and account the same iovec arrays. */
+#include "reply_iov.h"
 
 static void initReplyIOV(client *c, int iovsize, struct iovec *iov_arr, char (*prefixes)[], char *crlf, replyIOV *reply) {
     reply->iovcnt = 0;
@@ -3143,13 +3115,9 @@ static void proceedToUnwritten(replyIOV *reply, int nwritten) {
  * If we write successfully, it returns C_OK, otherwise, C_ERR is returned.
  * Sets the c->nwritten to the number of bytes the server wrote to the client.
  * Can be called from the main thread or an I/O thread */
-static int writevToClient(client *c) {
-    int iovmax = min(IOV_MAX, c->conn->iovcnt);
-    struct iovec iov_arr[iovmax];
-    /* iov_arr can accommodate iovmax / NUM_OF_IOV_PER_BULK_STR full bulk string replies
-     * and one partial bulk reply */
-    char prefixes[iovmax / NUM_OF_IOV_PER_BULK_STR + 1][BULK_STR_LEN_PREFIX_MAX_SIZE];
-    char crlf[2] = {'\r', '\n'};
+/* Gather half of writevToClient(), see reply_iov.h. */
+int buildReplyIOV(client *c, int iovmax, struct iovec *iov_arr, char (*prefixes)[BULK_STR_LEN_PREFIX_MAX_SIZE],
+                  char *crlf, replyIOV *reply, bufWriteMetadata *metadata) {
     size_t bufcnt = 0;
 
     size_t bufpos = 0;
@@ -3162,13 +3130,7 @@ static int writevToClient(client *c) {
         bufpos = lastblock ? (size_t)c->bufpos : c->io_last_bufpos;
     }
 
-    int reply_blocks = (lastblock ? listLength(c->reply) : 0);
-    /* +1 is for c->buf */
-    size_t replyLen = min(reply_blocks + 1, iovmax);
-    bufWriteMetadata buf_metadata[replyLen];
-
-    replyIOV reply;
-    initReplyIOV(c, iovmax, iov_arr, prefixes, crlf, &reply);
+    initReplyIOV(c, iovmax, iov_arr, prefixes, crlf, reply);
 
     /* If the static reply buffer is not empty,
      * add it to the iov array for writev() as well. */
@@ -3176,14 +3138,14 @@ static int writevToClient(client *c) {
         if (c->flag.buf_encoded) {
             trackBufReferences(c->buf, bufpos, c);
         }
-        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, bufpos, &reply, &buf_metadata[bufcnt++]);
+        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, bufpos, reply, &metadata[bufcnt++]);
     }
 
     if (lastblock) {
         listIter iter;
         listNode *next;
         listRewind(c->reply, &iter);
-        while ((next = listNext(&iter)) && !reply.limit_reached) {
+        while ((next = listNext(&iter)) && !reply->limit_reached) {
             clientReplyBlock *o = listNodeValue(next);
 
             size_t used = o->used;
@@ -3202,17 +3164,43 @@ static int writevToClient(client *c) {
                 trackBufReferences(o->buf, used, c);
             }
 
-            addBufferToReplyIOV(o->flag.buf_encoded, o->buf, used, &reply, &buf_metadata[bufcnt]);
-            if (!buf_metadata[bufcnt].data_len) break;
+            addBufferToReplyIOV(o->flag.buf_encoded, o->buf, used, reply, &metadata[bufcnt]);
+            if (!metadata[bufcnt].data_len) break;
             bufcnt++;
 
             if (next == lastblock) break;
 
-            if (reply.iovcnt == reply.iovsize) {
-                reply.limit_reached = 1;
+            if (reply->iovcnt == reply->iovsize) {
+                reply->limit_reached = 1;
             }
         }
     }
+
+    return (int)bufcnt;
+}
+
+/* Bookkeeping half of writevToClient(), see reply_iov.h. */
+int applyReplyIOVWritten(client *c, replyIOV *reply, bufWriteMetadata *metadata, int bufcnt, ssize_t totwritten) {
+    if (totwritten <= 0) c->write_flags |= WRITE_FLAGS_WRITE_ERROR;
+    c->nwritten = totwritten;
+    if (totwritten > 0) {
+        saveLastWrittenBuf(c, metadata, bufcnt, reply->iov_len_total, totwritten);
+    }
+    return totwritten > 0 ? C_OK : C_ERR;
+}
+
+static int writevToClient(client *c) {
+    int iovmax = min(IOV_MAX, c->conn->iovcnt);
+    struct iovec iov_arr[iovmax];
+    /* iov_arr can accommodate iovmax / NUM_OF_IOV_PER_BULK_STR full bulk string replies
+     * and one partial bulk reply */
+    char prefixes[iovmax / NUM_OF_IOV_PER_BULK_STR + 1][BULK_STR_LEN_PREFIX_MAX_SIZE];
+    char crlf[2] = {'\r', '\n'};
+    /* +1 is for c->buf */
+    bufWriteMetadata buf_metadata[iovmax + 1];
+    replyIOV reply;
+
+    int bufcnt = buildReplyIOV(c, iovmax, iov_arr, prefixes, crlf, &reply, buf_metadata);
 
     ssize_t totwritten = 0;
     while (1) {
@@ -3244,11 +3232,7 @@ static int writevToClient(client *c) {
         proceedToUnwritten(&reply, nwritten);
     }
 
-    c->nwritten = totwritten;
-    if (totwritten > 0) {
-        saveLastWrittenBuf(c, buf_metadata, bufcnt, reply.iov_len_total, totwritten);
-    }
-    return totwritten > 0 ? C_OK : C_ERR;
+    return applyReplyIOVWritten(c, &reply, buf_metadata, bufcnt, totwritten);
 }
 
 /* This function does actual writing output buffers to non-replica client, it is called by writeToClient.
@@ -7173,6 +7157,13 @@ void ioThreadReadQueryFromClient(client *c) {
     /* Read */
     readToQueryBuf(c);
 
+    ioThreadReadQueryFromClientTail(c);
+}
+
+/* Everything ioThreadReadQueryFromClient() does after the read(2) itself:
+ * parse, trim, hand the client back to the main thread. Split out so the
+ * io_uring batch path can run it after a batched recv completes. */
+void ioThreadReadQueryFromClientTail(client *c) {
     if (c->flag.close_asap) {
         goto done;
     }

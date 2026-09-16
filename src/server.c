@@ -7113,7 +7113,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     /* io_uring batching (PoC) */
     if (all_sections || (dictFind(section_dict, "io_uring") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
-        ioUringBatchStats *u = &io_uring_batch_stats;
+        ioUringBatchStats total;
+        ioUringBatchStatsTotal(&total);
+        ioUringBatchStats *u = &total;
         info = sdscatprintf(info,
                             "# io_uring\r\n"
                             "io_uring_active:%d\r\n"
@@ -7121,13 +7123,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "io_uring_read_sqes:%lld\r\n"
                             "io_uring_write_batches:%lld\r\n"
                             "io_uring_write_sqes:%lld\r\n"
+                            "io_uring_writev_sqes:%lld\r\n"
                             "io_uring_fallback_reads:%lld\r\n"
                             "io_uring_fallback_writes:%lld\r\n"
                             "io_uring_cancelled:%lld\r\n"
                             "io_uring_max_read_batch:%lld\r\n"
                             "io_uring_max_write_batch:%lld\r\n",
                             ioUringBatchActive(), u->read_batches, u->read_sqes, u->write_batches, u->write_sqes,
-                            u->fallback_reads, u->fallback_writes, u->cancelled, u->max_read_batch,
+                            u->writev_sqes, u->fallback_reads, u->fallback_writes, u->cancelled, u->max_read_batch,
                             u->max_write_batch);
     }
 

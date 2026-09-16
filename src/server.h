@@ -3215,6 +3215,7 @@ client *createCachedResponseClient(int resp);
 void deleteCachedResponseClient(client *recording_client);
 void waitForClientIO(client *c);
 void ioThreadReadQueryFromClient(client *c);
+void ioThreadReadQueryFromClientTail(client *c);
 void ioThreadWriteToClient(client *c);
 int canParseCommand(client *c);
 int processClientIOReadsDone(client *c);

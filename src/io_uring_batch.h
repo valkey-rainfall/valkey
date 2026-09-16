@@ -11,10 +11,10 @@
  * filled, flushed and fully reaped before any client handler runs again.
  *
  * Scope (deliberately narrow, see the design note in io_uring_batch.c):
- *   - main thread only (io-threads == 1); TLS/RDMA and replica/primary links
- *     take the ordinary synchronous path.
- *   - writes: only the static reply buffer (c->buf) with no reply list, the
- *     same restriction as valkey-io/valkey#112. Anything else falls back.
+ *   - main thread and I/O threads each run their own ring; TLS/RDMA and
+ *     replica/primary links take the ordinary synchronous path.
+ *   - writes: the static reply buffer as one send, or the reply list /
+ *     encoded buffer as one sendmsg over up to IOU_WIOV iovecs.
  *   - reads: plain client connections whose query buffer is not currently
  *     mid-bulk (big-arg) and are not replicated links.
  */
@@ -29,6 +29,10 @@ struct aeEventLoop;
 /* Returns 1 if the build has liburing and the kernel accepted the ring. */
 int ioUringBatchInit(void);
 void ioUringBatchFree(void);
+/* Per-I/O-thread ring; call from the thread itself (tid >= 1). */
+int ioUringBatchInitThread(int tid);
+void ioUringBatchFreeThread(void);
+/* 1 if the CALLING thread has a working ring. */
 int ioUringBatchActive(void);
 
 /* ---- read side --------------------------------------------------------
@@ -55,6 +59,17 @@ int ioUringBatchQueueWrite(struct client *c);
  * handleClientsWithPendingWrites(). */
 void ioUringBatchFlushWrites(void);
 
+/* ---- I/O-thread side --------------------------------------------------
+ * Called from IOThreadMain() for a dequeued JOB_REQ_READ_CLIENT /
+ * JOB_REQ_WRITE_CLIENT. Returns 1 if the job was absorbed into the thread's
+ * open batch (the caller must not process it), 0 to process it inline. */
+int ioUringBatchQueueIOThreadRead(struct client *c);
+int ioUringBatchQueueIOThreadWrite(struct client *c);
+/* Submit + reap the thread's open batches and run each job's tail. */
+void ioUringBatchFlushIOThread(void);
+/* Number of jobs absorbed and not yet flushed on this thread. */
+int ioUringBatchIOThreadPending(void);
+
 /* A client is being freed synchronously while it may still have a queued
  * SQE (e.g. CLIENT KILL from another client's handler in the same batch).
  * Detach it so the completion is dropped on the floor. */
@@ -65,13 +80,15 @@ typedef struct ioUringBatchStats {
     long long read_batches;   /* flushes with >=1 read */
     long long read_sqes;      /* recv SQEs submitted */
     long long write_batches;  /* flushes with >=1 write */
-    long long write_sqes;     /* send SQEs submitted */
+    long long write_sqes;     /* send + sendmsg SQEs submitted */
+    long long writev_sqes;    /* of which sendmsg (reply list / encoded) */
     long long fallback_reads; /* clients that took the read(2) path */
     long long fallback_writes;
-    long long cancelled;      /* SQEs whose client was freed mid-batch */
+    long long cancelled; /* SQEs whose client was freed mid-batch */
     long long max_read_batch;
     long long max_write_batch;
 } ioUringBatchStats;
-extern ioUringBatchStats io_uring_batch_stats;
+/* Sum of every thread's counters (for INFO). */
+void ioUringBatchStatsTotal(ioUringBatchStats *out);
 
 #endif /* IO_URING_BATCH_H */
