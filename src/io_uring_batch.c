@@ -139,9 +139,10 @@ typedef struct iouThread {
     int in_flush;
     int tid; /* 0 = main */
     iouSlot *rslots;
-    int nreads;
+    int nreads, rcap;
     iouSlot *wslots;
-    int nwrites;
+    int nwrites, wcap;
+    int last_pool_demand; /* pooled buffers handed out in the last batch */
     /* Query-buffer pool for batched reads (see invariant 3). */
     sds *qb_pool;
     int qb_pool_len, qb_pool_cap;
@@ -192,6 +193,26 @@ static void wctxReturn(iouWriteCtx *w) {
     T->wctx_pool[T->wctx_pool_len++] = w;
 }
 
+static int growSlots(iouSlot **slots, int *cap, int need) {
+    if (need < *cap) return 1;
+    if (*cap >= IOU_DEPTH) return 0;
+    int ncap = *cap * 2;
+    if (ncap > IOU_DEPTH) ncap = IOU_DEPTH;
+    *slots = zrealloc(*slots, sizeof(iouSlot) * ncap);
+    memset(*slots + *cap, 0, sizeof(iouSlot) * (ncap - *cap));
+    *cap = ncap;
+    return 1;
+}
+
+/* Keep only as many pooled query buffers as the last batch actually used
+ * (plus a small floor): steady state stays allocation-free, while a burst
+ * does not pin its buffers for the life of the thread. */
+static void qbPoolTrim(void) {
+    int keep = T->last_pool_demand > 8 ? T->last_pool_demand : 8;
+    while (T->qb_pool_len > keep) sdsfree(T->qb_pool[--T->qb_pool_len]);
+    T->last_pool_demand = 0;
+}
+
 static int threadInit(int tid) {
     if (!server.io_uring_enabled) return 0;
     if (T) return T->ok;
@@ -214,8 +235,11 @@ static int threadInit(int tid) {
         zfree(t);
         return 0;
     }
-    t->rslots = zcalloc(sizeof(iouSlot) * IOU_DEPTH);
-    t->wslots = zcalloc(sizeof(iouSlot) * IOU_DEPTH);
+    /* Slot arrays start small and grow with demand so an idle or lightly
+     * loaded server does not carry IOU_DEPTH slots per thread. */
+    t->rcap = t->wcap = 64;
+    t->rslots = zcalloc(sizeof(iouSlot) * t->rcap);
+    t->wslots = zcalloc(sizeof(iouSlot) * t->wcap);
     t->ok = 1;
     T = t;
     if (tid == 0)
@@ -332,6 +356,7 @@ static int queueRecv(client *c) {
     if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG)
         return 0;
     if (T->nreads + T->nwrites >= IOU_DEPTH) return 0;
+    if (!growSlots(&T->rslots, &T->rcap, T->nreads)) return 0;
     struct io_uring_sqe *sqe = io_uring_get_sqe(&T->ring);
     if (!sqe) return 0;
 
@@ -348,6 +373,7 @@ static int queueRecv(client *c) {
         c->querybuf = qbPoolTake();
         s->buf = c->querybuf;
         qblen = 0;
+        T->last_pool_demand++;
     }
     if (sdsalloc(c->querybuf) < PROTO_IOBUF_LEN) {
         c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, readlen);
@@ -459,6 +485,7 @@ static void completeReads(void (*tail)(iouSlot *)) {
         s->buf = NULL;
     }
     T->nreads = 0;
+    qbPoolTrim();
 }
 
 void ioUringBatchFlushReads(struct aeEventLoop *el) {
@@ -476,6 +503,7 @@ static void finishReadIOThread(iouSlot *s) {
 static int queueSend(client *c) {
     if (getClientType(c) == CLIENT_TYPE_REPLICA || c->flag.primary) return 0;
     if (T->nreads + T->nwrites >= IOU_DEPTH) return 0;
+    if (!growSlots(&T->wslots, &T->wcap, T->nwrites)) return 0;
 
     listNode *lastblock;
     size_t bufpos;
