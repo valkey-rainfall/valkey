@@ -152,8 +152,7 @@ typedef struct iouThread {
 
 static _Thread_local iouThread *T = NULL;
 
-static void flushReads(void (*tail)(iouSlot *));
-static void flushWrites(void (*tail)(client *));
+static void flushAll(void);
 static void finishReadIOThread(iouSlot *s);
 static void finishWriteIOThread(client *c);
 
@@ -280,8 +279,17 @@ static inline int batchableMain(client *c) {
     return 1;
 }
 
-/* Submit everything queued and reap exactly `want` completions into slots. */
-static void submitAndReap(iouSlot *slots, int want) {
+/* CQE user_data: slot index with the direction in the top bit. */
+#define UD_WRITE ((uintptr_t)1 << 63)
+#define UD_READ(i) ((void *)(uintptr_t)(i))
+#define UD_WRITE_OF(i) ((void *)(((uintptr_t)(i)) | UD_WRITE))
+
+/* Submit everything queued in BOTH directions and reap all of it. Both
+ * arrays are then fully accounted; callers apply results and run tails in
+ * whatever order they need. */
+static void submitAndReap(void) {
+    int want = T->nreads + T->nwrites;
+    if (want == 0) return;
     int got = 0;
     int rc = io_uring_submit_and_wait(&T->ring, want);
     if (rc < 0 && rc != -EINTR && rc != -EBUSY) {
@@ -291,8 +299,9 @@ static void submitAndReap(iouSlot *slots, int want) {
         struct io_uring_cqe *cqe;
         unsigned head, n = 0;
         io_uring_for_each_cqe(&T->ring, head, cqe) {
-            uintptr_t idx = (uintptr_t)io_uring_cqe_get_data(cqe);
-            slots[idx].res = cqe->res;
+            uintptr_t ud = (uintptr_t)io_uring_cqe_get_data(cqe);
+            iouSlot *slots = (ud & UD_WRITE) ? T->wslots : T->rslots;
+            slots[ud & ~UD_WRITE].res = cqe->res;
             n++;
         }
         io_uring_cq_advance(&T->ring, n);
@@ -302,8 +311,10 @@ static void submitAndReap(iouSlot *slots, int want) {
             if (rc < 0 && rc != -EINTR) {
                 serverLog(LL_WARNING, "io_uring_wait_cqe: %s", strerror(-rc));
                 /* Mark the stragglers as EAGAIN so callers retry via epoll. */
-                for (int i = 0; i < want; i++)
-                    if (slots[i].res == INT_MIN) slots[i].res = -EAGAIN;
+                for (int i = 0; i < T->nreads; i++)
+                    if (T->rslots[i].res == INT_MIN) T->rslots[i].res = -EAGAIN;
+                for (int i = 0; i < T->nwrites; i++)
+                    if (T->wslots[i].res == INT_MIN) T->wslots[i].res = -EAGAIN;
                 break;
             }
         }
@@ -320,7 +331,7 @@ static int queueRecv(client *c) {
      * read to the bulk boundary so the parser can steal the buffer). */
     if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG)
         return 0;
-    if (T->nreads == IOU_DEPTH || T->nwrites != 0) return 0;
+    if (T->nreads + T->nwrites >= IOU_DEPTH) return 0;
     struct io_uring_sqe *sqe = io_uring_get_sqe(&T->ring);
     if (!sqe) return 0;
 
@@ -350,7 +361,7 @@ static int queueRecv(client *c) {
     if (s->buf && c->querybuf != s->buf) s->buf = NULL;
 
     io_uring_prep_recv(sqe, c->conn->fd, c->querybuf + qblen, readlen, MSG_DONTWAIT);
-    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)T->nreads);
+    io_uring_sqe_set_data(sqe, UD_READ(T->nreads));
     c->io_uring_slot = T->nreads;
     T->nreads++;
     STATS.read_sqes++;
@@ -364,9 +375,6 @@ int ioUringBatchQueueRead(client *c) {
 }
 
 int ioUringBatchQueueIOThreadRead(client *c) {
-    /* Reads and writes interleave in the SPMC queue; flushing the pending
-     * writes here is cheaper than refusing the read. */
-    if (T && T->nwrites) flushWrites(finishWriteIOThread);
     if (batchableConn(c) && queueRecv(c)) return 1;
     if (T) STATS.fallback_reads++;
     return 0;
@@ -434,18 +442,13 @@ static void runReadTail(iouSlot *s, void (*tail)(iouSlot *)) {
     if (s->c) s->c->io_uring_slot = -1;
 }
 
-static void flushReads(void (*tail)(iouSlot *)) {
-    if (T->in_flush || T->nreads == 0) return;
-    T->in_flush = 1;
+/* Apply results + run tails for the reads that were part of the last
+ * submitAndReap(). T->in_flush must be held by the caller. */
+static void completeReads(void (*tail)(iouSlot *)) {
     int n = T->nreads;
+    if (n == 0) return;
     STATS.read_batches++;
     if (n > STATS.max_read_batch) STATS.max_read_batch = n;
-
-    submitAndReap(T->rslots, n);
-
-    /* Invariant 1: account every result before any handler runs. */
-    for (int i = 0; i < n; i++)
-        if (T->rslots[i].c) applyReadResult(&T->rslots[i]);
 
     for (int i = 0; i < n; i++) {
         iouSlot *s = &T->rslots[i];
@@ -456,13 +459,11 @@ static void flushReads(void (*tail)(iouSlot *)) {
         s->buf = NULL;
     }
     T->nreads = 0;
-    T->in_flush = 0;
 }
 
 void ioUringBatchFlushReads(struct aeEventLoop *el) {
     UNUSED(el);
-    if (!T) return;
-    flushReads(finishReadMain);
+    flushAll();
 }
 
 static void finishReadIOThread(iouSlot *s) {
@@ -474,7 +475,7 @@ static void finishReadIOThread(iouSlot *s) {
 /* Queue a send (static buffer) or sendmsg (reply list / encoded) SQE. */
 static int queueSend(client *c) {
     if (getClientType(c) == CLIENT_TYPE_REPLICA || c->flag.primary) return 0;
-    if (T->nwrites == IOU_DEPTH || T->nreads != 0) return 0;
+    if (T->nreads + T->nwrites >= IOU_DEPTH) return 0;
 
     listNode *lastblock;
     size_t bufpos;
@@ -511,7 +512,7 @@ static int queueSend(client *c) {
         w->msg.msg_iov = w->reply.iov;
         w->msg.msg_iovlen = w->reply.iovcnt;
         io_uring_prep_sendmsg(sqe, c->conn->fd, &w->msg, MSG_DONTWAIT | MSG_NOSIGNAL);
-        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)T->nwrites);
+        io_uring_sqe_set_data(sqe, UD_WRITE_OF(T->nwrites));
         s->wc = w;
         STATS.writev_sqes++;
     } else {
@@ -521,7 +522,7 @@ static int queueSend(client *c) {
         if (!sqe) return 0;
         size_t off = c->io_last_written.data_len;
         io_uring_prep_send(sqe, c->conn->fd, c->buf + off, bufpos - off, MSG_DONTWAIT | MSG_NOSIGNAL);
-        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)T->nwrites);
+        io_uring_sqe_set_data(sqe, UD_WRITE_OF(T->nwrites));
     }
     c->io_uring_slot = T->nwrites;
     T->nwrites++;
@@ -536,7 +537,6 @@ int ioUringBatchQueueWrite(client *c) {
 }
 
 int ioUringBatchQueueIOThreadWrite(client *c) {
-    if (T && T->nreads) flushReads(finishReadIOThread);
     if (batchableConn(c) && !(c->write_flags & WRITE_FLAGS_IS_REPLICA) && queueSend(c)) return 1;
     if (T) STATS.fallback_writes++;
     return 0;
@@ -579,17 +579,11 @@ static void applyWriteResult(iouSlot *s) {
     c->io_last_written.data_len += res;
 }
 
-static void flushWrites(void (*tail)(client *)) {
-    if (T->in_flush || T->nwrites == 0) return;
-    T->in_flush = 1;
+static void completeWrites(void (*tail)(client *)) {
     int n = T->nwrites;
+    if (n == 0) return;
     STATS.write_batches++;
     if (n > STATS.max_write_batch) STATS.max_write_batch = n;
-
-    submitAndReap(T->wslots, n);
-
-    for (int i = 0; i < n; i++)
-        if (T->wslots[i].c) applyWriteResult(&T->wslots[i]);
 
     for (int i = 0; i < n; i++) {
         iouSlot *s = &T->wslots[i];
@@ -604,17 +598,11 @@ static void flushWrites(void (*tail)(client *)) {
         tail(c);
     }
     T->nwrites = 0;
-    T->in_flush = 0;
 }
 
 static void finishWriteMain(client *c) {
     if (postWriteToClient(c) == C_ERR) return;
     if (clientHasPendingReplies(c)) installClientWriteHandler(c);
-}
-
-void ioUringBatchFlushWrites(void) {
-    if (!T) return;
-    flushWrites(finishWriteMain);
 }
 
 /* The tail of ioThreadWriteToClient(). */
@@ -623,10 +611,36 @@ static void finishWriteIOThread(client *c) {
     sendToMainThread(c, JOB_RES_WRITE_CLIENT);
 }
 
+/* One io_uring_enter for everything queued in both directions. Invariant 1:
+ * every result in both directions is applied to client state before any
+ * tail runs; then read tails (which may parse and, on main, execute and add
+ * replies), then write tails. On the main thread the two directions are
+ * never queued together (reads flush from after-events, writes from the end
+ * of handleClientsWithPendingWrites), so this degenerates to one direction. */
+static void flushAll(void) {
+    if (!T || T->in_flush || T->nreads + T->nwrites == 0) return;
+    T->in_flush = 1;
+    submitAndReap();
+    for (int i = 0; i < T->nreads; i++)
+        if (T->rslots[i].c) applyReadResult(&T->rslots[i]);
+    for (int i = 0; i < T->nwrites; i++)
+        if (T->wslots[i].c) applyWriteResult(&T->wslots[i]);
+    if (T->tid == 0) {
+        completeReads(finishReadMain);
+        completeWrites(finishWriteMain);
+    } else {
+        completeReads(finishReadIOThread);
+        completeWrites(finishWriteIOThread);
+    }
+    T->in_flush = 0;
+}
+
+void ioUringBatchFlushWrites(void) {
+    flushAll();
+}
+
 void ioUringBatchFlushIOThread(void) {
-    if (!T) return;
-    flushReads(finishReadIOThread);
-    flushWrites(finishWriteIOThread);
+    flushAll();
 }
 
 int ioUringBatchIOThreadPending(void) {
