@@ -465,6 +465,11 @@ robj *objectSetExpire(robj *o, long long expire) {
 /* Caller is responsible for ensuring that robj does not have an embedded value */
 void objectSetVal(robj *o, void *val) {
     assert(!o->hasembval);
+    /* A background iterator (forkless save) may be reading this object's value
+     * memory from another thread. Commands that replace a value are blocked
+     * while the entry is in use, so a replacement reaching an in-use entry means
+     * a command mutated a value without being classified as a writer. */
+    debugServerAssert(!bgIteration_isEntryInuse(o));
     o->val_ptr = val;
 }
 

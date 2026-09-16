@@ -3170,3 +3170,57 @@ TEST_F(BgIterationTest, checkNoKeysWriteIsReplicated) {
     expectReadKeySequence(it, 3, LAST_ITEM);
     expectReadComplete(it);
 }
+
+
+using BgIterationDeathTest = BgIterationTest;
+
+/* Replacing the value of an entry a background iterator holds in use must trip the debug
+ * assertion in objectSetVal(). This is the shape of a gate miss: a command that is not
+ * classified as a writer re-encodes an object in place (here, converting a listpack sorted
+ * set) while a forkless save may be reading the old value memory from another thread.
+ *
+ * The same conversion is legal once the iterator has returned the entry, which is checked
+ * after the death expectation. */
+TEST_F(BgIterationDeathTest, valueReplacementOnInuseEntryTripsAssertion) {
+    server.enable_debug_assert = 1;
+    server.zset_max_listpack_entries = 128;
+    server.zset_max_listpack_value = 64;
+
+    // Give item 0 a listpack-encoded sorted set value. Its listpack lives behind val_ptr, so
+    // a conversion goes through objectSetVal(); string values in this fixture are embedded.
+    robj *zobj = createZsetListpackObject();
+    int out_flags = 0;
+    sds member = sdsnew("member");
+    ASSERT_EQ(zsetAdd(zobj, 1.0, member, ZADD_IN_NONE, &out_flags, NULL), 1);
+    sdsfree(member);
+    robj *keyobj = createStringObjectFromCString(keyStr(0));
+    dbReplaceValue(server.db[0], keyobj, &zobj);
+    decrRefCount(keyobj);
+
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_NONE, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+
+    // Read item 0: the iterator now holds it in use.
+    bgIteration_feedIterators();
+    bgIteratorItem *item = bgIteratorRead(it);
+    bgIteration_feedIterators();
+    ASSERT_EQ(item->type, BGITERATOR_ITEM_DBENTRY);
+    dbEntry *de = item->u.dbe.de;
+    ASSERT_STREQ(objectGetKey(de), keyStr(0));
+    ASSERT_TRUE(bgIteration_isEntryInuse(de));
+    ASSERT_EQ(objectGetEncoding(de), OBJ_ENCODING_LISTPACK);
+
+    // Converting the in-use entry replaces its value: the tripwire must fire.
+    EXPECT_DEATH(zsetConvert(de, OBJ_ENCODING_BTREE), "");
+
+    // The death expectation ran in a child process; in this process the entry is untouched.
+    ASSERT_EQ(objectGetEncoding(de), OBJ_ENCODING_LISTPACK);
+
+    // Drain the iteration so the entry is released, then the same conversion is legal.
+    expectReadKeySequence(it, 1, LAST_ITEM);
+    expectReadComplete(it);
+    ASSERT_FALSE(bgIteration_isEntryInuse(de));
+    zsetConvert(de, OBJ_ENCODING_BTREE);
+    EXPECT_EQ(objectGetEncoding(de), OBJ_ENCODING_BTREE);
+    EXPECT_EQ(zsetLength(de), 1u);
+}

@@ -553,3 +553,37 @@ start_cluster 1 0 {tags {"external:skip cluster sort"}} {
         assert_equal {30 3 200 1 100 2} [r sort_ro "{a}mylist" by "{a}by*" get "{a}get*" get #]
     }
 }
+
+start_server {tags {"sort" "external:skip"} overrides {forkless-infrastructure-enabled yes save ""}} {
+    # A forkless save reads value memory from a background thread while the main
+    # thread keeps serving commands. Only commands classified as writers are held
+    # back from an entry the save is reading, so a read command must not replace
+    # the value it reads. With enable-debug-assert on, a replacement of an in-use
+    # entry aborts the server.
+    test "SORT_RO leaves a sorted set untouched while a forkless save is reading it" {
+        r flushall
+        r zadd zset 1 a 5 b 2 c 10 d 3 e
+        assert_encoding listpack zset
+        r config set bgsave-default-method forkless
+
+        # Make the save thread dwell on each key so the entry stays in use for the
+        # duration of the commands below.
+        r config set rdb-key-save-delay 2000000
+        r bgsave
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "forkless bgsave didn't start"
+        }
+
+        assert_equal [r sort_ro zset by nosort] {a c e b d}
+        assert_equal [r sort_ro zset by nosort desc limit 1 2] {b e}
+        assert_equal [r sort_ro zset alpha desc] {e d c b a}
+        assert_encoding listpack zset
+
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        assert_equal [s rdb_last_bgsave_status] ok
+        assert_equal [s rdb_last_bgsave_type] forkless
+    } {} {needs:save}
+}
