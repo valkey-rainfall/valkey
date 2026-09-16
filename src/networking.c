@@ -424,6 +424,10 @@ static void b13CancelOwnerWriteHandler(client *c);
 static void b13ReleaseOrRearmAfterRead(client *c);
 
 void putClientInPendingWriteQueue(client *c) {
+    /* PWTRACE: this function has no thread-affinity guard today; if this
+     * ever fires from a worker thread, that IS the smoking gun for the
+     * feature-1 crash -- see crash-pending-write-race-sep16.md. */
+    serverAssert(inMainThread());
     /* Door-2 B13/D5: an owned client in WAITING_WRITABLE must NEVER be linked
      * into clients_pending_write. Its delivery is owned by the f7 owner-write
      * handler (worker event), and the b13 rearm at read handoffs refreshes the
@@ -451,6 +455,7 @@ void putClientInPendingWriteQueue(client *c) {
          * a system call. We'll only really install the write handler if
          * we'll not be able to write the whole reply at once. */
         c->flag.pending_write = 1;
+        pwTraceRecord(c, PWTRACE_PUT_QUEUE, 1);
         listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
     }
 }
@@ -2104,6 +2109,8 @@ void unlinkClient(client *c) {
     /* Remove from the list of pending writes if needed. */
     if (c->flag.pending_write) {
         serverAssert(server.clients_pending_write->len > 0);
+        serverAssert(inMainThread());
+        pwTraceRecord(c, PWTRACE_UNLINK_CLIENT, 0);
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         c->flag.pending_write = 0;
     }
@@ -2478,6 +2485,8 @@ void beforeNextClient(client *c) {
             !c->flag.close_asap && !c->flag.lua_debug &&
             (c->bufpos > 0 || listLength(c->reply) > 0)) {
             if (c->flag.pending_write) {
+                serverAssert(inMainThread());
+                pwTraceRecord(c, PWTRACE_BEFORENEXT_F8_UNLINK, 0);
                 listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
                 c->flag.pending_write = 0;
             }
@@ -3530,6 +3539,8 @@ static int b13ArmOwnerWriteHandler(client *c) {
     int was_waiting = clientWriteIsWaiting(c);
 #endif
     if (c->flag.pending_write) {
+        serverAssert(inMainThread());
+        pwTraceRecord(c, PWTRACE_B13_ARM_UNLINK, 0);
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         c->flag.pending_write = 0;
     }
@@ -3717,12 +3728,17 @@ int handleClientsWithPendingWrites(void) {
     int processed = 0;
     int pending_writes = listLength(server.clients_pending_write);
     if (pending_writes == 0) return processed; /* Return ASAP if there are no clients. */
+    serverAssert(inMainThread());
 
     listIter li;
     listNode *ln;
     listRewind(server.clients_pending_write, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
+        /* PWTRACE: stash the client we're about to assert on so a failure
+         * dump (hooked into _serverAssert) can print its per-client ring
+         * even though the serverAssert() macro itself carries no context. */
+        pwtrace_last_client = c;
         serverAssert(c->flag.pending_write);
 
         /* If a client is protected, don't do anything,
@@ -3740,6 +3756,7 @@ int handleClientsWithPendingWrites(void) {
          * near-unreachable; heal defensively rather than wedge. */
         if (clientWriteIsWaiting(c)) {
             c->flag.pending_write = 0;
+            pwTraceRecord(c, PWTRACE_HANDLE_PW_HEAL_UNLINK, 0);
             listUnlinkNode(server.clients_pending_write, ln);
             continue;
         }
@@ -3760,6 +3777,7 @@ int handleClientsWithPendingWrites(void) {
         }
 
         c->flag.pending_write = 0;
+        pwTraceRecord(c, PWTRACE_HANDLE_PW_UNLINK, 0);
         listUnlinkNode(server.clients_pending_write, ln);
 
         if (!clientHasPendingReplies(c)) {

@@ -9053,7 +9053,9 @@ void moduleHandleBlockedClients(void) {
              * if there are pending replies here. This is needed since
              * during a non blocking command the client may receive output. */
             if (!clientHasModuleAuthInProgress(c) && clientHasPendingReplies(c) && !c->flag.pending_write && c->conn) {
+                serverAssert(inMainThread());
                 c->flag.pending_write = 1;
+                pwTraceRecord(c, PWTRACE_MODULE_LINK, 1);
                 listLinkNodeHead(server.clients_pending_write, &c->clients_pending_write_node);
             }
         }

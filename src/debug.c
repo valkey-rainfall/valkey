@@ -1192,6 +1192,16 @@ __attribute__((noinline, weak)) void _serverAssert(const char *estr, const char 
     serverLog(LL_WARNING, "=== %sASSERTION FAILED ===", new_report ? "" : "RECURSIVE ");
     serverLog(LL_WARNING, "==> %s:%d '%s' is not true", file, line, estr);
 
+    /* PWTRACE (debug, feature-1 crash instrumentation): dump the
+     * clients_pending_write mutation rings before anything else, so the
+     * crash log has them even if crashlog_enabled is off or backtrace
+     * generation itself hits trouble. pwtrace_last_client is set right
+     * before handleClientsWithPendingWrites' serverAssert(c->flag.pending_write)
+     * specifically; for every other assert it is stale/NULL and pwTraceDump
+     * simply omits the per-client section. No-op if the rings were never
+     * populated (pwtrace_populated == 0). */
+    pwTraceDump(pwtrace_last_client);
+
     if (server.crashlog_enabled) {
 #ifdef HAVE_BACKTRACE
         logStackTrace(NULL, 1, 0);

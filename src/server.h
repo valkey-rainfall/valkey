@@ -69,6 +69,7 @@
 #include "hashtable.h"  /* Hash tables (new implementation) */
 #include "kvstore.h"    /* Slot-based hash table */
 #include "adlist.h"     /* Linked lists */
+#include "pwtrace.h"    /* DEBUG: feature-1 clients_pending_write crash instrumentation */
 #include "zmalloc.h"    /* total memory usage aware version of malloc/free */
 #include "anet.h"       /* Networking the easy way */
 #include "version.h"    /* Version macro */
@@ -1340,6 +1341,10 @@ typedef struct client {
     LastWrittenBuf io_last_written;      /* Track state for last written buffer */
     unsigned long long reply_bytes;      /* Tot bytes of objects in reply list. */
     listNode clients_pending_write_node; /* list node in clients_pending_write or in clients_pending_io_write list */
+    /* PWTRACE (debug, feature-1 crash instrumentation): last 8 mutations of
+     * this client's clients_pending_write membership. See pwtrace.h. */
+    pwTraceEntry pwtrace_ring[PWTRACE_RING_SIZE];
+    uint8_t pwtrace_next;
     size_t bufpos;
     payloadHeader *last_header; /* Pointer to the last header in a buffer when using copy avoidance */
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */

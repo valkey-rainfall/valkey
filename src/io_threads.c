@@ -1063,6 +1063,8 @@ int trySendWriteToIOThreads(client *c) {
         }
     }
     if (c->flag.pending_write) {
+        serverAssert(inMainThread());
+        pwTraceRecord(c, PWTRACE_TRYSEND_UNLINK, 0);
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         c->flag.pending_write = 0;
     }

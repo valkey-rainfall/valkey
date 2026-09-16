@@ -537,6 +537,7 @@ ENGINE_SERVER_OBJ = \
     object.o \
     pqsort.o \
     pubsub.o \
+    pwtrace.o \
     quicklist.o \
     rand.o \
     rax.o \
