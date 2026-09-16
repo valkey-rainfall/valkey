@@ -9,6 +9,9 @@
 
 /* Cap on SPMC jobs one io_uring-batching worker absorbs per loop pass. */
 #define IO_URING_JOB_SHARE_MAX 512
+/* Fewer jobs of one direction than this run inline: a one-entry
+ * io_uring_enter costs more than the plain syscall it replaces. */
+#define IO_URING_MIN_BATCH 4
 #include "ae.h"
 #include "cluster.h"
 #include "cluster_legacy.h"
@@ -420,21 +423,39 @@ static void *IOThreadMain(void *myid) {
                 share = (int)(n / workers) + 1;
                 if (share > IO_URING_JOB_SHARE_MAX) share = IO_URING_JOB_SHARE_MAX;
             }
-            for (int i = 0; i < share; i++) {
+            /* Take the share first, then decide per direction: a single
+             * recv/send is cheaper as a plain syscall than as a one-entry
+             * io_uring_enter, so a direction is batched only when this pass
+             * holds at least IO_URING_MIN_BATCH jobs of it. */
+            void *jobs[IO_URING_JOB_SHARE_MAX];
+            int njobs = 0, nread = 0, nwrite = 0;
+            while (njobs < share) {
                 void *tagged_job = spmcDequeue(q);
                 if (tagged_job == NULL) break;
                 void *data;
                 int type;
                 untagJob(tagged_job, &data, &type);
-                if (type == JOB_REQ_READ_CLIENT && ioUringBatchQueueIOThreadRead((client *)data)) {
+                if (type == JOB_REQ_READ_CLIENT)
+                    nread++;
+                else if (type == JOB_REQ_WRITE_CLIENT)
+                    nwrite++;
+                jobs[njobs++] = tagged_job;
+            }
+            for (int i = 0; i < njobs; i++) {
+                void *data;
+                int type;
+                untagJob(jobs[i], &data, &type);
+                if (type == JOB_REQ_READ_CLIENT && nread >= IO_URING_MIN_BATCH &&
+                    ioUringBatchQueueIOThreadRead((client *)data)) {
                     processed++;
                     continue;
                 }
-                if (type == JOB_REQ_WRITE_CLIENT && ioUringBatchQueueIOThreadWrite((client *)data)) {
+                if (type == JOB_REQ_WRITE_CLIENT && nwrite >= IO_URING_MIN_BATCH &&
+                    ioUringBatchQueueIOThreadWrite((client *)data)) {
                     processed++;
                     continue;
                 }
-                processTaggedSPMCJob(tagged_job);
+                processTaggedSPMCJob(jobs[i]);
                 processed++;
             }
         }
