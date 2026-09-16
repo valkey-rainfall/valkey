@@ -57,7 +57,12 @@ ioUringBatchStats io_uring_batch_stats;
 #include <sys/socket.h>
 #include <limits.h>
 
-extern int ProcessingEventsWhileBlocked; /* networking.c */
+/* networking.c internals reused by the deferred completion paths. */
+extern int ProcessingEventsWhileBlocked;
+int handleReadResult(client *c);
+void trimCommandQueue(client *c);
+int postWriteToClient(client *c);
+void installClientWriteHandler(client *c);
 
 /* Ring depth. If more clients are ready in one iteration than fit, the
  * overflow simply takes the synchronous path (counted as fallback). */
