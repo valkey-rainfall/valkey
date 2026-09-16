@@ -1379,6 +1379,17 @@ typedef struct client {
     unsigned long long net_input_bytes_curr_cmd;  /* Total network input bytes read for the* execution of this client's current command. */
     unsigned long long net_output_bytes;          /* Total network output bytes sent to this client. */
     unsigned long long commands_processed;        /* Total count of commands this client executed. */
+    /* Adaptive disown-by-write-ratio (door-2): rolling window of this owned
+     * client's command mix. own_spec_cmds is incremented ONLY by the owning
+     * IO thread, inside dplusConsumeSpeculated, touching only its own
+     * client's struct. own_punted_cmds is incremented ONLY by main, inside
+     * commandProcessed, for the punted batch main just executed on this
+     * client's behalf -- main is the only thread touching an owned client
+     * between CLIENT_COMPLETED_IO and the beforeNextClient release, so this
+     * needs no atomics. The decision (and window reset) happens once per
+     * handback in beforeNextClient, also on main. */
+    uint32_t own_punted_cmds;                     /* Non-speculated commands executed by main since last window reset. */
+    uint32_t own_spec_cmds;                       /* Commands speculated/consumed by the owning worker since last window reset. */
     unsigned long long net_output_bytes_curr_cmd; /* Total network output bytes sent to this client, by the current command. */
     _Atomic(size_t) io_tracked_reply_len;         /* Total size of BULK_STR_REF replies tracked by I/O threads. */
     size_t buf_peak;                              /* Peak used size of buffer in last 5 sec interval. */
@@ -1851,6 +1862,8 @@ struct valkeyServer {
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int io_threads_ownership;                 /* Enable per-worker fd ownership (door-2, EXPERIMENTAL). */
+    int io_threads_disown_write_ratio;        /* Adaptive disown: punted%% threshold (0-100) to disown an owned client; 100 disables. */
+    int io_threads_disown_min_commands;       /* Adaptive disown: min commands in window before a decision is made. */
     int dplus_reclaim_budget_entries;         /* Max retired entries freed per beforeSleep reclaim pass. */
     int dplus_reclaim_budget_us;              /* Max microseconds per beforeSleep reclaim pass. */
     int dplus_reclaim_soft_entries;           /* Retired-entry backlog that closes the speculation gate. */
@@ -1940,6 +1953,7 @@ struct valkeyServer {
     long long stat_io_reads_pending;                   /* Number of read events pending in IO threads */
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
+    unsigned long long dplus_adaptive_disowns;         /* Adaptive disown-by-write-ratio: clients disowned for a predominantly-punted mix. Main-thread-only, written at the beforeNextClient handback. */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */

@@ -3392,6 +3392,12 @@ standardConfig static_configs[] = {
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
     createBoolConfig("io-threads-ownership", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_ownership, 0, NULL, NULL),
+    /* Adaptive disown-by-write-ratio (EXPERIMENTAL): a client whose recent
+     * command mix is predominantly punted (non-speculatable) is handed back
+     * to main's loop so it takes the stock (non-ownership) path. 100 disables
+     * the feature (ratio can never be reached). */
+    createIntConfig("io-threads-disown-write-ratio", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 100, server.io_threads_disown_write_ratio, 50, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-disown-min-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_disown_min_commands, 256, INTEGER_CONFIG, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),

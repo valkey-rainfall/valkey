@@ -1310,6 +1310,14 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     dplus_thread_stats[tid].get_commands += get_consumed;
     dplus_thread_stats[tid].mget_commands += mget_consumed;
     dplus_thread_stats[tid].scan_commands += scan_consumed;
+    /* Adaptive disown-by-write-ratio: this client's own_spec_cmds field is
+     * touched ONLY by its owning worker (here), never by main or another
+     * worker -- the worker exclusively owns c during this phase (io_read_state
+     * == CLIENT_PENDING_IO), so a plain (non-atomic) increment is safe. Main
+     * reads this field only at the beforeNextClient handback, after the
+     * worker has published CLIENT_COMPLETED_IO with a release fence, which
+     * main's corresponding acquire (in the handback path) synchronizes with. */
+    c->own_spec_cmds += (uint32_t)consumed;
     /* E3: every consumed speculative KEY is a hit (valid-nil misses punt to
      * main via E4; large/expired/torn also punt) -- an MGET contributes one
      * hit per key; SCAN returns keys, not values, and contributes none.
@@ -2017,7 +2025,8 @@ sds dplusInfoString(sds info) {
         "dplus_epoch_debug_reader_hold_us:%lld\r\n"
         "dplus_doorbell_rings:%llu\r\n"
         "dplus_doorbell_coalesced:%llu\r\n"
-        "dplus_punted_replies_written:%llu\r\n",
+        "dplus_punted_replies_written:%llu\r\n"
+        "dplus_adaptive_disowns:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
         (unsigned long long)entries,
         (unsigned long long)retries,
@@ -2043,7 +2052,8 @@ sds dplusInfoString(sds info) {
         debug_reader_hold_us,
         (unsigned long long)doorbell_rings,
         (unsigned long long)doorbell_coalesced,
-        (unsigned long long)punted_replies);
+        (unsigned long long)punted_replies,
+        (unsigned long long)server.dplus_adaptive_disowns);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
         "dplus_speculative_attempts:%llu\r\n"

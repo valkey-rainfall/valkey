@@ -2460,6 +2460,33 @@ void beforeNextClient(client *c) {
             c->pubsub_data != NULL) { /* lazily allocated on first pubsub/tracking use */
             disownClient(c);
         }
+        /* Adaptive disown-by-write-ratio: a simple request/response client
+         * (survived the complex-state check above) whose recent command mix
+         * is predominantly punted gets no benefit from ownership -- its
+         * writes wait on main's batch cadence regardless (measured: a
+         * mostly-write owned connection caps far below the stock path).
+         * Disown it back to main's loop, matching the design's "adaptive
+         * disown = predictability guarantee". Decision runs here, once per
+         * handback, entirely on main -- own_punted_cmds/own_spec_cmds are
+         * the same fields commandProcessed() and dplusConsumeSpeculated()
+         * maintain; both writers are synchronized with this read (main
+         * itself for punted, the owner's COMPLETED_IO release/acquire for
+         * speculated). Ratio check uses 64-bit math to avoid overflow before
+         * the divide. No re-own path: once disowned, a client is legacy for
+         * its lifetime, same as the complex-state disowns above. */
+        if (c->owner_tid != 0) {
+            uint32_t window = c->own_punted_cmds + c->own_spec_cmds;
+            if (window >= (uint32_t)server.io_threads_disown_min_commands) {
+                if (server.io_threads_disown_write_ratio < 100 &&
+                    (uint64_t)c->own_punted_cmds * 100 >=
+                        (uint64_t)window * (uint64_t)server.io_threads_disown_write_ratio) {
+                    disownClient(c);
+                    server.dplus_adaptive_disowns++;
+                }
+                c->own_punted_cmds = 0;
+                c->own_spec_cmds = 0;
+            }
+        }
         /* F8 (drain-time staging): if this punted batch produced replies and
          * the client still qualifies (not disowned above), stage the owner
          * write HERE — at per-client handback — instead of leaving it for the
@@ -4387,6 +4414,17 @@ void commandProcessed(client *c) {
      * 2. Don't update replication offset or propagate commands to replicas,
      *    since we have not applied the command. */
     if (c->flag.blocked) return;
+
+    /* Adaptive disown-by-write-ratio: this command ran on main because it was
+     * punted (non-speculatable) from an owned client's batch. Only main
+     * writes own_punted_cmds, and only for owned clients (c->owner_tid != 0);
+     * main is the sole thread touching an owned client's struct between
+     * CLIENT_COMPLETED_IO and the beforeNextClient release, so this needs no
+     * atomics. Blocked clients return above and are re-processed later via
+     * unblockClient -- not double counted here, but also not a normal punt:
+     * excluded is fine, they're already excluded from ownership by the
+     * disown-on-complex-state block in beforeNextClient. */
+    if (c->owner_tid != 0) c->own_punted_cmds++;
 
     reqresAppendResponse(c);
     clusterSlotStatsAddNetworkBytesInForUserClient(c);

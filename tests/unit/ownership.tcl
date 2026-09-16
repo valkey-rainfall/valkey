@@ -878,3 +878,57 @@ start_server {tags {"ownership"} overrides {io-threads 5 io-threads-ownership ye
         $mon close
     }
 }
+
+# --- Adaptive disown-by-write-ratio regression tests ---
+# A mostly-write owned connection gets terrible service from a busy owner
+# (punted batches wait on main's cadence); a client whose recent mix is
+# predominantly punted is disowned back to main's stock loop.
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes io-threads-disown-min-commands 256 io-threads-disown-write-ratio 50 save {}}} {
+
+    test {OWNERSHIP ADAPTIVE-DISOWN: mostly-write client is disowned after the window} {
+        set rd [valkey_deferring_client]
+        $rd debug dplus-owner
+        set owner_before [$rd read]
+        assert {$owner_before != 0}
+        set before [dplus_info_field r dplus_adaptive_disowns]
+        # SET never speculates -- every command in this window is punted, well
+        # above the 50% ratio threshold, so this must cross the disown decision
+        # inside the 256-command window.
+        set n 600
+        for {set i 0} {$i < $n} {incr i} { $rd set adk:$i v$i }
+        for {set i 0} {$i < $n} {incr i} { assert_equal "OK" [$rd read] }
+        wait_for_condition 100 50 {
+            [dplus_info_field r dplus_adaptive_disowns] > $before
+        } else {
+            fail "dplus_adaptive_disowns did not increment after a mostly-write window"
+        }
+        $rd debug dplus-owner
+        assert_equal 0 [$rd read] ; # disowned: owner_tid cleared
+        # The client keeps working correctly post-disown, on main's stock path.
+        for {set i 0} {$i < $n} {incr i} { $rd get adk:$i }
+        for {set i 0} {$i < $n} {incr i} { assert_equal "v$i" [$rd read] }
+        $rd close
+    }
+}
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes io-threads-disown-min-commands 256 io-threads-disown-write-ratio 100 save {}}} {
+
+    test {OWNERSHIP ADAPTIVE-DISOWN: ratio 100 disables the feature} {
+        set rd [valkey_deferring_client]
+        $rd debug dplus-owner
+        set owner_before [$rd read]
+        assert {$owner_before != 0}
+        set before [dplus_info_field r dplus_adaptive_disowns]
+        set n 600
+        for {set i 0} {$i < $n} {incr i} { $rd set adk100:$i v$i }
+        for {set i 0} {$i < $n} {incr i} { assert_equal "OK" [$rd read] }
+        # Give the window several chances to fire; with ratio=100 it never does.
+        for {set i 0} {$i < $n} {incr i} { $rd set adk100:$i v2$i }
+        for {set i 0} {$i < $n} {incr i} { assert_equal "OK" [$rd read] }
+        assert_equal $before [dplus_info_field r dplus_adaptive_disowns]
+        $rd debug dplus-owner
+        assert {[$rd read] != 0} ; # still owned
+        $rd close
+    }
+}
