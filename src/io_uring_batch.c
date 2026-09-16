@@ -57,6 +57,8 @@ ioUringBatchStats io_uring_batch_stats;
 #include <sys/socket.h>
 #include <limits.h>
 
+extern int ProcessingEventsWhileBlocked; /* networking.c */
+
 /* Ring depth. If more clients are ready in one iteration than fit, the
  * overflow simply takes the synchronous path (counted as fallback). */
 #define IOU_DEPTH 4096
