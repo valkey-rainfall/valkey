@@ -143,6 +143,7 @@ typedef struct iouThread {
     iouSlot *wslots;
     int nwrites, wcap;
     int last_pool_demand; /* pooled buffers handed out in the last batch */
+    int pool_keep;        /* decaying high-water mark of that demand */
     /* Query-buffer pool for batched reads (see invariant 3). */
     sds *qb_pool;
     int qb_pool_len, qb_pool_cap;
@@ -204,11 +205,17 @@ static int growSlots(iouSlot **slots, int *cap, int need) {
     return 1;
 }
 
-/* Keep only as many pooled query buffers as the last batch actually used
- * (plus a small floor): steady state stays allocation-free, while a burst
- * does not pin its buffers for the life of the thread. */
+/* Bound the pool by a high-water mark of per-batch demand that decays by
+ * 1/16 of the gap each batch: a steady load never reallocates even though
+ * batch sizes jitter, and a burst's buffers are released within a few dozen
+ * batches instead of being pinned for the life of the thread. */
 static void qbPoolTrim(void) {
-    int keep = T->last_pool_demand > 8 ? T->last_pool_demand : 8;
+    int d = T->last_pool_demand;
+    if (d > T->pool_keep)
+        T->pool_keep = d;
+    else
+        T->pool_keep -= (T->pool_keep - d) >> 4;
+    int keep = T->pool_keep > 8 ? T->pool_keep : 8;
     while (T->qb_pool_len > keep) sdsfree(T->qb_pool[--T->qb_pool_len]);
     T->last_pool_demand = 0;
 }
