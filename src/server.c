@@ -6923,8 +6923,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             info = sdscatprintf(info,
                                 "io_thread_%d_cmd_cpu_pct:%d\r\n"
                                 "io_thread_%d_io_cpu_pct:%d\r\n",
-                                i, atomic_load_explicit(&io_threads_stat_cmd_cpu[i], memory_order_relaxed),
-                                i, atomic_load_explicit(&io_threads_stat_io_cpu[i], memory_order_relaxed));
+                                i, getIOThreadCmdCpuPct(i),
+                                i, getIOThreadIoCpuPct(i));
         }
         info = genValkeyInfoStringACLStats(info);
     }

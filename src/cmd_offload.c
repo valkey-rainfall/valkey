@@ -592,12 +592,12 @@ static int shouldSkipSaturationUpdate(void) {
 void updateOffloadingSaturation(void) {
     if (shouldSkipSaturationUpdate()) return;
 
-    int avg_io_pct = getAverageThreadStat(io_threads_stat_io_cpu, server.active_io_threads_num);
+    int avg_io_pct = getAverageIOThreadIoCpuPct(server.active_io_threads_num);
     int active = server.active_io_threads_num;
 
     /* Check Becoming Saturated */
     if (!server.io_threads_saturated && active == server.io_threads_num) {
-        int avg_cmd_pct = getAverageThreadStat(io_threads_stat_cmd_cpu, active);
+        int avg_cmd_pct = getAverageIOThreadCmdCpuPct(active);
         int cmd_total = avg_cmd_pct * (active - 1);
 
         /* Only consider saturation if we aren't utilizing full core power on commands */
@@ -634,4 +634,107 @@ void updateOffloadingSaturation(void) {
             server.offload_throttle_pct = 100;
         }
     }
+}
+
+/* --------------------------------------------------------------------------
+ * Test-only accessors.
+ *
+ * slotQueue is intentionally opaque outside this file (see cmd_offload.h),
+ * so unit tests can't poke its fields directly the way the pre-port C
+ * harness did (it compiled this file in-process via #include). These hooks
+ * expose just enough of that private state, through the same static helpers
+ * production code already uses, to keep the ported tests behaviorally
+ * equivalent without leaking the struct layout.
+ * -------------------------------------------------------------------------- */
+
+void testOnlyResetSlotQueues(void) {
+    if (globalExclusiveQueue.pending_clients) listRelease(globalExclusiveQueue.pending_clients);
+    if (globalExclusiveQueue.deferred_jobs) listRelease(globalExclusiveQueue.deferred_jobs);
+    for (int i = 0; i < CLUSTER_SLOTS; i++) {
+        if (slotQueues[i].pending_clients) listRelease(slotQueues[i].pending_clients);
+        if (slotQueues[i].deferred_jobs) listRelease(slotQueues[i].deferred_jobs);
+    }
+    memset(&globalExclusiveQueue, 0, sizeof(globalExclusiveQueue));
+    memset(slotQueues, 0, sizeof(slotQueues));
+    current_slot_context = CTX_NONE;
+    offload_suspended_by_contention = 0;
+    initSlotQueues();
+}
+
+int testOnlyGetSlotRefCount(int slot) {
+    return getSlotQueue(slot)->refcount;
+}
+
+/* Set a slot's refcount directly, bypassing IncRef/DecRef's own bookkeeping.
+ * Mirrors the pre-port test's direct struct writes (e.g. manually resetting
+ * globalExclusiveQueue.refcount to avoid triggering queue draining). */
+void testOnlySetSlotRefCount(int slot, int refcount) {
+    getSlotQueue(slot)->refcount = refcount;
+}
+
+int testOnlyIsSlotExclusiveCmd(struct serverCommand *cmd, int slot) {
+    return isSlotExclusiveCmd(cmd, slot);
+}
+
+/* Mirrors how production code always pairs createJobNode() with
+ * processOrAddJob(): create the node then immediately hand it to the queue. */
+void testOnlyCreateAndProcessJob(int slot, job_handler handler, size_t data_size, void *data) {
+    listNode *node = createJobNode(slot, handler, data_size, data);
+    processOrAddJob(getSlotQueue(slot), node);
+}
+
+/* Append a job directly to a slot's deferred_jobs list, bypassing refcount
+ * and processOrAddJob's immediate-execute branch. Mirrors the original
+ * test's direct createJobNode()+listLinkNodeTail() onto gq->deferred_jobs. */
+void testOnlyQueueJobDirectly(int slot, job_handler handler, size_t data_size, void *data) {
+    slotQueue *q = getSlotQueue(slot);
+    listNode *node = createJobNode(slot, handler, data_size, data);
+    if (q->deferred_jobs == NULL) q->deferred_jobs = listCreate();
+    listLinkNodeTail(q->deferred_jobs, node);
+}
+
+void testOnlyProcessDeferredJobsForSlot(int slot) {
+    processDeferredJobsList(getSlotQueue(slot));
+}
+
+int testOnlyGetDeferredJobCount(int slot) {
+    slotQueue *q = getSlotQueue(slot);
+    return q->deferred_jobs ? (int)listLength(q->deferred_jobs) : 0;
+}
+
+/* Remove the first queued deferred job without executing it. Mirrors the
+ * original test's direct listFirst()+listDelNode() cleanup of the single
+ * deferred serverCron job it queued, without calling the job's handler. */
+void testOnlyClearDeferredJobsForSlot(int slot) {
+    slotQueue *q = getSlotQueue(slot);
+    if (!q->deferred_jobs) return;
+    listNode *ln = listFirst(q->deferred_jobs);
+    if (ln) listDelNode(q->deferred_jobs, ln);
+}
+
+int testOnlyDeferredJobsListIsNull(int slot) {
+    return getSlotQueue(slot)->deferred_jobs == NULL;
+}
+
+int testOnlyPendingClientsIsNull(int slot) {
+    return getSlotQueue(slot)->pending_clients == NULL;
+}
+
+/* The old context values (CTX_NONE / CTX_EXCLUSIVE) are private constants of
+ * this file; expose the two symbolic states plus the general "in slot N"
+ * state tests actually exercise, rather than leaking the raw ints. */
+void testOnlySetSlotContextToSlot(int slot) {
+    current_slot_context = slot;
+}
+
+void testOnlySetSlotContextExclusive(void) {
+    current_slot_context = CTX_EXCLUSIVE;
+}
+
+void testOnlyClearSlotContext(void) {
+    current_slot_context = CTX_NONE;
+}
+
+int testOnlyGetThreadDeferredJobCount(void) {
+    return thread_deferred_jobs ? (int)listLength(thread_deferred_jobs) : -1;
 }

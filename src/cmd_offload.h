@@ -94,4 +94,24 @@ void handleCommandJobs(struct client **command_jobs, int command_count);
 void updateOffloadingThrottle(void);
 void updateOffloadingSaturation(void);
 
+/* -----------------------------------------------------------------------
+ * Test-only accessors (unit tests only). slotQueue's fields are private to
+ * cmd_offload.c; these expose just enough of that state for src/unit tests.
+ * ----------------------------------------------------------------------- */
+void testOnlyResetSlotQueues(void);
+int testOnlyGetSlotRefCount(int slot);
+void testOnlySetSlotRefCount(int slot, int refcount);
+int testOnlyIsSlotExclusiveCmd(struct serverCommand *cmd, int slot);
+void testOnlyCreateAndProcessJob(int slot, job_handler handler, size_t data_size, void *data);
+void testOnlyQueueJobDirectly(int slot, job_handler handler, size_t data_size, void *data);
+void testOnlyProcessDeferredJobsForSlot(int slot);
+int testOnlyGetDeferredJobCount(int slot);
+void testOnlyClearDeferredJobsForSlot(int slot);
+int testOnlyDeferredJobsListIsNull(int slot);
+int testOnlyPendingClientsIsNull(int slot);
+void testOnlySetSlotContextToSlot(int slot);
+void testOnlySetSlotContextExclusive(void);
+void testOnlyClearSlotContext(void);
+int testOnlyGetThreadDeferredJobCount(void);
+
 #endif /* __CMD_OFFLOAD_H */

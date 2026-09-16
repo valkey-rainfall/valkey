@@ -56,10 +56,10 @@ static int io_threads_initialized = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 /* Statistics Publishing Arrays (Index corresponds to thread ID) */
-atomic_int io_threads_stat_cmd_cpu[IO_THREADS_MAX_NUM] = {0};
-atomic_int io_threads_stat_io_cpu[IO_THREADS_MAX_NUM] = {0};
+static _Atomic(int) io_threads_stat_cmd_cpu[IO_THREADS_MAX_NUM] = {0};
+static _Atomic(int) io_threads_stat_io_cpu[IO_THREADS_MAX_NUM] = {0};
 /* Flag to indicate if a thread is skipping IO due to high CPU usage */
-atomic_int io_threads_io_skipped[IO_THREADS_MAX_NUM] = {0};
+static _Atomic(int) io_threads_io_skipped[IO_THREADS_MAX_NUM] = {0};
 
 /* IO thread throttling thresholds for skip logic in updateIoStats() */
 #define IO_SKIP_CMD_RATIO 3.0      /* Skip if cmd_pct > avg_other_cmd * this ratio */
@@ -206,7 +206,7 @@ static inline void activateIOThread(int id) {
     server.active_io_threads_num++;
 }
 
-int getAverageThreadStat(_Atomic int *stats_array, int active_threads) {
+static int getAverageThreadStat(_Atomic(int) *stats_array, int active_threads) {
     if (active_threads <= 1) return 0;
 
     long total = 0;
@@ -214,6 +214,30 @@ int getAverageThreadStat(_Atomic int *stats_array, int active_threads) {
         total += atomic_load_explicit(&stats_array[i], memory_order_relaxed);
     }
     return (int)(total / (active_threads - 1));
+}
+
+/* Average published I/O-time percentage across active I/O threads (excluding main). */
+int getAverageIOThreadIoCpuPct(int active_threads) {
+    return getAverageThreadStat(io_threads_stat_io_cpu, active_threads);
+}
+
+/* Average published command-time percentage across active I/O threads (excluding main). */
+int getAverageIOThreadCmdCpuPct(int active_threads) {
+    return getAverageThreadStat(io_threads_stat_cmd_cpu, active_threads);
+}
+
+int getIOThreadCmdCpuPct(int tid) {
+    return atomic_load_explicit(&io_threads_stat_cmd_cpu[tid], memory_order_relaxed);
+}
+
+int getIOThreadIoCpuPct(int tid) {
+    return atomic_load_explicit(&io_threads_stat_io_cpu[tid], memory_order_relaxed);
+}
+
+/* Unit tests publish synthetic per-thread load to drive the saturation estimator. */
+void testOnlySetIOThreadCpuPct(int tid, int cmd_pct, int io_pct) {
+    atomic_store_explicit(&io_threads_stat_cmd_cpu[tid], cmd_pct, memory_order_relaxed);
+    atomic_store_explicit(&io_threads_stat_io_cpu[tid], io_pct, memory_order_relaxed);
 }
 
 static size_t calculateTargetThreadCount(size_t active, size_t max, size_t avg_q_size, long long now, long long last_scale_time) {

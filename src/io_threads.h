@@ -44,9 +44,10 @@ static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer a
 
 typedef void (*job_handler)(void *);
 
-/* Per IO thread stats (index = thread ID) */
-extern atomic_int io_threads_stat_cmd_cpu[IO_THREADS_MAX_NUM];
-extern atomic_int io_threads_stat_io_cpu[IO_THREADS_MAX_NUM];
+/* Per IO thread CPU-usage stats published by each thread (index = thread ID). */
+int getIOThreadCmdCpuPct(int tid);
+int getIOThreadIoCpuPct(int tid);
+void testOnlySetIOThreadCpuPct(int tid, int cmd_pct, int io_pct);
 
 void initIOThreads(int prev_threads_num);
 void killIOThreads(void);
@@ -75,6 +76,7 @@ int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
-int getAverageThreadStat(_Atomic int *stats_array, int active_threads);
+int getAverageIOThreadIoCpuPct(int active_threads);
+int getAverageIOThreadCmdCpuPct(int active_threads);
 
 #endif /* IO_THREADS_H */

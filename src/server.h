@@ -1965,8 +1965,8 @@ struct valkeyServer {
     long long stat_evictedscripts;                 /* Number of evicted lua scripts. */
     long long stat_total_eviction_exceeded_time;   /* Total time over the memory limit, unit us */
     monotime stat_last_eviction_exceeded_time;     /* Timestamp of current eviction start, unit us */
-    _Atomic long long stat_keyspace_hits;          /* Number of successful lookups of keys */
-    _Atomic long long stat_keyspace_misses;        /* Number of failed lookups of keys */
+    _Atomic(long long) stat_keyspace_hits;        /* Number of successful lookups of keys */
+    _Atomic(long long) stat_keyspace_misses;       /* Number of failed lookups of keys */
     long long stat_active_defrag_hits;             /* number of allocations moved */
     long long stat_active_defrag_misses;           /* number of allocations scanned but not moved */
     long long stat_active_defrag_key_hits;         /* number of keys with moved allocations */

@@ -62,5 +62,33 @@ estimator, per-thread I/O-skip heuristic, server-cron deferral, `AE_SERVER_POLL_
 - Tcl regression standalone (`--io-threads`, offload gated off): 1,422 passed; same
   pre-existing networking failure; two "can't start" were unbuilt test modules (since built).
 
-Not yet done: TSan/ASan runs; GTest port of the 21 unit tests; A/B throughput vs base on
-the benchmark fleet.
+## Unit tests: C harness -> GTest (2026-09-16)
+
+Upstream replaced the C unit-test harness with GoogleTest (`src/unit/*.cpp`, C++17, server
+headers pulled in through `wrappers.h`). The PR's 20 `test_cmd_offload.c` cases are ported
+1:1 by name to `src/unit/test_cmd_offload.cpp` (`CmdOffloadTest.*`); the earlier "21" count
+in this file was a miscount. Deviations forced by the C++ shim, not by design:
+
+- `wrappers.h` maps `_Atomic(T)` to `alignas(sizeof(T)) T`, and `extern alignas(...)` on an
+  array declaration is ill-formed C++. The PR exposed `io_threads_stat_{cmd,io}_cpu[]` and
+  `io_threads_io_skipped[]` as `extern atomic_int` arrays; they are now `static` in
+  `io_threads.c` behind `getIOThreadCmdCpuPct()`, `getIOThreadIoCpuPct()`,
+  `getAverageIOThreadIoCpuPct()`, `getAverageIOThreadCmdCpuPct()`, plus
+  `testOnlySetIOThreadCpuPct()` for the saturation-estimator tests. The generic
+  `getAverageThreadStat(_Atomic int *, int)` became static (a pointer-to-atomic parameter
+  cannot be spelled portably through the shim). INFO uses the accessors.
+- `slotQueue` internals stay private to `cmd_offload.c`; `testOnly*` accessors in
+  `cmd_offload.h` expose only what the tests need (refcounts, deferred-job lists, slot
+  context). Behaviour of the tested code is unchanged.
+- `_Thread_local` added to the shim's C11->C++ keyword map (the PR's thread-local state is
+  declared in headers the tests include).
+- `stat_keyspace_hits/misses` spelled `_Atomic(long long)` so the shim macro matches.
+- The unit-test link line does not carry `-lsystemd` even when the server objects were built
+  with libsystemd auto-detected; on this host pass it via `GTEST_LIBS`. Upstream gap, not
+  port-specific; CI hosts lack libsystemd and never hit it.
+
+Result: `valkey-unit-gtests --gtest_filter='CmdOffloadTest.*'` 20/20 pass; the full filter
+`*Offload*` (58 tests incl. upstream `ClusterIOOffloadTest`) passes. Server rebuild after the
+refactor: zero warnings.
+
+Not yet done: TSan/ASan runs; A/B throughput vs base on the benchmark fleet.

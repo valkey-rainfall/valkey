@@ -42,6 +42,7 @@ extern "C" {
 #define _Atomic(type) alignas(sizeof(type)) type /* Preserve alignment in C++ builds */
 #define _Alignas alignas                         /* Replace C _Alignas with C++ alignas */
 #define _Bool bool                               /* Replace C _Bool with C++ bool */
+#define _Thread_local thread_local               /* Replace C11 _Thread_local with C++11 thread_local */
 #define typename _typename                       /* Avoid conflict with C++ 'typename' keyword */
 #define protected protected_                     /* Avoid conflict with C++ 'protected' keyword */
 
