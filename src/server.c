@@ -49,6 +49,7 @@
 #include "threads_mngr.h"
 #include "fmtargs.h"
 #include "io_threads.h"
+#include "io_uring_batch.h"
 #include "compression.h"
 #include "tls.h"
 #include "sds.h"
@@ -3256,6 +3257,7 @@ void initServer(void) {
      * before loading persistence since it is used by processEventsWhileBlocked. */
     aeSetBeforeSleepProc(server.el, beforeSleep);
     aeSetAfterSleepProc(server.el, afterSleep);
+    if (ioUringBatchInit()) aeSetAfterEventsProc(server.el, ioUringBatchFlushReads);
 
     /* 32 bit instances are limited to 4GB of address space, so if there is
      * no explicit limit in the user provided configuration we set a limit
@@ -7108,6 +7110,27 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     }
 
     /* Error statistics */
+    /* io_uring batching (PoC) */
+    if (all_sections || (dictFind(section_dict, "io_uring") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        ioUringBatchStats *u = &io_uring_batch_stats;
+        info = sdscatprintf(info,
+                            "# io_uring\r\n"
+                            "io_uring_active:%d\r\n"
+                            "io_uring_read_batches:%lld\r\n"
+                            "io_uring_read_sqes:%lld\r\n"
+                            "io_uring_write_batches:%lld\r\n"
+                            "io_uring_write_sqes:%lld\r\n"
+                            "io_uring_fallback_reads:%lld\r\n"
+                            "io_uring_fallback_writes:%lld\r\n"
+                            "io_uring_cancelled:%lld\r\n"
+                            "io_uring_max_read_batch:%lld\r\n"
+                            "io_uring_max_write_batch:%lld\r\n",
+                            ioUringBatchActive(), u->read_batches, u->read_sqes, u->write_batches, u->write_sqes,
+                            u->fallback_reads, u->fallback_writes, u->cancelled, u->max_read_batch,
+                            u->max_write_batch);
+    }
+
     if (all_sections || (dictFind(section_dict, "errorstats") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscat(info, "# Errorstats\r\n");
