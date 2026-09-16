@@ -91,4 +91,39 @@ Result: `valkey-unit-gtests --gtest_filter='CmdOffloadTest.*'` 20/20 pass; the f
 `*Offload*` (58 tests incl. upstream `ClusterIOOffloadTest`) passes. Server rebuild after the
 refactor: zero warnings.
 
-Not yet done: TSan/ASan runs; A/B throughput vs base on the benchmark fleet.
+## Sanitizer passes (2026-09-16, tip 233a281c3, cluster mode, `io-threads 4`, 44 units)
+
+Harness: `run-sanitizer.sh <tsan|asan> [<sha> <label>]` at the worktree root; builds like
+upstream CI (`SANITIZER=address` without jemalloc, `SANITIZER=thread` with it), runs the same
+44 units as the Tcl regression above. This host lacks the libasan/libtsan runtime RPMs, so
+`~/.local/lib/sanitizer-rt` carries the `libtsan.so.0` / `libasan.so.6` soname links.
+
+- **ASan: clean.** 3,270 passed, 0 failed, 0 reports, runtest exit 0.
+- **TSan: no port-attributable race.** Upstream has no TSan CI job and its I/O-thread design
+  hands clients between threads through relaxed-atomic queues TSan cannot see as
+  happens-before edges, so a full run is a firehose on the *untouched base* too:
+
+  | run | passed | failed | TSan reports | distinct racing functions |
+  |---|---|---|---|---|
+  | base `6225ee7c3` | 3,273 | 43 | 1,926 | 103 |
+  | port `233a281c3` | 3,273 | 45 | 1,822 | 101 |
+
+  Top frames in both: `siphash` (~360), `ustime` (136), `consumeCommandQueue`, `sdsType`,
+  `sdslen`, `addCommandToBatchAndProcessIfFull`, `tryOffloadFreeArgvToIOThreads` -- all upstream
+  I/O-thread paths. Function-level diff of the racing frame: only two functions report in the
+  port and not the base, and both are the same handoff class with shifted attribution:
+  - `processClientIOWriteDone` (14): the PR's "nothing written" guard reads `c->nwritten` one
+    frame earlier than upstream's `postWriteToClient`, which carries 84 reports on the base.
+  - `zsetKeyCompare` (6): main compares an sds the I/O thread wrote while parsing; the base
+    reports the identical pattern via `dictSdsKeyCompare` / `objectGetVal`.
+  No `cmd_offload.c` frame is the racing access in any report. The zmalloc per-thread counter
+  race (`zmalloc_used_memory` vs `update_zmalloc_stat_*`, upstream's intentional design) is
+  suppressed via `tsan.supp`; the first halt-on-error run stopped on it within a minute.
+  Histograms: `read-offload-port-tsan/sanitizer-logs{,-base}/hist-*.txt`.
+
+  Caveat for the RFC: "no new TSan reports" is the strongest statement this tooling allows. A
+  TSan-clean baseline would need upstream to annotate its queue handoffs (or a suppression
+  file for the ~100 known classes), which is out of scope for Phase A but is exactly the kind
+  of "most solid guarantee" work the complexity objection asks for.
+
+Not yet done: A/B throughput vs base on the benchmark fleet.

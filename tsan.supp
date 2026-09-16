@@ -1,0 +1,9 @@
+# TSan suppressions for the read-offload port sanitizer pass.
+# Only KNOWN-BENIGN UPSTREAM races go here; anything touching the port stays visible.
+#
+# zmalloc per-thread used-memory counters: upstream deliberately uses plain
+# (non-atomic) per-thread slots summed racily by zmalloc_used_memory() (zmalloc.c,
+# used_memory_thread[]). Upstream has no TSan CI job, so this is never suppressed there.
+race:zmalloc_used_memory
+race:update_zmalloc_stat_alloc
+race:update_zmalloc_stat_free
