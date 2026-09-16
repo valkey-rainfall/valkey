@@ -1864,6 +1864,8 @@ struct valkeyServer {
     int io_threads_ownership;                 /* Enable per-worker fd ownership (door-2, EXPERIMENTAL). */
     int io_threads_disown_write_ratio;        /* Adaptive disown: punted%% threshold (0-100) to disown an owned client; 100 disables. */
     int io_threads_disown_min_commands;       /* Adaptive disown: min commands in window before a decision is made. */
+    int io_threads_owner_dispatch_slice;      /* Owner-loop cadence: max owned fds dispatched per pump slice before re-servicing SPSC/shared queues. INT_MAX reproduces the pre-fix single-pump behavior. */
+    int io_threads_shared_jobs_per_slice;     /* Owner-loop cadence: max shared-queue (SPMC) jobs drained per pump slice. */
     int dplus_reclaim_budget_entries;         /* Max retired entries freed per beforeSleep reclaim pass. */
     int dplus_reclaim_budget_us;              /* Max microseconds per beforeSleep reclaim pass. */
     int dplus_reclaim_soft_entries;           /* Retired-entry backlog that closes the speculation gate. */

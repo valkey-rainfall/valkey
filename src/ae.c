@@ -73,6 +73,11 @@
         assert(pthread_mutex_unlock(&(eventLoop)->poll_mutex) == 0); \
     }
 
+/* Forward declaration: aeDispatchFiredEvent is defined below (shared by
+ * aeProcessEvents and aeDispatchReady) but aeDispatchReady is defined
+ * earlier in the file, next to aePollReady/aePollDirect. */
+static int aeDispatchFiredEvent(aeEventLoop *eventLoop, int idx);
+
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
     int i;
@@ -92,6 +97,8 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->aftersleep = NULL;
     eventLoop->custompoll = NULL;
     eventLoop->flags = 0;
+    eventLoop->ready_numevents = 0;
+    eventLoop->ready_cursor = 0;
     /* Initialize the eventloop mutex with PTHREAD_MUTEX_RECURSIVE type.
      * Door-2 ownership: worker loops hold this lock across their whole
      * poll+dispatch iteration (aeProcessEventsProtected) so that another
@@ -421,6 +428,63 @@ int aePollDirect(aeEventLoop *eventLoop, struct timeval *tvp) {
     return aeApiPoll(eventLoop, tvp);
 }
 
+/* Owner-loop cadence: non-blocking poll that stores the ready set for
+ * INCREMENTAL dispatch via aeDispatchReady, instead of aeProcessEvents'
+ * all-at-once sweep. Intended for a caller (door-2 worker pump) that wants
+ * to interleave other service points (its private SPSC inbox, the shared
+ * job queue) between small slices of owned-fd dispatch, so a client with
+ * many ready fds cannot starve those other service points for a whole
+ * sweep.
+ *
+ * Always non-blocking (AE_DONT_WAIT semantics) — a pump loop calls this
+ * once per pump entry, not once per slice; blocking here would defeat the
+ * interleaving this API exists for. Discards any previous ready set that
+ * was not fully dispatched (callers are expected to drain via
+ * aeDispatchReady before polling again, per the io_threads.c pump; a short
+ * count here just means fewer fds were ready this round).
+ *
+ * Returns the number of file events now pending dispatch (0 if none). */
+int aePollReady(aeEventLoop *eventLoop) {
+    if (eventLoop->maxfd == -1) {
+        eventLoop->ready_numevents = 0;
+        eventLoop->ready_cursor = 0;
+        return 0;
+    }
+    struct timeval tv = {0, 0};
+    int numevents;
+    if (eventLoop->custompoll != NULL) {
+        numevents = eventLoop->custompoll(eventLoop);
+    } else {
+        numevents = aeApiPoll(eventLoop, &tv);
+    }
+    if (eventLoop->aftersleep != NULL) eventLoop->aftersleep(eventLoop, numevents);
+    eventLoop->ready_numevents = numevents;
+    eventLoop->ready_cursor = 0;
+    return numevents;
+}
+
+/* Owner-loop cadence: dispatch up to max_events entries from the ready set
+ * stashed by the most recent aePollReady, advancing the loop's cursor.
+ * Uses the SAME per-fd dispatch helper as aeProcessEvents (identical
+ * AE_PROTECT_POLL locking, fe->mask recheck, and barrier/invert handling),
+ * so a caller alternating aeDispatchReady slices with other work sees
+ * exactly the dispatch behavior aeProcessEvents would have given it in one
+ * pass — just spread across more, smaller calls.
+ *
+ * Returns the number of fds actually dispatched in this call: 0 means the
+ * ready set from the last aePollReady is exhausted (a pump should treat
+ * that as "no more owned-fd work this round" and fall through to its other
+ * service points, then poll again on its next iteration). */
+int aeDispatchReady(aeEventLoop *eventLoop, int max_events) {
+    int dispatched = 0;
+    while (dispatched < max_events && eventLoop->ready_cursor < eventLoop->ready_numevents) {
+        aeDispatchFiredEvent(eventLoop, eventLoop->ready_cursor);
+        eventLoop->ready_cursor++;
+        dispatched++;
+    }
+    return dispatched;
+}
+
 /* Door-2 ownership: quiesce/resume a protected event loop from another
  * thread. While held, the loop's owner cannot be inside poll OR dispatch
  * (aeProcessEventsProtected holds the same mutex across its whole
@@ -454,6 +518,84 @@ int aeProcessEventsProtected(aeEventLoop *eventLoop, int flags) {
     int ret = aeProcessEvents(eventLoop, flags);
     AE_UNLOCK(eventLoop);
     return ret;
+}
+
+/* Dispatch a single fired file-event entry (fired[idx]) exactly as
+ * aeProcessEvents's per-fd loop body did before this was factored out.
+ * Shared by aeProcessEvents (the original uninterrupted sweep) and
+ * aeDispatchReady (the bounded owner-loop-cadence slice) so both paths
+ * dispatch identically: same per-fd dispatch lock (AE_PROTECT_POLL), same
+ * fe->mask recheck under the lock (so a teardown that ran between poll and
+ * dispatch is honored), same barrier/invert handling. Returns 1 if the fd's
+ * callback(s) fired, 0 if the event was stale (fe->mask no longer matches --
+ * e.g. an in-between aeDeleteFileEvent). */
+static int aeDispatchFiredEvent(aeEventLoop *eventLoop, int idx) {
+    int fd = eventLoop->fired[idx].fd;
+    /* Protected loops (door-2 worker pumps): hold the lock across
+     * this fd's callback dispatch. Another thread tearing down a
+     * client (freeClient/disown) acquires the same lock, so after
+     * aeAcquireLock returns no callback is in flight — and the
+     * fe->mask recheck below runs under the lock, so an event the
+     * teardown deleted can no longer fire. Per-fd granularity keeps
+     * the other thread's wait bounded by ONE callback, not a whole
+     * sweep. No-op (flag unset) for main's loop.
+     *
+     * PAIRING: remember whether WE locked. The naive form re-reads
+     * eventLoop->flags at unlock time — if AE_PROTECT_POLL flips
+     * during the callback, that unlocks a mutex we never locked
+     * (EPERM assert, seen in the gate battery on server.el). Lock
+     * decisions must never be re-derived from mutable state. */
+    int dispatch_locked = (eventLoop->flags & AE_PROTECT_POLL) != 0;
+    if (dispatch_locked) assert(pthread_mutex_lock(&eventLoop->poll_mutex) == 0);
+    aeFileEvent *fe = &eventLoop->events[fd];
+    int mask = eventLoop->fired[idx].mask;
+    int fired = 0; /* Number of events fired for current fd. */
+
+    /* Normally we execute the readable event first, and the writable
+     * event later. This is useful as sometimes we may be able
+     * to serve the reply of a query immediately after processing the
+     * query.
+     *
+     * However if AE_BARRIER is set in the mask, our application is
+     * asking us to do the reverse: never fire the writable event
+     * after the readable. In such a case, we invert the calls.
+     * This is useful when, for instance, we want to do things
+     * in the beforeSleep() hook, like fsyncing a file to disk,
+     * before replying to a client. */
+    int invert = fe->mask & AE_BARRIER;
+
+    /* Note the "fe->mask & mask & ..." code: maybe an already
+     * processed event removed an element that fired and we still
+     * didn't processed, so we check if the event is still valid.
+     *
+     * Fire the readable event if the call sequence is not
+     * inverted. */
+    if (!invert && fe->mask & mask & AE_READABLE) {
+        fe->rfileProc(eventLoop, fd, fe->clientData, mask);
+        fired++;
+        fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
+    }
+
+    /* Fire the writable event. */
+    if (fe->mask & mask & AE_WRITABLE) {
+        if (!fired || fe->wfileProc != fe->rfileProc) {
+            fe->wfileProc(eventLoop, fd, fe->clientData, mask);
+            fired++;
+        }
+    }
+
+    /* If we have to invert the call, fire the readable event now
+     * after the writable one. */
+    if (invert) {
+        fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
+        if ((fe->mask & mask & AE_READABLE) && (!fired || fe->wfileProc != fe->rfileProc)) {
+            fe->rfileProc(eventLoop, fd, fe->clientData, mask);
+            fired++;
+        }
+    }
+    if (dispatch_locked) assert(pthread_mutex_unlock(&eventLoop->poll_mutex) == 0);
+
+    return fired != 0;
 }
 
 /* Process every pending file event, then every pending time event
@@ -521,71 +663,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
         if (eventLoop->aftersleep != NULL && flags & AE_CALL_AFTER_SLEEP) eventLoop->aftersleep(eventLoop, numevents);
 
         for (j = 0; j < numevents; j++) {
-            int fd = eventLoop->fired[j].fd;
-            /* Protected loops (door-2 worker pumps): hold the lock across
-             * this fd's callback dispatch. Another thread tearing down a
-             * client (freeClient/disown) acquires the same lock, so after
-             * aeAcquireLock returns no callback is in flight — and the
-             * fe->mask recheck below runs under the lock, so an event the
-             * teardown deleted can no longer fire. Per-fd granularity keeps
-             * the other thread's wait bounded by ONE callback, not a whole
-             * sweep. No-op (flag unset) for main's loop.
-             *
-             * PAIRING: remember whether WE locked. The naive form re-reads
-             * eventLoop->flags at unlock time — if AE_PROTECT_POLL flips
-             * during the callback, that unlocks a mutex we never locked
-             * (EPERM assert, seen in the gate battery on server.el). Lock
-             * decisions must never be re-derived from mutable state. */
-            int dispatch_locked = (eventLoop->flags & AE_PROTECT_POLL) != 0;
-            if (dispatch_locked) assert(pthread_mutex_lock(&eventLoop->poll_mutex) == 0);
-            aeFileEvent *fe = &eventLoop->events[fd];
-            int mask = eventLoop->fired[j].mask;
-            int fired = 0; /* Number of events fired for current fd. */
-
-            /* Normally we execute the readable event first, and the writable
-             * event later. This is useful as sometimes we may be able
-             * to serve the reply of a query immediately after processing the
-             * query.
-             *
-             * However if AE_BARRIER is set in the mask, our application is
-             * asking us to do the reverse: never fire the writable event
-             * after the readable. In such a case, we invert the calls.
-             * This is useful when, for instance, we want to do things
-             * in the beforeSleep() hook, like fsyncing a file to disk,
-             * before replying to a client. */
-            int invert = fe->mask & AE_BARRIER;
-
-            /* Note the "fe->mask & mask & ..." code: maybe an already
-             * processed event removed an element that fired and we still
-             * didn't processed, so we check if the event is still valid.
-             *
-             * Fire the readable event if the call sequence is not
-             * inverted. */
-            if (!invert && fe->mask & mask & AE_READABLE) {
-                fe->rfileProc(eventLoop, fd, fe->clientData, mask);
-                fired++;
-                fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
-            }
-
-            /* Fire the writable event. */
-            if (fe->mask & mask & AE_WRITABLE) {
-                if (!fired || fe->wfileProc != fe->rfileProc) {
-                    fe->wfileProc(eventLoop, fd, fe->clientData, mask);
-                    fired++;
-                }
-            }
-
-            /* If we have to invert the call, fire the readable event now
-             * after the writable one. */
-            if (invert) {
-                fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
-                if ((fe->mask & mask & AE_READABLE) && (!fired || fe->wfileProc != fe->rfileProc)) {
-                    fe->rfileProc(eventLoop, fd, fe->clientData, mask);
-                    fired++;
-                }
-            }
-            if (dispatch_locked) assert(pthread_mutex_unlock(&eventLoop->poll_mutex) == 0);
-
+            aeDispatchFiredEvent(eventLoop, j);
             processed++;
         }
     }

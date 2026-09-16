@@ -3398,6 +3398,15 @@ standardConfig static_configs[] = {
      * the feature (ratio can never be reached). */
     createIntConfig("io-threads-disown-write-ratio", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 100, server.io_threads_disown_write_ratio, 50, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-disown-min-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_disown_min_commands, 256, INTEGER_CONFIG, NULL, NULL),
+    /* Owner-loop cadence fix: bound how many ready owned fds an IO thread's
+     * pump dispatches before it re-services its private SPSC inbox and the
+     * shared SPMC job queue, so a worker with many owned readers cannot
+     * starve main-facing work (staged replies, shared-queue jobs) for a
+     * whole sweep. INT_MAX on either reproduces the pre-fix single-pump
+     * behavior for A/B (one dispatch slice big enough to drain everything
+     * polled, one shared job per outer-loop iteration). */
+    createIntConfig("io-threads-owner-dispatch-slice", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_owner_dispatch_slice, 8, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-shared-jobs-per-slice", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_shared_jobs_per_slice, 4, INTEGER_CONFIG, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),

@@ -425,6 +425,80 @@ void cleanupThreadResources(void *dummy) {
     freeSharedQueryBuf();
 }
 
+/* PRIORITY 1 helper: drain the worker's private SPSC inbox fully (batch
+ * processing). Factored out of IOThreadMain so the owner-loop-cadence slice
+ * loop can call it once per slice, identically to the pre-cadence single
+ * uninterrupted drain. Returns the number of jobs processed. */
+static size_t ioThreadDrainPrivateInbox(long id) {
+    void *batch_jobs[BATCH_SIZE];
+    size_t batch_count;
+    size_t total = 0;
+    while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
+        for (size_t i = 0; i < batch_count; i++) {
+            void *data;
+            int type;
+            untagJob(batch_jobs[i], &data, &type);
+
+            switch (type) {
+            case JOB_REQ_FREE_ARGV:
+                ioThreadFreeArgv((robj **)data);
+                break;
+            case JOB_REQ_POLL:
+                ioThreadPoll((aeEventLoop *)data);
+                break;
+            case JOB_REQ_OWNER_WRITE:
+                /* F8b: staged by main at punt handback (PENDING_IO already
+                 * published). Same write path as the F7 handler. Counter
+                 * lives HERE (worker's own stats slot — single-writer) now
+                 * that the F7 event-handler is bypassed. */
+                dplus_thread_stats[id].punted_replies_written++;
+                ioThreadWriteToClient((client *)data);
+                break;
+            default:
+                serverPanic("Invalid SPSC job type: %d", type);
+            }
+        }
+        total += batch_count;
+    }
+    return total;
+}
+
+/* PRIORITY 2 helper: dequeue up to max_jobs entries from the shared SPMC
+ * queue (READ_CLIENT/WRITE_CLIENT for main-owned clients — stock offload
+ * path, also used by disowned clients). Returns the number dequeued. */
+static size_t ioThreadDrainSharedInbox(size_t max_jobs) {
+    size_t n = 0;
+    while (n < max_jobs) {
+        void *tagged_job = spmcDequeue(&io_shared_inbox);
+        if (!tagged_job) break;
+        void *data;
+        int type;
+        untagJob(tagged_job, &data, &type);
+
+        switch (type) {
+        case JOB_REQ_READ_CLIENT:
+            ioThreadReadQueryFromClient((client *)data);
+            break;
+        case JOB_REQ_WRITE_CLIENT:
+            ioThreadWriteToClient((client *)data);
+            break;
+        case JOB_REQ_FREE_OBJ:
+            decrRefCount(data);
+            break;
+        case JOB_REQ_ACCEPT:
+            ioThreadAccept((client *)data);
+            break;
+        case JOB_REQ_POLL:
+            ioThreadPoll((aeEventLoop *)data);
+            break;
+        default:
+            serverPanic("Invalid SPMC job type: %d", type);
+        }
+        n++;
+    }
+    return n;
+}
+
 static void *IOThreadMain(void *myid) {
     /* The ID is the thread ID number (from 1 to server.io_threads_num-1). ID 0 is the main thread. */
     long id = (long)myid;
@@ -437,7 +511,6 @@ static void *IOThreadMain(void *myid) {
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
-    void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     /* F13a-v2 (spin-then-park): consecutive all-empty sweeps. The parked-bit
      * protocol only engages after DPLUS_F13_SPIN_SWEEPS empty passes — at
@@ -459,7 +532,6 @@ static void *IOThreadMain(void *myid) {
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
-        size_t batch_count = 0;
         monotime prev_work_start_time = work_start_time;
         work_start_time = getMonotonicUs();
         if (processed != 0) {
@@ -468,97 +540,88 @@ static void *IOThreadMain(void *myid) {
                                       memory_order_relaxed);
         }
         processed = 0;
-        /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
-            for (size_t i = 0; i < batch_count; i++) {
-                void *data;
-                int type;
-                untagJob(batch_jobs[i], &data, &type);
-
-                switch (type) {
-                case JOB_REQ_FREE_ARGV:
-                    ioThreadFreeArgv((robj **)data);
-                    break;
-                case JOB_REQ_POLL:
-                    ioThreadPoll((aeEventLoop *)data);
-                    break;
-                case JOB_REQ_OWNER_WRITE:
-                    /* F8b: staged by main at punt handback (PENDING_IO already
-                     * published). Same write path as the F7 handler. Counter
-                     * lives HERE (worker's own stats slot — single-writer) now
-                     * that the F7 event-handler is bypassed. */
-                    dplus_thread_stats[id].punted_replies_written++;
-                    ioThreadWriteToClient((client *)data);
-                    break;
-                default:
-                    serverPanic("Invalid SPSC job type: %d", type);
-                }
-            }
-            processed += batch_count;
-        }
-
-        /* PRIORITY 2: Shared Global Queue (SPMC)
-         * Only checked after SPSC is drained. */
-        void *tagged_job = spmcDequeue(&io_shared_inbox);
-        if (tagged_job) {
-            void *data;
-            int type;
-            untagJob(tagged_job, &data, &type);
-
-            switch (type) {
-            case JOB_REQ_READ_CLIENT:
-                ioThreadReadQueryFromClient((client *)data);
-                break;
-            case JOB_REQ_WRITE_CLIENT:
-                ioThreadWriteToClient((client *)data);
-                break;
-            case JOB_REQ_FREE_OBJ:
-                decrRefCount(data);
-                break;
-            case JOB_REQ_ACCEPT:
-                ioThreadAccept((client *)data);
-                break;
-            case JOB_REQ_POLL:
-                ioThreadPoll((aeEventLoop *)data);
-                break;
-            default:
-                serverPanic("Invalid SPMC job type: %d", type);
-            }
-            processed++;
-        }
-
-        if (processed) {
-            atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
-        }
-
-        /* Door-2 infrastructure: pump the per-worker event loop if it has
-         * any registered fds. With no fds, the maxfd == -1 check
-         * short-circuits before any syscall. Teardown safety comes from
-         * PER-FD dispatch locking inside aeProcessEvents (AE_PROTECT_POLL):
-         * main's aeAcquireLock waits at most one callback, and events
-         * deleted by a teardown can't fire afterwards (fe->mask recheck
-         * runs under the lock).
+        /* Owner-loop cadence fix: interleave the pump with the SPSC/shared
+         * service points instead of draining them once then pumping the
+         * WHOLE owned event loop in one uninterrupted sweep. The old
+         * ordering (drain SPSC fully -> dequeue ONE shared job -> pump every
+         * ready owned fd) starved main-facing work (replies staged via
+         * JOB_REQ_OWNER_WRITE, and this worker's share of the shared
+         * READ/WRITE_CLIENT queue) for as long as the pump had ready owned
+         * fds: a worker with many speculative GET readers could dispatch
+         * dozens of them back-to-back before servicing a single write
+         * reply, inflating write latency under mixed read/write load
+         * without moving read throughput (measured: writes capped ~200K/s
+         * at 22ms p99 with 400 read + 8 write conns, vs 500K/s at 2.5ms p99
+         * with only 100 read conns — same server, same write path, just
+         * fewer owned-fd pump entries per SPSC/shared service point).
          *
-         * BACKOFF: a fire whose client is still waiting on main (handoff in
-         * flight) does no work — level-triggered epoll re-fires it every
-         * sweep until main finishes. Counting those as "processed" makes
-         * this loop spin hot. Only count fires that did real work; an
-         * all-useless sweep falls through to the idle usleep below. */
+         * Fix: poll the owned loop ONCE per outer iteration (aePollReady),
+         * then alternate small DISPATCH slices of that ready set
+         * (aeDispatchReady) with full SPSC drains and bounded shared-queue
+         * drains, until the ready set is exhausted. Each call below uses
+         * the exact same switch/case bodies as before (factored into
+         * ioThreadDrainPrivateInbox/ioThreadDrainSharedInbox and
+         * aeDispatchFiredEvent in ae.c) — only the CADENCE changed, not the
+         * work done per job or per fd.
+         *
+         * io_threads_owner_dispatch_slice / io_threads_shared_jobs_per_slice
+         * default to 8/4; set either to INT_MAX to reproduce the pre-fix
+         * behavior exactly for A/B (one aePollReady, one dispatch slice big
+         * enough to drain everything in a single aeDispatchReady call —
+         * i.e. today's single pump — with one shared job per outer loop
+         * iteration same as before). */
+        io_worker_all_useless_sweep = 0;
         if (worker_el[id]->maxfd != -1) {
-            io_worker_useless_fires = 0;
-            int ev_processed = aeProcessEvents(worker_el[id], AE_FILE_EVENTS | AE_DONT_WAIT);
-            if (ev_processed > io_worker_useless_fires) processed += ev_processed - io_worker_useless_fires;
-            /* J1 park-not-spin: remember whether this sweep fired ONLY
-             * deferred (useless) events. In that state the loop contains a
-             * permanently-ready fd we refuse to dispatch (its client's
-             * io_read_state is held by main -- e.g. mid-busy-script), so
-             * sleeping in our own epoll below returns instantly and the
-             * park burns a core (observed: 96% spin for 810s while a busy
-             * Lua script ran, starving main of AE_LOCK on this loop and
-             * blocking kill delivery). */
-            io_worker_all_useless_sweep = (ev_processed > 0 && io_worker_useless_fires >= ev_processed);
-        } else {
-            io_worker_all_useless_sweep = 0;
+            aePollReady(worker_el[id]);
+        }
+        /* jobs_processed tracks ONLY SPSC/shared-queue jobs — the work main
+         * accounts for via io_jobs_submitted/io_jobs_finished
+         * (drainIOThreadsQueue's teardown/shrink synchronization spins on
+         * submitted==finished). Owned-fd pump dispatches (d below) are NOT
+         * jobs main submitted through those queues, so they must NOT be
+         * folded into io_jobs_finished — the pre-cadence code never did
+         * this either: its single atomic_fetch_add_explicit ran BEFORE the
+         * pump, so aeProcessEvents's ev_processed never reached
+         * io_jobs_finished. processed (used for used_active_time_io_thread
+         * and the idle/park decision below) legitimately includes BOTH,
+         * exactly as before. */
+        size_t jobs_processed = 0;
+        while (1) {
+            int d = 0;
+            if (worker_el[id]->maxfd != -1) {
+                /* BACKOFF: a fire whose client is still waiting on main
+                 * (handoff in flight) does no work — level-triggered epoll
+                 * re-fires it every sweep until main finishes. Counting
+                 * those as "processed" makes this loop spin hot. Only
+                 * count dispatches that did real work; an all-useless
+                 * slice sets io_worker_all_useless_sweep for the idle path
+                 * below. io_worker_useless_fires is incremented by the fd
+                 * callbacks themselves (ioWorkerCountUselessFire, called
+                 * from within aeDispatchFiredEvent's callback) — same
+                 * accounting as the pre-cadence single pump, just reset and
+                 * summed per SLICE instead of per SWEEP. */
+                io_worker_useless_fires = 0;
+                d = aeDispatchReady(worker_el[id], server.io_threads_owner_dispatch_slice);
+                if (d > io_worker_useless_fires) processed += d - io_worker_useless_fires;
+                if (d > 0 && io_worker_useless_fires >= d) io_worker_all_useless_sweep = 1;
+            }
+
+            /* Service points, run every slice (including the final one when
+             * d == 0) so replies staged by main DURING the pump — e.g. a
+             * JOB_REQ_OWNER_WRITE enqueued while this worker was mid-slice
+             * dispatching owned reads — go out THIS iteration rather than
+             * waiting for the next outer loop pass. */
+            size_t n = ioThreadDrainPrivateInbox(id);
+            n += ioThreadDrainSharedInbox(server.io_threads_shared_jobs_per_slice);
+            processed += n;
+            jobs_processed += n;
+            dplus_thread_stats[id].owner_dispatch_slices++;
+
+            if (d == 0) break;
+        }
+
+        if (jobs_processed) {
+            atomic_fetch_add_explicit(&io_jobs_finished, jobs_processed, memory_order_release);
         }
 
         /* If both queues were empty (no processing done), wait for signal. */

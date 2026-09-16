@@ -932,3 +932,69 @@ start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership ye
         $rd close
     }
 }
+
+# --- Owner-loop cadence fix regression test ---
+# Bug: IOThreadMain serviced its private SPSC inbox (owner-write replies) and
+# the shared SPMC job queue only ONCE per outer sweep, then pumped every
+# ready owned fd in one uninterrupted aeProcessEvents call. A worker with
+# many owned speculative-GET readers could dispatch dozens of them before
+# looping back to service a single staged write reply, inflating write
+# latency under mixed read/write load without moving read throughput. Fix:
+# aePollReady/aeDispatchReady let the pump interleave small dispatch slices
+# with full SPSC drains and bounded shared-queue drains. dplus_owner_dispatch_slices
+# (INFO dplus) counts these slices; it must advance under load, and both a
+# read-heavy and a write-heavy connection must still get exact, correctly
+# ordered replies.
+
+start_server {tags {"ownership"} overrides {io-threads 4 io-threads-ownership yes save {}}} {
+
+    test {OWNERSHIP CADENCE: concurrent pipelined GETs and SETs both make progress} {
+        r set cadence:key cadence:val
+        set slices_before [dplus_info_field r dplus_owner_dispatch_slices]
+
+        set reader [valkey_deferring_client]
+        set writer [valkey_deferring_client]
+
+        set n 2000
+        # Fire both pipelines up front, then drain both concurrently so
+        # neither client blocks waiting on a full read of the other -- this
+        # keeps read and write traffic genuinely concurrent against the
+        # ownership-mode workers for the few seconds the drain takes.
+        for {set i 0} {$i < $n} {incr i} {
+            $reader get cadence:key
+            $writer set cadence:write:$i $i
+        }
+        for {set i 0} {$i < $n} {incr i} {
+            assert_equal "cadence:val" [$reader read]
+            assert_equal "OK" [$writer read]
+        }
+        $reader close
+        $writer close
+
+        # The slice counter is per-thread and per-pump-iteration; concurrent
+        # read+write traffic across 3 owner workers for $n round trips must
+        # have driven at least one slice.
+        assert {[dplus_info_field r dplus_owner_dispatch_slices] > $slices_before}
+
+        # Correctness after the concurrent run: both keys settled correctly.
+        assert_equal "cadence:val" [r get cadence:key]
+        assert_equal [expr {$n - 1}] [r get cadence:write:[expr {$n - 1}]]
+        assert_equal "PONG" [r ping]
+    }
+
+    test {OWNERSHIP CADENCE: io-threads-owner-dispatch-slice INT_MAX reproduces single-pump semantics} {
+        # A/B knob sanity: with the slice size set to INT_MAX, the first
+        # aeDispatchReady call drains the whole polled ready set in one
+        # shot (today's old behavior) yet correctness must be unaffected.
+        r config set io-threads-owner-dispatch-slice 2147483647
+        r config set io-threads-shared-jobs-per-slice 2147483647
+        r set cadence:ab:key cadence:ab:val
+        set rd [valkey_deferring_client]
+        set n 500
+        for {set i 0} {$i < $n} {incr i} { $rd get cadence:ab:key }
+        for {set i 0} {$i < $n} {incr i} { assert_equal "cadence:ab:val" [$rd read] }
+        $rd close
+        r config set io-threads-owner-dispatch-slice 8
+        r config set io-threads-shared-jobs-per-slice 4
+    }
+}

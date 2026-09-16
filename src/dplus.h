@@ -100,6 +100,7 @@ typedef struct dplusThreadStats {
     long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
     long long keyspace_hits;      /* E3: speculative read hits (bypass main's stat_keyspace_hits) */
+    long long owner_dispatch_slices; /* owner-loop cadence: dispatch/service slices run by IOThreadMain */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];

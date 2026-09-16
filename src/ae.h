@@ -115,6 +115,15 @@ typedef struct aeEventLoop {
     aeCustomPollProc *custompoll;
     pthread_mutex_t poll_mutex;
     int flags;
+    /* Owner-loop cadence (bounded dispatch): the ready set from the most
+     * recent aePollReady, plus a cursor into it. Lets a caller (e.g. a
+     * door-2 worker pump) dispatch a few ready fds at a time, interleaving
+     * other service points between slices, instead of draining the whole
+     * poll result in one uninterrupted sweep. Single-threaded per loop:
+     * only the loop's own owner thread ever calls aePollReady/
+     * aeDispatchReady, so no synchronization is needed for these fields. */
+    int ready_numevents; /* events pending dispatch from the last poll */
+    int ready_cursor;    /* index of the next undispatched entry in fired[] */
 } aeEventLoop;
 
 /* Prototypes */
@@ -145,6 +154,8 @@ void aeReleaseLock(aeEventLoop *eventLoop);
 int aeProcessEventsProtected(aeEventLoop *eventLoop, int flags);
 int aePollDirect(aeEventLoop *eventLoop, struct timeval *tvp);
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);
+int aePollReady(aeEventLoop *eventLoop);
+int aeDispatchReady(aeEventLoop *eventLoop, int max_events);
 int aeGetSetSize(aeEventLoop *eventLoop);
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
 void aeSetDontWait(aeEventLoop *eventLoop, int noWait);
