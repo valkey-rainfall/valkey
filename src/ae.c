@@ -98,6 +98,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->aftersleep = NULL;
     eventLoop->afterevents = NULL;
     eventLoop->custompoll = NULL;
+    eventLoop->idlewait = NULL;
     eventLoop->flags = 0;
     eventLoop->priority_apidata = NULL;
     eventLoop->priority_fd = -1;
@@ -576,6 +577,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
         if (eventLoop->beforesleep != NULL && (flags & AE_CALL_BEFORE_SLEEP)) eventLoop->beforesleep(eventLoop);
 
         if (eventLoop->custompoll != NULL) {
+            /* The poll is offloaded. If beforesleep found nothing to do, let
+             * the owner wait for new work here instead of paying for another
+             * full beforesleep/aftersleep iteration that would find nothing. */
+            if (eventLoop->idlewait != NULL && !(flags & AE_DONT_WAIT) && !(eventLoop->flags & AE_DONT_WAIT))
+                eventLoop->idlewait(eventLoop);
             numevents = eventLoop->custompoll(eventLoop);
         } else {
             /* The eventLoop->flags may be changed inside beforesleep.
@@ -686,6 +692,10 @@ void aeSetAfterEventsProc(aeEventLoop *eventLoop, aeBeforeSleepProc *afterevents
  * The custom poll procedure, if set, will be called instead of the default aeApiPoll */
 void aeSetCustomPollProc(aeEventLoop *eventLoop, aeCustomPollProc *custompoll) {
     eventLoop->custompoll = custompoll;
+}
+
+void aeSetIdleWaitProc(aeEventLoop *eventLoop, aeIdleWaitProc *idlewait) {
+    eventLoop->idlewait = idlewait;
 }
 
 void aeSetPollProtect(aeEventLoop *eventLoop, int protect) {

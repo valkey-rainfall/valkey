@@ -84,6 +84,9 @@ typedef void aeEventFinalizerProc(struct aeEventLoop *eventLoop, void *clientDat
 typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 typedef void aeAfterSleepProc(struct aeEventLoop *eventLoop, int numevents);
 typedef int aeCustomPollProc(struct aeEventLoop *eventLoop);
+/* Called after beforesleep when a custom poll is installed; may spin waiting
+ * for work instead of letting the loop run another full iteration. */
+typedef void aeIdleWaitProc(struct aeEventLoop *eventLoop);
 /* Callback invoked with elapsed microseconds after high-priority events are processed. */
 typedef void aeQoSStatsProc(struct aeEventLoop *eventLoop, uint64_t duration_us);
 
@@ -128,6 +131,7 @@ typedef struct aeEventLoop {
     aeBeforeSleepProc *afterevents; /* runs after the fired-fd loop, before time events */
     aeAfterSleepProc *aftersleep;
     aeCustomPollProc *custompoll;
+    aeIdleWaitProc *idlewait;
     pthread_mutex_t poll_mutex;
     int flags;
 
@@ -165,6 +169,7 @@ void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep);
 void aeSetAfterEventsProc(aeEventLoop *eventLoop, aeBeforeSleepProc *afterevents);
 void aeSetCustomPollProc(aeEventLoop *eventLoop, aeCustomPollProc *custompoll);
+void aeSetIdleWaitProc(aeEventLoop *eventLoop, aeIdleWaitProc *idlewait);
 void aeSetPollProtect(aeEventLoop *eventLoop, int protect);
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);
 int aeGetSetSize(aeEventLoop *eventLoop);

@@ -1078,6 +1078,58 @@ static int getIOThreadPollResults(aeEventLoop *eventLoop) {
     return server.io_ae_fired_events;
 }
 
+/* Main-thread idle wait while the poll is offloaded.
+ *
+ * Called from aeProcessEvents right after beforeSleep, only when a custom poll
+ * is installed (an I/O thread is running epoll for us) and beforeSleep did not
+ * ask for AE_DONT_WAIT (so replies are flushed and nothing else is pending).
+ * At that point the only things that can give main new work are the offloaded
+ * poll completing or a worker handing a client back through the outbox. Rather
+ * than run another full beforeSleep/afterSleep iteration that finds nothing
+ * (~0.7us of housekeeping each), spin on those two conditions for at most
+ * main-idle-spin-us, then fall through so timers and cron still run. */
+extern int ProcessingEventsWhileBlocked; /* networking.c */
+
+void ioThreadsMainIdleWait(aeEventLoop *el) {
+    UNUSED(el);
+    int limit = server.main_idle_spin_us;
+    if (limit <= 0 || ProcessingEventsWhileBlocked) return;
+    if (atomic_load_explicit(&server.io_poll_state, memory_order_acquire) != AE_IO_STATE_POLL) return;
+    for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+        mpscQueue *q = &io_shared_outbox[p];
+        if (atomic_load_explicit(&q->head, memory_order_relaxed) != atomic_load_explicit(&q->tail, memory_order_acquire)) return;
+    }
+    monotime start = getMonotonicUs();
+    server.stat_main_idle_spins++;
+    unsigned spins = 0;
+    while (1) {
+        if (atomic_load_explicit(&server.io_poll_state, memory_order_acquire) != AE_IO_STATE_POLL) break;
+        int have = 0;
+        for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+            mpscQueue *q = &io_shared_outbox[p];
+            if (atomic_load_explicit(&q->head, memory_order_relaxed) != atomic_load_explicit(&q->tail, memory_order_acquire)) {
+                have = 1;
+                break;
+            }
+        }
+        if (have) break;
+        /* Re-read the clock every 32 spins; a clock read is itself ~20-40ns. */
+        if ((++spins & 31) == 0) {
+            monotime now = getMonotonicUs();
+            if (now - start >= (monotime)limit) {
+                server.stat_main_idle_spin_timeouts++;
+                break;
+            }
+        }
+#if defined(__aarch64__)
+        __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+    server.stat_main_idle_spin_us += getMonotonicUs() - start;
+}
+
 void trySendPollJobToIOThreads(void) {
     if (server.active_io_threads_num <= 1) {
         return;

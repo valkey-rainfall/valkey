@@ -2958,6 +2958,9 @@ void resetServerStats(void) {
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
     server.stat_poll_processed_by_io_threads = 0;
+    server.stat_main_idle_spins = 0;
+    server.stat_main_idle_spin_timeouts = 0;
+    server.stat_main_idle_spin_us = 0;
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
@@ -3257,6 +3260,7 @@ void initServer(void) {
      * before loading persistence since it is used by processEventsWhileBlocked. */
     aeSetBeforeSleepProc(server.el, beforeSleep);
     aeSetAfterSleepProc(server.el, afterSleep);
+    aeSetIdleWaitProc(server.el, ioThreadsMainIdleWait);
     if (ioUringBatchInit()) aeSetAfterEventsProc(server.el, ioUringBatchFlushReads);
 
     /* 32 bit instances are limited to 4GB of address space, so if there is
@@ -6904,6 +6908,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
+                "main_idle_spins:%lld\r\n", server.stat_main_idle_spins,
+                "main_idle_spin_timeouts:%lld\r\n", server.stat_main_idle_spin_timeouts,
+                "main_idle_spin_us:%lld\r\n", server.stat_main_idle_spin_us,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,

@@ -56,6 +56,7 @@ void testOnlyFreeIOThreadQueues(void);
 void testOnlyFillIOThreadInbox(void);
 size_t testOnlyGetClusterIOPendingResponses(void);
 void trySendPollJobToIOThreads(void);
+void ioThreadsMainIdleWait(struct aeEventLoop *el);
 int trySendAcceptToIOThreads(connection *conn);
 struct clusterLink;
 int trySendClusterReadToIOThreads(struct clusterLink *link);

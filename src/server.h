@@ -2041,6 +2041,10 @@ struct valkeyServer {
     long long stat_total_reads_processed;              /* Total number of read events processed */
     int io_uring_enabled;                              /* Batch main-thread client I/O syscalls via io_uring. */
     int io_uring_io_thread_share;                      /* Max SPMC jobs an I/O thread absorbs into one ring submit. */
+    int main_idle_spin_us;                             /* Main thread spins this long for I/O-thread work before a full loop iteration (0 = off). */
+    long long stat_main_idle_spins;                    /* Idle spins entered. */
+    long long stat_main_idle_spin_timeouts;            /* Idle spins that hit the time limit. */
+    long long stat_main_idle_spin_us;                  /* Total microseconds spent in idle spins. */
     long long stat_total_writes_processed;             /* Total number of write events processed */
     long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
