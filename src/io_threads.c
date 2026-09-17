@@ -421,7 +421,12 @@ static void *IOThreadMain(void *myid) {
                 int workers = server.active_io_threads_num - 1;
                 if (workers < 1) workers = 1;
                 share = (int)(n / workers) + 1;
-                if (share > IO_URING_JOB_SHARE_MAX) share = IO_URING_JOB_SHARE_MAX;
+                /* Runtime cap (io-uring-io-thread-share): bounds how long a
+                 * batch holds parsed clients back from the main thread. */
+                int cap = server.io_uring_io_thread_share;
+                if (cap < 1) cap = 1;
+                if (cap > IO_URING_JOB_SHARE_MAX) cap = IO_URING_JOB_SHARE_MAX;
+                if (share > cap) share = cap;
             }
             /* Take the share first, then decide per direction: a single
              * recv/send is cheaper as a plain syscall than as a one-entry
