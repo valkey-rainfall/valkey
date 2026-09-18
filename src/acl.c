@@ -552,6 +552,9 @@ static void ACLCopyRoles(user *dst, user *src) {
         user *r = listNodeValue(ln);
         listAddNodeTail(dst->roles, r);
         serverAssert(dictAdd(r->members, dst, dst) == DICT_OK);
+        /* acl-offload: a role held by a bound user is reachable from IO
+         * threads through that user, with no clientSetUser in between. */
+        if ((dst->flags & USER_FLAG_BOUND) && !(r->flags & USER_FLAG_BOUND)) r->flags |= USER_FLAG_BOUND;
     }
 }
 
@@ -627,9 +630,14 @@ static void ACLCopyUser(user *dst, user *src, int dst_is_live) {
         aclOffloadBumpEpoch();
         aclOffloadQuiesce();
         aclOffloadAssertNoReaders();
+    } else {
+        /* A destination some client is bound to must be published as live. */
+        serverAssert(!(dst->flags & USER_FLAG_BOUND));
     }
     listRelease(old_selectors);
-    dst->flags = src->flags;
+    /* Rules come from the staging copy; reachability is a property of dst
+     * alone (a staging copy made FROM a bound user must not inherit it). */
+    dst->flags = (src->flags & ~USER_FLAG_BOUND) | (dst->flags & USER_FLAG_BOUND);
     if (dst->acl_string) {
         decrRefCount(dst->acl_string);
     }
@@ -2622,19 +2630,29 @@ void aclOffloadBumpEpoch(void) {
     atomic_fetch_add_explicit(&acl_epoch, 1, memory_order_release);
 }
 
-/* A user object is reachable from IO threads once it is linked in the Users
- * or Roles tree (a client can be bound to it, or hold a role membership to it).
- * Staging copies, fake validation users and not-yet-linked objects are not.
- * ACL LOAD builds its new tree in place before rebinding any client; during
- * that window the new objects are linked but unreachable (see acl_loading). */
-static int acl_loading = 0;
+/* A user object is reachable from IO threads once a client has been bound to
+ * it (or to a member, for a role): only then can a read job dereference its
+ * rule set. USER_FLAG_BOUND records that, set once on first bind and never
+ * cleared, because a job parsed just before an unbind may still hold the
+ * pointer. Staging copies, fake validation users, module users that were
+ * never authenticated, and ACL LOAD's new objects before the rebind are all
+ * unbound and need none of the swap+drain discipline. Main-thread only. */
+void aclMarkUserBound(user *u) {
+    if (u->flags & USER_FLAG_BOUND) return;
+    u->flags |= USER_FLAG_BOUND;
+    if (u->roles) {
+        listIter li;
+        listNode *ln;
+        listRewind(u->roles, &li);
+        while ((ln = listNext(&li))) {
+            user *r = listNodeValue(ln);
+            if (!(r->flags & USER_FLAG_BOUND)) r->flags |= USER_FLAG_BOUND;
+        }
+    }
+}
+
 static int aclUserIsPublished(user *u) {
-    if (u == NULL || u->name == NULL || acl_loading) return 0;
-    rax *tree = (u->flags & USER_FLAG_ROLE) ? Roles : Users;
-    if (tree == NULL) return 0;
-    void *linked = NULL;
-    if (!raxFind(tree, (unsigned char *)u->name, sdslen(u->name), &linked)) return 0;
-    return linked == (void *)u;
+    return u != NULL && (u->flags & USER_FLAG_BOUND);
 }
 
 /* Structural guard for the offload invariant. Call this immediately before
@@ -3276,7 +3294,6 @@ static sds ACLLoadFromFile(const char *filename) {
     rax *old_roles = Roles;
     Users = raxNew();
     Roles = raxNew();
-    acl_loading = 1; /* acl-offload: new objects are linked but unreachable until the rebind below. */
 
     /* Load each line of the file. */
     /* First pass: load role definitions */
@@ -3496,19 +3513,17 @@ static sds ACLLoadFromFile(const char *filename) {
         /* acl-offload: every client was rebound to a new user object above. */
         aclOffloadBumpEpoch();
         aclOffloadQuiesce();
-        acl_loading = 0;
         raxFreeWithCallback(old_users, ACLFreeUserVoid);
         ACLRemapSurvivingRoleMembers(old_roles);
         raxFreeWithCallback(old_roles, ACLFreeUserVoid);
         sdsfree(errors);
         return NULL;
     } else {
-        /* The new objects were never reachable by any client. */
+        /* The new objects were never bound to any client (unpublished). */
         raxFreeWithCallback(Users, ACLFreeUserVoid);
         raxFreeWithCallback(Roles, ACLFreeUserVoid);
         Users = old_users;
         Roles = old_roles;
-        acl_loading = 0;
         errors =
             sdscat(errors, "WARNING: ACL errors detected, no change to the previously active ACL rules was performed");
         return errors;
