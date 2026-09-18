@@ -206,6 +206,9 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen);
 static struct serverCommand *ACLLookupCommand(const char *name);
 static sds ACLDescribeSelector(aclSelector *selector);
 static aclSelector *aclCreateSelectorFromOpSet(const char *opset, size_t opsetlen);
+/* acl-offload structural guard (defined with the other offload helpers). */
+static int aclUserIsPublished(user *u);
+static inline void aclOffloadAssertNoReaders(void);
 static sds *ACLMergeSelectorArguments(sds *argv, int argc, int *merged_argc, int *invalid_idx);
 static int ACLStringHasSpaces(const char *s, size_t len);
 static int ACLUserHasAllChannels(user *u);
@@ -524,6 +527,9 @@ user *ACLCreateUnlinkedUser(void) {
 /* Remove user from all roles' member lists and release the roles list. */
 static void ACLUserClearRoles(user *u) {
     if (!u->roles) return;
+    /* acl-offload: IO threads walk u->roles while tagging; only touch it
+     * in place once no job is in flight (ACLCopyUser quiesces before this). */
+    if (aclUserIsPublished(u)) aclOffloadAssertNoReaders();
     listIter li;
     listNode *ln;
     listRewind(u->roles, &li);
@@ -552,6 +558,8 @@ static void ACLCopyRoles(user *dst, user *src) {
 /* Release the memory used by the user structure. Note that this function
  * will not remove the user from the Users global radix tree. */
 void ACLFreeUser(user *u) {
+    /* acl-offload: a linked user may be referenced by an in-flight IO job. */
+    if (aclUserIsPublished(u)) aclOffloadAssertNoReaders();
     ACLUserClearRoles(u);
     sdsfree(u->name);
     if (u->acl_string) {
@@ -618,6 +626,7 @@ static void ACLCopyUser(user *dst, user *src, int dst_is_live) {
     if (dst_is_live) {
         aclOffloadBumpEpoch();
         aclOffloadQuiesce();
+        aclOffloadAssertNoReaders();
     }
     listRelease(old_selectors);
     dst->flags = src->flags;
@@ -787,6 +796,7 @@ static sds ACLStringSetRole(user *r, sds rolename, sds *argv, int argc) {
     if (role_is_live) {
         aclOffloadBumpEpoch();
         aclOffloadQuiesce();
+        aclOffloadAssertNoReaders();
     }
 
     /* Kill pubsub clients of member users whose channel access was revoked.
@@ -1780,6 +1790,11 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * ERANGE: A database ID provided with the db= rule is out of the supported range.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
+    /* acl-offload: this is the one function that mutates a user's rule set in
+     * place. Runtime callers operate on staging copies and publish through
+     * ACLCopyUser; the only in-place caller on a published user is the
+     * requirepass path, which quiesces first. Anything else is a bug. */
+    if (aclUserIsPublished(u)) aclOffloadAssertNoReaders();
     /* as we are changing the ACL, the old generated string is now invalid */
     if (u->acl_string) {
         decrRefCount(u->acl_string);
@@ -2607,6 +2622,34 @@ void aclOffloadBumpEpoch(void) {
     atomic_fetch_add_explicit(&acl_epoch, 1, memory_order_release);
 }
 
+/* A user object is reachable from IO threads once it is linked in the Users
+ * or Roles tree (a client can be bound to it, or hold a role membership to it).
+ * Staging copies, fake validation users and not-yet-linked objects are not.
+ * ACL LOAD builds its new tree in place before rebinding any client; during
+ * that window the new objects are linked but unreachable (see acl_loading). */
+static int acl_loading = 0;
+static int aclUserIsPublished(user *u) {
+    if (u == NULL || u->name == NULL || acl_loading) return 0;
+    rax *tree = (u->flags & USER_FLAG_ROLE) ? Roles : Users;
+    if (tree == NULL) return 0;
+    void *linked = NULL;
+    if (!raxFind(tree, (unsigned char *)u->name, sdslen(u->name), &linked)) return 0;
+    return linked == (void *)u;
+}
+
+/* Structural guard for the offload invariant. Call this immediately before
+ * mutating in place, or freeing, any rule-set memory (selectors or roles
+ * lists, or a whole user) that IO threads could reach. It holds after
+ * aclOffloadQuiesce() for the rest of the current command, because main is
+ * the only submitter of IO jobs. A code path that forgets the swap+drain
+ * discipline fails this assertion in every CI run of the ACL suites with
+ * io-threads on, instead of leaking only when a probe happens to race. */
+static inline void aclOffloadAssertNoReaders(void) {
+    if (!aclOffloadActive()) return;
+    serverAssert(inMainThread());
+    serverAssert(ioThreadsHaveNoPendingJobs());
+}
+
 /* Wait until no IO job is in flight. Called on main before freeing anything an
  * IO thread may be reading (selectors lists, user objects). Cheap when idle;
  * on the rare ACL-mutation path only. */
@@ -3137,6 +3180,9 @@ static int ACLLoadConfiguredRoles(void) {
  * the new role of the same name, or drop them if it is gone. Called after the old
  * users are freed, so only such survivors are left on the old member lists. */
 static void ACLRemapSurvivingRoleMembers(rax *old_roles) {
+    /* acl-offload: mutates published users' roles lists in place; ACL LOAD
+     * quiesces before calling this and frees nothing until it returns. */
+    aclOffloadAssertNoReaders();
     raxIterator ri;
     raxStart(&ri, old_roles);
     raxSeek(&ri, "^", NULL, 0);
@@ -3230,6 +3276,7 @@ static sds ACLLoadFromFile(const char *filename) {
     rax *old_roles = Roles;
     Users = raxNew();
     Roles = raxNew();
+    acl_loading = 1; /* acl-offload: new objects are linked but unreachable until the rebind below. */
 
     /* Load each line of the file. */
     /* First pass: load role definitions */
@@ -3449,16 +3496,19 @@ static sds ACLLoadFromFile(const char *filename) {
         /* acl-offload: every client was rebound to a new user object above. */
         aclOffloadBumpEpoch();
         aclOffloadQuiesce();
+        acl_loading = 0;
         raxFreeWithCallback(old_users, ACLFreeUserVoid);
         ACLRemapSurvivingRoleMembers(old_roles);
         raxFreeWithCallback(old_roles, ACLFreeUserVoid);
         sdsfree(errors);
         return NULL;
     } else {
+        /* The new objects were never reachable by any client. */
         raxFreeWithCallback(Users, ACLFreeUserVoid);
         raxFreeWithCallback(Roles, ACLFreeUserVoid);
         Users = old_users;
         Roles = old_roles;
+        acl_loading = 0;
         errors =
             sdscat(errors, "WARNING: ACL errors detected, no change to the previously active ACL rules was performed");
         return errors;
@@ -4451,6 +4501,13 @@ void authCommand(client *c) {
 /* Set the password for the "default" ACL user. This implements supports for
  * requirepass config, so passing in NULL will set the user to be nopass. */
 void ACLUpdateDefaultUserPassword(sds password) {
+    /* acl-offload: DefaultUser is published and this mutates it in place.
+     * Passwords are not read by IO threads, but the rule is uniform: no
+     * in-place change to a published user while a job may be reading it.
+     * requirepass changes are rare; one drain is the same class of pause as
+     * ACL SETUSER (see aclOffloadQuiesce). */
+    aclOffloadBumpEpoch();
+    aclOffloadQuiesce();
     ACLSetUser(DefaultUser, "resetpass", -1);
     if (password) {
         sds aclop = sdscatlen(sdsnew(">"), password, sdslen(password));
