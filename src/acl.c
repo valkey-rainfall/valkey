@@ -773,9 +773,21 @@ static sds ACLStringSetRole(user *r, sds rolename, sds *argv, int argc) {
         serverAssert(r != NULL);
     }
 
-    /* Save old selectors before updating. */
+    /* Save old selectors before updating.
+     * acl-offload: a member user's effective rules include this role's
+     * selectors, so IO threads may be walking r->selectors right now. Same
+     * discipline as ACLCopyUser on a live user: publish the new list by
+     * pointer swap, make every pending verdict stale, and free the old list
+     * only once no IO job is in flight. A brand-new role has no members yet
+     * and is unreachable from IO threads. */
+    int role_is_live = (r->members && dictSize(r->members) > 0);
     list *old_selectors = r->selectors;
-    r->selectors = listDup(tempr->selectors);
+    list *new_selectors = listDup(tempr->selectors);
+    atomic_store_explicit((_Atomic(list *) *)&r->selectors, new_selectors, memory_order_release);
+    if (role_is_live) {
+        aclOffloadBumpEpoch();
+        aclOffloadQuiesce();
+    }
 
     /* Kill pubsub clients of member users whose channel access was revoked.
      * Since the role's selectors are already updated, the member's effective
