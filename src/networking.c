@@ -3798,7 +3798,7 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
-    c->acl_tag.valid = 0;
+    c->acl_tag = 0;
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;

@@ -1365,15 +1365,13 @@ typedef struct ClientModuleData {
 } ClientModuleData;
 
 /* Parser state and parse result of a command from a client's input buffer. */
-/* ACL verdict computed off the main thread (acl-offload). A verdict is only
- * consumed by the main thread if its epoch still matches the global ACL epoch;
- * otherwise the main thread re-evaluates (stock path). See acl.c. */
-typedef struct aclVerdictTag {
-    uint64_t epoch;    /* Global ACL epoch observed BEFORE evaluating. */
-    int retval;        /* ACL_OK or ACL_DENIED_*. */
-    int errpos;        /* argv index that caused a denial. */
-    unsigned valid : 1; /* 0: no verdict, main must evaluate. */
-} aclVerdictTag;
+/* ACL verdict computed off the main thread (acl-offload). Only an ALLOW
+ * verdict is recorded: the value is the global ACL epoch observed BEFORE
+ * evaluating (never 0, the epoch starts at 1), or 0 when there is no verdict.
+ * Main consumes it only if the epoch still matches; otherwise, and for every
+ * denial, main re-evaluates on the stock path. One word, so it neither moves
+ * any existing field nor adds a cache line to the per-command structures. */
+typedef uint64_t aclVerdictTag;
 
 typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
@@ -1431,7 +1429,6 @@ typedef struct client {
     struct serverCommand *lastcmd;    /* Last command executed. */
     struct serverCommand *realcmd;    /* The original command that was executed by the client */
     struct serverCommand *parsed_cmd; /* The command that was parsed. */
-    aclVerdictTag acl_tag;            /* acl-offload verdict for the current command. */
     time_t last_interaction;          /* Time of the last interaction, used for timeout */
     serverDb *db;                     /* Pointer to currently SELECTed DB. */
     /* Client state structs. */
@@ -1519,6 +1516,8 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
+    aclVerdictTag acl_tag;             /* acl-offload verdict for the current command. Kept at
+                                        * the tail so it does not shift existing hot fields. */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -2056,11 +2055,6 @@ struct valkeyServer {
     long long stat_dump_payload_sanitizations;         /* Number deep dump payloads integrity validations. */
     long long stat_io_reads_processed;                 /* Number of read events processed by IO threads */
     long long stat_io_reads_pending;                   /* Number of read events pending in IO threads */
-    long long stat_acl_offload_hits;                   /* acl-offload: verdicts consumed without main-thread evaluation */
-    long long stat_acl_offload_punts;                  /* acl-offload: tagged verdicts rejected (epoch mismatch), re-evaluated on main */
-    long long stat_acl_offload_quiesce_count;          /* acl-offload: waits for in-flight IO jobs before freeing ACL memory */
-    long long stat_acl_offload_quiesce_total_us;       /* acl-offload: total time spent in those waits */
-    long long stat_acl_offload_quiesce_max_us;         /* acl-offload: longest single wait */
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
@@ -2559,6 +2553,13 @@ struct valkeyServer {
     int hotkeys_top_k;               /* Number of top keys to track (Space-Saving K); 0 disables detection. */
     int hotkeys_window_seconds;      /* Length of the QPS accounting window in seconds. */
     struct spaceSavingManager *hotkeys_manager;
+    /* acl-offload counters. Kept at the tail of the struct so adding them does
+     * not shift the offsets of existing fields (and their cache-line grouping). */
+    long long stat_acl_offload_hits;                   /* acl-offload: verdicts consumed without main-thread evaluation */
+    long long stat_acl_offload_punts;                  /* acl-offload: tagged verdicts rejected (epoch mismatch), re-evaluated on main */
+    long long stat_acl_offload_quiesce_count;          /* acl-offload: waits for in-flight IO jobs before freeing ACL memory */
+    long long stat_acl_offload_quiesce_total_us;       /* acl-offload: total time spent in those waits */
+    long long stat_acl_offload_quiesce_max_us;         /* acl-offload: longest single wait */
 };
 
 #define MAX_KEYS_BUFFER 256

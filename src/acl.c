@@ -2694,9 +2694,12 @@ int aclOffloadShouldStopTagging(struct serverCommand *cmd) {
 }
 
 /* IO-thread side: evaluate and tag. Never touches main-thread-owned state
- * except plain reads the read-job protocol already permits. */
+ * except plain reads the read-job protocol already permits. Only an ALLOW
+ * verdict is recorded; a denial leaves the tag empty so main runs the stock
+ * check and produces the exact error position itself. Denials are rare, and
+ * this keeps the offload strictly an accelerator for the permitted path. */
 void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int read_flags, aclVerdictTag *tag) {
-    tag->valid = 0;
+    *tag = 0;
     if (!aclOffloadActive()) return;
     if (cmd == NULL || argc == 0) return;
     if (!(read_flags & READ_FLAGS_PARSING_COMPLETED) || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)))
@@ -2708,22 +2711,17 @@ void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int
 
     uint64_t epoch = atomic_load_explicit(&acl_epoch, memory_order_acquire);
     int errpos = 0;
-    int retval = ACLCheckAllUserCommandPerm(u, cmd, argv, argc, c->db->id, &errpos);
-    tag->epoch = epoch;
-    tag->retval = retval;
-    tag->errpos = errpos;
-    tag->valid = 1;
+    if (ACLCheckAllUserCommandPerm(u, cmd, argv, argc, c->db->id, &errpos) == ACL_OK) *tag = epoch;
 }
 
-/* Main-thread side: consume a fresh verdict or fall back to evaluation. */
+/* Main-thread side: consume a fresh ALLOW verdict or fall back to evaluation. */
 int aclOffloadConsume(client *c, int *idxptr) {
-    aclVerdictTag *tag = &c->acl_tag;
-    if (tag->valid) {
-        tag->valid = 0;
-        if (!c->flag.multi && tag->epoch == atomic_load_explicit(&acl_epoch, memory_order_relaxed)) {
+    aclVerdictTag tag = c->acl_tag;
+    if (tag) {
+        c->acl_tag = 0;
+        if (!c->flag.multi && tag == atomic_load_explicit(&acl_epoch, memory_order_relaxed)) {
             server.stat_acl_offload_hits++;
-            *idxptr = tag->errpos;
-            return tag->retval;
+            return ACL_OK;
         }
         server.stat_acl_offload_punts++;
     }

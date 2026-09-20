@@ -4576,7 +4576,7 @@ uint64_t getCommandFlags(client *c) {
  * cluster slot. This should be done before calling processCommand() and can be
  * done by I/O threads to offload the main-thread. */
 static void prepareCommandGeneric(client *c, robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot, aclVerdictTag *acl_tag, int *acl_stop) {
-    acl_tag->valid = 0;
+    *acl_tag = 0;
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
     /* Make sure we don't do this twice. */
     debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
@@ -4593,8 +4593,9 @@ static void prepareCommandGeneric(client *c, robj **argv, int argc, int *read_fl
     }
     /* acl-offload: only IO threads tag (main would just duplicate its own
      * check). Stop tagging for the rest of the batch after a command that
-     * changes the identity/db the following commands run under. */
-    if (!inMainThread() && !*acl_stop) {
+     * changes the identity/db the following commands run under. With the
+     * feature off this costs one predictable branch per command. */
+    if (server.acl_offload && !inMainThread() && !*acl_stop) {
         aclOffloadTagCommand(c, *cmd, argv, argc, *read_flags, acl_tag);
         if (*cmd && aclOffloadShouldStopTagging(*cmd)) *acl_stop = 1;
     }
@@ -4622,7 +4623,7 @@ void prepareCommandQueue(client *c) {
 /* Undo prepareCommand(), to allow prepareCommand() again after applying command filters. */
 void unprepareCommand(client *c) {
     c->parsed_cmd = NULL;
-    c->acl_tag.valid = 0; /* argv may have been rewritten by a filter. */
+    c->acl_tag = 0; /* argv may have been rewritten by a filter. */
     c->read_flags &= ~(READ_FLAGS_COMMAND_NOT_FOUND |
                        READ_FLAGS_BAD_ARITY |
                        READ_FLAGS_CROSSSLOT |
