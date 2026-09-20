@@ -64,7 +64,16 @@ _Atomic int dplus_client_mem_pressure = 0;
 
 /* --- Component 6: Stats --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-dplusStats dplus_stats = {0};
+dplusStats dplus_stats[DPLUS_MAX_IO_THREADS] = {{0}};
+
+uint64_t dplusStatsSum(size_t field_offset) {
+    uint64_t sum = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        _Atomic(uint64_t) *p = (_Atomic(uint64_t) *)((char *)&dplus_stats[i] + field_offset);
+        sum += atomic_load_explicit(p, memory_order_relaxed);
+    }
+    return sum;
+}
 #endif
 
 /* --- Component 4: Exclusive mode implementation --- */
@@ -108,7 +117,7 @@ static int dplusReaderEnter(int tid) {
         if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_seq_cst)) {
             stats->exclusive_punts++;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.exclusive_punts, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(exclusive_punts, 1);
 #endif
             dplusReaderWorkerQuiescent(tid);
             return 0;
@@ -312,7 +321,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         /* Key not found — punt on miss (E4): main fires the keymiss notification
          * and increments stat_keyspace_misses exactly. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
+        DPLUS_STAT_ADD(miss_punts, 1);
 #endif
         return 0;
     }
@@ -328,7 +337,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         mstime_t when = objectGetExpire(o);
         if (when >= 0 && mstime() >= when) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.expired_replies, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(expired_replies, 1);
 #endif
             return 0;
         }
@@ -347,7 +356,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         vallen = sdslen(s);
         if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.large_value_punts, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(large_value_punts, 1);
 #endif
             return 0;
         }
@@ -404,7 +413,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
      * copy above before the version re-read. */
     if (!dplusVersionValidate(va, e->shard, e->v_before)) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+        DPLUS_STAT_ADD(validation_misses, 1);
 #endif
         return 0;
     }
@@ -414,7 +423,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
     if (written <= 0) return 0;
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-    atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
+    DPLUS_STAT_ADD(speculative_hits, 1);
 #endif
     return 1;
 }
@@ -553,7 +562,7 @@ int dplusSpeculateBatch(client *c, int tid) {
          * gate recovers once GETs resume. */
         if (__builtin_popcountll(gate->history) < DPLUS_WRITE_TAX_THRESHOLD) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.intra_batch_write_punts, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(intra_batch_write_punts, 1);
 #endif
             /* Shift in 1 (eligible batch seen) to allow recovery. */
             gate->history = (gate->history << 1) | 1;
@@ -588,7 +597,7 @@ int dplusSpeculateBatch(client *c, int tid) {
         if (e->v_before & 1) {
             /* S2.2a: writer bracket open -- punt to main */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.bracket_entry_punts, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(bracket_entry_punts, 1);
 #endif
             goto out;
         }
@@ -651,7 +660,7 @@ int dplusSpeculateBatch(client *c, int tid) {
             if (e->v_before & 1) {
                 /* S2.2a: writer bracket open -- refuse at entry */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-                atomic_fetch_add_explicit(&dplus_stats.bracket_entry_punts, 1, memory_order_relaxed);
+                DPLUS_STAT_ADD(bracket_entry_punts, 1);
 #endif
                 continue;
             }
@@ -675,7 +684,7 @@ int dplusSpeculateBatch(client *c, int tid) {
         while (head < tail && done[head % DPLUS_BATCH_DEPTH]) {
             dplusBatchEntry *e = &batch[head % DPLUS_BATCH_DEPTH];
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.speculative_attempts, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(speculative_attempts, 1);
 #endif
             if (dplusValidateAndReply(c, e, ht, c->resp)) {
                 if (e->is_first_cmd) {
@@ -1444,25 +1453,25 @@ sds dplusInfoString(sds info) {
         "dplus_b13_info_lock_calls:%llu\r\n"
         "dplus_b13_info_lock_wait_us:%llu\r\n"
         "dplus_b13_info_lock_hold_us:%llu\r\n",
-        (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_attempts, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.speculative_hits, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.validation_misses, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.exclusive_punts, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.large_value_punts, memory_order_relaxed),
+        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
+        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
+        (unsigned long long)DPLUS_STAT_SUM(validation_misses),
+        (unsigned long long)DPLUS_STAT_SUM(exclusive_punts),
+        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
         (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
         dplus_debug_pv_last_key,
         (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.bracket_entry_punts, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.expired_replies, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.intra_batch_write_punts, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.miss_punts, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_waiting_transitions, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_handler_fires, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_read_suspends, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_rearms, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_info_lock_calls, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_info_lock_wait_us, memory_order_relaxed),
-        (unsigned long long)atomic_load_explicit(&dplus_stats.b13_info_lock_hold_us, memory_order_relaxed));
+        (unsigned long long)DPLUS_STAT_SUM(bracket_entry_punts),
+        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
+        (unsigned long long)DPLUS_STAT_SUM(intra_batch_write_punts),
+        (unsigned long long)DPLUS_STAT_SUM(miss_punts),
+        (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
+        (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),
+        (unsigned long long)DPLUS_STAT_SUM(b13_read_suspends),
+        (unsigned long long)DPLUS_STAT_SUM(b13_rearms),
+        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_calls),
+        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_wait_us),
+        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_hold_us));
 #endif
     return info;
 }

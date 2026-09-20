@@ -30,6 +30,7 @@
 #define DPLUS_H
 
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -142,9 +143,21 @@ typedef struct {
     _Atomic(uint64_t) b13_info_lock_calls;
     _Atomic(uint64_t) b13_info_lock_wait_us;
     _Atomic(uint64_t) b13_info_lock_hold_us;
-} dplusStats;
+} __attribute__((aligned(DPLUS_CACHELINE))) dplusStats;
 
-extern dplusStats dplus_stats;
+/* One slot per thread, each on its own cache lines. A counter is written only
+ * by the thread that owns the slot, so an increment is an uncontended RMW on a
+ * line no other core writes; INFO sums the slots. A single shared struct would
+ * put every thread's increments on one line and turn the stats build into a
+ * coherence benchmark instead of a measurement of the code under test. */
+extern dplusStats dplus_stats[DPLUS_MAX_IO_THREADS];
+
+#define DPLUS_STAT_ADD(field, n) \
+    atomic_fetch_add_explicit(&dplus_stats[getCurTid()].field, (n), memory_order_relaxed)
+
+/* Sum of one counter across all thread slots (relaxed; INFO-time read). */
+uint64_t dplusStatsSum(size_t field_offset);
+#define DPLUS_STAT_SUM(field) dplusStatsSum(offsetof(dplusStats, field))
 #endif
 
 /* D5: owned-client over-limit signal (correctness machinery — present in

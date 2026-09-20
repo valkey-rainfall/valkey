@@ -3546,8 +3546,8 @@ static int b13ArmOwnerWriteHandler(client *c) {
         connSetPostponeUpdateState(c->conn, 0);
     } else {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.b13_waiting_transitions, 1, memory_order_relaxed);
-        if (was_waiting) atomic_fetch_add_explicit(&dplus_stats.b13_rearms, 1, memory_order_relaxed);
+        DPLUS_STAT_ADD(b13_waiting_transitions, 1);
+        if (was_waiting) DPLUS_STAT_ADD(b13_rearms, 1);
 #endif
     }
     aeReleaseLock(loop);
@@ -3707,7 +3707,7 @@ static void f7OwnerWriteHandler(connection *conn) {
     atomic_thread_fence(memory_order_acquire);
     c->io_write_state = CLIENT_PENDING_IO;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-    atomic_fetch_add_explicit(&dplus_stats.b13_handler_fires, 1, memory_order_relaxed);
+    DPLUS_STAT_ADD(b13_handler_fires, 1);
 #endif
     dplus_thread_stats[getCurTid()].punted_replies_written++;
     ioThreadWriteToClient(c);
@@ -4883,7 +4883,7 @@ void readQueryFromClient(connection *conn) {
         if (clientWriteIsWaiting(c) && connHasWriteHandler(c->conn)) {
             connSetWriteHandler(c->conn, NULL);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            atomic_fetch_add_explicit(&dplus_stats.b13_read_suspends, 1, memory_order_relaxed);
+            DPLUS_STAT_ADD(b13_read_suspends, 1);
 #endif
         }
         c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
@@ -5112,9 +5112,9 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
 #endif
         aeReleaseLock(b13_info_loop);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_calls, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_wait_us, b13_hold_start - b13_lock_start, memory_order_relaxed);
-        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_hold_us, end - b13_hold_start, memory_order_relaxed);
+        DPLUS_STAT_ADD(b13_info_lock_calls, 1);
+        DPLUS_STAT_ADD(b13_info_lock_wait_us, b13_hold_start - b13_lock_start);
+        DPLUS_STAT_ADD(b13_info_lock_hold_us, end - b13_hold_start);
 #endif
     }
     return ret;
@@ -5162,9 +5162,9 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
 #endif
         aeReleaseLock(b13_info_loop);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_calls, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_wait_us, b13_hold_start - b13_lock_start, memory_order_relaxed);
-        atomic_fetch_add_explicit(&dplus_stats.b13_info_lock_hold_us, end - b13_hold_start, memory_order_relaxed);
+        DPLUS_STAT_ADD(b13_info_lock_calls, 1);
+        DPLUS_STAT_ADD(b13_info_lock_wait_us, b13_hold_start - b13_lock_start);
+        DPLUS_STAT_ADD(b13_info_lock_hold_us, end - b13_hold_start);
 #endif
     }
     return ret;
