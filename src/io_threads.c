@@ -413,6 +413,28 @@ static void *IOThreadMain(void *myid) {
          * degenerates to the original one job per priority. */
         for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
             spmcQueue *q = &io_shared_inbox[p];
+            /* Dequeue one job first, exactly as stock does. spmcDequeue only
+             * touches the consumer-shared head line and the cell; spmcSize
+             * also reads q->tail, the producer's private cache line, which
+             * main writes on every enqueue. Reading it from every spinning
+             * worker on every empty pass keeps that line Shared and turns each
+             * of main's enqueues into a cross-core invalidate (measured
+             * +1-2% main cycles/cmd at P10/P16 with the ring otherwise idle).
+             * So the share is sized only once a pass has proven non-empty. */
+            void *jobs[IO_URING_JOB_SHARE_MAX];
+            int njobs = 0, nread = 0, nwrite = 0;
+            void *first = spmcDequeue(q);
+            if (first == NULL) continue;
+            {
+                void *data;
+                int type;
+                untagJob(first, &data, &type);
+                if (type == JOB_REQ_READ_CLIENT)
+                    nread++;
+                else if (type == JOB_REQ_WRITE_CLIENT)
+                    nwrite++;
+                jobs[njobs++] = first;
+            }
             int share = 1;
             if (ioUringBatchActive()) {
                 size_t n = spmcSize(q);
@@ -426,12 +448,10 @@ static void *IOThreadMain(void *myid) {
                 int cap = ioUringBatchIOThreadShareCap(server.io_uring_io_thread_share);
                 if (share > cap) share = cap;
             }
-            /* Take the share first, then decide per direction: a single
+            /* Take the rest of the share, then decide per direction: a single
              * recv/send is cheaper as a plain syscall than as a one-entry
              * io_uring_enter, so a direction is batched only when this pass
              * holds at least IO_URING_MIN_BATCH jobs of it. */
-            void *jobs[IO_URING_JOB_SHARE_MAX];
-            int njobs = 0, nread = 0, nwrite = 0;
             while (njobs < share) {
                 void *tagged_job = spmcDequeue(q);
                 if (tagged_job == NULL) break;
