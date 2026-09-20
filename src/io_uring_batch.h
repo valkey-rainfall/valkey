@@ -26,6 +26,10 @@
 struct client;
 struct aeEventLoop;
 
+/* Cap on SPMC jobs one io_uring-batching worker absorbs per loop pass
+ * (upper bound of the io-uring-io-thread-share config). */
+#define IO_URING_JOB_SHARE_MAX 512
+
 /* Returns 1 if the build has liburing and the kernel accepted the ring. */
 int ioUringBatchInit(void);
 void ioUringBatchFree(void);
@@ -70,6 +74,24 @@ void ioUringBatchFlushIOThread(void);
 /* Number of jobs absorbed and not yet flushed on this thread. */
 int ioUringBatchIOThreadPending(void);
 
+/* ---- adaptive share ---------------------------------------------------
+ * Batching worker reads pays off when each read carries one command (two
+ * syscalls per command to save) and costs tail latency when each read
+ * carries many (nothing left to save, and a batch of N reads holds N x
+ * depth commands back from the main thread). Each I/O thread keeps an EWMA
+ * of commands parsed per read and, when io-uring-adaptive-share is on,
+ * stops batching once it passes IOU_ADAPTIVE_HIGH, resuming below
+ * IOU_ADAPTIVE_LOW (hysteresis). Per-thread state, no sharing.
+ *
+ * Called from the I/O-thread read tail once the read has been parsed. */
+void ioUringBatchNoteIOThreadRead(struct client *c);
+/* The share cap this pass should use: ``configured`` (clamped to the legal
+ * range), or 1 while the calling thread's reads carry many commands. */
+int ioUringBatchIOThreadShareCap(int configured);
+/* Mean commands-per-read EWMA over worker threads that have parsed reads
+ * (0 if none), for INFO. */
+double ioUringBatchCmdsPerRead(void);
+
 /* A client is being freed synchronously while it may still have a queued
  * SQE (e.g. CLIENT KILL from another client's handler in the same batch).
  * Detach it so the completion is dropped on the floor. */
@@ -87,6 +109,7 @@ typedef struct ioUringBatchStats {
     long long cancelled; /* SQEs whose client was freed mid-batch */
     long long max_read_batch;
     long long max_write_batch;
+    long long adaptive_suppressed; /* worker passes whose share was forced to 1 */
 } ioUringBatchStats;
 /* Sum of every thread's counters (for INFO). */
 void ioUringBatchStatsTotal(ioUringBatchStats *out);

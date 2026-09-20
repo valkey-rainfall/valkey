@@ -7,8 +7,6 @@
 #include "io_threads.h"
 #include "io_uring_batch.h"
 
-/* Cap on SPMC jobs one io_uring-batching worker absorbs per loop pass. */
-#define IO_URING_JOB_SHARE_MAX 512
 /* Fewer jobs of one direction than this run inline: a one-entry
  * io_uring_enter costs more than the plain syscall it replaces. */
 #define IO_URING_MIN_BATCH 4
@@ -422,10 +420,10 @@ static void *IOThreadMain(void *myid) {
                 if (workers < 1) workers = 1;
                 share = (int)(n / workers) + 1;
                 /* Runtime cap (io-uring-io-thread-share): bounds how long a
-                 * batch holds parsed clients back from the main thread. */
-                int cap = server.io_uring_io_thread_share;
-                if (cap < 1) cap = 1;
-                if (cap > IO_URING_JOB_SHARE_MAX) cap = IO_URING_JOB_SHARE_MAX;
+                 * batch holds parsed clients back from the main thread. The
+                 * adaptive rule may force it to 1 while this thread's reads
+                 * carry many commands (see ioUringBatchIOThreadShareCap). */
+                int cap = ioUringBatchIOThreadShareCap(server.io_uring_io_thread_share);
                 if (share > cap) share = cap;
             }
             /* Take the share first, then decide per direction: a single

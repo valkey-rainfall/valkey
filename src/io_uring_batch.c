@@ -86,9 +86,63 @@ void ioUringBatchStatsTotal(ioUringBatchStats *out) {
         out->fallback_reads += s->fallback_reads;
         out->fallback_writes += s->fallback_writes;
         out->cancelled += s->cancelled;
+        out->adaptive_suppressed += s->adaptive_suppressed;
         if (s->max_read_batch > out->max_read_batch) out->max_read_batch = s->max_read_batch;
         if (s->max_write_batch > out->max_write_batch) out->max_write_batch = s->max_write_batch;
     }
+}
+
+/* ------------------------------------------------------- adaptive share
+ * Per-thread, touched only by the owning I/O thread except for the racy
+ * INFO read (same discipline as stats_per_thread). Lives outside the
+ * liburing block: the gauge is meaningful, and the cap decision harmless,
+ * without a ring. */
+#define IOU_ADAPTIVE_HIGH 4.0     /* commands/read above which batching stops */
+#define IOU_ADAPTIVE_LOW 2.0      /* ... and below which it resumes */
+#define IOU_ADAPTIVE_ALPHA (1.0 / 64.0)
+
+static double cmds_per_read_ewma[IO_THREADS_MAX_NUM];
+static int adaptive_suppressed_state[IO_THREADS_MAX_NUM];
+
+void ioUringBatchNoteIOThreadRead(client *c) {
+    if (!server.io_uring_enabled) return; /* keep the epoll arm untouched */
+    /* After the I/O-thread parse the first command sits in argv and the
+     * pipelined rest in cmd_queue (asserted empty before parsing). */
+    int ncmds = (c->argc > 0 ? 1 : 0) + c->cmd_queue.len;
+    if (ncmds <= 0) return;
+    int tid = getCurTid();
+    double *e = &cmds_per_read_ewma[tid];
+    *e = *e == 0.0 ? (double)ncmds : *e + IOU_ADAPTIVE_ALPHA * ((double)ncmds - *e);
+}
+
+int ioUringBatchIOThreadShareCap(int configured) {
+    int cap = configured;
+    if (cap < 1) cap = 1;
+    if (cap > IO_URING_JOB_SHARE_MAX) cap = IO_URING_JOB_SHARE_MAX;
+    if (!server.io_uring_adaptive_share || cap == 1) return cap;
+    int tid = getCurTid();
+    double e = cmds_per_read_ewma[tid];
+    int *suppressed = &adaptive_suppressed_state[tid];
+    if (*suppressed) {
+        if (e < IOU_ADAPTIVE_LOW) *suppressed = 0;
+    } else if (e > IOU_ADAPTIVE_HIGH) {
+        *suppressed = 1;
+    }
+    if (!*suppressed) return cap;
+    stats_per_thread[tid].adaptive_suppressed++;
+    return 1;
+}
+
+double ioUringBatchCmdsPerRead(void) {
+    double sum = 0.0;
+    int n = 0;
+    for (int t = 1; t < IO_THREADS_MAX_NUM; t++) {
+        if (cmds_per_read_ewma[t] > 0.0) {
+            sum += cmds_per_read_ewma[t];
+            n++;
+        }
+    }
+    return n ? sum / n : 0.0;
 }
 
 #ifdef HAVE_LIBURING
