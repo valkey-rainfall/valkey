@@ -3798,7 +3798,6 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
-    c->acl_tag = 0;
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
@@ -4526,7 +4525,6 @@ static bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
-    c->acl_tag = p->acl_tag;
     c->qb_applied += p->input_bytes;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in

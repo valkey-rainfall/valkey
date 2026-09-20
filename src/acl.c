@@ -2693,33 +2693,46 @@ int aclOffloadShouldStopTagging(struct serverCommand *cmd) {
            p == multiCommand;
 }
 
+/* IO-thread side, once per read job: record the ACL epoch every verdict in
+ * this job will be evaluated under. Must happen-before the evaluations
+ * (acquire), so a mutation that publishes a new rule set and bumps the epoch
+ * either is seen here (and the verdicts use the new rules) or is not (and
+ * main rejects the verdicts on the epoch compare). A read job is never
+ * submitted while the client still has unconsumed parsed commands
+ * (parseInputBuffer asserts an empty queue), so one snapshot per client is
+ * enough. Only the low 32 bits are kept: a stale verdict could then only be
+ * accepted after exactly 2^32 ACL mutations while its commands sit queued,
+ * and every one of those mutations drains the IO backlog first. */
+void aclOffloadBeginBatch(client *c) {
+    if (!aclOffloadActive() || inMainThread()) return;
+    c->acl_epoch_seen = (uint32_t)atomic_load_explicit(&acl_epoch, memory_order_acquire);
+}
+
 /* IO-thread side: evaluate and tag. Never touches main-thread-owned state
  * except plain reads the read-job protocol already permits. Only an ALLOW
- * verdict is recorded; a denial leaves the tag empty so main runs the stock
- * check and produces the exact error position itself. Denials are rare, and
- * this keeps the offload strictly an accelerator for the permitted path. */
-void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int read_flags, aclVerdictTag *tag) {
-    *tag = 0;
+ * verdict is recorded, as a bit in the command's read flags; a denial leaves
+ * the bit clear so main runs the stock check and produces the exact error
+ * position itself. Denials are rare, and this keeps the offload strictly an
+ * accelerator for the permitted path. */
+void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int *read_flags) {
     if (!aclOffloadActive()) return;
     if (cmd == NULL || argc == 0) return;
-    if (!(read_flags & READ_FLAGS_PARSING_COMPLETED) || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)))
+    if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || (*read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)))
         return;
     /* Inside MULTI the check runs against the transaction db; leave it to main. */
     if (c->flag.multi) return;
     user *u = c->user;
     if (u == NULL) return; /* No ACL: main's check is a no-op anyway. */
 
-    uint64_t epoch = atomic_load_explicit(&acl_epoch, memory_order_acquire);
     int errpos = 0;
-    if (ACLCheckAllUserCommandPerm(u, cmd, argv, argc, c->db->id, &errpos) == ACL_OK) *tag = epoch;
+    if (ACLCheckAllUserCommandPerm(u, cmd, argv, argc, c->db->id, &errpos) == ACL_OK) *read_flags |= READ_FLAGS_ACL_ALLOWED;
 }
 
 /* Main-thread side: consume a fresh ALLOW verdict or fall back to evaluation. */
 int aclOffloadConsume(client *c, int *idxptr) {
-    aclVerdictTag tag = c->acl_tag;
-    if (tag) {
-        c->acl_tag = 0;
-        if (!c->flag.multi && tag == atomic_load_explicit(&acl_epoch, memory_order_relaxed)) {
+    if (c->read_flags & READ_FLAGS_ACL_ALLOWED) {
+        c->read_flags &= ~READ_FLAGS_ACL_ALLOWED;
+        if (!c->flag.multi && c->acl_epoch_seen == (uint32_t)atomic_load_explicit(&acl_epoch, memory_order_relaxed)) {
             server.stat_acl_offload_hits++;
             return ACL_OK;
         }

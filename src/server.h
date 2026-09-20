@@ -1365,14 +1365,6 @@ typedef struct ClientModuleData {
 } ClientModuleData;
 
 /* Parser state and parse result of a command from a client's input buffer. */
-/* ACL verdict computed off the main thread (acl-offload). Only an ALLOW
- * verdict is recorded: the value is the global ACL epoch observed BEFORE
- * evaluating (never 0, the epoch starts at 1), or 0 when there is no verdict.
- * Main consumes it only if the epoch still matches; otherwise, and for every
- * denial, main re-evaluates on the stock path. One word, so it neither moves
- * any existing field nor adds a cache line to the per-command structures. */
-typedef uint64_t aclVerdictTag;
-
 typedef struct parsedCommand {
     int read_flags; /* complete, error or 0 (parsing not complete) */
     int argc;
@@ -1382,7 +1374,6 @@ typedef struct parsedCommand {
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
-    aclVerdictTag acl_tag; /* acl-offload verdict for this command, if any. */
 } parsedCommand;
 
 /* Queue of parsed commands. */
@@ -1452,6 +1443,11 @@ typedef struct client {
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;       /* Arguments of original command if arguments were rewritten. */
     uint32_t redact_arg_bitmap; /* Bitmap of argument indexes that should be redacted in logs. */
+    uint32_t acl_epoch_seen;    /* acl-offload: low 32 bits of the ACL epoch an IO thread observed
+                                 * before evaluating the commands of the current read job. Main
+                                 * honours a READ_FLAGS_ACL_ALLOWED verdict only while the epoch
+                                 * still matches. Fills a padding hole on a line the read-job
+                                 * protocol already shares between IO threads and main. */
     /* Client flags and state indicators */
     union {
         struct {
@@ -1516,8 +1512,6 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
-    aclVerdictTag acl_tag;             /* acl-offload verdict for the current command. Kept at
-                                        * the tail so it does not shift existing hot fields. */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -3098,6 +3092,9 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_CROSSSLOT (1 << 20)
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
+#define READ_FLAGS_ACL_ALLOWED (1 << 23) /* acl-offload: an IO thread evaluated this command's ACL \
+                                            permissions under client->acl_epoch_seen and it passed. \
+                                            Denials are never recorded; main re-checks them. */
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
@@ -3585,7 +3582,8 @@ int ACLUserCheckChannelPerm(user *u, sds channel, int literal);
 int ACLCheckAllUserCommandPerm(user *u, struct serverCommand *cmd, robj **argv, int argc, int dbid, int *idxptr);
 int ACLUserCheckCmdWithUnrestrictedKeyAccess(user *u, struct serverCommand *cmd, robj **argv, int argc, int dbid, int flags);
 int ACLCheckAllPerm(client *c, int *idxptr);
-void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int read_flags, aclVerdictTag *tag);
+void aclOffloadBeginBatch(client *c);
+void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int *read_flags);
 int aclOffloadShouldStopTagging(struct serverCommand *cmd);
 int aclOffloadConsume(client *c, int *idxptr);
 void aclOffloadBumpEpoch(void);
