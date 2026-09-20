@@ -29,6 +29,7 @@
  */
 
 #include "io_threads.h"
+#include "io_uring_batch.h"
 #include "sds.h"
 #include "server.h"
 #include "hotkeys.h"
@@ -3544,7 +3545,7 @@ standardConfig static_configs[] = {
     createIntConfig("cluster-databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases_cluster, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
     createBoolConfig("io-uring", NULL, IMMUTABLE_CONFIG, server.io_uring_enabled, 0, NULL, NULL),
-    createIntConfig("io-uring-io-thread-share", NULL, MODIFIABLE_CONFIG, 1, 512, server.io_uring_io_thread_share, 512, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-uring-io-thread-share", NULL, MODIFIABLE_CONFIG, 1, IO_URING_JOB_SHARE_MAX, server.io_uring_io_thread_share, IO_URING_JOB_SHARE_MAX, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("io-uring-adaptive-share", NULL, MODIFIABLE_CONFIG, server.io_uring_adaptive_share, 1, NULL, NULL),
     createIntConfig("main-idle-spin-us", NULL, MODIFIABLE_CONFIG, 0, 10000, server.main_idle_spin_us, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, updateIOThreads), /* Single threaded by default */

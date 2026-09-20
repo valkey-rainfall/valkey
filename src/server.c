@@ -7136,13 +7136,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "io_uring_cancelled:%lld\r\n"
                             "io_uring_max_read_batch:%lld\r\n"
                             "io_uring_max_write_batch:%lld\r\n"
-                            "io_uring_adaptive_share:%d\r\n"
                             "io_uring_cmds_per_read:%.2f\r\n"
                             "io_uring_adaptive_suppressed:%lld\r\n",
                             ioUringBatchActive(), u->read_batches, u->read_sqes, u->write_batches, u->write_sqes,
                             u->writev_sqes, u->fallback_reads, u->fallback_writes, u->cancelled, u->max_read_batch,
-                            u->max_write_batch, server.io_uring_adaptive_share, ioUringBatchCmdsPerRead(),
-                            u->adaptive_suppressed);
+                            u->max_write_batch, ioUringBatchCmdsPerRead(), u->adaptive_suppressed);
     }
 
     if (all_sections || (dictFind(section_dict, "errorstats") != NULL)) {
