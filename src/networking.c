@@ -4803,8 +4803,53 @@ __attribute__((noinline)) static bool readAndDecodePrimaryStream(client *primary
     return true;
 }
 
+/* The poller reported that this client's peer has closed its side of the
+ * connection (FIN received) and the socket has become readable, so whatever
+ * the peer sent before leaving is still waiting to be read, parsed, executed
+ * and replied to. Two situations produce that picture:
+ *
+ *  - A client that sent its commands, shut down its write side and is waiting
+ *    for the replies (a legal half-close). On a healthy server its input is a
+ *    few microseconds old when the event fires.
+ *  - A client that waited for a reply, gave up, and closed the socket while
+ *    the main thread was stalled or far behind. Its input is at least one
+ *    client timeout old, and every reply written to it is wasted work that
+ *    delays the clients still connected.
+ *
+ * The age of the peer's last byte separates the two: skip the work only when
+ * that age exceeds client-abandon-threshold-ms. Age comes from the kernel
+ * (TCP_INFO), so this costs one getsockopt and only for peer-closed clients.
+ * Replication and cluster links keep the stock path.
+ *
+ * Returns 1 when the client was scheduled to be freed (the caller must not
+ * touch it further), 0 to continue with the normal read path. */
+static int skipAbandonedClient(client *c) {
+    if (server.client_abandon_threshold_ms <= 0) return 0;
+    if (c->flag.close_asap) return 1;
+    int type = getClientType(c);
+    if (type != CLIENT_TYPE_NORMAL && type != CLIENT_TYPE_PUBSUB) return 0;
+    if (c->flag.primary || c->flag.replica) return 0;
+    /* Nothing unread means an ordinary disconnect: the stock path sees
+     * read() == 0 and frees the client. Only queued input is worth skipping,
+     * and only that case is counted. */
+    if (anetSockUnreadBytes(c->conn->fd) <= 0) return 0;
+    long long idle_ms = anetTcpMsSinceLastDataRecv(c->conn->fd);
+    if (idle_ms < 0 || idle_ms < server.client_abandon_threshold_ms) return 0;
+    server.stat_abandoned_clients_skipped++;
+    if (server.verbosity <= LL_VERBOSE) {
+        sds info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+        serverLog(LL_VERBOSE, "Skipping input of client whose peer closed %lld ms ago: %s", idle_ms, info);
+        sdsfree(info);
+    }
+    freeClientAsync(c);
+    return 1;
+}
+
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
+    /* The peer is gone: decide whether its pending input is still worth the work. */
+    if (unlikely(connPeerClosed(conn)) && skipAbandonedClient(c)) return;
+
     /* Check if we can send the client to be handled by the IO-thread */
     if (postponeClientRead(c)) return;
 

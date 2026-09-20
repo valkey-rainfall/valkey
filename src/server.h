@@ -2046,6 +2046,8 @@ struct valkeyServer {
     long long stat_total_writes_processed;             /* Total number of write events processed */
     long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
+    long long stat_abandoned_clients_skipped;          /* Clients freed without executing their pending input because
+                                                          the peer had already closed (see client-abandon-threshold-ms) */
     long long stat_total_prefetch_entries;             /* Total number of prefetched dict entries */
     long long stat_total_prefetch_batches;             /* Total number of prefetched batches */
     /* The following two are used to track instantaneous metrics, like
@@ -2465,6 +2467,7 @@ struct valkeyServer {
     sds cached_cluster_slot_info[CACHE_CONN_TYPE_MAX]; /* Index in array is a bitwise or of CACHE_CONN_TYPE_* */
     /* Scripting */
     mstime_t busy_reply_threshold;  /* Script / module timeout in milliseconds */
+    long long client_abandon_threshold_ms; /* Skip a peer-closed client's pending input once it is this old (0 = off) */
     int pre_command_oom_state;      /* OOM before command (script?) was started */
     int script_disable_deny_script; /* Allow running commands marked "noscript" inside a script. */
     int lua_enable_insecure_api;    /* Config to enable insecure api */

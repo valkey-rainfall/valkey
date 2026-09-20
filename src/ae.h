@@ -50,6 +50,10 @@
 #define AE_HIGH_PRIORITY 8             /* Virtual routing mask flag: when set in aeCreateFileEvent(), \
                                         * the event is registered on priority_apidata if available.   \
                                         * Stripped before passing to the underlying OS multiplexer. */
+#define AE_PEER_CLOSED 16              /* Fired-only bit, never registered: the poller reports that the   \
+                                        * peer has closed its side of the connection (Linux EPOLLRDHUP, \
+                                        * or a hangup). Always accompanied by AE_READABLE so the read     \
+                                        * handler runs and can decide what to do with the pending input. */
 #define AE_QOS_PREEMPT_CHECK_MASK 0x03 /* Mask to check high-priority preemption once every 4 iterations */
 
 #define AE_FILE_EVENTS (1 << 0)

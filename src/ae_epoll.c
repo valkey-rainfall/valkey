@@ -31,6 +31,15 @@
 
 #include <sys/epoll.h>
 
+/* Events that mean the peer has closed its side of the connection. EPOLLRDHUP
+ * is reported when the peer shuts down its write half (FIN received) and must
+ * be requested explicitly; EPOLLHUP is always reported and needs no request. */
+#ifdef EPOLLRDHUP
+#define AE_EPOLL_PEER_CLOSED_EVENTS (EPOLLRDHUP | EPOLLHUP)
+#else
+#define AE_EPOLL_PEER_CLOSED_EVENTS (EPOLLHUP)
+#endif
+
 typedef struct aeApiState {
     int epfd;
     int events_size;
@@ -77,7 +86,7 @@ static int aeApiAddEvent(aeApiState *state, int fd, int curr_mask, int add_mask)
 
     ee.events = 0;
     int mask = curr_mask | add_mask;
-    if (mask & AE_READABLE) ee.events |= EPOLLIN;
+    if (mask & AE_READABLE) ee.events |= EPOLLIN | AE_EPOLL_PEER_CLOSED_EVENTS;
     if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
     ee.data.fd = fd;
     if (epoll_ctl(state->epfd, op, fd, &ee) == -1) return -1;
@@ -90,7 +99,7 @@ static void aeApiDelEvent(aeApiState *state, int fd, int curr_mask, int del_mask
     int mask = curr_mask & ~del_mask;
 
     ee.events = 0;
-    if (mask & AE_READABLE) ee.events |= EPOLLIN;
+    if (mask & AE_READABLE) ee.events |= EPOLLIN | AE_EPOLL_PEER_CLOSED_EVENTS;
     if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
     ee.data.fd = fd;
     if (mask != AE_NONE) {
@@ -121,6 +130,11 @@ static int aeApiPoll(aeApiState *state, aeFiredEvent *fired, aeFileEvent *events
             if (e->events & EPOLLOUT) mask |= AE_WRITABLE;
             if (e->events & EPOLLERR) mask |= AE_WRITABLE | AE_READABLE;
             if (e->events & EPOLLHUP) mask |= AE_WRITABLE | AE_READABLE;
+            /* The peer closed its side (FIN, EPOLLRDHUP) or the socket hung up.
+             * Report it alongside readability: any unread bytes are still
+             * delivered, and the read handler can see the peer is gone before
+             * it spends work on them. */
+            if (e->events & AE_EPOLL_PEER_CLOSED_EVENTS) mask |= AE_READABLE | AE_PEER_CLOSED;
             fired[j].fd = e->data.fd;
             fired[j].mask = mask;
         }

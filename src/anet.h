@@ -87,6 +87,8 @@ int anetFormatAddr(char *fmt, size_t fmt_len, char *ip, int port);
 int anetPipe(int fds[2], int read_flags, int write_flags);
 int anetSetSockMarkId(char *err, int fd, uint32_t id);
 int anetGetError(int fd);
+long long anetTcpMsSinceLastDataRecv(int fd);
+long long anetSockUnreadBytes(int fd);
 int anetIsFifo(char *filepath);
 int anetRetryAcceptOnError(int err);
 

@@ -1684,6 +1684,9 @@ static void tlsEventHandler(struct aeEventLoop *el, int fd, void *clientData, in
     UNUSED(el);
     UNUSED(fd);
     tls_connection *conn = clientData;
+    /* Same as the plain socket handler: record that the peer is gone before
+     * any handler runs. The TLS layer may still have buffered plaintext. */
+    if (mask & AE_PEER_CLOSED) conn->c.flags |= CONN_FLAG_PEER_CLOSED;
     tlsHandleEvent(conn, mask);
 }
 

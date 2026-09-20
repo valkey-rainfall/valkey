@@ -76,6 +76,9 @@ typedef enum {
 #define CONN_FLAG_POSTPONE_UPDATE_STATE (1 << 4)  /* Connection update state is postponed by IO threads   \
                                                    * to prevent main thread event loop races while worker \
                                                    * threads access the socket buffers. */
+#define CONN_FLAG_PEER_CLOSED (1 << 5)            /* The poller reported that the peer closed its side of \
+                                                     the connection (FIN received, Linux EPOLLRDHUP).   \
+                                                     Unread bytes may still be pending. Never cleared.  */
 
 #define CONN_POSTPONE_READ (1 << 0)
 #define CONN_POSTPONE_WRITE (1 << 1)
@@ -557,6 +560,13 @@ int RedisRegisterConnectionTypeTLS(void);
 int RegisterConnectionTypeRdma(void);
 
 /* Return 1 if connection is using TLS protocol, 0 if otherwise. */
+/* True once the poller has reported that the peer closed its side of the
+ * connection. Pending input, if any, can still be read; nothing written will
+ * ever be read by the peer. */
+static inline int connPeerClosed(connection *conn) {
+    return conn && (conn->flags & CONN_FLAG_PEER_CLOSED);
+}
+
 static inline int connIsTLS(connection *conn) {
     return conn && conn->type == connectionTypeTls();
 }

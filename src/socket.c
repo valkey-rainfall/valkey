@@ -282,6 +282,10 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
     UNUSED(fd);
     connection *conn = clientData;
 
+    /* Remember that the peer is gone before running any handler, so the read
+     * handler can decide whether the pending input is still worth processing. */
+    if (mask & AE_PEER_CLOSED) conn->flags |= CONN_FLAG_PEER_CLOSED;
+
     if (conn->state == CONN_STATE_CONNECTING && (mask & AE_WRITABLE) && conn->conn_handler) {
         int conn_error = anetGetError(conn->fd);
         if (conn_error) {

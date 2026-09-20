@@ -41,6 +41,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stddef.h>
+#include <sys/ioctl.h>
 #include <netdb.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -68,6 +70,34 @@ int anetGetError(int fd) {
 
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &errlen) == -1) sockerr = errno;
     return sockerr;
+}
+
+/* Bytes waiting in the socket's receive queue (FIONREAD), or -1 when unknown. */
+long long anetSockUnreadBytes(int fd) {
+#ifdef FIONREAD
+    int n = 0;
+    if (ioctl(fd, FIONREAD, &n) == -1) return -1;
+    return n;
+#else
+    (void)fd;
+    return -1;
+#endif
+}
+
+/* Milliseconds since the kernel last received a data segment on this TCP
+ * socket, from TCP_INFO. Returns -1 when unavailable (not a TCP socket, or a
+ * platform without TCP_INFO), so callers must treat -1 as "unknown". */
+long long anetTcpMsSinceLastDataRecv(int fd) {
+#if defined(__linux__) && defined(TCP_INFO)
+    struct tcp_info info;
+    socklen_t len = sizeof(info);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) == -1) return -1;
+    if (len < offsetof(struct tcp_info, tcpi_last_data_recv) + sizeof(info.tcpi_last_data_recv)) return -1;
+    return info.tcpi_last_data_recv;
+#else
+    (void)fd;
+    return -1;
+#endif
 }
 
 static int anetGetSocketFlags(char *err, int fd) {
