@@ -447,6 +447,14 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* Early exit: speculation disabled (single-threaded or cluster mode). */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
+    /* ROLE GATE (replica-only deployment): with io-threads-speculation-replica-only
+     * set, a primary or standalone server never speculates and runs the stock
+     * read path. primary_host is written by main on REPLICAOF and read here as a
+     * plain word: a stale read only decides whether THIS batch is speculated,
+     * and a speculation racing a role change is no different from one racing
+     * any main-thread write, which the validate step already covers. */
+    if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
+
     /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
      * execute only at EXEC — speculating a GET here would execute it early
      * and strand it from the transaction (real bug: pipelined MULTI batches
