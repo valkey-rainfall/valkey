@@ -2045,6 +2045,7 @@ struct valkeyServer {
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     int io_uring_enabled;                              /* Batch main-thread client I/O syscalls via io_uring. */
+    int io_uring_io_thread_share;                      /* Max SPMC jobs an I/O thread absorbs into one ring submit. */
     long long stat_total_writes_processed;             /* Total number of write events processed */
     long long stat_client_qbuf_limit_disconnections;   /* Total number of clients reached query buf length limit */
     long long stat_client_outbuf_limit_disconnections; /* Total number of clients reached output buf length limit */
@@ -3221,6 +3222,7 @@ client *createCachedResponseClient(int resp);
 void deleteCachedResponseClient(client *recording_client);
 void waitForClientIO(client *c);
 void ioThreadReadQueryFromClient(client *c);
+void ioThreadReadQueryFromClientTail(client *c);
 void ioThreadWriteToClient(client *c);
 int canParseCommand(client *c);
 int processClientIOReadsDone(client *c);

@@ -5,6 +5,11 @@
  */
 
 #include "io_threads.h"
+#include "io_uring_batch.h"
+
+/* Fewer jobs of one direction than this run inline: a one-entry
+ * io_uring_enter costs more than the plain syscall it replaces. */
+#define IO_URING_MIN_BATCH 4
 #include "ae.h"
 #include "cluster.h"
 #include "cluster_legacy.h"
@@ -307,6 +312,8 @@ void cleanupThreadResources(void *dummy) {
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
 
+    ioUringBatchFreeThread();
+
     /* Free the shared query buffer */
     freeSharedQueryBuf();
 }
@@ -355,6 +362,7 @@ static void *IOThreadMain(void *myid) {
     valkey_set_thread_title(thdname);
     serverSetCpuAffinity(server.server_cpulist);
     initSharedQueryBuf();
+    ioUringBatchInitThread((int)id);
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
@@ -395,17 +403,68 @@ static void *IOThreadMain(void *myid) {
         }
 
         /* PRIORITY 2: Shared Global Queue (SPMC)
-         * Only checked after SPSC is drained. */
-        void *tagged_job;
-        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH])) != NULL) {
-            processTaggedSPMCJob(tagged_job);
-            processed++;
+         * Only checked after SPSC is drained.
+         *
+         * With io_uring batching active on this thread, take a fair share of
+         * the queued jobs (pending / worker threads, so one thread cannot
+         * starve the others) and absorb read/write jobs into the thread's
+         * ring; everything else runs inline in order. One flush per
+         * direction then completes the whole share. Without batching this
+         * degenerates to the original one job per priority. */
+        for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+            spmcQueue *q = &io_shared_inbox[p];
+            int share = 1;
+            if (ioUringBatchActive()) {
+                size_t n = spmcSize(q);
+                int workers = server.active_io_threads_num - 1;
+                if (workers < 1) workers = 1;
+                share = (int)(n / workers) + 1;
+                /* Runtime cap (io-uring-io-thread-share): bounds how long a
+                 * batch holds parsed clients back from the main thread. */
+                int cap = server.io_uring_io_thread_share;
+                if (cap < 1) cap = 1;
+                if (cap > IO_URING_JOB_SHARE_MAX) cap = IO_URING_JOB_SHARE_MAX;
+                if (share > cap) share = cap;
+            }
+            /* Take the share first, then decide per direction: a single
+             * recv/send is cheaper as a plain syscall than as a one-entry
+             * io_uring_enter, so a direction is batched only when this pass
+             * holds at least IO_URING_MIN_BATCH jobs of it. */
+            void *jobs[IO_URING_JOB_SHARE_MAX];
+            int njobs = 0, nread = 0, nwrite = 0;
+            while (njobs < share) {
+                void *tagged_job = spmcDequeue(q);
+                if (tagged_job == NULL) break;
+                void *data;
+                int type;
+                untagJob(tagged_job, &data, &type);
+                if (type == JOB_REQ_READ_CLIENT)
+                    nread++;
+                else if (type == JOB_REQ_WRITE_CLIENT)
+                    nwrite++;
+                jobs[njobs++] = tagged_job;
+            }
+            for (int i = 0; i < njobs; i++) {
+                void *data;
+                int type;
+                untagJob(jobs[i], &data, &type);
+                if (type == JOB_REQ_READ_CLIENT && nread >= IO_URING_MIN_BATCH &&
+                    ioUringBatchQueueIOThreadRead((client *)data)) {
+                    processed++;
+                    continue;
+                }
+                if (type == JOB_REQ_WRITE_CLIENT && nwrite >= IO_URING_MIN_BATCH &&
+                    ioUringBatchQueueIOThreadWrite((client *)data)) {
+                    processed++;
+                    continue;
+                }
+                processTaggedSPMCJob(jobs[i]);
+                processed++;
+            }
         }
-
-        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL])) != NULL) {
-            processTaggedSPMCJob(tagged_job);
-            processed++;
-        }
+        /* Invariant: a job is counted finished only after the flush that
+         * completes it, so drainIOThreadsQueue() keeps its meaning. */
+        ioUringBatchFlushIOThread();
 
         if (processed) {
             atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
