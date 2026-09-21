@@ -2929,6 +2929,10 @@ void dictVanillaFree(void *val);
 #define WRITE_FLAGS_OWNED_HANDLER (1 << 3) /* Door-2: write originated from the owner-loop \
                                             * writable handler; not a legacy SPMC write and \
                                             * therefore has no stat_io_writes_pending debit. */
+#define WRITE_FLAGS_DONE_DEFERRED (1 << 4) /* Door-2: the write completion was dequeued by \
+                                            * main while a read job was in flight and is held \
+                                            * (io_write_state stays COMPLETED_IO) until \
+                                            * processClientIOReadsDone finishes it. Main-only. */
 
 client *createClient(connection *conn);
 int freeClient(client *c);

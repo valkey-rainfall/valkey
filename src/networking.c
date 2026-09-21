@@ -3602,6 +3602,39 @@ static void b13ReleaseOrRearmAfterRead(client *c) {
 void processClientIOWriteDone(client *c) {
     if (c->io_write_state == CLIENT_IDLE) return; /* Already handled */
     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
+    /* Speculation makes the client's read job a writer of c->buf/bufpos and
+     * of the ClientFlags word (pending_command). Stock tolerates a read job
+     * in flight here because its read job only touches querybuf/argv; ours
+     * does not: postWriteToClient below reads and resets bufpos, and
+     * putClientInPendingWriteQueue sets pending_write in the word the I/O
+     * thread read-modify-writes. The window is real: the write job completes,
+     * the event loop offloads the client's next read (COMPLETED_IO does not
+     * block trySendReadToIOThreads), then beforeSleep lands here. Defer the
+     * completion instead. COMPLETED_IO already keeps every other writer away
+     * (trySendWriteToIOThreads returns C_OK, handleClientsWithPendingWrites
+     * skips, clientHasPendingIO holds freeClient), and processClientIOReadsDone
+     * finishes it the moment the read lands. Found with TSan (postWriteToClient
+     * vs dplusWriteBulkReply) behind the handleClientsWithPendingWrites
+     * 'pending_write' assertion on io16 replicas: main's pending_write = 1 was
+     * erased by the I/O thread's bitfield store of pending_command = 0.
+     * COMPLETED_IO alone cannot mark the deferral: it also describes a result
+     * still sitting in the outbox, which the dequeue asserts on; the flag
+     * says main has already consumed the result. write_flags is main's once
+     * the I/O thread has published COMPLETED_IO. A legacy client's read in
+     * COMPLETED_IO is deferred too: its result is still in the outbox
+     * (processClientIOReadsDone sets IDLE for owner_tid == 0 at once), so
+     * main has not yet synchronized with that thread and the job's buf/bufpos
+     * stores may not be visible here (TSan reported exactly this pair on x86;
+     * on ARM it is a real ordering hazard), and the re-trigger is guaranteed.
+     * An owned client at COMPLETED_IO is mid-execution on main with no
+     * I/O-thread writer and no read-done ahead, so it is not deferred. */
+    int read_in_flight = c->io_read_state == CLIENT_PENDING_IO ||
+                         (c->io_read_state == CLIENT_COMPLETED_IO && c->owner_tid == 0);
+    if (read_in_flight && !(c->write_flags & WRITE_FLAGS_DONE_DEFERRED)) {
+        c->write_flags |= WRITE_FLAGS_DONE_DEFERRED;
+        return;
+    }
+    c->write_flags &= ~WRITE_FLAGS_DONE_DEFERRED;
 /* Release-publish IDLE (the owner worker's green light): the fence pairs
  * with the acquire in the worker's dispatch guard, ordering all of main's
  * prior writes to this client (postWriteToClient consumption, buffer
@@ -7180,6 +7213,12 @@ void processClientIOReadsDone(client *c) {
                   c->flag.close_asap, (unsigned long long)c->id);
         serverPanic("Door-2: processClientIOReadsDone with NULL conn");
     }
+
+    /* A write completion deferred while this read was in flight (see
+     * processClientIOWriteDone) is finished first: the read job is done with
+     * c->buf, and the buffer bookkeeping must be consistent before the parsed
+     * commands execute and append replies. */
+    if (c->write_flags & WRITE_FLAGS_DONE_DEFERRED) processClientIOWriteDone(c);
 
     if (ProcessingEventsWhileBlocked) {
         /* When ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
