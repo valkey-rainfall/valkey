@@ -1091,7 +1091,7 @@ typedef struct readyList {
                                         not a regular user. Stored in the  \
                                         Roles rax instead of Users. */
 #define USER_FLAG_BOUND (1 << 4)     /* A client has been bound to this user \
-                                        (or to a member of this role) at    \
+                                        (or to a member of this role) at     \
                                         least once, so an IO thread may have \
                                         read its rule set. Set once, never   \
                                         cleared; main-thread only. Used by   \
@@ -1959,7 +1959,7 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
-    int acl_offload;                          /* Evaluate ACL permissions on IO threads (EXPERIMENTAL). */
+    int acl_offload;                          /* Evaluate ACL permissions on IO threads. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
@@ -2549,11 +2549,11 @@ struct valkeyServer {
     struct spaceSavingManager *hotkeys_manager;
     /* acl-offload counters. Kept at the tail of the struct so adding them does
      * not shift the offsets of existing fields (and their cache-line grouping). */
-    long long stat_acl_offload_hits;                   /* acl-offload: verdicts consumed without main-thread evaluation */
-    long long stat_acl_offload_punts;                  /* acl-offload: tagged verdicts rejected (epoch mismatch), re-evaluated on main */
-    long long stat_acl_offload_quiesce_count;          /* acl-offload: waits for in-flight IO jobs before freeing ACL memory */
-    long long stat_acl_offload_quiesce_total_us;       /* acl-offload: total time spent in those waits */
-    long long stat_acl_offload_quiesce_max_us;         /* acl-offload: longest single wait */
+    long long stat_acl_offload_hits;             /* acl-offload: verdicts consumed without main-thread evaluation */
+    long long stat_acl_offload_punts;            /* acl-offload: tagged verdicts rejected (epoch mismatch), re-evaluated on main */
+    long long stat_acl_offload_quiesce_count;    /* acl-offload: waits for in-flight IO jobs before freeing ACL memory */
+    long long stat_acl_offload_quiesce_total_us; /* acl-offload: total time spent in those waits */
+    long long stat_acl_offload_quiesce_max_us;   /* acl-offload: longest single wait */
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -3092,7 +3092,7 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_CROSSSLOT (1 << 20)
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
-#define READ_FLAGS_ACL_ALLOWED (1 << 23) /* acl-offload: an IO thread evaluated this command's ACL \
+#define READ_FLAGS_ACL_ALLOWED (1 << 23) /* acl-offload: an IO thread evaluated this command's ACL  \
                                             permissions under client->acl_epoch_seen and it passed. \
                                             Denials are never recorded; main re-checks them. */
 
@@ -3587,6 +3587,7 @@ void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int
 int aclOffloadShouldStopTagging(struct serverCommand *cmd);
 int aclOffloadConsume(client *c, int *idxptr);
 void aclOffloadBumpEpoch(void);
+int aclOffloadClientHasPendingVerdicts(client *c);
 void aclMarkUserBound(user *u);
 void aclOffloadQuiesce(void);
 int ACLSetUser(user *u, const char *op, ssize_t oplen);

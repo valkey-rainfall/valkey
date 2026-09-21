@@ -2599,16 +2599,17 @@ static int ACLUserHasAllChannels(user *u) {
     return 0;
 }
 
-/* ========================== ACL offload (EXPERIMENTAL) ==========================
+/* ============================== ACL offload ==============================
  *
- * IO threads evaluate a command's ACL permissions at parse time and attach a
- * verdict tag {retval, errpos, epoch}. The main thread consumes the verdict iff
- * the tag's epoch equals the global ACL epoch at execution time; otherwise it
+ * IO threads evaluate a command's ACL permissions at parse time and record an
+ * ALLOW verdict as a bit in the command's read flags, together with the ACL
+ * epoch the read job observed. The main thread consumes the verdict iff that
+ * epoch equals the global ACL epoch at execution time; otherwise it
  * re-evaluates on the stock path. Every mutation of ACL rules visible to a
- * client (SETUSER/LOAD/DELUSER, client rebinding while commands are pending)
- * bumps the epoch, so a verdict computed under old rules is never consumed
- * after those rules changed -- this is what closes the check-then-use window
- * (deny Y; write secret; Y's pre-parsed GET must not return the secret).
+ * client (SETUSER/SETROLE/LOAD/DELUSER, client rebinding while commands are
+ * pending) bumps the epoch, so a verdict computed under old rules is never
+ * consumed after those rules changed -- this is what closes the check-then-use
+ * window (deny Y; write secret; Y's pre-parsed GET must not return the secret).
  *
  * Memory safety: user->selectors is replaced by atomic pointer swap, never
  * mutated in place while linked (ACLCopyUser), and the old list -- or a whole
@@ -2628,6 +2629,21 @@ static inline int aclOffloadActive(void) {
 
 void aclOffloadBumpEpoch(void) {
     atomic_fetch_add_explicit(&acl_epoch, 1, memory_order_release);
+}
+
+/* True if rebinding this client to another user could leave a verdict
+ * evaluated under the old user waiting to be consumed: a parsed command
+ * (current or queued) already carries the ALLOW bit, or a read job is in
+ * flight and may be tagging right now. Main-thread only; the scan is bounded
+ * by the client's pending queue and runs only on the rare rebinding path. */
+int aclOffloadClientHasPendingVerdicts(client *c) {
+    if (!aclOffloadActive()) return 0;
+    if (c->io_read_state != CLIENT_IDLE) return 1;
+    if (c->read_flags & READ_FLAGS_ACL_ALLOWED) return 1;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        if (c->cmd_queue.cmds[i].read_flags & READ_FLAGS_ACL_ALLOWED) return 1;
+    }
+    return 0;
 }
 
 /* A user object is reachable from IO threads once a client has been bound to

@@ -1,7 +1,7 @@
-# acl-offload (EXPERIMENTAL): ACL permissions evaluated on IO threads, verdicts
-# consumed by main only while the global ACL epoch is unchanged.
+# acl-offload: ACL permissions evaluated on IO threads, verdicts consumed by
+# main only while the global ACL epoch is unchanged.
 #
-# Verification map (see design W1.1):
+# Verification map:
 #   (a)  same-batch AUTH/SELECT cutoff -- strict same-connection semantics
 #   (b)  cross-client SETUSER churn -- no torn verdicts, no crash
 #   (b') TOCTOU probe -- deny Y then write secret; Y must never read it
@@ -298,6 +298,42 @@ start_server {config "minimal.conf" tags {"acl external:skip valgrind:skip"} ove
         # but the INFO field must exist and be non-negative.
         assert {[acl_offload_punts] >= $before}
         $rd close
+    }
+
+    test {acl-offload: a client's own pipelined AUTH leaves other clients' verdicts fresh} {
+        r acl setuser bob on nopass ~* +@all
+        r acl setuser bob2 on nopass ~* +@all
+        r acl setuser carol on nopass ~carol:* +@all
+        r select 9
+        r set carol:k v
+        set carol [valkey_deferring_client]
+        $carol auth carol ""
+        assert_equal OK [$carol read]
+        $carol select 9
+        assert_equal OK [$carol read]
+        set bob [valkey_deferring_client]
+        set hits_before [acl_offload_hits]
+        set punts_before [acl_offload_punts]
+        for {set i 0} {$i < 200} {incr i} {
+            # bob rebinds on every batch (AUTH to a different user each time)
+            # with a command queued behind the AUTH in the SAME read. That
+            # queued command carries no verdict (tagging stops at AUTH), so
+            # the rebinding must not touch the global epoch.
+            set who [expr {$i % 2 ? "bob" : "bob2"}]
+            $bob write "[resp AUTH $who \"\"][resp PING]"
+            $bob flush
+            # carol's pipelined verdicts, parsed on an IO thread, must all be
+            # consumed fresh: no ACL rule changed.
+            $carol write "[resp GET carol:k][resp GET carol:k][resp GET carol:k][resp GET carol:k]"
+            $carol flush
+            assert_equal OK [$bob read]
+            assert_equal PONG [$bob read]
+            for {set j 0} {$j < 4} {incr j} { assert_equal v [$carol read] }
+        }
+        assert {[acl_offload_hits] > $hits_before}
+        assert_equal $punts_before [acl_offload_punts]
+        $bob close
+        $carol close
     }
 }
 

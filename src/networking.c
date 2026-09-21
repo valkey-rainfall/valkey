@@ -257,13 +257,15 @@ static void clientSetDefaultAuth(client *c) {
  * it will also set the ever_authenticated flag on the client in order to avoid low level
  * limiting of the client output buffer.*/
 void clientSetUser(client *c, user *u, int authenticated) {
-    /* acl-offload: if this client already has parsed commands carrying
-     * verdicts (or a read job in flight), those verdicts were computed under
-     * the OLD binding. AUTH/HELLO/RESET from the client itself never reach
-     * here with tagged commands (workers stop tagging after them), so this
-     * only fires for server/module-initiated rebinding -- rare. */
-    if (c->user != u && (c->cmd_queue.off < c->cmd_queue.len || c->io_read_state != CLIENT_IDLE))
-        aclOffloadBumpEpoch();
+    /* acl-offload: a verdict already attached to one of this client's parsed
+     * commands, or being computed by a read job in flight, was evaluated
+     * under the OLD binding; make it stale. The client's own AUTH/HELLO/RESET
+     * never trips this: IO threads stop tagging for the rest of the read after
+     * such a command, so the commands queued behind it carry no verdict and
+     * the epoch (and every other client's pending verdicts) is left alone.
+     * Only server- or module-initiated rebinding of a client with tagged
+     * commands pays the bump -- rare. */
+    if (c->user != u && aclOffloadClientHasPendingVerdicts(c)) aclOffloadBumpEpoch();
     /* acl-offload: from here on an IO thread may read u's rule set (and the
      * rule sets of u's roles). Record that once; the guard in acl.c keys off
      * it. Write only on the first bind so steady-state binds never dirty the
