@@ -89,13 +89,21 @@
 #include "reply_iov.h"
 #include "io_threads.h"
 
-/* Per-thread counters; index 0 is the main thread. Summed for INFO. */
-static ioUringBatchStats stats_per_thread[IO_THREADS_MAX_NUM];
+/* Per-thread state; index 0 is the main thread. Each thread writes only its
+ * own slot, on every read or flush, so a slot gets its own cache line(s):
+ * adjacent slots would otherwise bounce one line between every worker. INFO
+ * reads the counters racily from the main thread; the EWMA it prints is the
+ * one atomic field. */
+typedef struct ioUringThreadState {
+    ioUringBatchStats stats;
+    ioUringAdaptiveState adaptive;
+} __attribute__((aligned(CACHE_LINE_SIZE))) ioUringThreadState;
+static ioUringThreadState per_thread[IO_THREADS_MAX_NUM];
 
 void ioUringBatchStatsTotal(ioUringBatchStats *out) {
     memset(out, 0, sizeof(*out));
     for (int t = 0; t < IO_THREADS_MAX_NUM; t++) {
-        ioUringBatchStats *s = &stats_per_thread[t];
+        ioUringBatchStats *s = &per_thread[t].stats;
         out->read_batches += s->read_batches;
         out->read_sqes += s->read_sqes;
         out->write_batches += s->write_batches;
@@ -104,9 +112,70 @@ void ioUringBatchStatsTotal(ioUringBatchStats *out) {
         out->fallback_reads += s->fallback_reads;
         out->fallback_writes += s->fallback_writes;
         out->cancelled += s->cancelled;
+        out->adaptive_suppressed += s->adaptive_suppressed;
         if (s->max_read_batch > out->max_read_batch) out->max_read_batch = s->max_read_batch;
         if (s->max_write_batch > out->max_write_batch) out->max_write_batch = s->max_write_batch;
     }
+}
+
+/* ------------------------------------------------------- adaptive share
+ * Pure functions over an ioUringAdaptiveState, then the per-thread
+ * bindings. Lives outside the liburing block: the gauge is meaningful, and
+ * the cap decision harmless, without a ring. */
+
+void ioUringAdaptiveNoteRead(ioUringAdaptiveState *st, int ncmds) {
+    if (ncmds <= 0) return;
+    long long sample = (long long)ncmds << IO_URING_ADAPTIVE_Q;
+    long long e = atomic_load_explicit(&st->cmds_per_read_q16, memory_order_relaxed);
+    /* Start at the first sample rather than decaying up from zero. */
+    e = e == 0 ? sample : e + (sample - e) / (1LL << IO_URING_ADAPTIVE_ALPHA_SHIFT);
+    atomic_store_explicit(&st->cmds_per_read_q16, e, memory_order_relaxed);
+}
+
+int ioUringAdaptiveShareCap(ioUringAdaptiveState *st, int configured) {
+    if (configured <= 1) return configured;
+    long long e = atomic_load_explicit(&st->cmds_per_read_q16, memory_order_relaxed);
+    if (st->suppressed) {
+        if (e < ((long long)IO_URING_ADAPTIVE_LOW_CMDS << IO_URING_ADAPTIVE_Q)) st->suppressed = 0;
+    } else if (e > ((long long)IO_URING_ADAPTIVE_HIGH_CMDS << IO_URING_ADAPTIVE_Q)) {
+        st->suppressed = 1;
+    }
+    return st->suppressed ? 1 : configured;
+}
+
+double ioUringAdaptiveCmdsPerRead(const ioUringAdaptiveState *st) {
+    long long e = atomic_load_explicit(&st->cmds_per_read_q16, memory_order_relaxed);
+    return (double)e / (double)(1LL << IO_URING_ADAPTIVE_Q);
+}
+
+void ioUringBatchNoteIOThreadRead(client *c) {
+    if (!server.io_uring_enabled) return; /* keep the epoll arm untouched */
+    /* After the I/O-thread parse the first command sits in argv and the
+     * pipelined rest in cmd_queue (asserted empty before parsing). A read
+     * that ends mid-command counts what it completed, which biases the
+     * gauge low for large values; acceptable for a batching heuristic. */
+    int ncmds = (c->argc > 0 ? 1 : 0) + c->cmd_queue.len;
+    ioUringAdaptiveNoteRead(&per_thread[getCurTid()].adaptive, ncmds);
+}
+
+int ioUringBatchIOThreadShareCap(int configured) {
+    ioUringThreadState *ts = &per_thread[getCurTid()];
+    int cap = ioUringAdaptiveShareCap(&ts->adaptive, configured);
+    if (cap < configured) ts->stats.adaptive_suppressed++;
+    return cap;
+}
+
+double ioUringBatchCmdsPerRead(void) {
+    double sum = 0.0;
+    int n = 0;
+    for (int t = 1; t < IO_THREADS_MAX_NUM; t++) {
+        double e = ioUringAdaptiveCmdsPerRead(&per_thread[t].adaptive);
+        if (e > 0.0) {
+            sum += e;
+            n++;
+        }
+    }
+    return n ? sum / n : 0.0;
 }
 
 #ifdef HAVE_LIBURING
@@ -177,7 +246,7 @@ static void flushAll(void);
 static void finishReadIOThread(iouSlot *s);
 static void finishWriteIOThread(client *c);
 
-#define STATS (stats_per_thread[T->tid])
+#define STATS (per_thread[T->tid].stats)
 
 static sds qbPoolTake(void) {
     if (T->qb_pool_len > 0) return T->qb_pool[--T->qb_pool_len];

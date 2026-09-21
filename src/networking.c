@@ -7194,6 +7194,7 @@ void ioThreadReadQueryFromClientTail(client *c) {
     parseInputBuffer(c);
     trimCommandQueue(c);
     prepareCommandQueue(c);
+    ioUringBatchNoteIOThreadRead(c); /* commands-per-read gauge for the adaptive share */
 
     /* Parsing was not completed - let the main-thread handle it. */
     if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
