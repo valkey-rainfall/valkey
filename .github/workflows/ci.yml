@@ -118,6 +118,31 @@ jobs:
       - name: unit tests
         run: make -C build-release test-unit
 
+  test-ubuntu-latest-io-uring:
+    # Compiles the HAVE_LIBURING code paths under -Werror and runs the suite with
+    # io-uring enabled. --io-threads covers both ring paths: with two I/O threads
+    # always active, single-client tests still exercise the main-thread ring
+    # while multi-client tests exercise the per-thread rings. GitHub-hosted
+    # Ubuntu runners are VMs with io_uring available (kernel >= 5.6 needed for
+    # the recv/send opcodes); where io_uring_setup is refused, e.g. a container
+    # seccomp profile, the server falls back to plain syscalls and the job
+    # degrades into a repeat of test-ubuntu-latest rather than failing.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: make
+        run: |
+          sudo apt-get install liburing-dev pkg-config libgtest-dev libgmock-dev
+          make -j4 all-with-unit-tests SERVER_CFLAGS='-Werror' USE_IO_URING=yes
+      - name: test
+        run: |
+          sudo apt-get install tcl8.6 tclx
+          ./runtest --io-threads --config io-uring yes --verbose --tags -slow --dump-logs
+      - name: unit tests
+        run: |
+          make test-unit USE_IO_URING=yes
+
   test-sanitizer-address:
     runs-on: ubuntu-latest
     steps:
