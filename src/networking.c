@@ -37,6 +37,7 @@
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
 #include "io_threads.h"
+#include "io_uring_batch.h"
 #include "compression_stream.h"
 #include "throttle.h"
 #include "throttle_repl.h"
@@ -407,6 +408,7 @@ client *createClient(connection *conn) {
     c->sockname = NULL;
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
+    c->io_uring_slot = -1;
     c->io_write_state = CLIENT_IDLE;
     c->nwritten = 0;
     c->last_memory_usage = 0;
@@ -2362,6 +2364,9 @@ int freeClient(client *c) {
         return 0;
     }
 
+    /* Detach from any open io_uring batch (peer handler freeing us mid-batch). */
+    ioUringBatchClientFreed(c);
+
     /* For connected clients, call the disconnection event of modules hooks. */
     if (c->conn) {
         moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_DISCONNECTED, c);
@@ -3767,6 +3772,10 @@ int handleClientsWithPendingWrites(void) {
 
         processed++;
 
+        /* Batch the send into io_uring if eligible; completion handling
+         * (postWriteToClient + write handler install) runs in the flush. */
+        if (ioUringBatchQueueWrite(c)) continue;
+
         /* Try to write buffers to the client socket. */
         if (writeToClient(c) == C_ERR) continue;
 
@@ -3776,6 +3785,7 @@ int handleClientsWithPendingWrites(void) {
             installClientWriteHandler(c);
         }
     }
+    ioUringBatchFlushWrites();
     return processed;
 }
 
@@ -4809,6 +4819,10 @@ void readQueryFromClient(connection *conn) {
     if (postponeClientRead(c)) return;
 
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return;
+
+    /* Batch the recv into io_uring if eligible; the rest of this function
+     * runs for the client from ioUringBatchFlushReads() after the fd loop. */
+    if (ioUringBatchQueueRead(c)) return;
 
     bool repeat = false;
     int iter = 0;

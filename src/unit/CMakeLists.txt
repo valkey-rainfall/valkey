@@ -28,6 +28,11 @@ elseif (USE_TCMALLOC OR USE_TCMALLOC_MINIMAL)
     list(APPEND COMPILE_DEFINITIONS "USE_TCMALLOC")
 endif ()
 
+# Compile the io_uring module the same way the server was built.
+if (IO_URING_ENABLED EQUAL 1)
+    list(APPEND COMPILE_DEFINITIONS "HAVE_LIBURING")
+endif ()
+
 # Fetch GoogleTest using FetchContent (modern approach)
 include(FetchContent)
 FetchContent_Declare(
@@ -154,6 +159,10 @@ target_link_libraries(
 if (USE_TLS)
     # Add required libraries needed for TLS
     target_link_libraries(valkey-unit-gtests PRIVATE OpenSSL::SSL valkey::valkey_tls)
+endif ()
+
+if (IO_URING_ENABLED EQUAL 1)
+    target_link_libraries(valkey-unit-gtests PRIVATE "${URING_LIBS}")
 endif ()
 
 # Enable testing and discover tests

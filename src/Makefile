@@ -319,6 +319,13 @@ ifeq ($(BUILD_WITH_SYSTEMD),yes)
 	FINAL_CFLAGS+= -DHAVE_LIBSYSTEMD
 endif
 
+# io_uring batching of client I/O syscalls. USE_IO_URING=yes links
+# liburing and defines HAVE_LIBURING; anything else builds the no-op stubs.
+ifeq ($(USE_IO_URING),yes)
+	FINAL_CFLAGS+= -DHAVE_LIBURING
+	FINAL_LIBS+= -luring
+endif
+
 ifeq ($(MALLOC),tcmalloc)
 	FINAL_CFLAGS+= -DUSE_TCMALLOC
 	FINAL_LIBS+= -ltcmalloc
@@ -519,6 +526,7 @@ ENGINE_SERVER_OBJ = \
     hyperloglog.o \
     intset.o \
     io_threads.o \
+    io_uring_batch.o \
     kvstore.o \
     latency.o \
     lazyfree.o \

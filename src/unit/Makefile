@@ -199,6 +199,11 @@ ifeq ($(BUILD_TLS),yes)
 	LD_LIBS += $(TLS_LIBS)
 endif
 
+# Add liburing if enabled (io_uring_batch.o in libvalkey.a references it)
+ifeq ($(USE_IO_URING),yes)
+	LD_LIBS += -luring
+endif
+
 # Compile C++ test files, recompile if generated_wrappers or compiler flags change
 %.o: %.cpp generated_wrappers.cpp .flags
 	$(CXX) -MD -MP -std=c++17 -faligned-new -Wno-write-strings -fpermissive $(GCC_FLAGS) $(OPT) $(DEBUG) $(TEST_CFLAGS) -Wall -Wno-deprecated-declarations -c \
