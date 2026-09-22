@@ -66,6 +66,7 @@ void partitionedClientRelease(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 int tryOffloadFreePtrToIOThreads(void *ptr);
+void commitIOJobs(void);
 void beginInlineReclaim(void);
 void endInlineReclaim(void);
 void freeValueNeverOnMain(robj *key, robj *val, int dbid);

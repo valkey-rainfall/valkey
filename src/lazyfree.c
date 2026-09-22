@@ -4,6 +4,7 @@
 #include "functions.h"
 #include "cluster.h"
 #include "module.h"
+#include "dplus.h"
 
 #include <stdatomic.h>
 
