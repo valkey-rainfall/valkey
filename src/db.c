@@ -418,9 +418,9 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     if (d_va) dplusVersionBracketEnd(d_va, DPLUS_SHARD_INDEX(d_h));
 
     /* D+ entry-lifetime: defer the old object's free past walk quiescence
-     * (see entry-lifetime-design.md); routing recorded at defer time. With no
-     * reader registered (reader tier compile-only here) dplusDeferFree returns
-     * 0 and we free immediately, routed off main per Dante's transport. */
+     * (see entry-lifetime-design.md); routing recorded at defer time. When
+     * the deferral is refused (no reader can hold a pointer) the transport
+     * frees it immediately, off the main thread while IO threads are active. */
     int limbo_route = DPLUS_LIMBO_OFFLOAD_PREF;
     if (server.lazyfree_lazy_server_del && lazyfreeShouldBeAsync(key, old, db->id)) limbo_route = DPLUS_LIMBO_ASYNC;
     if (!dplusDeferFree(old, limbo_route)) {
@@ -548,12 +548,14 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         }
 
         /* D+ entry-lifetime: the unlinked object may still be read by an
-         * in-flight speculative walk — defer the free to the quiescence
-         * flush, recording the routing decision now (the effort heuristic
-         * needs the key). Falls back to Dante's off-main free when no walkers
-         * can exist (reader tier compile-only here, so always the fallback).
-         * See entry-lifetime-design.md. */
-        int d_route = (async && lazyfreeShouldBeAsync(key, val, db->id)) ? DPLUS_LIMBO_ASYNC : DPLUS_LIMBO_SYNC;
+         * in-flight speculative walk, so its free is deferred past walk
+         * quiescence. The routing decision is recorded now because the
+         * effort heuristic needs the key. Objects that are not worth a
+         * lazyfree job are handed back to the transport at reclaim time,
+         * which never frees on the main thread while IO threads are active.
+         * With no reader registered the deferral is refused and the same
+         * transport path runs immediately. See entry-lifetime-design.md. */
+        int d_route = (async && lazyfreeShouldBeAsync(key, val, db->id)) ? DPLUS_LIMBO_ASYNC : DPLUS_LIMBO_OFFLOAD_PREF;
         if (!dplusDeferFree(val, d_route)) freeValueNeverOnMain(key, val, db->id);
 
         return 1;
