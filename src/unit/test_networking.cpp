@@ -1019,3 +1019,140 @@ TEST_F(NetworkingTest, TestSetDeferredReplyNextMergeGuardsIoLastWritten) {
         freeReplyOffloadClient(c);
     }
 }
+
+/* --- Write completion vs. in-flight read job (Door-2 speculation) ---
+ *
+ * Stock lets main process a write completion while the same client's read
+ * job is in flight on another I/O thread: the write job completes, the event
+ * loop offloads the client's next read (COMPLETED_IO does not block
+ * trySendReadToIOThreads), and beforeSleep then runs processClientIOWriteDone.
+ * That is safe upstream because a read job only touches querybuf/argv. With
+ * speculation the read job also appends replies to c->buf/bufpos and writes
+ * the ClientFlags word, so the completion must be deferred until the read
+ * lands (WRITE_FLAGS_DONE_DEFERRED), or main resets bufpos under the I/O
+ * thread's appends and its pending_write bit is erased by the I/O thread's
+ * bitfield store (handleClientsWithPendingWrites asserts 'pending_write').
+ *
+ * Each test fails with the deferral removed: the first call would publish
+ * IDLE and reset bufpos with the read still PENDING_IO. */
+
+/* A client whose write job has just been dequeued as COMPLETED_IO after
+ * writing all `reply_len` bytes of c->buf (bookmark at reply_len). */
+static client *createWriteDoneClient(fakeConnection *fc, size_t reply_len) {
+    client *c = createTestClient();
+    c->conn = &fc->conn; /* CT_Fake: no postpone/update-state hooks */
+    memset(c->buf, 'r', reply_len);
+    c->bufpos = reply_len;
+    c->io_last_written.buf = c->buf;
+    c->io_last_written.bufpos = reply_len;
+    c->io_last_written.data_len = reply_len;
+    c->nwritten = (ssize_t)reply_len;
+    c->io_write_state = CLIENT_COMPLETED_IO;
+    return c;
+}
+
+TEST_F(NetworkingTest, TestWriteDoneDeferredWhileReadJobInFlight) {
+    if (!server.clients_pending_write) server.clients_pending_write = listCreate();
+    server.active_io_threads_num = 1; /* no I/O-thread write offload from the test */
+    fakeConnection *fc = connCreateFake();
+    const size_t reply_len = 32;
+    client *c = createWriteDoneClient(fc, reply_len);
+
+    /* The client's next read is in flight on a legacy (unowned) client. */
+    c->owner_tid = 0;
+    c->io_read_state = CLIENT_PENDING_IO;
+    long long writes_before = server.stat_total_writes_processed;
+
+    processClientIOWriteDone(c);
+
+    /* Deferred: nothing about the client's buffer or write state moved. */
+    ASSERT_EQ(c->io_write_state, CLIENT_COMPLETED_IO);
+    ASSERT_TRUE(c->write_flags & WRITE_FLAGS_DONE_DEFERRED);
+    ASSERT_EQ(c->bufpos, reply_len);
+    ASSERT_EQ(c->io_last_written.buf, c->buf);
+    ASSERT_EQ(c->io_last_written.bufpos, reply_len);
+    ASSERT_EQ(server.stat_total_writes_processed, writes_before);
+    ASSERT_FALSE(c->flag.pending_write);
+
+    /* The speculating read job appends its reply after the written bytes. */
+    const char spec[] = "$5\r\nhello\r\n";
+    const size_t spec_len = sizeof(spec) - 1;
+    memcpy(c->buf + c->bufpos, spec, spec_len);
+    c->bufpos += spec_len;
+
+    /* The read lands: processClientIOReadsDone finishes the deferred
+     * completion before the parsed commands run. */
+    c->io_read_state = CLIENT_COMPLETED_IO;
+    processClientIOWriteDone(c);
+
+    ASSERT_EQ(c->io_write_state, CLIENT_IDLE);
+    ASSERT_FALSE(c->write_flags & WRITE_FLAGS_DONE_DEFERRED);
+    ASSERT_EQ(server.stat_total_writes_processed, writes_before + 1);
+    /* Only the completed write was consumed: the bookmark still marks the
+     * written prefix and the speculated reply is intact behind it, queued
+     * for the next write. */
+    ASSERT_EQ(c->bufpos, reply_len + spec_len);
+    ASSERT_EQ(c->io_last_written.buf, c->buf);
+    ASSERT_EQ(c->io_last_written.bufpos, reply_len);
+    ASSERT_EQ(memcmp(c->buf + reply_len, spec, spec_len), 0);
+    ASSERT_TRUE(c->flag.pending_write);
+    ASSERT_EQ(listLength(server.clients_pending_write), 1u);
+
+    listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+    freeReplyOffloadClient(c);
+    zfree(fc);
+}
+
+TEST_F(NetworkingTest, TestWriteDoneNotDeferredWithoutInFlightRead) {
+    if (!server.clients_pending_write) server.clients_pending_write = listCreate();
+    server.active_io_threads_num = 1;
+    const size_t reply_len = 32;
+
+    /* Read idle: the completion runs at once and consumes the buffer. */
+    {
+        fakeConnection *fc = connCreateFake();
+        client *c = createWriteDoneClient(fc, reply_len);
+        c->owner_tid = 0;
+        c->io_read_state = CLIENT_IDLE;
+        processClientIOWriteDone(c);
+        ASSERT_EQ(c->io_write_state, CLIENT_IDLE);
+        ASSERT_FALSE(c->write_flags & WRITE_FLAGS_DONE_DEFERRED);
+        ASSERT_EQ(c->bufpos, 0u);
+        ASSERT_EQ(c->io_last_written.buf, nullptr);
+        ASSERT_FALSE(c->flag.pending_write);
+        freeReplyOffloadClient(c);
+        zfree(fc);
+    }
+
+    /* Legacy client whose read result is still in the I/O thread's outbox
+     * (COMPLETED_IO, owner_tid == 0): main has not synchronized with that
+     * thread's buf/bufpos stores yet, so it is deferred like PENDING_IO. */
+    {
+        fakeConnection *fc = connCreateFake();
+        client *c = createWriteDoneClient(fc, reply_len);
+        c->owner_tid = 0;
+        c->io_read_state = CLIENT_COMPLETED_IO;
+        processClientIOWriteDone(c);
+        ASSERT_EQ(c->io_write_state, CLIENT_COMPLETED_IO);
+        ASSERT_TRUE(c->write_flags & WRITE_FLAGS_DONE_DEFERRED);
+        ASSERT_EQ(c->bufpos, reply_len);
+        c->write_flags &= ~WRITE_FLAGS_DONE_DEFERRED;
+        freeReplyOffloadClient(c);
+        zfree(fc);
+    }
+
+    /* Owned client at COMPLETED_IO is mid-execution on main with no I/O-thread
+     * writer and no read-done ahead of it: not deferred. */
+    {
+        fakeConnection *fc = connCreateFake();
+        client *c = createWriteDoneClient(fc, reply_len);
+        c->owner_tid = 1;
+        c->io_read_state = CLIENT_COMPLETED_IO;
+        processClientIOWriteDone(c);
+        ASSERT_EQ(c->io_write_state, CLIENT_IDLE);
+        ASSERT_FALSE(c->write_flags & WRITE_FLAGS_DONE_DEFERRED);
+        ASSERT_EQ(c->bufpos, 0u);
+        freeReplyOffloadClient(c);
+        zfree(fc);
+    }
+}
