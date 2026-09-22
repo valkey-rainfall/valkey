@@ -48,6 +48,7 @@
 #include "syscheck.h"
 #include "threads_mngr.h"
 #include "fmtargs.h"
+#include "dplus.h"
 #include "io_threads.h"
 #include "compression.h"
 #include "fastpath.h"
@@ -679,10 +680,6 @@ hashtableType zsetHashtableType = {
     .keyCompare = zsetKeyCompare,
 };
 
-uint64_t hashtableSdsHash(const void *key) {
-    return hashtableGenHashFunction((const char *)key, sdslen((char *)key));
-}
-
 const void *hashtableObjectGetKey(const void *entry) {
     return objectGetKey(entry);
 }
@@ -1261,6 +1258,21 @@ static bool clientsCronTcpIsClosing(client *c) {
  * very fast. Sometimes the server has tens of thousands of connected clients, and all
  * of them need to be processed every second.
  */
+
+/* D5: refresh an OWNED client's memory accounting from main, under the
+ * owner-loop lock so field reads (querybuf, reply list, argv) cannot race
+ * the worker's IO pump — the same synchronization CLIENT LIST uses (B13).
+ * Bucket list manipulation itself is main-only state and needs no lock.
+ * Without this, owned clients whose completions stop flowing through main
+ * (WAITING_WRITABLE hogs, querybuf growers) have stale/absent bucket
+ * entries and maxmemory-clients eviction selects the wrong victims. */
+void clientsCronRefreshOwnedMemUsage(client *c) {
+    /* Door-2 owner-loop locking (owner_tid / ioGetWorkerEventLoop) was dropped
+     * on Dante's fast-path transport: fast-path clients are skipped in
+     * clientsCron before this is reached, so plain accounting suffices. */
+    if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
+}
+
 static void clientsCron(int clients_this_cycle) {
     /* for debug purposes: skip actual cron work if pause_cron is on */
     if (server.pause_cron) return;
@@ -1557,8 +1569,11 @@ static void sumEngineUsedMemory(scriptingEngine *engine, void *context) {
 
 /* Called from serverCron and cronUpdateMemoryStats to update cached memory metrics. */
 void cronUpdateMemoryStats(void) {
-    /* Record the max memory used since the server was started. */
-    if (zmalloc_used_memory() > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used_memory();
+    /* Record the max memory used since the server was started.
+     * (Single walk: zmalloc_used_memory() sums per-thread cache lines —
+     * don't pay it twice for a compare-then-assign.) */
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
 
     run_with_period(100) {
         /* Sample the RSS and other metrics here since this is a relatively slow call.
@@ -1629,12 +1644,12 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
         trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
                                  server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
                                  factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes, current_time,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed), current_time,
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT_REPLICATION, server.stat_net_repl_output_bytes, current_time,
                                  factor);
@@ -1991,8 +2006,22 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
 
-    size_t zmalloc_used = zmalloc_used_memory();
-    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    /* Memstats decimation: zmalloc_used_memory() is not one atomic read — it
+     * walks used_memory_thread[], one cache line PER THREAD, each dirtied by
+     * its owner on every alloc/free. Sampling it every event-loop iteration
+     * makes main pull ~N remote-modified lines per wakeup (profiled at ~11%
+     * of main at high wakeup rates). used_memory_peak is an advisory INFO
+     * stat and already blind to spikes between iterations; sample it at most
+     * once per millisecond instead. server.mstime is refreshed every wakeup
+     * in afterSleep, so this adds no clock read. Eviction is unaffected:
+     * getMaxmemoryState() reads zmalloc_used_memory() fresh in the command
+     * path. */
+    static mstime_t peak_sample_last_ms = 0;
+    if (server.mstime != peak_sample_last_ms) {
+        peak_sample_last_ms = server.mstime;
+        size_t zmalloc_used = zmalloc_used_memory();
+        if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    }
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -2020,6 +2049,14 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
+    /* D+ Phase-1: aggregate per-IO-thread command counters into
+     * stat_numcommands before processing responses (which read it for
+     * instantaneous metrics). One shared-line touch per event-loop, not
+     * per-command. */
+    dplusAggregateStats();
+    /* D+ epoch reclamation: seal this loop's retirements, advance the
+     * epoch, and perform bounded safe reclamation without a global drain. */
+    dplusReclaimRetired();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -2991,6 +3028,10 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+    /* D+ boundary: settle pending per-thread speculated-command counters
+     * into the stats we are about to clear — otherwise they survive the
+     * reset and fold in later (calls=101-vs-100 class of test failures). */
+    dplusAggregateStats();
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -3043,7 +3084,7 @@ void resetServerStats(void) {
     server.stat_net_output_bytes = 0;
     server.stat_reply_copy_avoided = 0;
     server.stat_net_repl_input_bytes = 0;
-    server.bio_stat_net_repl_input_bytes = 0;
+    atomic_store_explicit(&server.bio_stat_net_repl_input_bytes, 0, memory_order_relaxed);
     server.stat_net_repl_output_bytes = 0;
     server.stat_net_cluster_slot_export_bytes = 0;
     server.stat_net_cluster_slot_import_bytes = 0;
@@ -4301,7 +4342,42 @@ void call(client *c, int flags) {
         }
     }
 
+    /* D+ Read-Side: Exclusive mode for commands that require full atomicity.
+     * Normal writes (SET/DEL/EXPIRE) are safe — the sharded version bump
+     * invalidates concurrent speculative reads. Exclusive mode is only for
+     * multi-key atomic operations (EVAL/EXEC/KEYS/FLUSH/DEBUG) where a
+     * partial read mid-operation could observe inconsistent cross-key state.
+     *
+     * We check nesting depth (server.execution_nesting) to avoid redundant
+     * enter/leave for commands called from within EVAL/EXEC (they're already
+     * under exclusive mode from the outer command). */
+    int dplus_exclusive = 0;
+    if (server.io_threads_num > 1 && server.execution_nesting == 1) {
+        /* NOTE: call() has already run enterExecutionUnit() above, so the
+         * top-level command sees execution_nesting == 1 here (NOT 0 — that
+         * was a dead-gate bug caught by the atomicity gauntlet). Commands
+         * invoked from within EVAL/EXEC see >= 2 and skip (already covered
+         * by the outer command's exclusive window). */
+        /* Check if this is an exclusive-mode command by proc pointer. */
+        serverCommandProc *proc = c->cmd->proc;
+        int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
+                                     (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
+                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
+                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
+        if (proc == evalCommand || proc == evalShaCommand ||
+            proc == fcallCommand || proc == execCommand ||
+            proc == keysCommand || proc == flushdbCommand ||
+            proc == flushallCommand || (proc == debugCommand && !dplus_epoch_debug_hook)) {
+            dplusExclusiveEnter();
+            dplus_exclusive = 1;
+        }
+    }
+
     c->cmd->proc(c);
+
+    if (dplus_exclusive) {
+        dplusExclusiveLeave();
+    }
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
@@ -6985,7 +7061,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
-                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
                 "reply_copy_avoided:%lld\r\n", server.stat_reply_copy_avoided,
                 "copy_avoid_mode:%s\r\n",
@@ -6994,7 +7070,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                                                                       : "static"),
                 "copy_avoid_current_floor:%d\r\n", server.copy_avoid_current_floor,
                 "main_thread_busy_pct:%d\r\n", (int)(server.copy_avoid_busy_ema + 0.5),
-                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes,
+                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed),
                 "total_net_repl_output_bytes:%lld\r\n", server.stat_net_repl_output_bytes,
                 "total_net_cluster_slot_import_bytes:%lld\r\n", server.stat_net_cluster_slot_import_bytes,
                 "total_net_cluster_slot_export_bytes:%lld\r\n", server.stat_net_cluster_slot_export_bytes,
@@ -7046,6 +7122,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
+                "io_threaded_doorbell_rings:%lld\r\n", dplusDoorbellRings(),
+                "io_threaded_doorbell_coalesced:%lld\r\n", dplusDoorbellCoalesced(),
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
@@ -7248,6 +7326,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "commandstats") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
+        /* D+ boundary: fold pending per-thread speculated counts in before
+         * rendering, so INFO sees commands whose replies were already sent
+         * (calls=10000-vs-10010 class of test failures). */
+        dplusAggregateStats();
         info = genValkeyInfoStringCommandStats(info, server.commands);
     }
 
@@ -7335,6 +7417,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoMetrics(info);
     }
 
+    /* D+ epoch engagement and lifecycle gauges are always available. Detailed
+     * speculative counters are appended when IO_LOOKUP_OFFLOAD_STATS is set. */
+    if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = dplusInfoString(info);
+    }
+
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
      * We're not aware of the module section names here, and we rather avoid the search when we can.
@@ -7411,6 +7500,7 @@ void monitorCommand(client *c) {
     c->flag.replica = 1;
     c->flag.monitor = 1;
     listAddNodeTail(server.monitors, c);
+    dplusOnMonitorsChanged(); /* F1: gate speculation off while a monitor is attached */
     addReply(c, shared.ok);
 }
 

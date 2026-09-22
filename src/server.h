@@ -1499,7 +1499,7 @@ typedef struct client {
     slotMigrationJob *slot_migration_job; /* Pointer to the slot migration job, or NULL. */
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
-    volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
+    _Atomic uint8_t io_write_state;      /* Cross-thread client write state; use atomic predicates/publication. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
@@ -1514,6 +1514,10 @@ typedef struct client {
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
     struct ClientControl *control;        /* Shared control for this connection: allocated once when it first becomes crossing-capable, reclaimed once at free. NULL until then. */
+    _Atomic(uint8_t) spec_acl_ok;         /* D+ ACL gate: 1 = authenticated AND user may run GET with
+                                           * unrestricted key read access, so workers may speculate.
+                                           * Written ONLY on the main thread at auth-state changes
+                                           * (clientSetUser, SELECT, ACL admin ops); read by workers. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -2346,7 +2350,10 @@ struct valkeyServer {
                                                  * RDB save to disk has completed, or failed */
     _Atomic(bool) replica_bio_abort_save;       /* Flag set by main thread, used to signal to replica's
                                                  * disk-saving bio thread to abort the save */
-    long long bio_stat_net_repl_input_bytes;    /* Used to calculate stat_net_repl_input_bytes on the
+    _Atomic(long long) bio_stat_net_repl_input_bytes; /* Written by the BIO RDB-load thread, read by main
+                                                 * (cron metrics, INFO). Relaxed atomics -- stats only.
+                                                 * D+ S1.6: was a plain long long (TSan-confirmed race).
+                                                 * Used to calculate stat_net_repl_input_bytes on the
                                                  * replica's bio thread without touching main thread vars */
     off_t bio_repl_transfer_size;               /* Used to calculate bio_repl_transfer_size on the
                                                  * replica's bio thread without touching main thread vars */
@@ -3178,6 +3185,9 @@ void dictVanillaFree(void *val);
      READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN | READ_FLAGS_ERROR_BIG_BULK_COUNT |                                 \
      READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER | READ_FLAGS_ERROR_UNEXPECTED_INLINE_FROM_REPLICATED_CLIENT |   \
      READ_FLAGS_ERROR_UNBALANCED_QUOTES | READ_FLAGS_ERROR_INVALID_CRLF)
+/* D+: set on a queued command whose reply the reader tier already produced
+ * speculatively on the IO thread. Reader tier is compile-only in this build. */
+#define READ_FLAGS_DPLUS_SPECULATED (1 << 23)
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
@@ -3193,6 +3203,7 @@ void freeClientAsync(client *c);
 void freeClientOrCloseLater(client *c, int async);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 void beforeNextClient(client *c);
+void disownClient(client *c);
 void clearClientConnectionState(client *c);
 void resetClient(client *c);
 void resetClientIOState(client *c);
@@ -3314,6 +3325,7 @@ void adjustThreadedIOIfNeeded(void);
 int clientHasPendingReplies(client *c);
 int updateClientMemUsageAndBucket(client *c);
 void removeClientFromMemUsageBucket(client *c, int allow_eviction);
+void clientsCronRefreshOwnedMemUsage(client *c); /* D5: owner-lock-safe accounting refresh */
 void unlinkClient(client *c);
 void removeFromServerClientList(client *c);
 int writeToClient(client *c);
@@ -3488,9 +3500,27 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */
+/* D+ S3: bracket a mutation of a PUBLISHED key's value from command code
+ * (t_string.c etc.) without exposing dplus internals. Begin computes the
+ * shard from the table's own hash fn; End closes the bracket. no_table=1
+ * -> End is a no-op. */
+typedef struct dbKeyBracket {
+    void *va;       /* dplusVersionArray* (opaque here) */
+    unsigned shard;
+} dbKeyBracket;
+void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk);
+void dbKeyBracketEnd(dbKeyBracket *brk);
+/* Ensure a published RAW string value has capacity for total_len bytes,
+ * safely vs speculative readers: returns unchanged sds when capacity
+ * suffices (caller mutates in place inside its bracket); otherwise builds
+ * the replacement buffer (the same copy a realloc would perform), publishes
+ * it on 'o', and defer-frees the old allocation. Call INSIDE a bracket. */
+sds dbGrowPublishedStringValue(robj *o, size_t total_len);
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
 robj *tryPrebuildStringEntry(robj *valobj, const_sds key);
+robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired);
 robj *objectSetExpire(robj *o, long long expire);
+robj *objectSetExpireEx(robj *o, long long expire, robj **retired);
 void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);
 void *objectGetVal(const robj *o);
@@ -4168,6 +4198,8 @@ int inMainThread(void);
 #define assertNoMainThreadFree() ((void)0)
 #endif
 size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid);
+void lazyfreeObjPrejudged(robj *obj);
+int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
 void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
 void dbUntrackKeyWithVolatileItems(serverDb *db, robj *o);
