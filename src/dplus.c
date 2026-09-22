@@ -1126,7 +1126,10 @@ static void dplusReclaimEntry(const dplusRetireEntry *entry) {
     robj *o = entry->ptr;
     switch (entry->route) {
     case DPLUS_LIMBO_OFFLOAD_PREF:
-        if (tryOffloadFreeObjToIOThreads(o) != C_OK) decrRefCount(o);
+        /* The transport decides where an unlinked value may be freed. It
+         * never frees on the main thread while IO threads are active, and
+         * keeps single-threaded lazyfree semantics otherwise. */
+        freeValueNeverOnMain(NULL, o, -1);
         break;
     case DPLUS_LIMBO_SYNC: decrRefCount(o); break;
     case DPLUS_LIMBO_ASYNC: lazyfreeObjPrejudged(o); break;
