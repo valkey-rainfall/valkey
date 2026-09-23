@@ -770,8 +770,14 @@ dplusFpOutcome dplusFastpathSpeculateGet(int tid, serverDb *db, void *key_sds, i
         goto done;
     }
 
+    /* Reader-safe lookup: hashtableFind() runs an incremental rehash step on
+     * the way in (a table mutation main also performs) and its bucket scan
+     * assumes filled slots are non-NULL, which a concurrent writer breaks
+     * transiently. hashtableFindSpeculative() takes the hash already computed,
+     * never rehashes, and skips transient NULL slots; the version validation
+     * below catches anything it saw mid-mutation. */
     void *entry = NULL;
-    bool found = hashtableFind(ht, key_sds, &entry);
+    bool found = hashtableFindSpeculative(ht, key_sds, &entry, hash, shard, NULL);
     if (!found) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
