@@ -717,11 +717,15 @@ static int fpLocalEligible(client *c, struct serverCommand *cmd, int argc) {
     return 1;
 }
 
-/* The client's speculative prefix is open while it has no entry on main and no
- * earlier non-local entry sits in the batch under assembly. Cleared by the
- * first non-local append, reset once its entries drain at delivery. */
+/* The client's speculative prefix is open while no main-bound entry of its is
+ * in flight or sits in the batch under assembly. The flag alone encodes that:
+ * the first non-local append clears it and delivery reopens it once every
+ * entry has drained. fp_inflight must NOT gate this: it also counts local
+ * entries, and a local entry never reaches main, so a second GET behind one
+ * cannot overtake anything. Gating on it capped speculation at one GET per
+ * read event per client (the rest of a pipeline went to main). */
 static int fpPrefixOpen(client *c) {
-    return c->fp_inflight == 0 && c->flag.fp_prefix_open;
+    return c->flag.fp_prefix_open;
 }
 
 /* Append a speculatively-answered GET: its reply already sits in the arena, so
