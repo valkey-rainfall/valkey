@@ -678,6 +678,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->reply_big = NULL;
     e->reply_big_len = 0;
     e->requeued = 0;
+    e->local = 0; /* batches are recycled: a slot may have held a speculated entry */
     c->fp_inflight++;
 }
 
