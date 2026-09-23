@@ -96,6 +96,7 @@ typedef struct dplusThreadStats {
     long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
     long long keyspace_hits;      /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
+    long long retire_segs_freed;  /* D+ deferred-free segments freed whole on this IO thread */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -378,5 +379,11 @@ long long dplusDoorbellCoalesced(void);
 /* Component 6: INFO section. Epoch engagement/lifecycle gauges are always
  * available; detailed speculative counters remain build-flag dependent. */
 sds dplusInfoString(sds info);
+
+/* Free one whole D+ deferred-free segment on an IO thread. The segment was
+ * detached from the retire list and handed off by the reclaim walk; this frees
+ * every entry by its recorded route and then frees the segment metadata. `tid`
+ * is the owning IO thread (single writer of its per-thread stats slot). */
+void dplusFreeRetireSegmentOnWorker(void *segment, int tid);
 
 #endif /* DPLUS_H */

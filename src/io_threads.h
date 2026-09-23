@@ -14,6 +14,7 @@ typedef enum {
     JOB_SPSC_POLL = 1,
     JOB_SPSC_WRITE_SLAB = 2, /* batch of clients to write, one job per event loop drain */
     JOB_SPSC_FREE_SLAB = 3,  /* batch of terminal frees from main */
+    JOB_SPSC_FREE_RETIRE_SEG = 4, /* one D+ deferred-free segment, freed whole on the IO thread */
 } JobRequestSPSC;
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */
@@ -74,6 +75,13 @@ void drainPendingMainFrees(void);
 size_t pendingMainFreesLen(void);
 /* Bytes committed to off-main frees but not yet physically reclaimed. */
 size_t offloadPendingFreeBytes(void);
+/* Submit one detached D+ retire segment to an IO thread's private inbox to be
+ * freed whole. Returns 1 if enqueued, 0 if no worker could take it (caller then
+ * frees the segment inline). */
+int submitRetireSegmentJob(void *segment);
+/* Terminal free of a sole-referenced OFFLOAD_PREF retire value on the IO thread
+ * that received its segment (mirrors freeValueNeverOnMain's per-type decision). */
+void freeRetiredValueOnWorker(robj *o);
 void IOThreadsAfterSleep(int numevents);
 void IOThreadsBeforeSleep(long long current_time);
 void drainIOThreadsQueue(void);
