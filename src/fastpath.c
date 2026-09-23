@@ -2,6 +2,7 @@
 
 #include "server.h"
 #include "fastpath.h"
+#include "dplus.h"
 #include "io_threads.h"
 #include "memory_prefetch.h"
 #include <sys/epoll.h>
@@ -70,6 +71,11 @@ typedef struct fpThread {
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
     long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals;
+    /* Speculative reader tier (single writer: the owning IO thread). */
+    long long spec_reads;      /* GETs answered on this thread without main */
+    long long spec_punts;      /* eligible GETs that fell through to main after a speculation attempt */
+    long long spec_punt_miss, spec_punt_expired, spec_punt_type, spec_punt_large, spec_punt_validate,
+        spec_punt_bracket, spec_punt_guard;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
@@ -77,7 +83,9 @@ static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per I
 static size_t fastpath_clients = 0;                 /* main thread only */
 static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
 static unsigned fp_rr = 0;
-static long long fp_retired[6]; /* main thread only: counters of threads since retired */
+static long long fp_retired[15]; /* main thread only: counters of threads since retired */
+
+static void fpDeliverLocalBatch(fpThread *t, cmdBatch *b);
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
@@ -117,6 +125,11 @@ void fastpathInitThread(int tid) {
     t->owner_slots_free = FP_OWNER_SLOT_NONE;
     t->ret_overflow = listCreate();
     atomic_init(&t->role, FP_ROLE_OPEN);
+    /* Register as an epoch reader for the speculative tier: the slot starts
+     * QUIESCENT (holds nothing) and each speculation brackets it ACTIVE only for
+     * the lookup. A DRAINED worker owns no client and never speculates, so it
+     * holds no slot and cannot block reclamation. */
+    dplusReaderWorkerOnline(tid);
     if (tid + 1 > fp_slots) fp_slots = tid + 1;
 }
 
@@ -151,6 +164,18 @@ void fastpathFreeThread(int tid) {
     fp_retired[3] += t->writes;
     fp_retired[4] += t->batches;
     fp_retired[5] += t->deferrals;
+    fp_retired[6] += t->spec_reads;
+    fp_retired[7] += t->spec_punts;
+    fp_retired[8] += t->spec_punt_miss;
+    fp_retired[9] += t->spec_punt_expired;
+    fp_retired[10] += t->spec_punt_type;
+    fp_retired[11] += t->spec_punt_large;
+    fp_retired[12] += t->spec_punt_validate;
+    fp_retired[13] += t->spec_punt_bracket;
+    fp_retired[14] += t->spec_punt_guard;
+    /* No client, batch or ring entry names this thread now (asserted above), so it
+     * holds no speculative pointer: retire its epoch reader slot. */
+    dplusReaderWorkerOffline(tid);
     while (fp_slots > 0 && fp_threads[fp_slots - 1].submit.buffer == NULL) fp_slots--;
 }
 
@@ -442,6 +467,7 @@ int fastpathAttach(client *c) {
     c->fp_owner_slot = FP_OWNER_SLOT_NONE;
     c->fp_out = NULL;
     c->flag.fp_deferred = 0;
+    c->flag.fp_prefix_open = 1; /* no entries yet, so a leading GET may be answered locally */
     listInitNode(&c->fp_defer_node, c);
     /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
      * next writer of these fields. control->lifecycle is the single source of truth for the state. */
@@ -470,6 +496,24 @@ static void fpSubmit(fpThread *t) {
     cmdBatch *b = t->cur;
     if (!b || b->count == 0) return;
     t->cur = NULL;
+    /* Hook 3: a batch whose every entry was answered speculatively never needs
+     * main. Deliver its replies on this IO thread and recycle it, touching
+     * neither the submit ring nor the reply-memory counters (nothing crossed,
+     * so there is no produced charge to release). Mixed batches submit as usual
+     * and are delivered in entry order on return, preserving reply order. */
+    int all_local = 1;
+    for (int i = 0; i < b->count; i++) {
+        if (!b->e[i].local) {
+            all_local = 0;
+            break;
+        }
+    }
+    if (all_local) {
+        fpDeliverLocalBatch(t, b);
+        fpRecycleBatch(t, b);
+        t->batches++;
+        return;
+    }
     spscEnqueue(&t->submit, b, true);
     t->inflight++;
     t->batches++;
@@ -477,7 +521,28 @@ static void fpSubmit(fpThread *t) {
 
 void fastpathSubmitPending(int tid) {
     fpThread *t = &fp_threads[tid];
-    if (!t->cur || t->cur->count == 0 || t->cur_hold || t->quiescing || spscBacklog(&t->submit) != 0) return;
+    if (!t->cur || t->cur->count == 0) return;
+    /* A local-only batch never touches the ring, so neither a submit backlog nor
+     * the amortization hold applies: deliver it now while the client is hot.
+     * cur_hold/quiescing still defer it (its client is leaving). */
+    if (!t->cur_hold && !t->quiescing) {
+        cmdBatch *b = t->cur;
+        int all_local = 1;
+        for (int i = 0; i < b->count; i++) {
+            if (!b->e[i].local) {
+                all_local = 0;
+                break;
+            }
+        }
+        if (all_local) {
+            t->cur = NULL;
+            fpDeliverLocalBatch(t, b);
+            fpRecycleBatch(t, b);
+            t->batches++;
+            return;
+        }
+    }
+    if (t->cur_hold || t->quiescing || spscBacklog(&t->submit) != 0) return;
     /* The hold amortizes per-batch work while bounding latency. */
     if (server.io_batch_hold_us > 0 && getMonotonicUs() - t->cur->opened_us < (monotime)server.io_batch_hold_us) return;
     fpSubmit(t);
@@ -616,6 +681,110 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     c->fp_inflight++;
 }
 
+/* --- Hook 1: speculative GET on the owning IO thread --- */
+
+/* GET command identity, cached once (main sets io_threads before any worker
+ * reads it; a benign double init is idempotent). */
+static struct serverCommand *fp_get_cmd = NULL;
+
+/* Eligibility for answering a GET without main. Conservative: any doubt punts.
+ * Global gates (MONITOR, module command-result, exclusive/defrag) are shared
+ * with the phase-1 reader via dplus; per-client gates (ACL, tracking) are the
+ * published bytes dplus maintains at auth/tracking changes. */
+static int fpLocalEligible(client *c, struct serverCommand *cmd, int argc) {
+    if (!server.io_threads_speculative_reads) return 0;
+    if (!fp_get_cmd) fp_get_cmd = lookupCommandByCString("get");
+    if (cmd != fp_get_cmd || cmd == NULL || argc != 2) return 0;
+    if (c->resp != 2 && c->resp != 3) return 0; /* RESP must be known */
+    if (server.cluster_enabled) return 0;
+    /* ACL: authenticated principal with unrestricted GET key access. The byte is
+     * published by main at every auth-state change; key-pattern-restricted or
+     * unauthenticated principals punt (never a false allow). */
+    if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
+    /* CLIENT TRACKING on this client: a non-BCAST tracker would cache a value
+     * that trackingRememberKeys never registered, so a later write could not
+     * invalidate it. BCAST invalidation is prefix-based and unaffected. */
+    if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
+    /* MONITOR attached: every executed command must feed the monitor stream from
+     * call() on main; a speculated GET bypasses call(). Global gate. */
+    if (atomic_load_explicit(&dplus_monitor_gate, memory_order_acquire)) return 0;
+    /* Module command-result SUCCESS subscribers require an exact per-command
+     * event from call(); speculation bypasses it. Global gate. */
+    if (atomic_load_explicit(&dplus_module_cmdresult_gate, memory_order_acquire)) return 0;
+    /* Active defrag moves/frees allocations outside the limbo hooks. */
+    if (server.active_defrag_cpu_percent > 0) return 0;
+    return 1;
+}
+
+/* The client's speculative prefix is open while it has no entry on main and no
+ * earlier non-local entry sits in the batch under assembly. Cleared by the
+ * first non-local append, reset once its entries drain at delivery. */
+static int fpPrefixOpen(client *c) {
+    return c->fp_inflight == 0 && c->flag.fp_prefix_open;
+}
+
+/* Append a speculatively-answered GET: its reply already sits in the arena, so
+ * main never executes it. argv is consumed here (the reply is done with it). */
+static void fpAppendLocalEntry(cmdBatch *b, client *c, robj **argv, int argc, struct serverCommand *cmd,
+                               uint32_t reply_off, uint32_t reply_len) {
+    cmdEntry *e = &b->e[b->count++];
+    e->handle = fastpathHandleFor(c);
+    e->argv = argv; /* freed at delivery like any entry; main never touches it */
+    e->argc = argc;
+    e->argv_len = argc;
+    e->argv_len_sum = 0;
+    e->input_bytes = 0;
+    e->cmd = cmd;
+    e->slot = -1;
+    e->read_flags = 0;
+    e->db = c->db;
+    e->resp = (uint8_t)c->resp;
+    e->origin.client_id = c->id;
+    e->origin.principal = c->user;
+    e->origin.authenticated = c->flag.authenticated;
+    e->origin.peer = c->fp_peer;
+    e->origin.local = c->fp_local;
+    e->reply_off = reply_off;
+    e->reply_len = reply_len;
+    e->reply_big = NULL;
+    e->reply_big_len = 0;
+    e->requeued = 0;
+    e->local = 1;
+    c->fp_inflight++;
+}
+
+/* Try to answer one parsed GET speculatively into the current batch's arena.
+ * Returns 1 if it was answered locally (entry appended, argv consumed), 0 if it
+ * must be executed on main. On 0 nothing is appended and argv is untouched.
+ * Counts the punt reason. */
+static int fpTrySpeculate(fpThread *t, int tid, client *c, robj **argv, int argc, struct serverCommand *cmd) {
+    if (!fpLocalEligible(c, cmd, argc) || !fpPrefixOpen(c)) return 0;
+    if (!t->cur) t->cur = fpAllocBatch(t, tid);
+    cmdBatch *b = t->cur;
+    char *dst = b->arena + b->arena_used;
+    size_t cap = b->arena_cap - b->arena_used;
+    size_t written = 0;
+    dplusFpOutcome r = dplusFastpathSpeculateGet(tid, c->db, objectGetVal(argv[1]), c->resp, dst, cap, &written);
+    if (r != DPLUS_FP_HIT) {
+        t->spec_punts++;
+        switch (r) {
+        case DPLUS_FP_PUNT_MISS: t->spec_punt_miss++; break;
+        case DPLUS_FP_PUNT_EXPIRED: t->spec_punt_expired++; break;
+        case DPLUS_FP_PUNT_TYPE: t->spec_punt_type++; break;
+        case DPLUS_FP_PUNT_LARGE: t->spec_punt_large++; break;
+        case DPLUS_FP_PUNT_VALIDATE: t->spec_punt_validate++; break;
+        case DPLUS_FP_PUNT_BRACKET: t->spec_punt_bracket++; break;
+        case DPLUS_FP_PUNT_GUARD: t->spec_punt_guard++; break;
+        default: break;
+        }
+        return 0;
+    }
+    fpAppendLocalEntry(b, c, argv, argc, cmd, (uint32_t)b->arena_used, (uint32_t)written);
+    b->arena_used += written;
+    t->spec_reads++;
+    return 1;
+}
+
 /* The first unsupported command and all successors remain queued for main. */
 static void fpHarvest(fpThread *t, int tid, client *c) {
     int leave = 0;
@@ -626,17 +795,22 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
             leave = 1;
         } else {
-            if (!t->cur) t->cur = fpAllocBatch(t, tid);
-            fpAppendEntry(t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
-                          c->parsed_cmd, c->slot, c->read_flags);
-            c->argv = NULL;
+            if (fpTrySpeculate(t, tid, c, c->argv, c->argc, c->parsed_cmd)) {
+                c->argv = NULL; /* the local entry owns argv now */
+            } else {
+                if (!t->cur) t->cur = fpAllocBatch(t, tid);
+                fpAppendEntry(t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
+                              c->parsed_cmd, c->slot, c->read_flags);
+                c->argv = NULL;
+                c->flag.fp_prefix_open = 0; /* a non-local entry ends this client's speculative prefix */
+            }
             c->argc = 0;
             c->argv_len = 0;
             c->argv_len_sum = 0;
             c->parsed_cmd = NULL;
             c->read_flags = 0;
             c->net_input_bytes_curr_cmd = 0; /* the parser accumulates; resetClient never runs for this client */
-            if (t->cur->count >= max) fpSubmit(t);
+            if (t->cur && t->cur->count >= max) fpSubmit(t);
         }
     } else if (c->read_flags & READ_FLAGS_ERROR_MASK) {
         leave = 1;
@@ -650,11 +824,17 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             leave = 1;
             break;
         }
-        if (!t->cur) t->cur = fpAllocBatch(t, tid);
-        fpAppendEntry(t->cur, c, p->argv, p->argc, p->argv_len, p->argv_len_sum, p->input_bytes, p->cmd, p->slot,
-                      p->read_flags);
-        q->off++;
-        if (t->cur->count >= max) fpSubmit(t);
+        if (fpTrySpeculate(t, tid, c, p->argv, p->argc, p->cmd)) {
+            p->argv = NULL; /* consumed by the local entry */
+            q->off++;
+        } else {
+            if (!t->cur) t->cur = fpAllocBatch(t, tid);
+            fpAppendEntry(t->cur, c, p->argv, p->argc, p->argv_len, p->argv_len_sum, p->input_bytes, p->cmd, p->slot,
+                          p->read_flags);
+            c->flag.fp_prefix_open = 0;
+            q->off++;
+        }
+        if (t->cur && t->cur->count >= max) fpSubmit(t);
     }
 
     if (leave) {
@@ -863,6 +1043,46 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
     fpBeginLeave(t, c, FP_LEAVING, 1);
 }
 
+/* Deliver a batch whose entries were ALL answered speculatively on this IO
+ * thread. Replies live in the arena; write them per client (one writev per
+ * client run), drop fp_inflight, reopen the client's speculative prefix, and
+ * free argv here. Nothing crossed to main, so there is no reply-memory charge
+ * to release and no ring entry to return. Every entry is local by construction
+ * (fpSubmit's all-local check), so the client always resolves and never requeues. */
+static void fpDeliverLocalBatch(fpThread *t, cmdBatch *b) {
+    struct iovec iov[IO_BATCH_MAX];
+    int i = 0;
+    while (i < b->count) {
+        client *c = fpResolve(t, &b->e[i].handle);
+        ClientControl *cc = b->e[i].handle.control;
+        int n = 0;
+        int j = i;
+        while (j < b->count && b->e[j].handle.control == cc) {
+            cmdEntry *e = &b->e[j];
+            if (e->reply_len) {
+                iov[n].iov_base = b->arena + e->reply_off, iov[n].iov_len = e->reply_len, n++;
+            }
+            j++;
+        }
+        if (c) {
+            if (n) fpSend(t, c, iov, n);
+            c->fp_inflight -= (j - i);
+            c->commands_processed += (j - i);
+            if (c->fp_inflight == 0) c->flag.fp_prefix_open = 1; /* prefix reopens once its entries drain */
+        }
+        i = j;
+    }
+    for (int k = 0; k < b->count; k++) {
+        cmdEntry *e = &b->e[k];
+        if (e->argv) {
+            for (int a = 0; a < e->argc; a++)
+                if (e->argv[a]) decrRefCount(e->argv[a]);
+            zfree(e->argv);
+            e->argv = NULL;
+        }
+    }
+}
+
 /* Consecutive entries for one client share a writev. */
 static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
     struct iovec iov[IO_BATCH_MAX];
@@ -889,6 +1109,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             c->fp_inflight -= (j - i);
             c->commands_processed += (j - i) - requeued;
             if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+            else if (c->fp_inflight == 0) c->flag.fp_prefix_open = 1; /* entries drained: speculation may resume */
         }
         i = j;
     }
@@ -1076,6 +1297,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
+    if (e->local) return; /* answered speculatively on the IO thread; main never executes it */
     if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
         e->requeued = 1; /* the main path postpones it like any other client's command */
@@ -1185,6 +1407,7 @@ again:
                 ClientControl *last_control = NULL;
                 for (int k = 0; k < b->count && room; k++) {
                     cmdEntry *e = &b->e[k];
+                    if (e->local) continue; /* answered on the IO thread; no key to prefetch for main */
                     ClientControl *cc = e->handle.control;
                     if (cc != last_control) {
                         __builtin_prefetch(cc);
@@ -1333,6 +1556,9 @@ void fastpathHandoffDone(client *c, int closing) {
 void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
               batches = fp_retired[4], deferrals = fp_retired[5];
+    long long spec_reads = fp_retired[6], spec_punts = fp_retired[7], p_miss = fp_retired[8], p_expired = fp_retired[9],
+              p_type = fp_retired[10], p_large = fp_retired[11], p_validate = fp_retired[12], p_bracket = fp_retired[13],
+              p_guard = fp_retired[14];
     int open = 0, quiescing = 0;
     for (int i = 1; i < fp_slots; i++) {
         if (fp_threads[i].submit.buffer == NULL) continue;
@@ -1345,6 +1571,15 @@ void fastpathInfo(sds *info) {
         writes += fp_threads[i].writes;
         batches += fp_threads[i].batches;
         deferrals += fp_threads[i].deferrals;
+        spec_reads += fp_threads[i].spec_reads;
+        spec_punts += fp_threads[i].spec_punts;
+        p_miss += fp_threads[i].spec_punt_miss;
+        p_expired += fp_threads[i].spec_punt_expired;
+        p_type += fp_threads[i].spec_punt_type;
+        p_large += fp_threads[i].spec_punt_large;
+        p_validate += fp_threads[i].spec_punt_validate;
+        p_bracket += fp_threads[i].spec_punt_bracket;
+        p_guard += fp_threads[i].spec_punt_guard;
     }
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
@@ -1355,6 +1590,19 @@ void fastpathInfo(sds *info) {
                          "fastpath_batches:%lld\r\n"
                          "fastpath_deferrals:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
-                         "fastpath_net_output_bytes:%lld\r\n",
-                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, in, out);
+                         "fastpath_net_output_bytes:%lld\r\n"
+                         "fastpath_speculative_reads:%lld\r\n"
+                         "fastpath_speculative_punts:%lld\r\n"
+                         "fastpath_speculative_punt_miss:%lld\r\n"
+                         "fastpath_speculative_punt_expired:%lld\r\n"
+                         "fastpath_speculative_punt_type:%lld\r\n"
+                         "fastpath_speculative_punt_large:%lld\r\n"
+                         "fastpath_speculative_punt_validate:%lld\r\n"
+                         "fastpath_speculative_punt_bracket:%lld\r\n"
+                         "fastpath_speculative_punt_guard:%lld\r\n"
+                         "fastpath_speculative_keyspace_hits:%lld\r\n"
+                         "fastpath_speculative_keyspace_misses:%lld\r\n",
+                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, in, out, spec_reads,
+                         spec_punts, p_miss, p_expired, p_type, p_large, p_validate, p_bracket, p_guard,
+                         dplusFastpathKeyspaceHits(), dplusFastpathKeyspaceMisses());
 }

@@ -1294,6 +1294,7 @@ typedef struct ClientFlags {
     uint64_t fp_detach_sent : 1; /* Main asked the owning IO thread to detach this fast-path client. */
     uint64_t fp_readmit : 1;     /* Authenticated on main; joins the fast path once main has nothing further to do for it. */
     uint64_t fp_deferred : 1;    /* Readable but turned away by the owning IO thread's in-flight cap; waiting in its deferred FIFO. */
+    uint64_t fp_prefix_open : 1; /* Fast path: no earlier non-local entry of this client sits in the batch under assembly, so a leading GET may still be answered speculatively. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -2035,6 +2036,7 @@ struct valkeyServer {
     int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */
     int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
+    int io_threads_speculative_reads;         /* Fast path: IO threads answer eligible GETs without main (speculative reader tier) */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */

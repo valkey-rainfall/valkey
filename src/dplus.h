@@ -35,6 +35,7 @@
 
 struct client;
 struct serverObject;
+struct serverDb;
 
 /* --- Component 1: Sharded version array --- */
 
@@ -264,6 +265,12 @@ void dplusOnAclRulesChanged(void);
 void dplusOnCommandResultListenersChanged(int success_listeners);
 void dplusOnMonitorsChanged(void);
 
+/* Global speculation gates: nonzero disables speculation fleet-wide while a
+ * MONITOR is attached or a module subscribes to command-result SUCCESS events.
+ * Written by main under an exclusive drain; read (acquire) by IO threads. */
+extern _Atomic int dplus_monitor_gate;
+extern _Atomic int dplus_module_cmdresult_gate;
+
 /* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
 struct client;
 
@@ -299,6 +306,52 @@ int dplusDebugUnpinReader(void);
 void dplusDebugEpochStats(uint64_t stats[8]);
 
 int dplusSpeculateBatch(struct client *c, int tid);
+
+/* --- Fast-path transport reader tier ---
+ *
+ * A single-key GET answered on the owning IO thread against Dante's fast-path
+ * transport: the reply RESP bulk is written into the batch's reply arena, not
+ * into a stock client output buffer. Reuses the same optimistic protocol as
+ * dplusSpeculateBatch (shard snapshot -> find -> copy -> fenced revalidate)
+ * and the same epoch reader bracketing, so a speculating IO thread is a
+ * registered reader for the duration of the lookup. Correctness gates
+ * (exclusive mode, ACL, MONITOR, tracking, module command-result) are checked
+ * by the caller (fpLocalEligible) before entry; this function owns only the
+ * keyspace read and its lifetime protection. */
+
+/* Outcome of one fast-path speculative GET. Every non-hit outcome punts the
+ * command to main so main keeps the exact side effect (miss notification and
+ * keyspace_misses on a miss, expiry+propagation on an expired key). */
+typedef enum {
+    DPLUS_FP_HIT = 0,          /* value written into the arena; e->local may be set */
+    DPLUS_FP_PUNT_MISS,        /* key absent: main fires keymiss + counts the miss */
+    DPLUS_FP_PUNT_EXPIRED,     /* logically expired: main expires + propagates */
+    DPLUS_FP_PUNT_TYPE,        /* not a plain string */
+    DPLUS_FP_PUNT_LARGE,       /* value larger than the arena remainder / cap */
+    DPLUS_FP_PUNT_VALIDATE,    /* shard version moved under the read (torn / racing writer) */
+    DPLUS_FP_PUNT_BRACKET,     /* writer bracket open at entry (odd version) */
+    DPLUS_FP_PUNT_GUARD,       /* exclusive mode / epoch retry / pressure gate refused entry */
+} dplusFpOutcome;
+
+/* Register (Online) / retire (Offline) an IO thread as an epoch reader. The
+ * fast-path transport calls Online when a worker slot is initialized and
+ * Offline when it is torn down, so a DRAINED worker that owns nothing also
+ * holds no reader slot and never blocks reclamation. */
+/* (dplusReaderWorkerOnline / dplusReaderWorkerOffline declared above.) */
+
+/* Speculatively answer one GET on IO thread `tid` for db `db`, key `key_sds`,
+ * RESP version `resp`. On DPLUS_FP_HIT the RESP bulk is written at `dst`
+ * (capacity `dst_cap`) and `*written` holds its length. Any other return is a
+ * punt with the reason. Per-thread hit/miss keyspace counters are maintained
+ * internally and summed by dplusFastpathKeyspaceHits/Misses. */
+dplusFpOutcome dplusFastpathSpeculateGet(int tid, struct serverDb *db, void *key_sds, int resp,
+                                         char *dst, size_t dst_cap, size_t *written);
+
+/* Per-thread keyspace hit/miss counters for the fast-path reader tier, summed
+ * across threads (racy-by-design plain reads, single-writer per slot). */
+long long dplusFastpathKeyspaceHits(void);
+long long dplusFastpathKeyspaceMisses(void);
+
 
 /* Component 5: IO-thread consumption (implemented in dplus.c).
  * Called from ioThreadReadQueryFromClient AFTER dplusSpeculateBatch succeeds.
