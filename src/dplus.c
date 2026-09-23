@@ -742,7 +742,7 @@ static size_t dplusFpWriteBulk(char *dst, size_t dst_cap, const char *val, size_
     return total;
 }
 
-dplusFpOutcome dplusFastpathSpeculateGet(int tid, serverDb *db, void *key_sds, int resp,
+dplusFpOutcome dplusFastpathSpeculateGet(int tid, serverDb *db, void *key_sds, int resp, uint64_t client_id,
                                          char *dst, size_t dst_cap, size_t *written) {
     (void)resp; /* bulk reply is RESP-agnostic; misses punt (main keeps the miss side effect) */
     *written = 0;
@@ -825,6 +825,33 @@ dplusFpOutcome dplusFastpathSpeculateGet(int tid, serverDb *db, void *key_sds, i
         out = DPLUS_FP_PUNT_TYPE;
         goto done;
     }
+
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    /* Test-only preemption point between the value copy and the validation
+     * re-read (pillar 2 of the correctness battery). Same contract as the
+     * batch path above: publish 'holding', sleep the requested window, and
+     * when a bump was armed run one full writer bracket on this key's shard
+     * so the validation below must fail. A live mutation cannot land inside
+     * this window (main parks at the rendezvous), hence the injected bracket. */
+    {
+        long long pv_hold_us = atomic_exchange_explicit(&dplus_debug_prevalidate_hold_us, 0, memory_order_seq_cst);
+        if (unlikely(pv_hold_us > 0)) {
+            atomic_fetch_add_explicit(&dplus_debug_prevalidate_consumed, 1, memory_order_seq_cst);
+            size_t klen = sdslen((sds)key_sds);
+            if (klen > sizeof(dplus_debug_pv_last_key) - 1) klen = sizeof(dplus_debug_pv_last_key) - 1;
+            memcpy(dplus_debug_pv_last_key, key_sds, klen);
+            dplus_debug_pv_last_key[klen] = '\0';
+            atomic_store_explicit(&dplus_debug_pv_last_client, client_id, memory_order_seq_cst);
+            atomic_store_explicit(&dplus_debug_reader_holding, 1, memory_order_seq_cst);
+            usleep((useconds_t)pv_hold_us);
+            if (atomic_exchange_explicit(&dplus_debug_prevalidate_bump, 0, memory_order_seq_cst)) {
+                dplusVersionBracketBegin(va, shard);
+                dplusVersionBracketEnd(va, shard);
+            }
+            atomic_store_explicit(&dplus_debug_reader_holding, 0, memory_order_seq_cst);
+        }
+    }
+#endif
 
     /* Fenced revalidation: the acquire fence orders the value copy above before
      * the version re-read, so a racing writer's bracket is always observed. */

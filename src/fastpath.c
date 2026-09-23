@@ -769,7 +769,7 @@ static int fpTrySpeculate(fpThread *t, int tid, client *c, robj **argv, int argc
     char *dst = b->arena + b->arena_used;
     size_t cap = b->arena_cap - b->arena_used;
     size_t written = 0;
-    dplusFpOutcome r = dplusFastpathSpeculateGet(tid, c->db, objectGetVal(argv[1]), c->resp, dst, cap, &written);
+    dplusFpOutcome r = dplusFastpathSpeculateGet(tid, c->db, objectGetVal(argv[1]), c->resp, c->id, dst, cap, &written);
     if (r != DPLUS_FP_HIT) {
         t->spec_punts++;
         switch (r) {
