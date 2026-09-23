@@ -344,7 +344,7 @@ typedef enum {
  * (capacity `dst_cap`) and `*written` holds its length. Any other return is a
  * punt with the reason. Per-thread hit/miss keyspace counters are maintained
  * internally and summed by dplusFastpathKeyspaceHits/Misses. */
-dplusFpOutcome dplusFastpathSpeculateGet(int tid, struct serverDb *db, void *key_sds, int resp,
+dplusFpOutcome dplusFastpathSpeculateGet(int tid, struct serverDb *db, void *key_sds, int resp, uint64_t client_id,
                                          char *dst, size_t dst_cap, size_t *written);
 
 /* Per-thread keyspace hit/miss counters for the fast-path reader tier, summed
