@@ -16,7 +16,9 @@ proc spec_kv_hits {} {
 # A raw client that sends a GET as its very first command stays on the fast
 # path (SELECT / SETNAME would move it to the main path). It therefore reads
 # db 0, so the control client below is pinned to db 0 as well. Pass defer=1
-# for the write/flush/read pipelined form.
+# for the write/flush/read pipelined form. Pipelines are sent multibulk via
+# formatCommand: the fast-path transport executes only one INLINE command per
+# read event (base behaviour, reported upstream), which would hang these tests.
 proc spec_client {{defer 0}} {
     return [valkey [srv 0 host] [srv 0 port] $defer $::tls]
 }
@@ -63,7 +65,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
         # A pipeline that begins with a write: the SET is not eligible, so it and
         # every command after it punt to main, where ordering is preserved. The
         # trailing GET must observe the write that precedes it.
-        $rd write "SET pipe new\r\nGET pipe\r\n"
+        $rd write [formatCommand SET pipe new][formatCommand GET pipe]
         $rd flush
         assert_equal OK [$rd read]
         assert_equal new [$rd read]
@@ -74,7 +76,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
         r set a 1
         r set b 2
         set rd [spec_client 1]
-        $rd write "GET a\r\nGET b\r\nSET a 9\r\nGET a\r\n"
+        $rd write [formatCommand GET a][formatCommand GET b][formatCommand SET a 9][formatCommand GET a]
         $rd flush
         assert_equal 1 [$rd read]
         assert_equal 2 [$rd read]
