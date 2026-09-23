@@ -250,6 +250,41 @@ static void submitFreeSlab(freeSlab *slab) {
     pending_free_slabs[pending_free_slabs_len++] = slab;
 }
 
+/* D+ deferred-free: hand one detached retire segment to an IO thread to be freed
+ * whole. Uses the same private-inbox round-robin as the free-slab path; on a full
+ * ring or with no active worker the caller frees the segment inline instead. */
+int submitRetireSegmentJob(void *segment) {
+    return submitSlabJob(segment, JOB_SPSC_FREE_RETIRE_SEG);
+}
+
+/* Terminal free of a sole-referenced OFFLOAD_PREF value, executed on the IO
+ * thread that received its retire segment. Mirrors freeValueNeverOnMain's
+ * per-type decision, but the "offload to an IO thread" step is a direct free
+ * because this IS an IO thread: slab-eligible object types (string and the
+ * in-object aggregates) are freed here, while types whose teardown must run on
+ * bio (streams, module values) go to the async free. A shared reference only
+ * decrements. Never called for a value that must free on main -- that is the
+ * SYNC route, which stays inline. */
+void freeRetiredValueOnWorker(robj *o) {
+    if (o->refcount > 1) {
+        decrRefCount(o);
+        return;
+    }
+    switch (o->type) {
+    case OBJ_STRING:
+    case OBJ_LIST:
+    case OBJ_SET:
+    case OBJ_ZSET:
+    case OBJ_HASH:
+        decrRefCount(o);
+        break;
+    default:
+        /* Module callbacks and stream teardown remain on bio. */
+        freeObjAsyncForce(o);
+        break;
+    }
+}
+
 static void slabAppendFree(void *ptr, int is_obj) {
     if (cur_free_slab == NULL) {
         cur_free_slab = zmalloc(sizeof(freeSlab) + FREE_SLAB_CAPACITY * sizeof(void *));
@@ -1104,6 +1139,9 @@ static void *IOThreadMain(void *myid) {
                     break;
                 case JOB_SPSC_FREE_SLAB:
                     ioThreadFreeSlab((freeSlab *)data);
+                    break;
+                case JOB_SPSC_FREE_RETIRE_SEG:
+                    dplusFreeRetireSegmentOnWorker(data, (int)id);
                     break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);

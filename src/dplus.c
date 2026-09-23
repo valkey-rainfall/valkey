@@ -1106,6 +1106,8 @@ static uint64_t dplus_forced_reclaims = 0;
 static uint64_t dplus_pressure_activations = 0;
 static uint64_t dplus_pressure_forced_drains = 0;
 static uint64_t dplus_pressure_forced_wait_us = 0;
+static uint64_t dplus_worker_segments_handed = 0;
+static uint64_t dplus_worker_entries_handed = 0;
 
 static dplusRetireChunk *dplusAllocRetireChunk(void) {
     dplusRetireChunk *chunk = dplus_retire_chunk_freelist;
@@ -1309,6 +1311,59 @@ static void dplusReclaimEntry(const dplusRetireEntry *entry) {
     }
 }
 
+/* Free one retired entry directly on the IO thread that received the segment.
+ * OFFLOAD_PREF mirrors the transport's terminal-free decision executed on this
+ * thread (freeRetiredValueOnWorker): slab-eligible object types free here, while
+ * stream/module values still go to bio -- the same outcome freeValueNeverOnMain
+ * produces on main, so lazyfree accounting is unchanged. RAW is a plain buffer
+ * free. ASYNC hands large values to bio (its submit is mutex-guarded, so any
+ * thread may enqueue). SYNC never reaches a worker: those entries are freed
+ * inline on main at handoff and a segment carrying one is never handed off
+ * (see dplusReclaimSealed). */
+static void dplusReclaimEntryOnWorker(const dplusRetireEntry *entry) {
+    robj *o = entry->ptr;
+    switch (entry->route) {
+    case DPLUS_LIMBO_OFFLOAD_PREF: freeRetiredValueOnWorker(o); break;
+    case DPLUS_LIMBO_ASYNC: lazyfreeObjPrejudged(o); break;
+    case DPLUS_LIMBO_RAW: zfree(o); break;
+    case DPLUS_LIMBO_SYNC:
+    default: serverPanic("invalid D+ worker retirement route %d", entry->route);
+    }
+}
+
+/* Does this segment carry any entry that must be freed on the main thread? A
+ * SYNC entry re-embeds a shared refcount or settles maxmemory accounting inline,
+ * so such a segment is not eligible for whole-segment worker handoff. No caller
+ * currently produces SYNC entries, so this is a guard, not a hot path. */
+static int dplusSegmentHasMainOnlyEntry(const dplusRetireSegment *segment) {
+    for (const dplusRetireChunk *chunk = segment->head; chunk; chunk = chunk->next) {
+        for (uint16_t i = chunk->first; i < chunk->first + chunk->count; i++) {
+            if (chunk->entries[i].route == DPLUS_LIMBO_SYNC) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Worker entry point: free every entry of one detached segment by its route,
+ * then release the segment metadata. The worker cannot return chunks/segment to
+ * main's recycle freelists (single-threaded owner), so it zfrees them directly;
+ * the header allocations are tiny next to the values they carry. Accounting was
+ * already decremented on main at handoff. */
+void dplusFreeRetireSegmentOnWorker(void *segment_ptr, int tid) {
+    dplusRetireSegment *segment = segment_ptr;
+    dplusRetireChunk *chunk = segment->head;
+    while (chunk) {
+        for (uint16_t i = chunk->first; i < chunk->first + chunk->count; i++) {
+            dplusReclaimEntryOnWorker(&chunk->entries[i]);
+        }
+        dplusRetireChunk *next = chunk->next;
+        zfree(chunk);
+        chunk = next;
+    }
+    zfree(segment);
+    dplus_thread_stats[tid].retire_segs_freed++;
+}
+
 static int dplusReclaimSealed(int force) {
     if (dplus_retire_head == NULL) return 1;
     size_t processed = 0;
@@ -1318,6 +1373,39 @@ static int dplusReclaimSealed(int force) {
         if (!segment->safe) {
             if (!force && !dplusRetireSegmentIsSafe(segment)) break;
             segment->safe = 1;
+        }
+
+        /* Normal path: hand the whole safe segment to an always-awake IO thread
+         * so main performs no per-entry free work. Detach it, decrement the
+         * main-owned accounting by the segment totals now (the pressure gate
+         * keys off dplus_retired_entries; limbo bytes are a lower bound until
+         * the worker physically frees), and submit. A segment carrying a
+         * main-only (SYNC) entry is not eligible; a full ring or no active
+         * worker falls through to the inline walk below. The force path (hard
+         * pressure, exclusive mode) always walks inline. */
+        if (!force && !dplusSegmentHasMainOnlyEntry(segment)) {
+            size_t seg_entries = segment->entries;
+            size_t seg_bytes = segment->bytes_lower_bound;
+            dplusRetireSegment *next = segment->next;
+            /* Detach before submit: once a worker owns it, main must not touch
+             * it. Restore the links if no worker takes it. */
+            dplus_retire_head = next;
+            if (dplus_retire_head == NULL) dplus_retire_tail = NULL;
+            segment->next = NULL;
+            if (submitRetireSegmentJob(segment)) {
+                dplus_retired_entries -= seg_entries;
+                dplus_retired_bytes_lower_bound -= seg_bytes;
+                dplus_reclaimed_entries += seg_entries;
+                dplus_retired_segments--; /* metadata now owned by the worker */
+                dplus_worker_segments_handed++;
+                dplus_worker_entries_handed += seg_entries;
+                continue;
+            }
+            /* No worker took it: re-attach at the head and fall through to the
+             * inline walk. */
+            segment->next = next;
+            dplus_retire_head = segment;
+            if (dplus_retire_tail == NULL) dplus_retire_tail = segment;
         }
 
         while (segment->head) {
@@ -1520,6 +1608,7 @@ sds dplusInfoString(sds info) {
     uint64_t entries = 0, retries = 0, epoch_exclusive_punts = 0, pressure_punts = 0;
     unsigned online = 0, active = 0, quiescent = 0;
     long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
+    uint64_t worker_segs_freed = 0;
     int debug_reader_holding = 0;
     long long debug_reader_hold_us = 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -1542,6 +1631,9 @@ sds dplusInfoString(sds info) {
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
         punted_replies += dplus_thread_stats[i].punted_replies_written;
+    }
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
+        worker_segs_freed += (uint64_t)dplus_thread_stats[i].retire_segs_freed;
     }
     info = sdscatprintf(info,
         "# Dplus\r\n"
@@ -1570,7 +1662,10 @@ sds dplusInfoString(sds info) {
         "dplus_epoch_debug_reader_hold_us:%lld\r\n"
         "dplus_doorbell_rings:%llu\r\n"
         "dplus_doorbell_coalesced:%llu\r\n"
-        "dplus_punted_replies_written:%llu\r\n",
+        "dplus_punted_replies_written:%llu\r\n"
+        "dplus_worker_segments_handed:%llu\r\n"
+        "dplus_worker_entries_handed:%llu\r\n"
+        "dplus_worker_segments_freed:%llu\r\n",
         (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
         (unsigned long long)entries,
         (unsigned long long)retries,
@@ -1596,7 +1691,10 @@ sds dplusInfoString(sds info) {
         debug_reader_hold_us,
         (unsigned long long)doorbell_rings,
         (unsigned long long)doorbell_coalesced,
-        (unsigned long long)punted_replies);
+        (unsigned long long)punted_replies,
+        (unsigned long long)dplus_worker_segments_handed,
+        (unsigned long long)dplus_worker_entries_handed,
+        (unsigned long long)worker_segs_freed);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
         "dplus_speculative_attempts:%llu\r\n"
