@@ -995,6 +995,7 @@ void dplusAggregateStats(void) {
     static long long seen_writes[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_net_bytes[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_hits[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_fp_hits[DPLUS_MAX_IO_THREADS] = {0};
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
@@ -1013,6 +1014,17 @@ void dplusAggregateStats(void) {
         if (h > seen_hits[i]) {
             server.stat_keyspace_hits += h - seen_hits[i];
             seen_hits[i] = h;
+        }
+        /* Fast-path tier: a GET answered on the owning IO thread never reaches
+         * main's lookupKey or call(), so fold it into keyspace_hits, numcommands
+         * and the GET command's calls here. Same monotonic-delta scheme. */
+        long long fh = dplus_fp_keyspace[i].hits;
+        if (fh > seen_fp_hits[i]) {
+            long long delta = fh - seen_fp_hits[i];
+            seen_fp_hits[i] = fh;
+            server.stat_keyspace_hits += delta;
+            server.stat_numcommands += delta;
+            if (get_cmd) get_cmd->calls += delta;
         }
         long long us = dplus_thread_stats[i].usec;
         if (us > seen_usec[i]) {
