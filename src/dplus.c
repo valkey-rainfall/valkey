@@ -709,9 +709,162 @@ out:
     return speculated;
 }
 
-/* --- Phase-1 no-enqueue: IO-thread command consumption --- */
+/* --- Fast-path transport reader tier --- */
 
-/* Consume speculated commands at the IO thread so they never reach main.
+/* Per-IO-thread keyspace hit/miss counters for the fast-path speculative GET.
+ * Single writer per slot (the owning IO thread); summed racily at INFO time,
+ * which can only under-read the very latest increment. Kept here rather than in
+ * dplusThreadStats so the fast-path tier owns its own accounting. */
+typedef struct dplusFpKeyspace {
+    long long hits;
+    long long misses;
+    char pad[DPLUS_CACHELINE - 2 * sizeof(long long)];
+} __attribute__((aligned(DPLUS_CACHELINE))) dplusFpKeyspace;
+
+static dplusFpKeyspace dplus_fp_keyspace[DPLUS_MAX_IO_THREADS] = {{0}};
+
+/* Write a RESP2/3 GET bulk into dst (capacity dst_cap). Returns bytes written,
+ * or 0 if it does not fit. GET's bulk framing is RESP-version-agnostic, so resp
+ * only matters for the (punted) nil case, which never reaches here. */
+static size_t dplusFpWriteBulk(char *dst, size_t dst_cap, const char *val, size_t vallen) {
+    char hdr[32];
+    hdr[0] = '$';
+    int numlen = ll2string(hdr + 1, sizeof(hdr) - 3, (long long)vallen);
+    hdr[numlen + 1] = '\r';
+    hdr[numlen + 2] = '\n';
+    size_t hdrlen = (size_t)numlen + 3;
+    size_t total = hdrlen + vallen + 2;
+    if (total > dst_cap) return 0;
+    memcpy(dst, hdr, hdrlen);
+    memcpy(dst + hdrlen, val, vallen);
+    dst[hdrlen + vallen] = '\r';
+    dst[hdrlen + vallen + 1] = '\n';
+    return total;
+}
+
+dplusFpOutcome dplusFastpathSpeculateGet(int tid, serverDb *db, void *key_sds, int resp,
+                                         char *dst, size_t dst_cap, size_t *written) {
+    (void)resp; /* bulk reply is RESP-agnostic; misses punt (main keeps the miss side effect) */
+    *written = 0;
+
+    int dict_index = 0;
+    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+    if (!ht) return DPLUS_FP_PUNT_GUARD;
+    dplusVersionArray *va = hashtableGetVersionArray(ht);
+    if (!va) return DPLUS_FP_PUNT_GUARD;
+
+    /* Epoch reader entry: publishes ACTIVE(epoch) and re-checks exclusive mode,
+     * the reclaim pressure gate and the epoch before any pointer load. A refusal
+     * here means an admin/exclusive window or reclaim pressure; punt to main. */
+    if (!dplusReaderEnter(tid)) return DPLUS_FP_PUNT_GUARD;
+
+    dplusFpOutcome out;
+    uint64_t hash = hashtableHashKey(ht, key_sds);
+    unsigned shard = DPLUS_SHARD_INDEX(hash);
+    uint64_t v_before = dplusVersionRead(va, shard);
+    if (v_before & 1) { /* S2.2a: writer bracket open -- refuse at entry */
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.bracket_entry_punts, 1, memory_order_relaxed);
+#endif
+        out = DPLUS_FP_PUNT_BRACKET;
+        goto done;
+    }
+
+    void *entry = NULL;
+    bool found = hashtableFind(ht, key_sds, &entry);
+    if (!found) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.miss_punts, 1, memory_order_relaxed);
+#endif
+        dplus_fp_keyspace[tid].misses++; /* main also counts it, but the tier reports what it saw */
+        out = DPLUS_FP_PUNT_MISS;
+        goto done;
+    }
+
+    robj *o = (robj *)entry;
+    if (objectGetType(o) != OBJ_STRING) {
+        out = DPLUS_FP_PUNT_TYPE;
+        goto done;
+    }
+    if (o->hasexpire) {
+        mstime_t when = objectGetExpire(o);
+        if (when >= 0 && mstime() >= when) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.expired_replies, 1, memory_order_relaxed);
+#endif
+            out = DPLUS_FP_PUNT_EXPIRED;
+            goto done;
+        }
+    }
+
+    /* Copy the value BEFORE the validation re-read (seqlock read side). */
+    char valbuf[DPLUS_MAX_SPECULATIVE_VALUE_LEN + 21];
+    size_t vallen;
+    int encoding = objectGetEncoding(o);
+    if (encoding == OBJ_ENCODING_INT) {
+        long long intval = (long long)(long)objectGetVal(o);
+        vallen = ll2string(valbuf, sizeof(valbuf), intval);
+    } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
+        sds s = objectGetVal(o);
+        vallen = sdslen(s);
+        if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+            atomic_fetch_add_explicit(&dplus_stats.large_value_punts, 1, memory_order_relaxed);
+#endif
+            out = DPLUS_FP_PUNT_LARGE;
+            goto done;
+        }
+        memcpy(valbuf, s, vallen);
+    } else {
+        out = DPLUS_FP_PUNT_TYPE;
+        goto done;
+    }
+
+    /* Fenced revalidation: the acquire fence orders the value copy above before
+     * the version re-read, so a racing writer's bracket is always observed. */
+    if (!dplusVersionValidate(va, shard, v_before)) {
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+        atomic_fetch_add_explicit(&dplus_stats.validation_misses, 1, memory_order_relaxed);
+#endif
+        out = DPLUS_FP_PUNT_VALIDATE;
+        goto done;
+    }
+
+    /* Value is validated. Serialize into the caller's arena slot; a value that
+     * does not fit the arena remainder punts (its predecessors already replied,
+     * so the prefix rule keeps ordering). */
+    size_t n = dplusFpWriteBulk(dst, dst_cap, valbuf, vallen);
+    if (n == 0) {
+        out = DPLUS_FP_PUNT_LARGE;
+        goto done;
+    }
+    *written = n;
+    dplus_fp_keyspace[tid].hits++;
+#ifdef IO_LOOKUP_OFFLOAD_STATS
+    atomic_fetch_add_explicit(&dplus_stats.speculative_hits, 1, memory_order_relaxed);
+#endif
+    out = DPLUS_FP_HIT;
+
+done:
+    /* Publish quiescence on every post-entry exit path (OOM-pinning invariant:
+     * a worker must not hold an ACTIVE epoch slot once it stops reading). */
+    dplusReaderWorkerQuiescent(tid);
+    return out;
+}
+
+long long dplusFastpathKeyspaceHits(void) {
+    long long sum = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) sum += dplus_fp_keyspace[i].hits;
+    return sum;
+}
+
+long long dplusFastpathKeyspaceMisses(void) {
+    long long sum = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) sum += dplus_fp_keyspace[i].misses;
+    return sum;
+}
+
+/* --- Phase-1 no-enqueue: IO-thread command consumption --- *//* Consume speculated commands at the IO thread so they never reach main.
  *
  * After dplusSpeculateBatch writes replies into c->buf and marks commands
  * with READ_FLAGS_DPLUS_SPECULATED, this function:
