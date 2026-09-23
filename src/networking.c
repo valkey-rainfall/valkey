@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "dplus.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -270,6 +271,10 @@ void clientSetUser(client *c, user *u, int authenticated) {
     c->flag.authenticated = authenticated;
     if (authenticated)
         c->flag.ever_authenticated = authenticated;
+    /* The speculative-read ACL gate follows auth state: AUTH, HELLO, RESET,
+     * module auth and the deluser kick all funnel through here. Main thread
+     * only; IO threads read the published byte. */
+    dplusRecomputeSpecAclOk(c);
 }
 
 static int clientEverAuthenticated(client *c) {
@@ -2354,6 +2359,7 @@ void clearClientConnectionState(client *c) {
 
         c->flag.monitor = 0;
         c->flag.replica = 0;
+        dplusOnMonitorsChanged(); /* speculation may resume once the last monitor detaches */
     }
 
     serverAssert(!(c->flag.replica || c->flag.primary || c->slot_migration_job));

@@ -14,12 +14,15 @@ proc spec_kv_hits {} {
 }
 
 # A raw client that sends a GET as its very first command stays on the fast
-# path (SELECT / SETNAME would move it to the main path).
-proc spec_client {} {
-    return [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+# path (SELECT / SETNAME would move it to the main path). It therefore reads
+# db 0, so the control client below is pinned to db 0 as well. Pass defer=1
+# for the write/flush/read pipelined form.
+proc spec_client {{defer 0}} {
+    return [valkey [srv 0 host] [srv 0 port] $defer $::tls]
 }
 
 start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000 io-threads-speculative-reads yes enable-debug-command yes}} {
+    r select 0
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-speculative-reads yes} [r config get io-threads-speculative-reads]
 
@@ -56,7 +59,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
 
     test "GET after SET in the same pipeline sees the new value" {
         r set pipe old
-        set rd [spec_client]
+        set rd [spec_client 1]
         # A pipeline that begins with a write: the SET is not eligible, so it and
         # every command after it punt to main, where ordering is preserved. The
         # trailing GET must observe the write that precedes it.
@@ -70,7 +73,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
     test "A leading GET run then a write in one pipeline stays coherent" {
         r set a 1
         r set b 2
-        set rd [spec_client]
+        set rd [spec_client 1]
         $rd write "GET a\r\nGET b\r\nSET a 9\r\nGET a\r\n"
         $rd flush
         assert_equal 1 [$rd read]
@@ -108,7 +111,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
 
     test "MONITOR attached forces GETs to punt to main" {
         r set mon v
-        set monc [spec_client]
+        set monc [spec_client 1]
         $monc monitor
         assert_equal OK [$monc read]
         # Let the monitor gate settle across the exclusive drain on main.
