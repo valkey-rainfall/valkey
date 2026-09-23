@@ -474,17 +474,41 @@ int dplusSpeculateBatch(client *c, int tid) {
         c->flag.buf_encoded || listLength(c->reply) != 0)
         return 0;
 
-    /* CLIENT TRACKING GUARD (E7): speculation bypasses trackingRememberKeys,
-     * so a non-BCAST tracking client could cache a speculatively-read value
-     * WITHOUT being registered in the TrackingTable — a later write would
-     * never invalidate it (stale client cache = correctness violation).
-     * Punt such clients to the stock path. BCAST tracking is unaffected
-     * (invalidation is prefix-based, not registration-based) and keeps
-     * speculating. Safe to test plain flags here: per-client io_read_state
-     * serialization means main cannot be executing this client's CLIENT
-     * TRACKING command while its read is parsed, and a tracking command
-     * inside this batch ends the speculative prefix before any later GET. */
-    if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
+    /* WRITER-SOURCE GUARD: dplusWriteBulkReply appends to c->buf and bumps
+     * c->bufpos from THIS worker while main may be running. Upstream's read
+     * job never touches the output buffer, so main's reply path has no
+     * IO-state check at all (_addReplyToBufferOrList, prepareClientToWrite)
+     * and freely pushes into a client whose read is offloaded. Speculation
+     * removes that freedom: any client main appends to asynchronously --
+     * from a producer other than the client's own command stream -- would
+     * see two writers on one buffer, plus a read-modify-write on the
+     * ClientFlags word (flag.pushing vs the parser's flag.pending_command,
+     * the io16 crash class). Those clients punt every read:
+     *   - Pub/Sub subscribers: PUBLISH / SPUBLISH / keyspace notifications
+     *     deliver via addReplyPubsubMessage on main. RESP2 forbids GET while
+     *     subscribed; RESP3 does not, so a subscriber issuing GETs is a
+     *     legitimate client shape.
+     *   - CLIENT TRACKING, any mode: invalidations deliver via
+     *     sendTrackingMessage on main -- trackingInvalidateKey for default
+     *     mode, trackingBroadcastInvalidationMessages (beforeSleep, every
+     *     write under a tracked prefix) for BCAST, tracking-redir-broken
+     *     for redirected clients whose target died. This also covers E7
+     *     (speculation bypasses trackingRememberKeys, so a default-mode
+     *     client would cache a value it is never registered to be
+     *     invalidated for).
+     *   - Primary link: main appends REPLCONF ACK with primary_force_reply.
+     *   - Replica clients and Lua debug clients: upstream's
+     *     trySendReadToIOThreads refuses these today, but the owned-client
+     *     read path (readQueryFromClient, owner_tid != 0) bypasses that
+     *     function, so the protection is restated here to keep the
+     *     invariant local rather than inherited.
+     * Enumerated from main-side addReply producers that target a client
+     * other than current_client, not from client type (PR 2976 missed
+     * tracking that way) or from the read's own side effects (the earlier
+     * E7 gate missed pubsub and BCAST that way). Plain-byte tests. */
+    if (c->flag.pubsub || c->flag.tracking || c->flag.primary ||
+        c->flag.replica || c->flag.lua_debug)
+        return 0;
 
     /* MODULE COMMAND-RESULT GUARD (F6): a subscribed module expects an exact
      * success event per executed command; speculation bypasses call() and

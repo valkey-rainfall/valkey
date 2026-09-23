@@ -263,4 +263,95 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 io-threads-owne
         $rd close
         assert_equal "PONG" [r ping]
     }
+
+    # --- A12: main-side asynchronous writers vs a speculating client ---
+    #
+    # dplusWriteBulkReply writes c->buf from the worker. Main's reply path has
+    # no IO-state guard, so any client main pushes into asynchronously (pubsub
+    # delivery, tracking invalidation) is a second writer on the same buffer
+    # and a second RMW on the ClientFlags word. The writer-source guard must
+    # punt those clients. Each test: (a) the client keeps working with correct,
+    # in-order replies under sustained main-side pushes racing pipelined GETs;
+    # (b) with an instrumented build, its GETs contribute zero speculative
+    # hits. Under TSan these were deterministic reports before the guard.
+
+    test {A12-PUBSUB: RESP3 subscriber issuing GETs punts and stays coherent under PUBLISH} {
+        r flushall
+        r set a12:k a12value
+        set sub [valkey_deferring_client]
+        $sub hello 3
+        $sub read
+        $sub subscribe a12chan
+        $sub read
+        set pub [valkey_deferring_client]
+        if {$::dplus_instrumented} { set before [dplus_field r dplus_speculative_hits] }
+        for {set round 0} {$round < 40} {incr round} {
+            for {set i 0} {$i < 10} {incr i} { $sub get a12:k }
+            for {set i 0} {$i < 10} {incr i} { $pub publish a12chan m$round }
+            for {set i 0} {$i < 10} {incr i} { $pub read }
+            set gets 0
+            set msgs 0
+            while {$gets < 10 || $msgs < 10} {
+                set reply [$sub read]
+                if {$reply eq "a12value"} {
+                    incr gets
+                } elseif {[lindex $reply 0] eq "message"} {
+                    assert_equal a12chan [lindex $reply 1]
+                    incr msgs
+                } else {
+                    fail "unexpected reply on subscriber: $reply"
+                }
+            }
+        }
+        if {$::dplus_instrumented} {
+            assert_equal $before [dplus_field r dplus_speculative_hits]
+        }
+        $sub close
+        $pub close
+        assert_equal "PONG" [r ping]
+    }
+
+    test {A12-BCAST: BCAST tracking client issuing GETs punts and stays coherent under prefix writes} {
+        r flushall
+        r set a12b:k a12value
+        set tc [valkey_deferring_client]
+        $tc hello 3
+        $tc read
+        $tc client tracking on bcast prefix a12b:
+        $tc read
+        set wr [valkey_deferring_client]
+        if {$::dplus_instrumented} { set before [dplus_field r dplus_speculative_hits] }
+        for {set round 0} {$round < 40} {incr round} {
+            for {set i 0} {$i < 10} {incr i} { $tc get a12b:k }
+            for {set i 0} {$i < 10} {incr i} { $wr set a12b:w$i $round }
+            for {set i 0} {$i < 10} {incr i} { $wr read }
+            set gets 0
+            while {$gets < 10} {
+                set reply [$tc read]
+                if {$reply eq "a12value"} {
+                    incr gets
+                } elseif {[lindex $reply 0] eq "invalidate"} {
+                    # BCAST pushes are delivered from beforeSleep; count is
+                    # timing-dependent, content must be well-formed.
+                    assert {[llength [lindex $reply 1]] >= 1}
+                } else {
+                    fail "unexpected reply on tracking client: $reply"
+                }
+            }
+        }
+        # Drain: any invalidation still in flight lands before the OK from
+        # tracking-off (same connection, main-ordered).
+        $tc client tracking off
+        while {1} {
+            set reply [$tc read]
+            if {$reply eq "OK"} break
+            assert_equal invalidate [lindex $reply 0]
+        }
+        if {$::dplus_instrumented} {
+            assert_equal $before [dplus_field r dplus_speculative_hits]
+        }
+        $tc close
+        $wr close
+        assert_equal "PONG" [r ping]
+    }
 }
