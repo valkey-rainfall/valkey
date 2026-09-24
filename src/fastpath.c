@@ -702,9 +702,21 @@ static void fpRead(fpThread *t, int tid, client *c) {
         fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }
-    parseInputBuffer(c);
-    prepareCommandQueue(c);
-    fpHarvest(t, tid, c);
+    /* Drain the read like processInputBuffer does. The multibulk parser queues every
+     * complete command it finds in one call, but the inline parser returns after one, so
+     * a pipelined inline read would otherwise leave commands in querybuf until the next
+     * network read arrives. Stop when the buffer is drained, when a partial command is
+     * waiting for bytes (no progress), or when fpHarvest began a leave or close. */
+    for (;;) {
+        size_t before = c->qb_pos;
+        parseInputBuffer(c);
+        prepareCommandQueue(c);
+        fpHarvest(t, tid, c);
+        if (c->control->lifecycle != FP_ACTIVE) break;
+        if (c->argc > 0 || c->qb_pos == before) break;
+        if (!c->querybuf || c->qb_pos >= sdslen(c->querybuf)) break;
+        c->read_flags = 0;
+    }
     trimClientQueryBuffer(c);
 }
 

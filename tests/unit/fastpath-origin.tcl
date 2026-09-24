@@ -524,3 +524,71 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {require
         fp_wait_fastpath_clients 0
     }
 }
+
+# The inline parser returns after one command where the multibulk parser queues
+# every complete command it finds, so a pipelined inline read must be drained by
+# the reader loop or the tail waits for the next network read.
+start_server {tags {"fastpath pipelining external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+    # Count +PONG replies that arrive within a bounded window. A blocking read
+    # would hang if the server never drained the tail of the pipeline, so read
+    # raw bytes non-blocking and stop at n or at the deadline.
+    proc fp_read_pongs {rd n {timeout_ms 2000}} {
+        set fd [$rd channel]
+        fconfigure $fd -blocking 0
+        set buf ""
+        set deadline [expr {[clock milliseconds] + $timeout_ms}]
+        while {[clock milliseconds] < $deadline} {
+            append buf [read $fd]
+            if {[regexp -all {\+PONG\r\n} $buf] >= $n} break
+            after 10
+        }
+        fconfigure $fd -blocking 1
+        return [regexp -all {\+PONG\r\n} $buf]
+    }
+
+    test {Fast path: pipelined inline commands in one write are all served} {
+        set a [fp_client]
+        $a ping
+        assert_equal PONG [$a read]
+        fp_wait_fastpath_clients 1
+        $a write [string repeat "PING\r\n" 20]
+        $a flush
+        set got [fp_read_pongs $a 20]
+        $a close
+        fp_wait_fastpath_clients 0
+        assert_equal 20 $got
+    }
+
+    test {Fast path: pipelined multibulk commands in one write are all served} {
+        set a [fp_client]
+        $a ping
+        assert_equal PONG [$a read]
+        fp_wait_fastpath_clients 1
+        $a write [string repeat "*1\r\n\$4\r\nPING\r\n" 20]
+        $a flush
+        set got [fp_read_pongs $a 20]
+        $a close
+        fp_wait_fastpath_clients 0
+        assert_equal 20 $got
+    }
+
+    test {Fast path: an inline pipeline with a trailing partial resumes on the next read} {
+        set a [fp_client]
+        $a ping
+        assert_equal PONG [$a read]
+        fp_wait_fastpath_clients 1
+        $a write "PING\r\nPING\r\nPI"
+        $a flush
+        set first [fp_read_pongs $a 2]
+        $a write "NG\r\n"
+        $a flush
+        set second [fp_read_pongs $a 1]
+        # Still on the fast path: nothing here should have demoted the client.
+        set still [getInfoProperty [r info fastpath] fastpath_clients]
+        $a close
+        fp_wait_fastpath_clients 0
+        assert_equal 2 $first
+        assert_equal 1 $second
+        assert_equal 1 $still
+    }
+}
