@@ -183,8 +183,27 @@ size_t pendingMainFreesLen(void) {
     return n;
 }
 
-/* Pending-free bytes leave maxmemory pressure until physical reclamation completes. */
-static _Atomic size_t offload_pending_free_bytes = 0;
+/* Pending-free bytes leave maxmemory pressure until physical reclamation completes.
+ *
+ * Accounting is per thread: the thread that hands a value off adds on its own
+ * slot, the IO thread that frees it subtracts on its own slot, and every slot
+ * owns a cache line. A single shared counter would be RMW'd once per handoff by
+ * main and once per free by whichever IO thread received the slab, so the line
+ * would migrate between cores on every write under load. The only reader is
+ * maxmemory accounting on the main thread, which sums the slots (see
+ * offloadPendingFreeBytes). */
+typedef struct offloadFreeSlot {
+    _Atomic long long bytes;
+    char pad[CACHE_LINE_SIZE - sizeof(_Atomic long long)];
+} __attribute__((aligned(CACHE_LINE_SIZE))) offloadFreeSlot;
+
+static offloadFreeSlot offload_free_slots[IO_THREADS_MAX_NUM];
+/* Main-thread snapshot of the IO-thread slots, refreshed at most once per
+ * millisecond so maxmemory checks do not read one remote line per IO thread
+ * per command. A retiring thread's balance is folded into main's slot in
+ * freeIOThreadSlot, so summing 1..io_worker_hwm never drops bytes. */
+static long long offload_worker_slots_cached = 0;
+static mstime_t offload_worker_slots_cached_ms = -1;
 
 /* Estimates never exceed physical frees, so maxmemory cannot under-evict. */
 static inline size_t offloadObjFreeBytes(robj *o) {
@@ -195,11 +214,11 @@ static inline size_t offloadObjFreeBytes(robj *o) {
 }
 
 static inline void offloadFreeAccountAdd(size_t bytes) {
-    atomic_fetch_add_explicit(&offload_pending_free_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&offload_free_slots[thread_id].bytes, (long long)bytes, memory_order_relaxed);
 }
 
 static inline void offloadFreeAccountSub(size_t bytes) {
-    atomic_fetch_sub_explicit(&offload_pending_free_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&offload_free_slots[thread_id].bytes, (long long)bytes, memory_order_relaxed);
 }
 
 /* Client eviction reclaims inline so its next pressure check sees the freed bytes. */
@@ -213,7 +232,19 @@ void endInlineReclaim(void) {
 }
 
 size_t offloadPendingFreeBytes(void) {
-    return atomic_load_explicit(&offload_pending_free_bytes, memory_order_relaxed);
+    serverAssert(inMainThread());
+    if (offload_worker_slots_cached_ms != server.mstime) {
+        long long sum = 0;
+        for (int i = 1; i < io_worker_hwm; i++)
+            sum += atomic_load_explicit(&offload_free_slots[i].bytes, memory_order_relaxed);
+        offload_worker_slots_cached = sum;
+        offload_worker_slots_cached_ms = server.mstime;
+    }
+    /* Main's own slot is always read live so an eviction sees the bytes it just
+     * handed off; the worker slots lag by at most one millisecond. */
+    long long pending = atomic_load_explicit(&offload_free_slots[0].bytes, memory_order_relaxed) +
+                        offload_worker_slots_cached;
+    return pending > 0 ? (size_t)pending : 0;
 }
 
 #ifdef DEBUG_NEVER_FREE_ON_MAIN
@@ -1166,6 +1197,11 @@ static void freeIOThreadSlot(int id) {
         io_partition_clients[id] = NULL;
     }
     io_threads[id] = 0;
+    /* The thread is joined: nothing writes its accounting slot any more. Keep
+     * its balance by folding it into main's slot before hwm may drop the id. */
+    long long retired_bytes = atomic_exchange_explicit(&offload_free_slots[id].bytes, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&offload_free_slots[0].bytes, retired_bytes, memory_order_relaxed);
+    offload_worker_slots_cached_ms = -1; /* force a fresh worker sum */
     atomic_store_explicit(&io_worker_state[id], IO_WORKER_ABSENT, memory_order_release);
     while (io_worker_hwm > 1 && ioWorkerState(io_worker_hwm - 1) == IO_WORKER_ABSENT) io_worker_hwm--;
 }
