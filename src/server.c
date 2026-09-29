@@ -2018,10 +2018,14 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
-    /* D+: fold per-IO-thread speculated command counters into stat_numcommands, then seal this
-     * loop's retirements, advance the epoch and reclaim what no reader can still reach. */
-    dplusAggregateStats();
-    dplusReclaimRetired();
+    /* One staged iteration: read the policy once into a local, then drive the stages. The primary
+     * drive is processIOThreadsResponses(): handoff.take dequeues each worker's submit ring,
+     * stageExecute runs the batch, and write.publish returns it to the IO owner (fastpathDrain),
+     * ahead of the legacy ring completions and the high-priority/normal outboxes it also drains.
+     * Epoch bookkeeping (fold speculated counts, seal, advance, reclaim) moved to the end of the
+     * iteration, next to where the frees happen. */
+    stagePolicy stage_policy = stagePolicyRead();
+    UNUSED(stage_policy); /* consumed by the read gate and fanout in later steps; read once here now */
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -2194,6 +2198,12 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * connection has pending data). Fast-path batches arrive on rings the
      * event loop knows nothing about, so main polls while such clients exist. */
     aeSetDontWait(server.el, dont_sleep || fastpathClientCount() > 0);
+
+    /* Epoch bookkeeping at the end of the staged iteration, where this loop's frees happen: fold
+     * this loop's speculated command counters into the stats, then seal the retirements, advance
+     * the epoch, and reclaim what no reader can still reach. */
+    dplusAggregateStats();
+    dplusReclaimRetired();
 
     updateCopyAvoidPressure(current_time);
 

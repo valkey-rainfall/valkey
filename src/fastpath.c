@@ -1189,6 +1189,61 @@ static void fpRetFlushOverflow(fpThread *t) {
     }
 }
 
+/* handoff.take: move a run of published batches off one worker's submit ring into the caller's
+ * ready array and warm the client state each batch's commands will touch. Returns how many batches
+ * it took. The prefetch is part of take: it is the read that execute immediately depends on. */
+static size_t handoffTake(fpThread *t, void **items, size_t cap, int use_prefetch, int paused) {
+    size_t n = spscDequeueBatch(&t->submit, items, cap);
+    if (n == 0) return 0;
+    if (use_prefetch && !paused) {
+        for (size_t i = 0; i < n; i++) {
+            cmdBatch *b = items[i];
+            getKeysResult result;
+            initGetKeysResult(&result);
+            int room = 1;
+            ClientControl *last_control = NULL;
+            for (int k = 0; k < b->count && room; k++) {
+                cmdEntry *e = &b->e[k];
+                ClientControl *cc = e->handle.control;
+                if (cc != last_control) {
+                    __builtin_prefetch(cc);
+                    __builtin_prefetch(&cc->reply_bytes_produced, 1, 1);
+                    last_control = cc;
+                }
+                if (!e->cmd || (e->read_flags & READ_FLAGS_BAD_ARITY)) continue;
+                room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
+            }
+            getKeysFreeResult(&result);
+            prefetchBatchRun();
+            prefetchBatchReset();
+        }
+    }
+    return n;
+}
+
+/* execute: run one taken batch's commands on the shared executor, writing replies into the batch
+ * arena and charging them. Main holds the batch here. */
+static void stageExecuteBatch(client *ec, cmdBatch *b) {
+    stageAssertHolds(b); /* handoff take completed: main holds the published batch through execute */
+    for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
+    fpReplyChargeBatch(b);
+    ec->origin = NULL;
+    clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
+}
+
+/* write.publish: return the executed batch to its IO owner, which writes the replies out. */
+static void stageWritePublish(fpThread *t, cmdBatch *b) {
+    stageAssertHolds(b);                                              /* main held it through execute */
+    b->holder = (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)b->io_tid}; /* returned to its IO owner */
+    spscEnqueue(&t->ret, b, false);
+}
+
+/* One drain of the fast-path lane: take -> execute -> write.publish per worker, with the
+ * io_batch_drain_us deadline wrapped around take+execute+publish together so a thin batch still
+ * amortizes. This is the fast-path ready queue; legacy io-thread completions and the priority
+ * outboxes stay a separate ordered lane after it in processIOThreadsResponses (see the step-1 note
+ * in SLP-REPORT: unifying the two into one physical queue needs a per-command dispatch and is not
+ * done here). */
 int fastpathDrain(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
@@ -1203,40 +1258,14 @@ again:
         if (t->submit.buffer == NULL) continue;
         if (unlikely(listLength(t->ret_overflow) > 0)) fpRetFlushOverflow(t);
         void *items[8];
-        size_t n = spscDequeueBatch(&t->submit, items, 8);
+        size_t n = handoffTake(t, items, 8, use_prefetch, paused);
         if (n == 0) continue;
         client *ec = fpExecutor(tid);
         for (size_t i = 0; i < n; i++) {
             cmdBatch *b = items[i];
-            stageAssertHolds(b); /* handoff take: main now holds the published batch */
-            if (use_prefetch && !paused) {
-                getKeysResult result;
-                initGetKeysResult(&result);
-                int room = 1;
-                ClientControl *last_control = NULL;
-                for (int k = 0; k < b->count && room; k++) {
-                    cmdEntry *e = &b->e[k];
-                    ClientControl *cc = e->handle.control;
-                    if (cc != last_control) {
-                        __builtin_prefetch(cc);
-                        __builtin_prefetch(&cc->reply_bytes_produced, 1, 1);
-                        last_control = cc;
-                    }
-                    if (!e->cmd || (e->read_flags & READ_FLAGS_BAD_ARITY)) continue;
-                    room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
-                }
-                getKeysFreeResult(&result);
-                prefetchBatchRun();
-                prefetchBatchReset();
-            }
-            for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
-            fpReplyChargeBatch(b);
-            ec->origin = NULL;
-            clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
+            stageExecuteBatch(ec, b);
             total += b->count;
-            stageAssertHolds(b);                                          /* handoff return: main held it through execute */
-            b->holder = (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)b->io_tid}; /* returned to its IO owner */
-            spscEnqueue(&t->ret, b, false);
+            stageWritePublish(t, b);
         }
         spscCommit(&t->ret);
     }
