@@ -623,7 +623,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
 }
 
 /* The first unsupported command and all successors remain queued for main. */
-static void fpHarvest(fpThread *t, int tid, client *c) {
+static void handoffPublish(fpThread *t, int tid, client *c) {
     int leave = 0;
     int max = server.io_batch_commands;
     cmdQueue *q = &c->cmd_queue;
@@ -686,7 +686,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     q->off = q->len = 0;
 }
 
-static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
+static void stageWriteSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
 
 /* Reads at the head of what a client just sent execute here, on its owning IO thread: a
  * contiguous prefix of GETs is answered from the keyspace under D+ version validation and the
@@ -694,7 +694,7 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
  * command after it, goes to main in the batch, so a read never overtakes an earlier write of the
  * same connection. For the same reason nothing is executed here while the client still has
  * commands pending on main. */
-static void fpSpeculate(fpThread *t, int tid, client *c) {
+static void stageExecuteEligible(fpThread *t, int tid, client *c) {
     if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
     int n = dplusSpeculateBatch(c, tid);
     if (n <= 0) return;
@@ -703,10 +703,10 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
     t->speculated += n;
     struct iovec iov = {.iov_base = c->buf, .iov_len = c->bufpos};
     c->bufpos = 0;
-    fpSend(t, c, &iov, 1);
+    stageWriteSend(t, c, &iov, 1);
 }
 
-static void fpRead(fpThread *t, int tid, client *c) {
+static void stageReadCollect(fpThread *t, int tid, client *c) {
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     readToQueryBuf(c);
     t->reads++;
@@ -737,8 +737,8 @@ static void fpRead(fpThread *t, int tid, client *c) {
         parseInputBuffer(c);
         int completed = c->read_flags & READ_FLAGS_PARSING_COMPLETED;
         prepareCommandQueue(c);
-        fpSpeculate(t, tid, c);
-        if (c->control->lifecycle == FP_ACTIVE) fpHarvest(t, tid, c);
+        stageExecuteEligible(t, tid, c);
+        if (c->control->lifecycle == FP_ACTIVE) handoffPublish(t, tid, c);
         /* Stop once the client has left the fast path, a partial command needs more
          * bytes, a parse error is pending for main, or the buffer is drained. */
         if (c->control->lifecycle != FP_ACTIVE) break;
@@ -765,7 +765,7 @@ static void fpServeDeferred(fpThread *t, int tid) {
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
         c->flag.fp_deferred = 0;
         if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) continue; /* still readable; the poll brings it back */
-        fpRead(t, tid, c);
+        stageReadCollect(t, tid, c);
     }
 }
 
@@ -779,7 +779,7 @@ void fastpathClientReadable(int tid, client *c) {
         fpServeDeferred(t, tid);
         return;
     }
-    fpRead(t, tid, c);
+    stageReadCollect(t, tid, c);
 }
 
 static void fpEnableWriteInterest(client *c, int on) {
@@ -804,7 +804,7 @@ static int fpFlushOut(fpThread *t, client *c) {
 }
 
 /* Buffered bytes always precede newly returned replies. */
-static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
+static void stageWriteSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     stageAssertOwner(c->control); /* write send: only the current owner may write this connection's output */
     if (c->control->lifecycle == FP_CLOSING) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
@@ -894,7 +894,7 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
 }
 
 /* Consecutive entries for one client share a writev. */
-static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
+static void handoffReturn(fpThread *t, cmdBatch *b) {
     struct iovec iov[IO_BATCH_MAX];
     int i = 0;
     while (i < b->count) {
@@ -915,7 +915,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             j++;
         }
         if (c) {
-            if (n) fpSend(t, c, iov, n);
+            if (n) stageWriteSend(t, c, iov, n);
             c->fp_inflight -= (j - i);
             c->commands_processed += (j - i) - requeued;
             if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
@@ -1063,7 +1063,7 @@ int fastpathProcessReturns(int tid) {
                 continue;
             }
             cmdBatch *b = (cmdBatch *)v;
-            fpDeliverBatch(t, b);
+            handoffReturn(t, b);
             fpRecycleBatch(t, b);
             t->inflight--;
         }
