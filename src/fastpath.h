@@ -3,6 +3,7 @@
 
 #include "server.h"
 #include "queues.h"
+#include "stage_thread.h"
 
 #define IO_BATCH_MAX 64
 
@@ -97,6 +98,7 @@ typedef struct cmdBatch {
     size_t arena_cap;
     size_t arena_used;
     monotime opened_us;
+    stageThreadId holder; /* the thread currently entitled to touch this batch; set at handoff publish/take/return */
     cmdEntry e[IO_BATCH_MAX];
 } cmdBatch;
 

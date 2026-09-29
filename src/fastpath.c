@@ -2,6 +2,7 @@
 
 #include "server.h"
 #include "fastpath.h"
+#include "stage.h"
 #include "io_threads.h"
 #include "memory_prefetch.h"
 #include "dplus.h"
@@ -97,6 +98,7 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     b->io_tid = tid;
     b->arena_used = 0;
     b->opened_us = getMonotonicUs();
+    b->holder = (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)tid}; /* the IO owner holds it until publish */
     return b;
 }
 
@@ -471,6 +473,8 @@ static int fpCommandAllowed(struct serverCommand *cmd) {
 static void fpSubmit(fpThread *t) {
     cmdBatch *b = t->cur;
     if (!b || b->count == 0) return;
+    stageAssertHolds(b);                      /* handoff publish: only the IO owner may publish its batch */
+    b->holder = (stageThreadId){STAGE_DOMAIN_MAIN, 0}; /* published to main, which executes it */
     t->cur = NULL;
     spscEnqueue(&t->submit, b, true);
     t->inflight++;
@@ -694,6 +698,7 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
     if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
     int n = dplusSpeculateBatch(c, tid);
     if (n <= 0) return;
+    stageAssertOwner(c->control); /* reply-append: the speculated reply lands in this owner's reply buffer */
     dplusConsumeSpeculated(c, n, tid);
     t->speculated += n;
     struct iovec iov = {.iov_base = c->buf, .iov_len = c->bufpos};
@@ -800,6 +805,7 @@ static int fpFlushOut(fpThread *t, client *c) {
 
 /* Buffered bytes always precede newly returned replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
+    stageAssertOwner(c->control); /* write send: only the current owner may write this connection's output */
     if (c->control->lifecycle == FP_CLOSING) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
@@ -1202,6 +1208,7 @@ again:
         client *ec = fpExecutor(tid);
         for (size_t i = 0; i < n; i++) {
             cmdBatch *b = items[i];
+            stageAssertHolds(b); /* handoff take: main now holds the published batch */
             if (use_prefetch && !paused) {
                 getKeysResult result;
                 initGetKeysResult(&result);
@@ -1227,6 +1234,8 @@ again:
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
+            stageAssertHolds(b);                                          /* handoff return: main held it through execute */
+            b->holder = (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)b->io_tid}; /* returned to its IO owner */
             spscEnqueue(&t->ret, b, false);
         }
         spscCommit(&t->ret);

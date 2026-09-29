@@ -52,6 +52,7 @@
 #include "io_threads.h"
 #include "compression.h"
 #include "fastpath.h"
+#include "stage.h"
 #include "tls.h"
 #include "sds.h"
 #include "module.h"
@@ -3143,6 +3144,7 @@ void initServer(void) {
     setupSignalHandlers();
     ThreadsManager_init();
     makeThreadKillable();
+    stageSetSelf(STAGE_DOMAIN_MAIN, 0); /* this thread walks the main domain of every stage */
 
     if (server.syslog_enabled) {
         openlog(server.syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT, server.syslog_facility);

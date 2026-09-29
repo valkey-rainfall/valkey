@@ -12,6 +12,7 @@
 #include "connhelpers.h"
 #include "dplus.h"
 #include "fastpath.h"
+#include "stage.h"
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
@@ -1109,6 +1110,7 @@ static void *IOThreadMain(void *myid) {
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
+    stageSetSelf(STAGE_DOMAIN_IO, (uint16_t)id); /* this thread owns fast-path connections end to end */
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;

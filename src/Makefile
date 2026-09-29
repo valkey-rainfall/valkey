@@ -563,6 +563,7 @@ ENGINE_SERVER_OBJ = \
     intset.o \
     io_threads.o \
     fastpath.o \
+    stage.o \
     kvstore.o \
     latency.o \
     lazyfree.o \
