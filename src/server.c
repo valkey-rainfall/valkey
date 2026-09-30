@@ -2022,8 +2022,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * drive is processIOThreadsResponses(): handoff.take dequeues each worker's submit ring,
      * stageExecute runs the batch, and write.publish returns it to the IO owner (fastpathDrain),
      * ahead of the legacy ring completions and the high-priority/normal outboxes it also drains.
-     * Epoch bookkeeping (fold speculated counts, seal, advance, reclaim) moved to the end of the
-     * iteration, next to where the frees happen. */
+     * Epoch bookkeeping runs at the head in this diag build (see above). */
+    /* DIAG (reclaim-head): epoch bookkeeping back at the head of the iteration, as on the base,
+     * to discriminate the reclaim move from layout in the step-1 flat A/B. */
+    dplusAggregateStats();
+    dplusReclaimRetired();
     stagePolicy stage_policy = stagePolicyRead();
     UNUSED(stage_policy); /* consumed by the read gate and fanout in later steps; read once here now */
     int io_responses = processIOThreadsResponses();
@@ -2198,12 +2201,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * connection has pending data). Fast-path batches arrive on rings the
      * event loop knows nothing about, so main polls while such clients exist. */
     aeSetDontWait(server.el, dont_sleep || fastpathClientCount() > 0);
-
-    /* Epoch bookkeeping at the end of the staged iteration, where this loop's frees happen: fold
-     * this loop's speculated command counters into the stats, then seal the retirements, advance
-     * the epoch, and reclaim what no reader can still reach. */
-    dplusAggregateStats();
-    dplusReclaimRetired();
 
     updateCopyAvoidPressure(current_time);
 
