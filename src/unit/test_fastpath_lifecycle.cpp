@@ -150,7 +150,7 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     std::string req = std::string(INCR_A) + INCR_A + INCR_A;
     send(peer, req.c_str());
     fastpathClientReadable(1, c);
-    EXPECT_EQ(c->fp_inflight, 3u);
+    EXPECT_EQ(fastpathClientInflight(c), 3u);
     EXPECT_EQ(fastpathDrain(), 0); /* below the batch size, nothing published yet */
 
     fastpathWorkerQuiesce(1);
@@ -158,7 +158,7 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     fastpathProcessReturns(1);
     EXPECT_EQ(fastpathDrain(), 0); /* nothing was published after the quiesce */
     EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
-    EXPECT_EQ(c->fp_inflight, 0u);
+    EXPECT_EQ(fastpathClientInflight(c), 0u);
     EXPECT_EQ(c->argc, 2);
     EXPECT_EQ(c->cmd_queue.len - c->cmd_queue.off, 2);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_DRAINED);
@@ -187,18 +187,18 @@ TEST_F(FastpathLifecycleTest, QuiesceWaitsForInflightBatchThenCancelsTheRest) {
     fastpathSubmitPending(1); /* published: one batch of two */
     send(peer, two.c_str());
     fastpathClientReadable(1, c); /* two more, unpublished */
-    EXPECT_EQ(c->fp_inflight, 4u);
+    EXPECT_EQ(fastpathClientInflight(c), 4u);
 
     fastpathWorkerQuiesce(1);
     fastpathProcessReturns(1); /* observed; a batch is still out, so nothing is cancelled */
     EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_QUIESCING);
-    EXPECT_EQ(c->fp_inflight, 4u);
+    EXPECT_EQ(fastpathClientInflight(c), 4u);
 
     EXPECT_EQ(fastpathDrain(), 2); /* main runs the published batch only */
     fastpathProcessReturns(1);     /* replies written, remainder requeued, client handed off */
     EXPECT_EQ(recv(peer), ":1\r\n:2\r\n");
-    EXPECT_EQ(c->fp_inflight, 0u);
+    EXPECT_EQ(fastpathClientInflight(c), 0u);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_DRAINED);
     EXPECT_EQ(fastpathDrain(), 0);
 

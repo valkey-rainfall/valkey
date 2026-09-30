@@ -140,7 +140,7 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     const char *req = "*2\r\n$3\r\nGET\r\n$5\r\nnokey\r\n*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     ASSERT_EQ(write(sv[1], req, strlen(req)), (ssize_t)strlen(req));
     fastpathClientReadable(1, c);
-    ASSERT_EQ(c->fp_inflight, 2u);
+    ASSERT_EQ(fastpathClientInflight(c), 2u);
     fastpathSubmitPending(1);
 
     /* Main runs the batch while the client is unreachable: it must resolve via handle + origin only. */
@@ -150,7 +150,7 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
 
     /* Back on the IO thread the handle resolves to the client again: replies go out, entries released. */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
-    EXPECT_EQ(c->fp_inflight, 0u);
+    EXPECT_EQ(fastpathClientInflight(c), 0u);
     EXPECT_EQ(readReply(sv[1]), "$-1\r\n+OK\r\n");
     robj *key = createStringObject("foo", 3);
     EXPECT_NE(lookupKeyRead(server.db[0], key), nullptr);

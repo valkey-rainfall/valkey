@@ -311,7 +311,7 @@ TEST_F(FastpathClientControlTest, ReplyAccountingProducesAndReleasesExactly) {
     const char *req = "*2\r\n$4\r\nINCR\r\n$4\r\nrc:a\r\n*2\r\n$4\r\nINCR\r\n$4\r\nrc:a\r\n";
     send(peer, req);
     fastpathClientReadable(1, c);
-    EXPECT_EQ(c->fp_inflight, 2u);
+    EXPECT_EQ(fastpathClientInflight(c), 2u);
     fastpathSubmitPending(1);
 
     /* Main executes the batch: replies become retained storage, so produced advances by the reply

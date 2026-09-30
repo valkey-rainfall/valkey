@@ -40,13 +40,27 @@ static_assert(sizeof(ClientControl) == 3 * CACHE_LINE_SIZE, "identity/control li
 #define FP_RET_RESERVE 64 /* ring slots admission leaves free so returned batches and detaches never block */
 #define FP_OWNER_SLOT_NONE UINT32_MAX
 
+#define FP_OWNER_SLOT_BYTES 64 /* one 64-byte element per owned client (x86-64 / Graviton line; see the layout note) */
+
+/* One IO-owner-private element per client an IO thread owns: the O(1) handle-resolution pair plus the
+ * per-command client state that only the owning IO thread touches. Kept off struct client so no IO
+ * thread writes any bit of the shared ClientFlags word (fp_deferred was a flag bit) and so the state
+ * of a client an IO thread owns lives thread-private, one 64-byte element per owned client. The table
+ * grows by reallocation, so it is reached only by index (fpSlot()), never by a cached pointer. */
 typedef struct fpOwnerSlot {
-    ClientControl *control;
+    /* hot line: resolution + per-command state, all clean IO-owner-private */
+    _Alignas(FP_OWNER_SLOT_BYTES) ClientControl *control; /* resolve + generation check; 64-byte-aligned element */
     union {
-        client *connection;
-        uint32_t next_free;
+        client *connection;   /* the owned client, when the slot is in use */
+        uint32_t next_free;    /* free-list link when the slot is free (control == NULL) */
     };
+    uint32_t fp_inflight;      /* this client's commands on main right now */
+    uint16_t fp_held;          /* commands main handed back, now first in argv + cmd_queue */
+    uint8_t fp_deferred;       /* readable but turned away by the in-flight cap; waiting in the deferred FIFO */
+    char pad[64 - (2 * sizeof(void *) + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t))]; /* fill to one 64-byte element */
 } fpOwnerSlot;
+static_assert(sizeof(fpOwnerSlot) == FP_OWNER_SLOT_BYTES, "fpOwnerSlot is exactly one 64-byte element");
+static_assert(_Alignof(fpOwnerSlot) == FP_OWNER_SLOT_BYTES, "fpOwnerSlot elements are 64-byte aligned");
 
 typedef struct fpThread {
     spscQueue submit; /* IO thread -> main: cmdBatch * */
@@ -74,6 +88,14 @@ typedef struct fpThread {
     long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals, speculated;
 } fpThread;
 
+/* Index-only access to a client's owner slot. The table grows by reallocation (fpOwnerSlotAssign), so
+ * a fpOwnerSlot * must never be held across any call that can reach fpOwnerSlotAssign on the same
+ * thread; resolve by index at the point of use instead. Debug-asserts the client is currently owned. */
+static inline fpOwnerSlot *fpSlot(fpThread *t, client *c) {
+    serverAssert(c->fp_owner_slot != FP_OWNER_SLOT_NONE && c->fp_owner_slot < t->owner_slots_len);
+    return &t->owner_slots[c->fp_owner_slot];
+}
+
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
 static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per IO thread */
 static size_t fastpath_clients = 0;                 /* main thread only */
@@ -83,6 +105,14 @@ static long long fp_retired[7]; /* main thread only: counters of threads since r
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
+}
+
+/* Test/observability accessor: this client's in-flight count, now held in its IO owner slot. Returns 0
+ * when the client owns no slot (not attached, or already handed back), so a caller never indexes a
+ * freed slot. Reached by index through the owning thread's table; the owner is the only writer. */
+uint32_t fastpathClientInflight(client *c) {
+    if (c->fp_owner_slot == FP_OWNER_SLOT_NONE) return 0;
+    return fp_threads[c->io_tid].owner_slots[c->fp_owner_slot].fp_inflight;
 }
 
 static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
@@ -441,14 +471,12 @@ int fastpathAttach(client *c) {
     if (fastpathControlEnsure(c) != C_OK) return C_ERR;
     c->io_tid = tid;
     c->flag.fastpath = 1;
-    c->fp_inflight = 0;
-    c->fp_held = 0;
     c->fp_owner_slot = FP_OWNER_SLOT_NONE;
     c->fp_out = NULL;
-    c->flag.fp_deferred = 0;
     listInitNode(&c->fp_defer_node, c);
-    /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
-     * next writer of these fields. control->lifecycle is the single source of truth for the state. */
+    /* fp_inflight, fp_held and fp_deferred now live in the owner slot and are zero-initialised there
+     * when the IO thread assigns it (fpOwnerSlotAssign); attach, which runs on main before the slot
+     * exists, no longer initialises them. control->lifecycle is the single source of truth for state. */
     c->control->owner_domain = CC_OWNER_IO;
     c->control->owner_tid = (uint8_t)tid;
     c->control->lifecycle = FP_ACTIVE;
@@ -499,15 +527,28 @@ static void fpOwnerSlotAssign(fpThread *t, client *c) {
         if (t->owner_slots_len == t->owner_slots_cap) {
             uint32_t cap = t->owner_slots_cap ? t->owner_slots_cap * 2 : 64;
             serverAssert(cap > t->owner_slots_cap);
-            t->owner_slots = zrealloc(t->owner_slots, (size_t)cap * sizeof(*t->owner_slots));
+            /* zrealloc cannot preserve the 64-byte element alignment, so grow into a fresh
+             * cache-aligned table and copy the live elements over. */
+            fpOwnerSlot *grown = zmalloc_cache_aligned((size_t)cap * sizeof(*grown));
+            if (t->owner_slots) {
+                memcpy(grown, t->owner_slots, (size_t)t->owner_slots_len * sizeof(*grown));
+                zfree(t->owner_slots);
+            }
+            t->owner_slots = grown;
             t->owner_slots_cap = cap;
         }
         index = t->owner_slots_len++;
     }
     ClientControl *cc = c->control;
     if (++cc->generation == 0) cc->generation++;
-    t->owner_slots[index].control = cc;
-    t->owner_slots[index].connection = c;
+    fpOwnerSlot *slot = &t->owner_slots[index];
+    slot->control = cc;
+    slot->connection = c;
+    /* fastpathAttach runs on main before the slot exists (it is assigned here, on the IO thread), so
+     * the moved per-command fields are zero-initialised at assign, not at attach. */
+    slot->fp_inflight = 0;
+    slot->fp_held = 0;
+    slot->fp_deferred = 0;
     t->owner_slots_used++;
     c->fp_owner_slot = index;
 }
@@ -567,9 +608,9 @@ static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
-    if (c->flag.fp_deferred) {
+    if (fpSlot(t, c)->fp_deferred) {
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
-        c->flag.fp_deferred = 0;
+        fpSlot(t, c)->fp_deferred = 0;
     }
     listUnlinkNode(&t->owned, &c->io_owner_node);
     listLinkNodeTail(&t->leaving, &c->io_owner_node);
@@ -596,7 +637,7 @@ static void fpExecuteRequests(fpThread *t, client *c) {
     atomic_fetch_and_explicit(&cc->requests, ~win, memory_order_release);
 }
 
-static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
+static void fpAppendEntry(fpThread *t, cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
                           unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
     e->handle = fastpathHandleFor(c);
@@ -619,7 +660,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->reply_big = NULL;
     e->reply_big_len = 0;
     e->requeued = 0;
-    c->fp_inflight++;
+    fpSlot(t, c)->fp_inflight++;
 }
 
 /* The first unsupported command and all successors remain queued for main. */
@@ -633,7 +674,7 @@ static void handoffPublish(fpThread *t, int tid, client *c) {
             leave = 1;
         } else {
             if (!t->cur) t->cur = fpAllocBatch(t, tid);
-            fpAppendEntry(t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
+            fpAppendEntry(t, t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
                           c->parsed_cmd, c->slot, c->read_flags);
             c->argv = NULL;
             c->argc = 0;
@@ -657,7 +698,7 @@ static void handoffPublish(fpThread *t, int tid, client *c) {
             break;
         }
         if (!t->cur) t->cur = fpAllocBatch(t, tid);
-        fpAppendEntry(t->cur, c, p->argv, p->argc, p->argv_len, p->argv_len_sum, p->input_bytes, p->cmd, p->slot,
+        fpAppendEntry(t, t->cur, c, p->argv, p->argc, p->argv_len, p->argv_len_sum, p->input_bytes, p->cmd, p->slot,
                       p->read_flags);
         q->off++;
         if (t->cur->count >= max) fpSubmit(t);
@@ -695,7 +736,7 @@ static void stageWriteSend(fpThread *t, client *c, struct iovec *iov, int iovcnt
  * same connection. For the same reason nothing is executed here while the client still has
  * commands pending on main. */
 static void stageExecuteEligible(fpThread *t, int tid, client *c) {
-    if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
+    if (fpSlot(t, c)->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
     int n = dplusSpeculateBatch(c, tid);
     if (n <= 0) return;
     stageAssertOwner(c->control); /* reply-append: the speculated reply lands in this owner's reply buffer */
@@ -753,8 +794,8 @@ static void stageReadCollect(fpThread *t, int tid, client *c) {
  * level-triggered readable, but the poll only enqueues it; reads come from the FIFO head as
  * returned batches free capacity, so service order does not follow the kernel's ready list. */
 static void fpDefer(fpThread *t, client *c) {
-    if (c->flag.fp_deferred) return;
-    c->flag.fp_deferred = 1;
+    if (fpSlot(t, c)->fp_deferred) return;
+    fpSlot(t, c)->fp_deferred = 1;
     t->deferrals++;
     listLinkNodeTail(&t->deferred, &c->fp_defer_node);
 }
@@ -763,8 +804,8 @@ static void fpServeDeferred(fpThread *t, int tid) {
     while (listLength(&t->deferred) > 0 && t->inflight < server.io_batch_inflight) {
         client *c = listNodeValue(listFirst(&t->deferred));
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
-        c->flag.fp_deferred = 0;
-        if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) continue; /* still readable; the poll brings it back */
+        fpSlot(t, c)->fp_deferred = 0;
+        if (fpSlot(t, c)->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) continue; /* still readable; the poll brings it back */
         stageReadCollect(t, tid, c);
     }
 }
@@ -772,8 +813,8 @@ static void fpServeDeferred(fpThread *t, int tid) {
 void fastpathClientReadable(int tid, client *c) {
     fpThread *t = &fp_threads[tid];
     if (c->control->lifecycle != FP_ACTIVE) return;
-    if (c->flag.fp_deferred) return; /* already waiting its turn */
-    if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
+    if (fpSlot(t, c)->fp_deferred) return; /* already waiting its turn */
+    if (fpSlot(t, c)->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
     if (t->inflight >= server.io_batch_inflight || listLength(&t->deferred) > 0) {
         fpDefer(t, c);
         fpServeDeferred(t, tid);
@@ -856,11 +897,12 @@ static parsedCommand fpEntryToParsed(cmdEntry *e) {
  * already held; the client then leaves so the main path runs them with its own semantics. */
 static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
     cmdQueue *q = &c->cmd_queue;
-    int qheld = c->fp_held ? c->fp_held - 1 : 0; /* held commands queued behind c->argv */
+    uint16_t held = fpSlot(t, c)->fp_held;
+    int qheld = held ? held - 1 : 0; /* held commands queued behind c->argv */
     int rest = q->len - q->off - qheld;
-    int first = c->fp_held ? 0 : 1; /* with nothing held, e[0] becomes c->argv */
+    int first = held ? 0 : 1; /* with nothing held, e[0] becomes c->argv */
     parsedCommand cur;
-    int has_cur = !c->fp_held && c->argc > 0; /* a promoted command or a trailing partial, parsed after the entries */
+    int has_cur = !held && c->argc > 0; /* a promoted command or a trailing partial, parsed after the entries */
     if (has_cur) {
         cur = (parsedCommand){.read_flags = c->read_flags,
                               .argc = c->argc,
@@ -889,7 +931,7 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
         c->net_input_bytes_curr_cmd = head.input_bytes, c->parsed_cmd = head.cmd, c->slot = head.slot;
         c->read_flags = head.read_flags;
     }
-    c->fp_held += n;
+    fpSlot(t, c)->fp_held += n;
     fpBeginLeave(t, c, FP_LEAVING, 1);
 }
 
@@ -916,7 +958,7 @@ static void handoffReturn(fpThread *t, cmdBatch *b) {
         }
         if (c) {
             if (n) stageWriteSend(t, c, iov, n);
-            c->fp_inflight -= (j - i);
+            fpSlot(t, c)->fp_inflight -= (j - i);
             c->commands_processed += (j - i) - requeued;
             if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
         }
@@ -949,8 +991,12 @@ static void fpFinishLeaving(fpThread *t) {
         listNode *next = ln->next;
         client *c = listNodeValue(ln);
         ln = next;
-        if (c->fp_inflight > 0) continue;
+        if (fpSlot(t, c)->fp_inflight > 0) continue;
         if (c->control->lifecycle == FP_LEAVING && open && !fpFlushOut(t, c)) continue; /* still draining output */
+        /* Handoff invariant: the drain above guarantees the client holds nothing live on this owner
+         * before its slot is freed. fp_out stays on struct client (main consumes the residue in
+         * fastpathHandoffDone), so only fp_inflight is asserted here. */
+        serverAssert(fpSlot(t, c)->fp_inflight == 0);
         fpUnregister(t, c);
         sendToMainThread(c, c->control->lifecycle == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
     }
@@ -979,7 +1025,7 @@ static void fpCancelLeavingInCur(fpThread *t) {
             grp[n++] = b->e[j];
             b->e[j].handle.control = NULL;
         }
-        if (c) c->fp_inflight -= n;
+        if (c) fpSlot(t, c)->fp_inflight -= n;
         if (c && c->control->lifecycle == FP_CLOSING) {
             for (int k = 0; k < n; k++) {
                 for (int a = 0; a < grp[k].argc; a++) decrRefCount(grp[k].argv[a]);

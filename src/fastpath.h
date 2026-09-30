@@ -110,6 +110,9 @@ void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
+/* Test/observability accessor: a fast-path client's in-flight command count, held in its IO owner
+ * slot. Returns 0 when the client currently owns no slot. */
+uint32_t fastpathClientInflight(client *c);
 void fastpathInfo(sds *info);
 
 /* Build a generation-checked handle for a control-bearing client. */
