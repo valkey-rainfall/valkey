@@ -1518,11 +1518,17 @@ void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
               batches = fp_retired[4], deferrals = fp_retired[5], speculated = fp_retired[6];
     int open = 0, quiescing = 0;
-    for (int i = 1; i < fp_slots; i++) {
+    /* The main owner (tid 0) carries its own reads/writes/batches when the config is on; include it
+     * in the counter sums so the fast path is observable at io-threads 1. It is not a worker, so it
+     * is left out of the open/quiescing worker tallies (its role is always open by construction). */
+    int first = fpSingleIoActive() ? 0 : 1;
+    for (int i = first; i < fp_slots; i++) {
         if (fp_threads[i].submit.buffer == NULL) continue;
-        int role = fastpathWorkerRole(i);
-        open += role == FP_ROLE_OPEN;
-        quiescing += role == FP_ROLE_QUIESCING;
+        if (i >= 1) {
+            int role = fastpathWorkerRole(i);
+            open += role == FP_ROLE_OPEN;
+            quiescing += role == FP_ROLE_QUIESCING;
+        }
         reads += fp_threads[i].reads;
         in += fp_threads[i].net_input_bytes;
         out += fp_threads[i].net_output_bytes;
