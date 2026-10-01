@@ -2031,6 +2031,9 @@ struct valkeyServer {
     int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */
     int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
+    int io_threads_main_owner;                /* At io-threads 1, main owns its clients through the IO-owner stage
+                                               * code (STAGE_FANOUT_SINGLE_IO) instead of the inline single-thread
+                                               * loop. Immutable, default off: with it off io-threads 1 is unchanged. */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */

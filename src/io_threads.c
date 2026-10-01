@@ -1501,6 +1501,15 @@ int applyIOThreadsFastpathConfig(const char **err) {
 
 /* Initialize the data structures needed for I/O threads. */
 void initIOThreads(int prev_threads_num) {
+    /* The main-owner path (STAGE_FANOUT_SINGLE_IO) runs the IO-owner stage code on main at
+     * io-threads 1: main needs its own fast-path thread state (submit/return rings, owner-slot
+     * table, registry) at fp_threads[0], the same state fastpathInitThread sets up for a worker,
+     * but no worker thread and no shared job queues. Initialized once at startup; the config is
+     * immutable so it never toggles at runtime. With io-threads >= 2 the workers own clients and
+     * main executes, so tid 0 needs no owner rings and this is skipped. */
+    if (server.io_threads_main_owner && server.io_threads_num == 1 && prev_threads_num <= 1)
+        fastpathInitThread(0);
+
     /* Don't spawn any thread if the user selected a single thread:
      * we'll handle I/O directly from the main thread. */
     if (server.io_threads_num == 1) return;

@@ -18,8 +18,14 @@ stagePolicy stagePolicyRead(void) {
 
     /* One active IO thread means main walks all three stages inline; more than one means the
      * workers own read and write and main executes. active_io_threads_num counts main, so the
-     * boundary is at 1. */
-    p.fanout = (server.active_io_threads_num <= 1) ? STAGE_FANOUT_INLINE : STAGE_FANOUT_WORKERS;
+     * boundary is at 1. At one thread the main-owner config selects SINGLE_IO instead of INLINE:
+     * main owns its clients through the same IO-owner stage code, on one thread with no crossing.
+     * The config is immutable and defaults off, so INLINE stays the default and no existing
+     * behavior changes. */
+    if (server.active_io_threads_num <= 1)
+        p.fanout = server.io_threads_main_owner ? STAGE_FANOUT_SINGLE_IO : STAGE_FANOUT_INLINE;
+    else
+        p.fanout = STAGE_FANOUT_WORKERS;
 
     /* The read stage speculates eligible reads when the fast path is on; otherwise every command
      * crosses to main. The replica-only knob is carried as a predicate, not a third read_exec
