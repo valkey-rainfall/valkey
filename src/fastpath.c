@@ -135,7 +135,10 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     b->io_tid = tid;
     b->arena_used = 0;
     b->opened_us = getMonotonicUs();
-    b->holder = (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)tid}; /* the IO owner holds it until publish */
+    /* The owner holds a fresh batch until publish. For a worker that owner is {IO,tid}; for tid 0 it
+     * is main holding its own batch end to end ({MAIN,0}), which is exactly what the publishing
+     * domain is on a single thread, so stageAssertHolds passes with no widening. */
+    b->holder = (tid == 0) ? (stageThreadId){STAGE_DOMAIN_MAIN, 0} : (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)tid};
     return b;
 }
 
@@ -767,6 +770,12 @@ static void stageWriteSend(fpThread *t, client *c, struct iovec *iov, int iovcnt
  * commands pending on main. */
 static void stageExecuteEligible(fpThread *t, int tid, client *c) {
     if (fpSlot(t, c)->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
+    /* No read-stage speculation on the tid-0 main owner: the speculating reader and the execute
+     * writer would be the same thread, so the seqlock's reader-vs-writer concurrency the validation
+     * relies on does not exist. The read is punted to execute through handoffPublish instead, which
+     * keeps the SINGLE_IO A/B a clean measure of staging overhead. fastpath_speculated stays 0 on
+     * tid 0 by design (see SLP5-MAP.md, speculation site). */
+    if (tid == 0) return;
     int n = dplusSpeculateBatch(c, tid);
     if (n <= 0) return;
     stageAssertOwner(c->control); /* reply-append: the speculated reply lands in this owner's reply buffer */
@@ -1331,8 +1340,11 @@ static void stageExecuteBatch(client *ec, cmdBatch *b) {
 
 /* write.publish: return the executed batch to its IO owner, which writes the replies out. */
 static void stageWritePublish(fpThread *t, cmdBatch *b) {
-    stageAssertHolds(b);                                              /* main held it through execute */
-    b->holder = (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)b->io_tid}; /* returned to its IO owner */
+    stageAssertHolds(b); /* main held it through execute */
+    /* Return to the batch's owner: a worker's batch to {IO,tid}; a tid-0 batch stays with main
+     * ({MAIN,0}), which is the same thread that will write it out in the self-loop. */
+    b->holder = (b->io_tid == 0) ? (stageThreadId){STAGE_DOMAIN_MAIN, 0}
+                                 : (stageThreadId){STAGE_DOMAIN_IO, (uint16_t)b->io_tid};
     spscEnqueue(&t->ret, b, false);
 }
 
@@ -1350,8 +1362,13 @@ int fastpathDrain(void) {
     /* io-batch-drain-us bounds how long a thin batch waits for amortization. */
     monotime deadline = server.io_batch_drain_us > 0 ? getMonotonicUs() + server.io_batch_drain_us : 0;
     int enough = server.io_batch_commands * 4;
+    /* Under the main-owner path tid 0 is a real owner with its own submit/ret rings, drained here on
+     * the same thread that filled them (a synchronous self-loop: take -> execute -> write.publish,
+     * then fastpathProcessReturns(0) from the same beforeSleep writes the replies out). Workers only:
+     * start at 1. */
+    int first = fpSingleIoActive() ? 0 : 1;
 again:
-    for (int tid = 1; tid < fp_slots; tid++) {
+    for (int tid = first; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         if (t->submit.buffer == NULL) continue;
         if (unlikely(listLength(t->ret_overflow) > 0)) fpRetFlushOverflow(t);

@@ -2343,7 +2343,16 @@ static int processOutboxBatch(mpscQueue *outbox) {
 int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
+    /* Main-owner self-loop (tid 0): main is the IO owner of its own clients, so the submit and
+     * return sides a worker would run on its own thread run here. Flush any partial tid-0 batch into
+     * the submit ring, let fastpathDrain take/execute/publish it (it includes tid 0 in this mode),
+     * then consume the tid-0 return ring to write the replies out and take newly attached clients.
+     * Reads were already collected by main's server.el read handler (fpMainReadable). */
+    if (server.io_threads_main_owner && server.active_io_threads_num <= 1) fastpathSubmitPending(0);
+
     int fp_processed = fastpathDrain();
+
+    if (server.io_threads_main_owner && server.active_io_threads_num <= 1) fastpathProcessReturns(0);
 
     if (getPendingIOResponsesCount() == 0 && fastpathClientCount() == 0) return fp_processed;
 
