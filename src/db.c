@@ -31,7 +31,7 @@
 #include "listpack.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
-#include "dplus.h"
+#include "specread.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -366,11 +366,11 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
      * single trailing bump used to be. Hash MUST come from the table's own
      * hash function (I3). */
     hashtable *d_ht = kvstoreGetHashtable(db->keys, getKVStoreIndexForKey(objectGetVal(key)));
-    dplusVersionArray *d_va = d_ht ? hashtableGetVersionArray(d_ht) : NULL;
+    specreadVersionArray *d_va = d_ht ? hashtableGetVersionArray(d_ht) : NULL;
     uint64_t d_h = 0;
     if (d_va) {
         d_h = key_hash ? *key_hash : hashtableHashKey(d_ht, objectGetVal(key));
-        dplusVersionBracketBegin(d_va, DPLUS_SHARD_INDEX(d_h));
+        specreadVersionBracketBegin(d_va, SPECREAD_SHARD_INDEX(d_h));
     }
     if ((old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
         (val->refcount == 1 && val->encoding != OBJ_ENCODING_EMBSTR)) {
@@ -415,15 +415,15 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     dbTrackKeyWithVolatileItems(db, new);
 
     /* S2.2: close the bracket opened above the swap/replace block. */
-    if (d_va) dplusVersionBracketEnd(d_va, DPLUS_SHARD_INDEX(d_h));
+    if (d_va) specreadVersionBracketEnd(d_va, SPECREAD_SHARD_INDEX(d_h));
 
-    /* D+ entry-lifetime: defer the old object's free past walk quiescence
+    /* specread entry-lifetime: defer the old object's free past walk quiescence
      * (see entry-lifetime-design.md); routing recorded at defer time. When
      * the deferral is refused (no reader can hold a pointer) the transport
      * frees it immediately, off the main thread while IO threads are active. */
-    int limbo_route = DPLUS_LIMBO_OFFLOAD_PREF;
-    if (server.lazyfree_lazy_server_del && lazyfreeShouldBeAsync(key, old, db->id)) limbo_route = DPLUS_LIMBO_ASYNC;
-    if (!dplusDeferFree(old, limbo_route)) freeValueNeverOnMain(key, old, db->id);
+    int limbo_route = SPECREAD_LIMBO_OFFLOAD_PREF;
+    if (server.lazyfree_lazy_server_del && lazyfreeShouldBeAsync(key, old, db->id)) limbo_route = SPECREAD_LIMBO_ASYNC;
+    if (!specreadDeferFree(old, limbo_route)) freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
 
@@ -508,7 +508,7 @@ robj *dbRandomKey(serverDb *db) {
 }
 
 int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index) {
-    /* D+ (S1.4): keyspace deletes must run on main -- IO threads punt.
+    /* specread (S1.4): keyspace deletes must run on main -- IO threads punt.
      * See expireIfNeededWithDictIndex for the rationale. */
     debugServerAssert(inMainThread());
     hashtablePosition pos;
@@ -545,7 +545,7 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        /* D+ entry-lifetime: the unlinked object may still be read by an
+        /* specread entry-lifetime: the unlinked object may still be read by an
          * in-flight speculative walk, so its free is deferred past walk
          * quiescence. The routing decision is recorded now because the
          * effort heuristic needs the key. Objects that are not worth a
@@ -553,8 +553,8 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
          * which never frees on the main thread while IO threads are active.
          * With no reader registered the deferral is refused and the same
          * transport path runs immediately. See entry-lifetime-design.md. */
-        int d_route = (async && lazyfreeShouldBeAsync(key, val, db->id)) ? DPLUS_LIMBO_ASYNC : DPLUS_LIMBO_OFFLOAD_PREF;
-        if (!dplusDeferFree(val, d_route)) freeValueNeverOnMain(key, val, db->id);
+        int d_route = (async && lazyfreeShouldBeAsync(key, val, db->id)) ? SPECREAD_LIMBO_ASYNC : SPECREAD_LIMBO_OFFLOAD_PREF;
+        if (!specreadDeferFree(val, d_route)) freeValueNeverOnMain(key, val, db->id);
 
         return 1;
     } else {
@@ -977,8 +977,8 @@ void selectCommand(client *c) {
         addReplyError(c, "DB index is out of range");
         return;
     }
-    /* Per-db ACL selectors: the D+ speculation gate is db-dependent. */
-    dplusRecomputeSpecAclOk(c);
+    /* Per-db ACL selectors: the specread speculation gate is db-dependent. */
+    specreadRecomputeSpecAclOk(c);
 
     if (c->flag.multi) {
         serverAssert(c->mstate != NULL);
@@ -1593,16 +1593,16 @@ void renameGenericCommand(client *c, int nx) {
          * with the same name. */
         dbDelete(c->db, c->argv[2]);
     }
-    /* D+ (B10): hold exclusive across delete→re-add. The table's decref
+    /* specread (B10): hold exclusive across delete→re-add. The table's decref
      * must apply immediately — a limbo-deferred decref leaves the value's
      * refcount inflated, and the key re-embed (objectSetKeyAndExpire)
      * panics for non-string types with refcount > 1. The drain also makes
      * the old shell's free safe against in-flight speculative walks. */
-    dplusExclusiveEnter();
+    specreadExclusiveEnter();
     dbDelete(c->db, c->argv[1]);
     dbAdd(c->db, c->argv[2], &o);
     if (expire != -1) o = setExpire(c, c->db, c->argv[2], expire);
-    dplusExclusiveLeave();
+    specreadExclusiveLeave();
     signalModifiedKey(c, c->db, c->argv[1]);
     signalModifiedKey(c, c->db, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_from", c->argv[1], c->db->id);
@@ -1677,13 +1677,13 @@ void moveCommand(client *c) {
     }
 
     incrRefCount(o); /* ref counter = 2 */
-    /* D+ (B10): exclusive across delete→re-add — see renameGenericCommand. */
-    dplusExclusiveEnter();
+    /* specread (B10): exclusive across delete→re-add — see renameGenericCommand. */
+    specreadExclusiveEnter();
     dbDelete(src, c->argv[1]); /* ref counter = 1 */
 
     setKey(c, dst, c->argv[1], &o, set_key_flags);
     if (expire != -1) o = setExpire(c, dst, c->argv[1], expire);
-    dplusExclusiveLeave();
+    specreadExclusiveLeave();
 
     /* OK! key moved */
     signalModifiedKey(c, src, c->argv[1]);
@@ -1870,13 +1870,13 @@ int dbSwapDatabases(int id1, int id2) {
     scanDatabaseForDeletedKeys(db1, db2);
     scanDatabaseForDeletedKeys(db2, db1);
 
-    /* D+ (S1.3): the table-pointer swap yanks db->keys out from under
+    /* specread (S1.3): the table-pointer swap yanks db->keys out from under
      * speculative readers -- a reader that resolved the old kvstore may
      * compute a reply from a table that no longer belongs to its db
      * (linearization violation even when nothing is freed). Drain in-flight
      * walks and punt new ones for the duration of the swap; SWAPDB is rare
      * and the drain is bounded by one in-flight read. */
-    dplusExclusiveEnter();
+    specreadExclusiveEnter();
 
     /* Swap hash tables. Note that we don't swap blocking_keys,
      * ready_keys and watched_keys, since we want clients to
@@ -1891,7 +1891,7 @@ int dbSwapDatabases(int id1, int id2) {
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
     copyDbExpiry(db2, &aux);
 
-    dplusExclusiveLeave();
+    specreadExclusiveLeave();
 
     /* Now we need to handle clients blocked on lists: as an effect
      * of swapping the two DBs, a client that was waiting for list
@@ -1925,10 +1925,10 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         /* Try to unblock any XREADGROUP clients if the key no longer exists. */
         scanDatabaseForDeletedKeys(activedb, newdb);
 
-        /* D+ (S1.3): same table-pointer-swap hazard as dbSwapDatabases,
+        /* specread (S1.3): same table-pointer-swap hazard as dbSwapDatabases,
          * plus the displaced tables are freed shortly after this returns
          * (old main db discarded post-replication-load). Gate the swap. */
-        dplusExclusiveEnter();
+        specreadExclusiveEnter();
 
         /* Swap hash tables. Note that we don't swap blocking_keys,
          * ready_keys and watched_keys, since clients
@@ -1943,7 +1943,7 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         newdb->keys_with_volatile_items = aux.keys_with_volatile_items;
         copyDbExpiry(newdb, &aux);
 
-        dplusExclusiveLeave();
+        specreadExclusiveLeave();
 
         /* Now we need to handle clients blocked on lists: as an effect
          * of swapping the two DBs, a client that was waiting for list
@@ -1992,24 +1992,24 @@ void swapdbCommand(client *c) {
  * Expires API
  *----------------------------------------------------------------------------*/
 
-/* --- D+ S3 helpers: bracketing published-value mutations from command code --- */
+/* --- specread S3 helpers: bracketing published-value mutations from command code --- */
 
 void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk) {
     brk->va = NULL;
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
     hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
     if (!ht) return;
-    dplusVersionArray *va = hashtableGetVersionArray(ht);
+    specreadVersionArray *va = hashtableGetVersionArray(ht);
     if (!va) return;
     uint64_t h = hashtableHashKey(ht, objectGetVal(key));
     brk->va = va;
-    brk->shard = DPLUS_SHARD_INDEX(h);
-    dplusVersionBracketBegin(va, brk->shard);
+    brk->shard = SPECREAD_SHARD_INDEX(h);
+    specreadVersionBracketBegin(va, brk->shard);
 }
 
 void dbKeyBracketEnd(dbKeyBracket *brk) {
     if (!brk->va) return;
-    dplusVersionBracketEnd((dplusVersionArray *)brk->va, brk->shard);
+    specreadVersionBracketEnd((specreadVersionArray *)brk->va, brk->shard);
     brk->va = NULL;
 }
 
@@ -2025,7 +2025,7 @@ sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
     memcpy(news, s, sdslen(s));
     sdssetlen(news, sdslen(s));
     objectSetVal(o, news);
-    if (!dplusDeferFreeRaw(sdsAllocPtr(s))) sdsfree(s);
+    if (!specreadDeferFreeRaw(sdsAllocPtr(s))) sdsfree(s);
     return news;
 }
 
@@ -2034,7 +2034,7 @@ int removeExpire(serverDb *db, robj *key) {
     void *popped;
     if (kvstoreHashtablePop(db->expires, dict_index, objectGetVal(key), &popped)) {
         robj *val = popped;
-        /* D+ S3: the embedded-expiry clear is an in-place 8-byte write on a
+        /* specread S3: the embedded-expiry clear is an in-place 8-byte write on a
          * published shell (S1.2a finding b) -- bracket it. */
         dbKeyBracket brk;
         dbKeyBracketBegin(db, key, &brk);
@@ -2068,14 +2068,14 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     long long old_when = objectGetExpire(val);
 
     robj *retired = NULL;
-    /* D+ (S1.2a): first-time expire REALLOCATES the shell of a published,
+    /* specread (S1.2a): first-time expire REALLOCATES the shell of a published,
      * reader-reachable object. The pre-fix code freed the old shell
      * immediately (and cleared its val_ptr) — a confirmed UAF / NULL-deref
      * against in-flight speculative readers
      * (sharded-version-safety-audit-sep4.md, defect 1). The Ex variant keeps
      * the displaced shell fully intact and hands it back for shell-only
      * retirement past reader quiescence. */
-    /* D+ S3: when val already has an expire field, objectSetExpireEx writes
+    /* specread S3: when val already has an expire field, objectSetExpireEx writes
      * the embedded 8-byte expiry IN PLACE (no realloc) -- bracket it. The
      * realloc path's publication is bracketed separately below (S2.2). */
     dbKeyBracket ttl_brk;
@@ -2107,21 +2107,21 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
              * had NO bump: a reader could validate successfully against the
              * freed shell. */
             hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-            dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
+            specreadVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
             uint64_t h = 0;
             if (va) {
                 h = hashtableHashKey(ht, objectGetVal(key));
-                dplusVersionBracketBegin(va, DPLUS_SHARD_INDEX(h));
+                specreadVersionBracketBegin(va, SPECREAD_SHARD_INDEX(h));
             }
             val = *valref = newval;
-            if (va) dplusVersionBracketEnd(va, DPLUS_SHARD_INDEX(h));
+            if (va) specreadVersionBracketEnd(va, SPECREAD_SHARD_INDEX(h));
             if (retired) {
                 /* Shell-only free: val_ptr ownership transferred to newval
                  * (or the value is inline in the shell allocation). RAW
                  * route = zfree at quiescence flush; fallback zfree is safe
                  * only because no reader can hold this shell when the defer
                  * machinery is inactive. */
-                if (!dplusDeferFreeRaw(retired)) zfree(retired);
+                if (!specreadDeferFreeRaw(retired)) zfree(retired);
                 retired = NULL;
             }
         }
@@ -2354,9 +2354,9 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
 
-    /* D+ (S1.4): expiry deletion mutates the keyspace and MUST run on main.
+    /* specread (S1.4): expiry deletion mutates the keyspace and MUST run on main.
      * Speculative readers check embedded expiry and punt the whole command
-     * to main (dplus.c) -- they must never reach this point. Checked
+     * to main (specread.c) -- they must never reach this point. Checked
      * invariant so any future IO-thread path that forgets the punt rule
      * trips immediately in debug builds instead of corrupting silently. */
     debugServerAssert(inMainThread());

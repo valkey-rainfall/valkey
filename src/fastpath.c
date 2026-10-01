@@ -4,7 +4,7 @@
 #include "fastpath.h"
 #include "io_threads.h"
 #include "memory_prefetch.h"
-#include "dplus.h"
+#include "specread.h"
 #include <sys/epoll.h>
 #include <sys/uio.h>
 
@@ -685,16 +685,16 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
 
 /* Reads at the head of what a client just sent execute here, on its owning IO thread: a
- * contiguous prefix of GETs is answered from the keyspace under D+ version validation and the
+ * contiguous prefix of GETs is answered from the keyspace under specread version validation and the
  * replies go straight to the socket. The first command that cannot be executed here, and every
  * command after it, goes to main in the batch, so a read never overtakes an earlier write of the
  * same connection. For the same reason nothing is executed here while the client still has
  * commands pending on main. */
 static void fpSpeculate(fpThread *t, int tid, client *c) {
     if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
-    int n = dplusSpeculateBatch(c, tid);
+    int n = specreadSpeculateBatch(c, tid);
     if (n <= 0) return;
-    dplusConsumeSpeculated(c, n, tid);
+    specreadConsumeSpeculated(c, n, tid);
     t->speculated += n;
     struct iovec iov = {.iov_base = c->buf, .iov_len = c->bufpos};
     c->bufpos = 0;

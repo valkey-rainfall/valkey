@@ -164,10 +164,10 @@ void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtabl
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
 
-/* D+ speculative read support */
-struct dplusVersionArray;
-typedef struct dplusVersionArray dplusVersionArray;
-dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
+/* specread speculative read support */
+struct specreadVersionArray;
+typedef struct specreadVersionArray specreadVersionArray;
+specreadVersionArray *hashtableGetVersionArray(hashtable *ht);
 uint64_t hashtableHashKey(hashtable *ht, const void *key);
 
 /* Iteration & scan */

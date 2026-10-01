@@ -1,7 +1,7 @@
-/* dplus no-op stubs for standalone tools (valkey-cli, valkey-benchmark).
+/* specread no-op stubs for standalone tools (valkey-cli, valkey-benchmark).
  *
- * hashtable.c calls the dplus quiescence hooks (dplusExclusiveEnter/Leave,
- * dplusDeferFreeRaw), whose real definitions live in dplus.c — which depends
+ * hashtable.c calls the specread quiescence hooks (specreadExclusiveEnter/Leave,
+ * specreadDeferFreeRaw), whose real definitions live in specread.c — which depends
  * on the server core and is not linked into the tools. The tools have no
  * speculative walkers, so no-ops are correct.
  *
@@ -10,9 +10,9 @@
  * strong-symbol resolution, silently no-op'ing the server's drains (observed
  * as the expiry-race crash returning). */
 
-void dplusExclusiveEnter(void) {}
-void dplusExclusiveLeave(void) {}
-int dplusDeferFreeRaw(void *ptr) {
+void specreadExclusiveEnter(void) {}
+void specreadExclusiveLeave(void) {}
+int specreadDeferFreeRaw(void *ptr) {
     (void)ptr;
     return 0;
 }

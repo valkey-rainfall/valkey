@@ -38,7 +38,7 @@
 #include "cluster.h"
 #include "threads_mngr.h"
 #include "io_threads.h"
-#include "dplus.h"
+#include "specread.h"
 #include "sds.h"
 #include "module.h"
 
@@ -547,15 +547,15 @@ void debugCommand(client *c) {
             "    Grace period in seconds for replica main channel to establish psync.",
             "DICT-RESIZING <0|1>",
             "    Enable or disable the main dict and expire dict resizing.",
-            "DPLUS-OWNER",
+            "SPECREAD-OWNER",
             "    Return the current client's IO owner id for deterministic tests.",
-            "DPLUS-EPOCH-HOLD <milliseconds>",
+            "SPECREAD-EPOCH-HOLD <milliseconds>",
             "    Delay the next real speculative reader after entry (instrumented builds only).",
-            "DPLUS-EPOCH-PIN",
-            "    Pin a synthetic reader in the current D+ epoch for testing.",
-            "DPLUS-EPOCH-UNPIN",
-            "    Release the synthetic D+ epoch reader used by tests.",
-            "DPLUS-EPOCH-STATS",
+            "SPECREAD-EPOCH-PIN",
+            "    Pin a synthetic reader in the current specread epoch for testing.",
+            "SPECREAD-EPOCH-UNPIN",
+            "    Release the synthetic specread epoch reader used by tests.",
+            "SPECREAD-EPOCH-STATS",
             "    Return epoch, retired, reclaimed, forced, advances, scans, gate, and activations.",
             "HASHTABLE-CAN-ABORT-SHRINK <0|1>",
             "    Enable or disable the hashtable shrink abort.",
@@ -601,61 +601,61 @@ void debugCommand(client *c) {
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "assert")) {
         serverAssertWithInfo(c, c->argv[0], 1 == 2);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-hold") && c->argc == 3) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-epoch-hold") && c->argc == 3) {
         long long milliseconds;
         if (getLongLongFromObjectOrReply(c, c->argv[2], &milliseconds, NULL) != C_OK) return;
         if (milliseconds < 1 || milliseconds > 5000) {
-            addReplyError(c, "D+ reader hold must be between 1 and 5000 milliseconds");
-        } else if (dplusDebugHoldNextReader(milliseconds * 1000) != C_OK) {
-            addReplyError(c, "D+ reader hold requires an instrumented build or is already armed");
+            addReplyError(c, "specread reader hold must be between 1 and 5000 milliseconds");
+        } else if (specreadDebugHoldNextReader(milliseconds * 1000) != C_OK) {
+            addReplyError(c, "specread reader hold requires an instrumented build or is already armed");
         } else {
             addReply(c, shared.ok);
         }
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-prevalidate-hold") && (c->argc == 3 || c->argc == 4)) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-prevalidate-hold") && (c->argc == 3 || c->argc == 4)) {
         long long milliseconds;
         if (getLongLongFromObjectOrReply(c, c->argv[2], &milliseconds, NULL) != C_OK) return;
         if (milliseconds < 1 || milliseconds > 5000) {
-            addReplyError(c, "D+ prevalidate hold must be between 1 and 5000 milliseconds");
-        } else if (dplusDebugHoldPrevalidate(milliseconds * 1000) != C_OK) {
-            addReplyError(c, "D+ prevalidate hold requires an instrumented build or is already armed");
+            addReplyError(c, "specread prevalidate hold must be between 1 and 5000 milliseconds");
+        } else if (specreadDebugHoldPrevalidate(milliseconds * 1000) != C_OK) {
+            addReplyError(c, "specread prevalidate hold requires an instrumented build or is already armed");
         } else {
-            if (c->argc >= 4 && !strcasecmp(objectGetVal(c->argv[3]), "bump")) dplusDebugPrevalidateBump();
+            if (c->argc >= 4 && !strcasecmp(objectGetVal(c->argv[3]), "bump")) specreadDebugPrevalidateBump();
             addReply(c, shared.ok);
         }
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-pv-state") && c->argc == 2) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-pv-state") && c->argc == 2) {
         uint64_t holding, consumed;
-        dplusDebugPrevalidateState(&holding, &consumed);
+        specreadDebugPrevalidateState(&holding, &consumed);
         addReplyArrayLen(c, 2);
         addReplyLongLong(c, (long long)holding);
         addReplyLongLong(c, (long long)consumed);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-shard-version") && c->argc == 3) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-shard-version") && c->argc == 3) {
         /* S5 diagnostic: reply [shard, version] for the key's shard in db->keys. */
         int dict_index = getKVStoreIndexForKey(objectGetVal(c->argv[2]));
         hashtable *ht = kvstoreGetHashtable(c->db->keys, dict_index);
-        dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
+        specreadVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
         if (!va) {
             addReplyError(c, "no version array");
         } else {
             uint64_t h = hashtableHashKey(ht, objectGetVal(c->argv[2]));
-            unsigned shard = DPLUS_SHARD_INDEX(h);
+            unsigned shard = SPECREAD_SHARD_INDEX(h);
             addReplyArrayLen(c, 2);
             addReplyLongLong(c, (long long)shard);
-            addReplyLongLong(c, (long long)dplusVersionRead(va, shard));
+            addReplyLongLong(c, (long long)specreadVersionRead(va, shard));
         }
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") && c->argc == 2) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-epoch-pin") && c->argc == 2) {
         uint64_t epoch;
-        if (dplusDebugPinReader(&epoch) != C_OK)
-            addReplyError(c, "D+ synthetic epoch reader slot is unavailable or already pinned");
+        if (specreadDebugPinReader(&epoch) != C_OK)
+            addReplyError(c, "specread synthetic epoch reader slot is unavailable or already pinned");
         else
             addReplyLongLong(c, (long long)epoch);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") && c->argc == 2) {
-        if (dplusDebugUnpinReader() != C_OK)
-            addReplyError(c, "D+ synthetic epoch reader is not pinned");
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-epoch-unpin") && c->argc == 2) {
+        if (specreadDebugUnpinReader() != C_OK)
+            addReplyError(c, "specread synthetic epoch reader is not pinned");
         else
             addReply(c, shared.ok);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats") && c->argc == 2) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "specread-epoch-stats") && c->argc == 2) {
         uint64_t stats[8];
-        dplusDebugEpochStats(stats);
+        specreadDebugEpochStats(stats);
         addReplyArrayLen(c, 8);
         for (int i = 0; i < 8; i++) addReplyLongLong(c, (long long)stats[i]);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "log") && c->argc == 3) {

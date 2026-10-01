@@ -544,7 +544,7 @@ start_server {tags {"info" "external:skip"}} {
         assert_equal [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] {0}
         # overhead.db.hashtable.lut = memory overhead of hashtable including hashtable struct and tables
         set hashtable_overhead [dict get $mem_stats overhead.db.hashtable.lut]
-        # The D+ version array adds a fixed 2KB LUT per hashtable, so infer
+        # The specread version array adds a fixed 2KB LUT per hashtable, so infer
         # architecture directly and widen the absolute bound (ported from
         # the Lane C fix for the same feature-1 test debt).
         set bits [expr {$::tcl_platform(wordSize) * 8}]

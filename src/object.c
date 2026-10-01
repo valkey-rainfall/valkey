@@ -476,7 +476,7 @@ mstime_t objectGetExpire(const robj *o) {
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function.
  *
- * D+ (S1.2a): objectSetExpireEx threads the retirement out-param through to
+ * specread (S1.2a): objectSetExpireEx threads the retirement out-param through to
  * objectSetKeyAndExpireEx for reader-reachable objects — see the contract
  * there. First-time expire on a published object MUST use the Ex form. */
 robj *objectSetExpireEx(robj *o, long long expire, robj **retired) {
@@ -529,13 +529,13 @@ void objectUnembedVal(robj *o) {
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function.
  *
- * D+ (S1.2a): the Ex variant supports replacement of a READER-REACHABLE
+ * specread (S1.2a): the Ex variant supports replacement of a READER-REACHABLE
  * object (published in db->keys while IO threads speculate). When 'retired'
  * is non-NULL and this call would have freed the old shell, the old shell is
  * instead returned in *retired, INTACT: it is not freed and — critically —
  * its val_ptr is NOT cleared, so an in-flight speculative reader can still
  * dereference it (it reads the coherent old value and linearizes before the
- * replacement). The caller must retire the shell with dplusDeferFreeRaw()
+ * replacement). The caller must retire the shell with specreadDeferFreeRaw()
  * (shell-only zfree at quiescence): val_ptr ownership has transferred to the
  * new object (or, for EMBSTR, the value lives inline in the shell
  * allocation), so a full decrRefCount at flush would double-free. */

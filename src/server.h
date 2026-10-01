@@ -1500,7 +1500,7 @@ typedef struct client {
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
-    _Atomic(uint8_t) spec_acl_ok;         /* D+ ACL gate: 1 = authenticated AND user may run GET with
+    _Atomic(uint8_t) spec_acl_ok;         /* specread ACL gate: 1 = authenticated AND user may run GET with
                                            * unrestricted key read access, so IO threads may speculate.
                                            * Written only on main at auth-state changes; read by IO threads. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
@@ -3176,7 +3176,7 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_CROSSSLOT (1 << 20)
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
-#define READ_FLAGS_DPLUS_SPECULATED (1 << 23) /* The IO thread already executed and replied to this read. */
+#define READ_FLAGS_SPECREAD_SPECULATED (1 << 23) /* The IO thread already executed and replied to this read. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                     \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
@@ -3491,10 +3491,10 @@ int compareStringObjects(const robj *a, const robj *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
-/* D+: bracket a mutation of a PUBLISHED key's value from command code without exposing
- * dplus internals. Begin computes the shard from the table's own hash fn; End closes it. */
+/* specread: bracket a mutation of a PUBLISHED key's value from command code without exposing
+ * specread internals. Begin computes the shard from the table's own hash fn; End closes it. */
 typedef struct dbKeyBracket {
-    void *va; /* dplusVersionArray* (opaque here) */
+    void *va; /* specreadVersionArray* (opaque here) */
     unsigned shard;
 } dbKeyBracket;
 void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk);

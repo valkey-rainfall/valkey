@@ -9,7 +9,7 @@
 #
 # Engagement is asserted on fastpath_speculated (INFO fastpath), which every
 # batch that speculates its read prefix increments in the always-on build, and
-# cross-checked against dplus_epoch_reader_entries (INFO dplus, also always-on),
+# cross-checked against specread_epoch_reader_entries (INFO specread, also always-on),
 # which every speculation attempt bumps once past the entry gates. A test that
 # depends on the tier engaging MUST assert on one of these, or it passes
 # vacuously in a build where the instrumented hit counters are absent.
@@ -20,12 +20,12 @@ proc fp_speculated {} {
     return [getInfoProperty [r info fastpath] fastpath_speculated]
 }
 
-# dplus_epoch_reader_entries: reader-epoch entries, bumped once per speculation
+# specread_epoch_reader_entries: reader-epoch entries, bumped once per speculation
 # attempt past the entry gates. Always present. Used as an independent
 # cross-check that the same activity that moved fastpath_speculated also drove
-# the D+ reader epoch.
-proc dplus_reader_entries {} {
-    return [getInfoProperty [r info dplus] dplus_epoch_reader_entries]
+# the specread reader epoch.
+proc specread_reader_entries {} {
+    return [getInfoProperty [r info specread] specread_epoch_reader_entries]
 }
 
 # A client that sends a GET as its very first command stays on the fast path;
@@ -42,12 +42,12 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
     r select 0
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
 
-    # Instrumented-build probe: the D+ hit/attempt counters and the prevalidate
+    # Instrumented-build probe: the specread hit/attempt counters and the prevalidate
     # hold exist only under -DIO_LOOKUP_OFFLOAD_STATS. Cross-checks that read
     # them are guarded on this; the always-on engagement asserts run everywhere.
-    set ::dplus_instrumented 1
-    if {[catch {r debug dplus-prevalidate-hold 1} e]} {
-        if {[string match "*instrumented*" $e]} { set ::dplus_instrumented 0 }
+    set ::specread_instrumented 1
+    if {[catch {r debug specread-prevalidate-hold 1} e]} {
+        if {[string match "*instrumented*" $e]} { set ::specread_instrumented 0 }
     }
     after 20 ;# a 1ms probe arm expires harmlessly if it was set
 
@@ -70,7 +70,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
     test "fastpath_speculated advances for a served GET run" {
         r set counted yes
         set before [fp_speculated]
-        set entries_before [dplus_reader_entries]
+        set entries_before [specread_reader_entries]
         set rd [spec_client]
         assert_equal yes [$rd get counted]
         for {set i 0} {$i < 50} {incr i} { assert_equal yes [$rd get counted] }
@@ -78,18 +78,18 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
         # Engagement, on always-on counters. If speculation silently stops
         # engaging this is the assert that fails.
         wait_for_condition 100 20 {
-            [fp_speculated] > $before && [dplus_reader_entries] > $entries_before
+            [fp_speculated] > $before && [specread_reader_entries] > $entries_before
         } else {
-            fail "fastpath_speculated/dplus_epoch_reader_entries did not advance: [r info fastpath] [r info dplus]"
+            fail "fastpath_speculated/specread_epoch_reader_entries did not advance: [r info fastpath] [r info specread]"
         }
-        # Instrumented cross-check: the served reads register as D+ hits too.
-        if {$::dplus_instrumented} {
-            assert {[getInfoProperty [r info dplus] dplus_speculative_hits] > 0}
+        # Instrumented cross-check: the served reads register as specread hits too.
+        if {$::specread_instrumented} {
+            assert {[getInfoProperty [r info specread] specread_speculative_hits] > 0}
         }
     }
 
     test "A served GET increments keyspace_hits" {
-        # B has no always-on per-served-key speculation counter (the D+ hit
+        # B has no always-on per-served-key speculation counter (the specread hit
         # counter is instrumented-only), so the served-GET observable here is
         # the engine-independent keyspace_hits in INFO stats: a GET served on a
         # worker accounts its hit the same as one served on main.
@@ -202,12 +202,12 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
         assert_equal PONG [r ping]
     }
 
-    test "DEBUG dplus-shard-version bracket probe still works" {
+    test "DEBUG specread-shard-version bracket probe still works" {
         r set probe one
-        set res1 [r debug dplus-shard-version probe]
+        set res1 [r debug specread-shard-version probe]
         set v1 [lindex $res1 1]
         r set probe two
-        set res2 [r debug dplus-shard-version probe]
+        set res2 [r debug specread-shard-version probe]
         set v2 [lindex $res2 1]
         # Every bracketed mutation advances the shard version, and the version
         # is even at rest (a mutation opens then closes an odd/even bracket).
@@ -219,7 +219,7 @@ start_server {tags {"speculative-reads external:skip tls:skip"} overrides {io-th
     test "Turning the fast path off routes GETs through main" {
         # B has no single "speculation off, fast path on" switch that applies to
         # already-attached standalone clients: io-threads-speculation-replica-only
-        # is exercised on the standalone by unit/dplus-replica-only, but it gates
+        # is exercised on the standalone by unit/specread-replica-only, but it gates
         # the read prefix, not the transport, and a client that attached while it
         # was off is a separate concern. io-threads-fast-path is the non-hidden,
         # runtime-modifiable transport switch: with it off, fastpathEligibleClient

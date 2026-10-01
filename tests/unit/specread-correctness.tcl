@@ -1,4 +1,4 @@
-# D+ Phase 1 deterministic correctness battery (S5).
+# specread Phase 1 deterministic correctness battery (S5).
 # Requires an instrumented build (-DIO_LOOKUP_OFFLOAD_STATS).
 #
 # DECOMPOSITION NOTE: a live command-driven mutation can NEVER land inside a
@@ -9,62 +9,62 @@
 #
 #   Pillar 1 (writer side): every mutation path bumps its key's shard version
 #   by exactly one even bracket (+2) -- probed directly with
-#   DEBUG dplus-shard-version, no timing involved.
+#   DEBUG specread-shard-version, no timing involved.
 #
 #   Pillar 2 (reader side): a version change between a reader's copy and its
 #   validation forces a punt -- an odd/even bracket is injected at the exact
-#   preemption point via DEBUG dplus-prevalidate-hold <ms> bump.
+#   preemption point via DEBUG specread-prevalidate-hold <ms> bump.
 #
 #   Together: mutation => bracket (pillar 1); bracket during window => punt
 #   (pillar 2). The end-to-end composition under real concurrency is covered
 #   by the T-RACE-* stress tests below (nondeterministic interleavings,
 #   coherence asserted on every reply) and the ASan/TSan legs.
 
-proc dplus_field {r field} {
-    set payload [$r info dplus]
+proc specread_field {r field} {
+    set payload [$r info specread]
     if {![regexp "${field}:(\\d+)" $payload -> value]} {
-        fail "missing $field in INFO dplus"
+        fail "missing $field in INFO specread"
     }
     return $value
 }
 
 proc shard_version {r key} {
-    return [lindex [$r debug dplus-shard-version $key] 1]
+    return [lindex [$r debug specread-shard-version $key] 1]
 }
 
 # A deferring client that sends nothing before its first command: a SELECT would move
 # it off the fast path, and only fast-path clients execute reads on their IO thread.
-proc dplus_client {} {
+proc specread_client {} {
     return [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
 }
 
 # Pump pipelined GETs until the speculative path demonstrably engages for this client.
 proc ensure_engaged {r rd key} {
-    if {!$::dplus_instrumented} {
+    if {!$::specread_instrumented} {
         # No hit counter to verify against -- pump enough for ownership
         # handoff and proceed; the race tests remain valid coherence checks.
         for {set i 0} {$i < 30} {incr i} { $rd get $key }
         for {set i 0} {$i < 30} {incr i} { $rd read }
         return
     }
-    set before [dplus_field $r dplus_speculative_hits]
+    set before [specread_field $r specread_speculative_hits]
     for {set round 0} {$round < 20} {incr round} {
         for {set i 0} {$i < 10} {incr i} { $rd get $key }
         for {set i 0} {$i < 10} {incr i} { $rd read }
-        if {[dplus_field $r dplus_speculative_hits] > $before} return
+        if {[specread_field $r specread_speculative_hits] > $before} return
     }
     fail "speculative path never engaged for test client"
 }
 
-start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
+start_server {tags {"specread-correctness"} overrides {io-threads 4 save {}}} {
     r select 0 ;# the same db as the fast-path clients
 
     # Instrumented-build probe: the prevalidate hold exists only with
     # -DIO_LOOKUP_OFFLOAD_STATS. P2 hold tests are guarded on it; P1 probes
     # and the race/parity/rehash tests run everywhere.
-    set ::dplus_instrumented 1
-    if {[catch {r debug dplus-prevalidate-hold 1} e]} {
-        if {[string match "*instrumented*" $e]} { set ::dplus_instrumented 0 }
+    set ::specread_instrumented 1
+    if {[catch {r debug specread-prevalidate-hold 1} e]} {
+        if {[string match "*instrumented*" $e]} { set ::specread_instrumented 0 }
     }
     after 20 ;# a 1ms probe arm expires harmlessly if set
 
@@ -155,20 +155,20 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         assert {$v1 % 2 == 0 && $v1 >= $v0 + 4} ;# del bracket + insert bracket
     }
 
-    if {$::dplus_instrumented} {
+    if {$::specread_instrumented} {
     test {P2-PUNT-INJECTED-BRACKET: version change inside the copy-validate window forces punt} {
         r set p2:a stable
-        set rd [dplus_client]
+        set rd [specread_client]
         ensure_engaged r $rd p2:a
-        set before_miss [dplus_field r dplus_validation_misses]
+        set before_miss [specread_field r specread_validation_misses]
         # Arm hold+bump: reader copies 'stable', parks 50ms, an odd/even
         # bracket fires on its shard at the preemption point, validation
         # must fail, the whole burst punts to main.
-        r debug dplus-prevalidate-hold 50 bump
+        r debug specread-prevalidate-hold 50 bump
         for {set i 0} {$i < 4} {incr i} { $rd get p2:a }
         for {set i 0} {$i < 4} {incr i} { assert_equal "stable" [$rd read] }
         wait_for_condition 100 50 {
-            [dplus_field r dplus_validation_misses] > $before_miss
+            [specread_field r specread_validation_misses] > $before_miss
         } else {
             fail "injected bracket did not force a validation punt"
         }
@@ -177,28 +177,28 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
 
     test {P2-CLEAN-HOLD-CONTROL: hold without bump validates clean (no false punts)} {
         r set p2:b steady
-        set rd [dplus_client]
+        set rd [specread_client]
         ensure_engaged r $rd p2:b
-        set before_miss [dplus_field r dplus_validation_misses]
-        set before_hits [dplus_field r dplus_speculative_hits]
-        r debug dplus-prevalidate-hold 50
+        set before_miss [specread_field r specread_validation_misses]
+        set before_hits [specread_field r specread_speculative_hits]
+        r debug specread-prevalidate-hold 50
         for {set i 0} {$i < 4} {incr i} { $rd get p2:b }
         for {set i 0} {$i < 4} {incr i} { assert_equal "steady" [$rd read] }
-        assert_equal $before_miss [dplus_field r dplus_validation_misses]
+        assert_equal $before_miss [specread_field r specread_validation_misses]
         wait_for_condition 100 50 {
-            [dplus_field r dplus_speculative_hits] > $before_hits
+            [specread_field r specread_speculative_hits] > $before_hits
         } else {
             fail "clean held read did not complete speculatively"
         }
         $rd close
     }
-    } ;# end dplus_instrumented guard
+    } ;# end specread_instrumented guard
 
     test {T-RACE-SET-COHERENCE: reads racing writes always return complete values} {
         set big1 [string repeat A 64]
         set big2 [string repeat B 64]
         r set race:a $big1
-        set rd [dplus_client]
+        set rd [specread_client]
         ensure_engaged r $rd race:a
         for {set round 0} {$round < 200} {incr round} {
             for {set i 0} {$i < 8} {incr i} { $rd get race:a }
@@ -212,7 +212,7 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
     }
 
     test {T-RACE-EXPIRE-SAFETY: reads racing first-time expiry churn never crash or tear} {
-        set rd [dplus_client]
+        set rd [specread_client]
         r set race:e keepme
         ensure_engaged r $rd race:e
         for {set round 0} {$round < 100} {incr round} {
@@ -235,14 +235,14 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         }
         r set final fval
         set before_hits 0
-        if {$::dplus_instrumented} { set before_hits [dplus_field r dplus_speculative_hits] }
-        set rd [dplus_client]
+        if {$::specread_instrumented} { set before_hits [specread_field r specread_speculative_hits] }
+        set rd [specread_client]
         for {set i 0} {$i < 50} {incr i} { $rd get final }
         for {set i 0} {$i < 50} {incr i} { assert_equal "fval" [$rd read] }
         $rd close
-        if {$::dplus_instrumented} {
+        if {$::specread_instrumented} {
             wait_for_condition 100 50 {
-                [dplus_field r dplus_speculative_hits] > $before_hits
+                [specread_field r specread_speculative_hits] > $before_hits
             } else {
                 fail "speculation dead after mixed load -- parity residue (missed bracket?)"
             }
@@ -250,7 +250,7 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
             # Uninstrumented: parity residue is still observable indirectly --
             # an odd shard makes every read of 'final' punt, which the
             # even-at-rest probe catches:
-            set v [lindex [r debug dplus-shard-version final] 1]
+            set v [lindex [r debug specread-shard-version final] 1]
             assert {$v % 2 == 0}
         }
     }
@@ -258,7 +258,7 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
     test {T-REHASH-WINDOW: reads racing active rehash punt or serve coherently, never crash} {
         r flushall
         for {set i 0} {$i < 20000} {incr i} { r set rh:$i v$i }
-        set rd [dplus_client]
+        set rd [specread_client]
         for {set round 0} {$round < 20} {incr round} {
             for {set i 0} {$i < 200} {incr i} { $rd get rh:[expr {$round * 200 + $i}] }
             for {set i 0} {$i < 200} {incr i} { $rd read }

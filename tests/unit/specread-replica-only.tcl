@@ -1,13 +1,13 @@
 # io-threads-speculation-replica-only: with the flag set, a primary or
 # standalone server never speculates reads on IO threads (stock read path);
-# a replica does. The flagless observable is dplus_epoch_reader_entries in
-# INFO dplus, which every speculation attempt increments once it passes the
+# a replica does. The flagless observable is specread_epoch_reader_entries in
+# INFO specread, which every speculation attempt increments once it passes the
 # entry gates.
 
 proc epoch_entries {r} {
-    set payload [$r info dplus]
-    if {![regexp {dplus_epoch_reader_entries:(\d+)} $payload -> value]} {
-        fail "missing dplus_epoch_reader_entries in INFO dplus"
+    set payload [$r info specread]
+    if {![regexp {specread_epoch_reader_entries:(\d+)} $payload -> value]} {
+        fail "missing specread_epoch_reader_entries in INFO specread"
     }
     return $value
 }
@@ -26,7 +26,7 @@ proc pump_gets {r key {level 0}} {
     return [expr {[epoch_entries $r] - $before}]
 }
 
-start_server {tags {"dplus-replica-only"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
+start_server {tags {"specread-replica-only"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
     r select 0 ;# the same db as the fast-path clients
     r set ro:key v1
 

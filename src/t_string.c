@@ -517,7 +517,7 @@ void setrangeCommand(client *c) {
         o = dbUnshareStringValue(c->db, c->argv[1], o);
     }
 
-    /* D+ S3 (sweep H5): same pattern as APPEND -- grow may realloc+free
+    /* specread S3 (sweep H5): same pattern as APPEND -- grow may realloc+free
      * under a reader, and the memcpy is an unversioned byte mutation.
      * Capacity is ensured inside the bracket so sdsgrowzero never moves
      * the allocation (it only extends len and zero-fills in place). */
@@ -762,7 +762,7 @@ void incrDecrCommand(client *c, long long incr) {
     if (o && o->refcount == 1 && objectGetEncoding(o) == OBJ_ENCODING_INT &&
         value >= LONG_MIN && value <= LONG_MAX) {
         new = o;
-        /* D+ S3 (audit defect 3 / sweep H3): in-place tagged-int rewrite of a
+        /* specread S3 (audit defect 3 / sweep H3): in-place tagged-int rewrite of a
          * published value had NO version bump -- a speculative reader could
          * return the stale integer and validate. Bracket the single store;
          * no free involved (tagged pointer). */
@@ -1042,7 +1042,7 @@ void appendCommand(client *c) {
             return;
 
         /* Append the value.
-         * D+ S3 (sweep H4): sdscatlen on the published sds could realloc,
+         * specread S3 (sweep H4): sdscatlen on the published sds could realloc,
          * FREEING the buffer an in-flight reader is copying (UAF), with no
          * bump on the byte mutation. Bracket the whole mutation; when growth
          * is needed, dbGrowPublishedStringValue publishes a replacement

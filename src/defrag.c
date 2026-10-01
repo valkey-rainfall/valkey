@@ -40,7 +40,7 @@
 
 #include "server.h"
 #include "ordered_index.h"
-#include "dplus.h" /* S1.2b exclusive gate */
+#include "specread.h" /* S1.2b exclusive gate */
 #include "hashtable.h"
 #include "eval.h"
 #include "script.h"
@@ -1152,7 +1152,7 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
     mstime_t latency;
     latencyStartMonitor(latency);
 
-    /* D+ (S1.2b): defrag reallocates object shells, sds keys, skiplist and
+    /* specread (S1.2b): defrag reallocates object shells, sds keys, skiplist and
      * quicklist nodes, and inner hashtable buckets, freeing the originals
      * IMMEDIATELY (allocatorDefragFree) and rewriting live pointers in
      * place — every one of those frees and swaps is a UAF/torn-walk hazard
@@ -1163,7 +1163,7 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
      * frees stay immediate so defrag's accounting is unchanged. Defrag is
      * already a rare, latency-budgeted slow path; refining to per-swap
      * bump+defer is performance-gated later work (Phase 3 territory). */
-    dplusExclusiveEnter();
+    specreadExclusiveEnter();
 
     do {
         if (!defrag.current_stage) {
@@ -1186,7 +1186,7 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
          * starvation protection has increased the duty-cycle. */
     } while (haveMoreWork && getMonotonicUs() <= endtime - server.active_defrag_cycle_us);
 
-    dplusExclusiveLeave();
+    specreadExclusiveLeave();
 
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded("active-defrag-cycle", latency);
