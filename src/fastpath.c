@@ -222,10 +222,20 @@ int fastpathWorkerReopen(int tid) {
     return 1;
 }
 
+/* The main-owner path runs the IO-owner stage code on main at one active IO thread: the config is on
+ * and the fanout policy resolved to SINGLE_IO. Admission, attach, and the four socket edges key on
+ * this to route tid 0 to main's event loop instead of a worker's epoll fd. */
+static inline int fpSingleIoActive(void) {
+    return server.io_threads_main_owner && server.active_io_threads_num <= 1;
+}
+
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
 static int fpSessionEligible(client *c) {
     if (!server.io_threads_fast_path) return 0;
-    if (!strictOffloadActive() || server.io_threads_num < 2) return 0;
+    /* Thread-count gate, split from the per-client session gate below. The worker fast path needs
+     * strict offload and at least one worker thread (io_threads_num >= 2); the main-owner path needs
+     * neither, admitting at io-threads 1 when its config is on. */
+    if (!fpSingleIoActive() && (!strictOffloadActive() || server.io_threads_num < 2)) return 0;
     if (!c->conn || c->flag.fake) return 0;
     if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
     if (authRequired(c)) return 0; /* main enforces a later default-user password change per entry */
@@ -455,18 +465,25 @@ size_t fastpathReplyOutstanding(const ClientControl *cc) {
 
 /* Ownership passes with the ring entry: after it main touches nothing of the client until it is handed back. */
 int fastpathAttach(client *c) {
-    int n = ioThreadsReadyNum() - 1;
     fpThread *t = NULL;
     int tid = 0;
-    for (int i = 0; i < n; i++) {
-        tid = 1 + (int)(fp_rr++ % (unsigned)n);
-        t = &fp_threads[tid];
-        if (t->submit.buffer && fastpathWorkerRole(tid) == FP_ROLE_OPEN && listLength(t->ret_overflow) == 0 &&
-            spscFreeSlots(&t->ret) > FP_RET_RESERVE)
-            break;
-        t = NULL;
+    if (fpSingleIoActive()) {
+        /* Main owns its own clients on tid 0: no worker selection, no ready/role check (main is
+         * always the open owner of its own ring), the self-loop takes and returns on this thread. */
+        t = &fp_threads[0];
+        if (t->submit.buffer == NULL) return C_ERR;
+    } else {
+        int n = ioThreadsReadyNum() - 1;
+        for (int i = 0; i < n; i++) {
+            tid = 1 + (int)(fp_rr++ % (unsigned)n);
+            t = &fp_threads[tid];
+            if (t->submit.buffer && fastpathWorkerRole(tid) == FP_ROLE_OPEN && listLength(t->ret_overflow) == 0 &&
+                spscFreeSlots(&t->ret) > FP_RET_RESERVE)
+                break;
+            t = NULL;
+        }
+        if (!t) return C_ERR;
     }
-    if (!t) return C_ERR;
     if (c->fp_peer.family == 0 && fpCaptureAddrs(c) != C_OK) return C_ERR;
     if (fastpathControlEnsure(c) != C_OK) return C_ERR;
     c->io_tid = tid;
@@ -477,7 +494,7 @@ int fastpathAttach(client *c) {
     /* fp_inflight, fp_held and fp_deferred now live in the owner slot and are zero-initialised there
      * when the IO thread assigns it (fpOwnerSlotAssign); attach, which runs on main before the slot
      * exists, no longer initialises them. control->lifecycle is the single source of truth for state. */
-    c->control->owner_domain = CC_OWNER_IO;
+    c->control->owner_domain = (tid == 0) ? CC_OWNER_MAIN : CC_OWNER_IO; /* tid 0 is main owning its own client */
     c->control->owner_tid = (uint8_t)tid;
     c->control->lifecycle = FP_ACTIVE;
     fastpathControlPin(c, CC_PIN_OWNER); /* IO now owns the connection; hold until handoff returns it to main */
