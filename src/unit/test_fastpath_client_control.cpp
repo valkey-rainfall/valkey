@@ -17,6 +17,7 @@
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 extern "C" {
@@ -116,6 +117,11 @@ class FastpathClientControlTest : public ::testing::Test {
         EXPECT_EQ(fastpathAttach(c), C_OK);
         EXPECT_EQ(c->io_tid, 1);
         EXPECT_EQ(fastpathProcessReturns(1), 1); /* the attach request: thread takes ownership */
+        /* A reply that never arrives must fail the test, not block the binary forever. */
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        EXPECT_EQ(setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)), 0);
         *peer = sv[1];
         return c;
     }
@@ -344,21 +350,27 @@ TEST_F(FastpathClientControlTest, ReplyAccountingHandlesSpilledBigReply) {
     std::string big(32 * 1024, 'x');
     std::string set = "*3\r\n$3\r\nSET\r\n$5\r\nbigky\r\n$" + std::to_string(big.size()) + "\r\n" + big + "\r\n";
     send(peer, set.c_str());
+    /* One read takes at most PROTO_IOBUF_LEN (16 KiB) while the parser has not yet seen the bulk
+     * length; the socket stays level-triggered readable and the second event reads the rest of the
+     * big argument. Two readable calls stand in for those two epoll wakeups. */
+    fastpathClientReadable(1, c);
     fastpathClientReadable(1, c);
     fastpathSubmitPending(1);
     EXPECT_EQ(fastpathDrain(), 1);
     EXPECT_EQ(fastpathProcessReturns(1), 1);
     EXPECT_EQ(recv(peer), "+OK\r\n");
     EXPECT_EQ(fastpathReplyOutstanding(cc), 0u); /* +OK sent and reclaimed */
+    size_t released_after_set = cc->reply_bytes_released; /* the counters are cumulative across commands */
 
     const char *get = "*2\r\n$3\r\nGET\r\n$5\r\nbigky\r\n";
     send(peer, get);
     fastpathClientReadable(1, c);
     fastpathSubmitPending(1);
     EXPECT_EQ(fastpathDrain(), 1);
-    /* The big reply is retained (spilled to reply_big): outstanding covers at least the value bytes. */
+    /* The big reply is retained (spilled to reply_big): outstanding covers at least the value bytes,
+     * and nothing of it has been released yet. */
     EXPECT_GE(fastpathReplyOutstanding(cc), big.size());
-    EXPECT_EQ(cc->reply_bytes_released, 0u);
+    EXPECT_EQ(cc->reply_bytes_released, released_after_set);
 
     /* Delivered and reclaimed exactly once: outstanding returns to zero, produced == released. The
      * bulk reply is "$<len>\r\n<value>\r\n": one '$', the ascii length, two CRLFs, and the value. */

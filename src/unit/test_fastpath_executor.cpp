@@ -44,6 +44,7 @@ class FastpathExecutorTest : public ::testing::Test {
         server.main_thread_id = pthread_self();
         server.client_max_querybuf_len = 1024ll * 1024 * 1024;
         server.proto_max_bulk_len = 512ll * 1024 * 1024;
+        server.el = aeCreateEventLoop(1024); /* fastpathHandoffDone re-arms the read handler on main's loop */
         createSharedObjects();
         moduleInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
