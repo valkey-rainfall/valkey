@@ -1053,7 +1053,14 @@ static void fpFinishLeaving(fpThread *t) {
          * fastpathHandoffDone), so only fp_inflight is asserted here. */
         serverAssert(fpSlot(t, c)->fp_inflight == 0);
         fpUnregister(t, c);
-        sendToMainThread(c, c->control->lifecycle == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
+        if (c->io_tid == 0) {
+            /* Self-handoff: main is both the leaving owner and the taker, so there is no thread to
+             * cross. Call the main-side taker inline rather than posting a JOB_RES_FP_* on the shared
+             * outbox, which the main-owner path does not initialize or drain at io-threads 1. */
+            fastpathHandoffDone(c, c->control->lifecycle == FP_CLOSING);
+        } else {
+            sendToMainThread(c, c->control->lifecycle == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
+        }
     }
 }
 

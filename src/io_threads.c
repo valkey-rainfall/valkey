@@ -2352,7 +2352,14 @@ int processIOThreadsResponses(void) {
 
     int fp_processed = fastpathDrain();
 
-    if (server.io_threads_main_owner && server.active_io_threads_num <= 1) fastpathProcessReturns(0);
+    if (server.io_threads_main_owner && server.active_io_threads_num <= 1) {
+        fastpathProcessReturns(0);
+        /* The main-owner self-loop uses only the fast-path rings. The worker-offload tail below
+         * (command ring and the shared JOB_PRIORITY outboxes) belongs to the io-threads >= 2 path,
+         * and its shared state (ioThreadsInitShared) is never set up at io-threads 1, so return here
+         * rather than dequeue from an uninitialized mpsc outbox. */
+        return fp_processed;
+    }
 
     if (getPendingIOResponsesCount() == 0 && fastpathClientCount() == 0) return fp_processed;
 
