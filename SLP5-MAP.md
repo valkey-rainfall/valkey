@@ -129,3 +129,44 @@ sockets: route B reuses `server.el` as the poller and splits only the four
 socket edges by `c->io_tid == 0`. The one genuine design decision is speculation
 on a single thread (gated off on the main owner, option (i)), which is a policy
 choice, not a structural obstacle. Proceeding to M1.
+
+## What the build found beyond the map (post-M1)
+
+Route B held exactly at the four socket edges: the register/deregister/
+write-interest/callback split by `c->io_tid == 0` was the whole of the
+socket-poller change, no second poll on main, no restructure. `stageAssertHolds`
+needed no widening after all: `fpAllocBatch` opens a tid-0 batch as `{MAIN,0}`
+and `stageWritePublish` returns it there, so holder and self are the same domain
+end to end and the existing assert passes. `stageAssertOwner` was correct as the
+map predicted.
+
+Two sites the map under-specified, both found by the ON smoke, neither a socket
+edge and neither a route-B failure:
+
+1. **The handback edge (self-handoff).** The map inventoried the owner read/write/
+   register edges but not the path a client takes when it *leaves* the fast path
+   (the first non-fast-path command, e.g. an admin `CONFIG`). On a worker that
+   path posts `JOB_RES_FP_HANDOFF` on the shared outbox for main to consume;
+   `fpFinishLeaving` is driven by `fastpathProcessReturns`, which the self-loop
+   already calls, so the leaving client *was* drained — but the handoff job was
+   posted to a shared outbox the main-owner path never drains (see 2), so the
+   client hung on its first punt. Fix: for tid 0, `fpFinishLeaving` calls
+   `fastpathHandoffDone` inline (main is both the leaving owner and the taker;
+   no thread to cross). This is the one edge the map missed; it is a *handback*
+   edge, not one of the four *socket* edges, and route B is unaffected.
+
+2. **The worker-offload tail of `processIOThreadsResponses`.** Once a fast-path
+   client exists, that function falls past its early return into
+   `processCommandRing()` and `processOutboxBatch(&io_shared_outbox[...])`. At
+   io-threads 1 the shared IO infrastructure (`ioThreadsInitShared`) is never set
+   up, so the first drive dereferenced an uninitialized `mpscQueue` and crashed in
+   `mpscDequeueBatch`. The map treated the io-threads==1 early returns as "init
+   `fastpathInitThread(0)` only" and did not note that driving the fast-path lane
+   on main also reaches this worker-offload tail. Fix: the SINGLE_IO self-loop
+   returns after its own rings; it uses only the fast-path submit/ret rings and
+   never the command ring or the shared outboxes (those belong to io-threads >= 2).
+
+3. **INFO aggregation (observability, not a path).** `fastpathInfo` summed only
+   worker tids (>= 1), so tid-0 reads/writes/batches read as zero. Included tid 0
+   in the counter sums (not the worker-role tally). `fastpath_batches` is now the
+   smoke's engagement signal; `fastpath_speculated` stays 0 on tid 0 by design.

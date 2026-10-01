@@ -270,3 +270,121 @@ Logs: `slp-logs/build.log`, `gate1.log`, `gatespec.log`, `gate2a.log`,
   relocation. Deprioritised in favour of step 3, the design's actual "PoC proves
   the interfaces" gate, which is self-contained.
 
+
+## Step 5 — STAGE_FANOUT_SINGLE_IO: main as IO owner at io-threads 1
+
+Branch `exp/slp-step5-single-io`, cut from `f036ebf8b` (the slot prototype).
+`SLP5-MAP.md` carries the feasibility map (verdict: feasible, route B) and a
+post-M1 "what the build found" section.
+
+### What moved
+
+A new immutable config `io-threads-main-owner` (default off). When it is on and
+there is one active IO thread, `stagePolicyRead()` yields `STAGE_FANOUT_SINGLE_IO`
+instead of `STAGE_FANOUT_INLINE`, and main owns its own clients through the same
+IO-owner stage code a worker runs — read/parse -> `handoffPublish` into its own
+submit ring -> `handoffTake` -> `stageExecute` -> write.publish -> write-out — on
+one thread (tid 0) with no thread crossing. The same functions select by policy,
+not by `#if` or a separate code path: the sketch's "main is domain MAIN with its
+own slot table, same code" row. With the config off, io-threads 1 is byte-for-byte
+the stock single-thread loop (proven by the OFF gate battery below).
+
+Route B (map's choice): main's existing `server.el` is the socket poller for
+tid-0-owned clients. The four socket edges split by `c->io_tid == 0` — register
+installs the owner read handler on `server.el` (not `epoll_ctl ADD`), deregister
+clears the ae handlers, write-interest toggles the ae write handler, and
+readability/writability arrive through two `ConnectionCallbackFunc` wrappers onto
+the shared `fastpathClientReadable/Writable` at tid 0. No second poll on main, no
+restructure of main's loop. Read-stage speculation is gated off on tid 0 (map
+option (i)): the speculating reader and the execute writer would be the same
+thread, so the seqlock concurrency the validation relies on does not exist;
+`fastpath_speculated` is 0 on the main owner by design. This keeps the A/B Jim
+wants a clean measure of staging overhead (ring hops, arena, two-pass execute)
+with the crossing removed.
+
+### Map sites and how each was handled
+
+22 sites, 16 flagged for a relaxation. All held as mapped except as noted:
+
+- **Owner-tid selection (3):** `fpSessionEligible` thread-count gate split from the
+  session gate so the main owner admits at io-threads 1; `fastpathAttach` routes to
+  tid 0 and tags `owner_domain = CC_OWNER_MAIN`; eligibility reuses the session
+  checks minus the `io_threads_num >= 2` gate.
+- **Socket edges (4):** split by `c->io_tid == 0` exactly as mapped (route B held
+  with no surprises).
+- **Ring init/drive (4):** `fastpathInitThread(0)` under the config (M1 part 1);
+  `fastpathDrain` includes tid 0; the self-loop (submit-pending + drain + process-
+  returns) rides `processIOThreadsResponses` from `beforeSleep`; no worker loop.
+- **Identity/asserts (2):** `fpAllocBatch`/`stageWritePublish` set the tid-0 holder
+  to `{MAIN,0}`. `stageAssertHolds` needed **no widening** after all — holder and
+  self are the same domain end to end — so the map's "widen to the publishing
+  domain" was satisfied by construction, not by changing the macro. `stageAssertOwner`
+  correct as mapped.
+- **io-threads==1 init early return (1):** `fastpathInitThread(0)` added.
+- **Speculation gate (1):** punted on tid 0.
+
+Two sites the map under-specified, both found by the ON smoke, both fixed, neither
+a route-B failure (detail in `SLP5-MAP.md` "What the build found"):
+
+1. **Handback edge (self-handoff).** A client leaving the fast path (first admin/
+   unsupported command) posts `JOB_RES_FP_HANDOFF` on a worker; at tid 0 that is a
+   self-handoff, so `fpFinishLeaving` calls `fastpathHandoffDone` inline. Without
+   this the first `CONFIG` hung the connection.
+2. **Worker-offload tail.** `processIOThreadsResponses` falls past its early return
+   into the command ring and shared outboxes once a fast-path client exists; those
+   are never initialized at io-threads 1 (`ioThreadsInitShared` is skipped), so the
+   SINGLE_IO self-loop returns after its own rings. Without this the server crashed
+   in `mpscDequeueBatch` on the first drive.
+
+### Gate results
+
+- **OFF battery (config default off), must match `f036ebf8b` exactly:** all green.
+  - `unit/io-threads`+`unit/lazyfree`: 12/12
+  - `unit/speculative-reads`: 12/12
+  - `unit/dplus-correctness` run 1: 16/16
+  - `unit/dplus-correctness` run 2: 16/16
+  - `unit/dplus-replica-only`: 4/4
+  - Zero behavior change by default confirmed.
+- **StageTransport gtest:** RED 4/4 (guard off), GREEN 4/4 (guard on); build clean,
+  `.make-settings` unchanged.
+- **ON smoke (io-threads 1, `io-threads-main-owner yes`):** server healthy;
+  `valkey-benchmark -t set,get -n 20000 -P 4`: SET ~345k rps, GET ~351k rps; direct
+  `SET`/`GET slp:probe -> hello` correct. Counters after the run:
+  `fastpath_reads:10104`, `fastpath_writes:10001`, `fastpath_batches:2643` (> 0, the
+  engagement signal), `fastpath_speculated:0` (gated off on tid 0 by design). The
+  admin-command punt path exercised and served.
+- **ON batteries (io-threads 1, main-owner).** `--config io-threads-main-owner yes`
+  does **not** reach the tests' own `start_server overrides`, which pin `io-threads 4`
+  (so that form passes 12/12 but runs the worker fast path, not SINGLE_IO). To
+  actually exercise SINGLE_IO, the one-line `overrides` was rewritten to `io-threads 1
+  io-threads-main-owner yes` in a throwaway copy of each test:
+  - `speculative-reads` at io-threads 1: **11/12**. The one failure,
+    "fastpath_speculated advances for a served GET run", asserts speculation
+    engagement — which SINGLE_IO disables on the main owner by design.
+    **Classification: expected (assert on a counter the design deliberately keeps 0
+    on tid 0), not a bug.** The other 11 (correctness + side-effect punts) pass.
+  - `dplus-correctness` at io-threads 1: **11/16**. All 5 failures report "speculative
+    path never engaged" / "speculation dead after mixed load" — the same engagement
+    precondition. **Classification: expected (speculation gated off on tid 0), not
+    bugs:** no torn read, no crash, no wrong value. The correctness-only tests
+    (delete-bracket, rehash-window coherence) pass.
+  The copies were classification scaffolding and were removed; reproduce by changing
+  the `start_server overrides` `io-threads 4`/`io-threads 4 ...` to `io-threads 1
+  io-threads-main-owner yes ...` in each test.
+- **TSan differential:** `make SANITIZER=thread MALLOC=libc OPTIMIZATION=-O1
+  SERVER_CFLAGS=-DIO_LOOKUP_OFFLOAD_STATS`, ON and OFF smoke (incl. the admin-punt
+  handback) under TSan: **0 warnings ON, 0 warnings OFF**, no race locations.
+  Expected — SINGLE_IO runs on one thread with no crossing. Rebuilt non-sanitized
+  after.
+
+### Deferred / notes
+
+- Speculation on the single-thread main owner is left off (option (i)); option (ii)
+  (allow it as trivially consistent) is a follow-up measurement, not needed for the
+  A/B.
+- The crossing-cost arm (io-threads 2 with `server-cpulist` pinning main and one
+  worker to a core) is config-only and needs no code from this branch.
+- Host scripts in the worktree (untracked): `slp-build.sh`, `slp-gate.sh`,
+  `slp-gtest.sh`, `slp-gtest-full.sh`, `slp-smoke-on.sh`, `slp-probe-on.sh`,
+  `slp-probe2-on.sh`, `slp-tsan-diff.sh`.
+- Out-of-scope edits: none.
