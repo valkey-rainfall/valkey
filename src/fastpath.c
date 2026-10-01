@@ -11,6 +11,13 @@
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
+/* Route-B socket edges for a tid-0 (main-owned) client: main's event loop is the poller, so
+ * readability and writability arrive as server.el connection callbacks rather than from a worker's
+ * epoll scan. These wrappers adapt the ConnectionCallbackFunc signature onto the shared owner path
+ * at tid 0. Defined after fastpathClientReadable/Writable; forward-declared here for the edges. */
+static void fpMainReadable(connection *conn);
+static void fpMainWritable(connection *conn);
+
 /* Keep crossing-capable records compact: ClientHandle fits without growing the base command entry. */
 static_assert(sizeof(ClientHandle) == 2 * sizeof(void *),
               "ClientHandle is a compact {control ref, generation, owner slot}");
@@ -624,7 +631,13 @@ static int fpCurHasClient(fpThread *t, client *c) {
 static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
-    epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
+    if (c->io_tid == 0) {
+        /* Main owns tid 0 through server.el: drop both interests on the ae loop, not an epoll fd. */
+        connSetReadHandler(c->conn, NULL);
+        connSetWriteHandler(c->conn, NULL);
+    } else {
+        epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
+    }
     if (fpSlot(t, c)->fp_deferred) {
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
         fpSlot(t, c)->fp_deferred = 0;
@@ -841,6 +854,11 @@ void fastpathClientReadable(int tid, client *c) {
 }
 
 static void fpEnableWriteInterest(client *c, int on) {
+    if (c->io_tid == 0) {
+        /* Main-owned: toggle writability through server.el's write handler, not epoll interest bits. */
+        connSetWriteHandler(c->conn, on ? fpMainWritable : NULL);
+        return;
+    }
     struct epoll_event ev = {.events = on ? (EPOLLIN | EPOLLOUT) : EPOLLIN, .data.ptr = c};
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_MOD, c->conn->fd, &ev);
 }
@@ -895,6 +913,17 @@ static void stageWriteSend(fpThread *t, client *c, struct iovec *iov, int iovcnt
 void fastpathClientWritable(int tid, client *c) {
     fpThread *t = &fp_threads[tid];
     if (fpFlushOut(t, c)) fpEnableWriteInterest(c, 0);
+}
+
+/* server.el delivers readability/writability for a main-owned (tid 0) client to these; they adapt the
+ * ConnectionCallbackFunc signature onto the shared owner path at tid 0, the same functions a worker
+ * runs from its epoll scan. The client is the connection's private data, as for readQueryFromClient. */
+static void fpMainReadable(connection *conn) {
+    fastpathClientReadable(0, connGetPrivateData(conn));
+}
+
+static void fpMainWritable(connection *conn) {
+    fastpathClientWritable(0, connGetPrivateData(conn));
 }
 
 static parsedCommand fpEntryToParsed(cmdEntry *e) {
@@ -1099,6 +1128,12 @@ static void fpTakeClient(fpThread *t, client *c) {
     fpRegister(t, c);
     if (atomic_load_explicit(&t->role, memory_order_relaxed) != FP_ROLE_OPEN) {
         fpBeginLeave(t, c, FP_LEAVING, 0); /* admitted as the role closed: straight back to main */
+        return;
+    }
+    if (c->io_tid == 0) {
+        /* Main-owned: install the owner read path on server.el. Main's existing ae loop delivers
+         * readability; no epoll fd is registered for tid 0 (route B). */
+        if (connSetReadHandler(c->conn, fpMainReadable) != C_OK) fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }
     struct epoll_event ev = {.events = EPOLLIN, .data.ptr = c};
