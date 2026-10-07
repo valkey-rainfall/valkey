@@ -154,6 +154,7 @@ static void deferClientRead(client *c);
 char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
 static int clientMatchesFilter(client *client, clientFilter *client_filter);
+static void clientKillVictimGone(uint64_t id);
 static int validateClientFlagFilter(sds flag_filter);
 static int validateClientCapaFilter(sds capa);
 static sds getAllFilteredClientsInfoString(clientFilter *client_filter, int hide_user_data);
@@ -2266,6 +2267,7 @@ void unlinkClient(client *c) {
             raxRemove(server.clients_index, (unsigned char *)&id, sizeof(id), NULL);
             listDelNode(server.clients, c->client_list_node);
             c->client_list_node = NULL;
+            if (server.kill_waiters && raxSize(server.kill_waiters)) clientKillVictimGone(c->id);
 
             /* Decrement active client counters. Fake clients (where c->conn is NULL)
              * and unlinked clients (c->client_list_node is NULL) do not increment these
@@ -6245,6 +6247,55 @@ void clientNoEvictCommand(client *c) {
     }
 }
 
+/* A killed client that an IO thread still owns is freed once that thread releases it, and CLIENT KILL replies
+ * only then. The caller must be able to block, and its ID must find it when its last victim goes. */
+static int clientKillMayWait(client *c) {
+    return !c->flag.deny_blocking && c->conn && !isReplicatedClient(c) && lookupClientByID(c->id) == c;
+}
+
+static void clientKillAwait(uint64_t victim, uint64_t killer) {
+    uint64_t key = htonu64(victim);
+    void *waiters = NULL;
+    if (!server.kill_waiters) server.kill_waiters = raxNew();
+    if (!raxFind(server.kill_waiters, (unsigned char *)&key, sizeof(key), &waiters)) {
+        waiters = listCreate();
+        raxInsert(server.kill_waiters, (unsigned char *)&key, sizeof(key), waiters, NULL);
+    }
+    listAddNodeTail(waiters, (void *)(uintptr_t)killer);
+}
+
+static void clientKillReply(client *c, long long killed) {
+    if (killed < 0)
+        addReply(c, shared.ok);
+    else
+        addReplyLongLong(c, killed);
+}
+
+/* Called as a client leaves the client list: its waiting killers reply once their last victim is gone. */
+static void clientKillVictimGone(uint64_t id) {
+    uint64_t key = htonu64(id);
+    void *v = NULL;
+    if (!raxRemove(server.kill_waiters, (unsigned char *)&key, sizeof(key), &v)) return;
+    list *waiters = v;
+    listIter li;
+    listNode *ln;
+    listRewind(waiters, &li);
+    while ((ln = listNext(&li))) {
+        client *k = lookupClientByID((uint64_t)(uintptr_t)listNodeValue(ln));
+        if (!k || !k->flag.blocked || k->bstate->btype != BLOCKED_KILL) continue; /* the killer is gone */
+        if (--k->bstate->kill_pending > 0) continue;
+        clientKillReply(k, k->bstate->kill_reply);
+        if (k->bstate->kill_close_self) k->flag.close_after_reply = 1;
+        unblockClient(k, 1);
+    }
+    listRelease(waiters);
+}
+
+void unblockClientWaitingKills(client *c) {
+    c->bstate->kill_pending = 0;
+    updateStatsOnUnblock(c, 0, 0, 0);
+}
+
 void clientKillCommand(client *c) {
     /* CLIENT KILL <ip:port>
      * CLIENT KILL <option> [value] ... <option> [value] */
@@ -6280,6 +6331,8 @@ void clientKillCommand(client *c) {
     }
 
     /* Iterate clients killing all the matching clients. */
+    int may_wait = clientKillMayWait(c), nawait = 0, cap = 0;
+    uint64_t *awaited = NULL;
     listRewind(server.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *client = listNodeValue(ln);
@@ -6289,20 +6342,46 @@ void clientKillCommand(client *c) {
         if (c == client) {
             close_this_client = 1;
         } else {
-            freeClient(client);
+            uint64_t id = client->id;
+            /* Still listed after freeClient: freed later, once an IO thread releases it. */
+            if (!freeClient(client) && may_wait && client->client_list_node && !client->flag.protected &&
+                !client->flag.protected_rdb_channel) {
+                if (nawait == cap) {
+                    cap = cap ? cap * 2 : 8;
+                    awaited = zrealloc(awaited, cap * sizeof(*awaited));
+                }
+                awaited[nawait++] = id;
+            }
         }
         killed++;
     }
 
-    /* Reply according to old/new format. */
-    if (c->argc == 3) {
-        if (killed == 0)
-            addReplyError(c, "No such client");
-        else
-            addReply(c, shared.ok);
-    } else {
-        addReplyLongLong(c, killed);
+    /* A later free in the loop may have released an earlier victim; only the ones still listed are waited for. */
+    int pending = 0;
+    for (int j = 0; j < nawait; j++) {
+        if (!lookupClientByID(awaited[j])) continue;
+        clientKillAwait(awaited[j], c->id);
+        pending++;
     }
+    zfree(awaited);
+
+    long long reply = (c->argc == 3) ? -1 : killed;
+    if (pending > 0) {
+        initClientBlockingState(c);
+        c->bstate->timeout = 0;
+        c->bstate->kill_pending = pending;
+        c->bstate->kill_reply = reply;
+        c->bstate->kill_close_self = close_this_client;
+        c->flag.pending_command = 0;
+        blockClient(c, BLOCKED_KILL);
+        goto client_kill_done;
+    }
+
+    /* Reply according to old/new format. */
+    if (c->argc == 3 && killed == 0)
+        addReplyError(c, "No such client");
+    else
+        clientKillReply(c, reply);
 
     /* If this client has to be closed, flag it as CLOSE_AFTER_REPLY
      * only after we queued the reply to its output buffers. */

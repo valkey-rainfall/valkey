@@ -554,3 +554,92 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
         $s close
     }
 }
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    proc fastpath_count {} {
+        return [getInfoProperty [r info fastpath] fastpath_clients]
+    }
+    # Clients that send no SELECT stay on the fast path; CLIENT ID leaves it and the client rejoins after.
+    proc fastpath_victims {n} {
+        set base [fastpath_count]
+        set clients {}
+        set ids {}
+        for {set i 0} {$i < $n} {incr i} {
+            set v [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+            lappend ids [$v client id]
+            lappend clients $v
+        }
+        wait_for_condition 100 20 {[fastpath_count] >= $base + $n} else { fail "victims did not join the fast path" }
+        return [list $clients $ids]
+    }
+    proc kill_raw_socket {} {
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation {crlf binary} -blocking 1
+        return $fd
+    }
+    proc kill_raw_read {fd n} {
+        set out {}
+        fconfigure $fd -blocking 0
+        set deadline [expr {[clock milliseconds] + 5000}]
+        while {[llength $out] < $n && [clock milliseconds] < $deadline} {
+            set line [gets $fd]
+            if {$line eq ""} {
+                if {[eof $fd]} break
+                after 5
+                continue
+            }
+            lappend out $line
+        }
+        fconfigure $fd -blocking 1
+        return $out
+    }
+    proc close_all {clients} {
+        foreach v $clients { catch {$v close} }
+    }
+
+    # The IO thread that owns a fast-path client releases it before main frees it. The killer's next
+    # command, pipelined behind CLIENT KILL, must not find the killed clients.
+    test {CLIENT KILL replies once the killed fast-path clients are gone} {
+        lassign [fastpath_victims 5] clients ids
+        set fd [kill_raw_socket]
+        puts -nonewline $fd "CLIENT KILL ID $ids\r\nCLIENT LIST ID $ids\r\n"
+        flush $fd
+        assert_equal [list :5 {$0}] [kill_raw_read $fd 2]
+        close $fd
+        close_all $clients
+    }
+
+    test {CLIENT KILL with the old syntax replies +OK once the killed fast-path client is gone} {
+        lassign [fastpath_victims 1] clients ids
+        set addr [get_field_in_client_info [r client list id $ids] addr]
+        set fd [kill_raw_socket]
+        puts -nonewline $fd "CLIENT KILL $addr\r\nCLIENT LIST ID $ids\r\n"
+        flush $fd
+        assert_equal [list +OK {$0}] [kill_raw_read $fd 2]
+        close $fd
+        close_all $clients
+    }
+
+    test {CLIENT KILL that also kills the caller replies after the other clients are gone} {
+        lassign [fastpath_victims 3] clients ids
+        set fd [kill_raw_socket]
+        puts -nonewline $fd "CLIENT ID\r\n"
+        flush $fd
+        set me [string range [lindex [kill_raw_read $fd 1] 0] 1 end]
+        puts -nonewline $fd "CLIENT KILL ID $me $ids SKIPME NO\r\n"
+        flush $fd
+        assert_equal {:4} [kill_raw_read $fd 2]
+        assert_equal {} [r client list id {*}$ids]
+        close $fd
+        close_all $clients
+    }
+
+    test {CLIENT KILL inside MULTI replies without waiting} {
+        lassign [fastpath_victims 1] clients ids
+        r multi
+        r client kill id $ids
+        assert_equal {1} [r exec]
+        wait_for_condition 100 20 {[r client list id $ids] eq {}} else { fail "killed client still listed" }
+        close_all $clients
+    }
+}

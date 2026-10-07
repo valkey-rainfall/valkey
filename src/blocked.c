@@ -91,6 +91,9 @@ void initClientBlockingState(client *c) {
     c->bstate->numreplicas = 0;
     c->bstate->numlocal = 0;
     c->bstate->reploffset = 0;
+    c->bstate->kill_pending = 0;
+    c->bstate->kill_close_self = 0;
+    c->bstate->kill_reply = 0;
     c->bstate->generic_blocked_list_node = NULL;
     c->bstate->module_blocked_handle = NULL;
     c->bstate->async_rm_call_handle = NULL;
@@ -254,6 +257,9 @@ void unblockClient(client *c, int queue_for_reprocessing) {
     case BLOCKED_INUSE:
         unlinkBlockInUseClient(c);
         break;
+    case BLOCKED_KILL:
+        unblockClientWaitingKills(c);
+        break;
     default:
         serverPanic("Unknown btype in unblockClient().");
     }
@@ -367,6 +373,9 @@ void disconnectOrRedirectAllBlockedClients(void) {
             /* BLOCKED_INUSE clients will reprocess their command when unblocked
              * by the caller. Sending error replies here would be incorrect. */
             if (c->bstate->btype == BLOCKED_INUSE) continue;
+
+            /* CLIENT KILL does not depend on the role; it replies once its kills complete. */
+            if (c->bstate->btype == BLOCKED_KILL) continue;
 
             if (server.cluster_enabled) {
                 if (clusterRedirectBlockedClientIfNeeded(c))

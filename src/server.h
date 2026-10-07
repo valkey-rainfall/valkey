@@ -367,6 +367,7 @@ typedef enum blocking_type {
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
     BLOCKED_INUSE,    /* Key in use by background thread. */
+    BLOCKED_KILL,     /* CLIENT KILL, until IO threads release the clients it killed. */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
@@ -1053,6 +1054,11 @@ typedef struct blockingState {
     int numreplicas;      /* Number of replicas we are waiting for ACK. */
     int numlocal;         /* Indication if WAITAOF is waiting for local fsync. */
     long long reploffset; /* Replication offset to reach. */
+
+    /* BLOCKED_KILL */
+    int kill_pending;     /* Killed clients not yet freed. */
+    int kill_close_self;  /* The caller killed itself too: close it after the reply. */
+    long long kill_reply; /* Number of killed clients, or -1 to reply +OK (old syntax). */
 
     /* BLOCKED_MODULE */
     void *module_blocked_handle; /* ValkeyModuleBlockedClient structure.
@@ -2041,6 +2047,7 @@ struct valkeyServer {
                                  * e.g. call(), async module stuff (timers, events, etc.),
                                  * cron stuff (active expire, eviction) */
     rax *clients_index;         /* Active clients dictionary by client ID. */
+    rax *kill_waiters;          /* Killed client ID -> list of IDs of CLIENT KILL callers waiting for its free. */
     uint32_t paused_actions;    /* Bitmask of actions that are currently paused */
     list *postponed_clients;    /* List of postponed clients */
     pause_event client_pause_per_purpose[NUM_PAUSE_PURPOSES];
@@ -3619,6 +3626,7 @@ void refreshGoodReplicasCount(void);
 int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);
 void unblockClientWaitingReplicas(client *c);
+void unblockClientWaitingKills(client *c);
 int replicationCountAcksByOffset(long long offset);
 int replicationCountAOFAcksByOffset(long long offset);
 void replicationSendNewlineToPrimary(void);
