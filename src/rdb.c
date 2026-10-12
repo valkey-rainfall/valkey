@@ -971,8 +971,10 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             hashtableInitIterator(&iterator, set, 0);
             void *next;
             while (hashtableNext(&iterator, &next)) {
-                sds ele = next;
-                if ((n = rdbSaveRawString(rdb, (unsigned char *)ele, sdslen(ele))) == -1) {
+                char buf[LONG_STR_SIZE];
+                size_t elelen;
+                const char *ele = setTypeEntryToString(next, buf, &elelen);
+                if ((n = rdbSaveRawString(rdb, (unsigned char *)ele, elelen)) == -1) {
                     hashtableCleanupIterator(&iterator);
                     return -1;
                 }
@@ -2262,10 +2264,13 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             /* This will also be called when the set was just converted
              * to a regular hash table encoded set. */
             if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
-                if (!hashtableAdd((hashtable *)objectGetVal(o), sdsele)) {
+                void *intentry = setEntryIntFromString(sdsele, elelen);
+                int added = hashtableAdd((hashtable *)objectGetVal(o), intentry ? intentry : sdsele);
+                if (intentry) sdsfree(sdsele);
+                if (!added) {
                     rdbReportCorruptRDB("Duplicate set members detected");
                     decrRefCount(o);
-                    sdsfree(sdsele);
+                    if (!intentry) sdsfree(sdsele);
                     return NULL;
                 }
             } else {

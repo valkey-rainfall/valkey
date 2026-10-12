@@ -845,8 +845,7 @@ void dismissSetObject(robj *o, size_t size_hint) {
             hashtableInitIterator(&iter, ht, 0);
             void *next;
             while (hashtableNext(&iter, &next)) {
-                sds item = next;
-                dismissSds(item);
+                if (!setEntryIsInt(next)) dismissSds((sds)next);
             }
             hashtableCleanupIterator(&iter);
         }
@@ -1367,8 +1366,8 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             hashtableInitIterator(&iter, ht, 0);
             void *next;
             while (hashtableNext(&iter, &next) && samples < sample_size) {
-                sds element = next;
-                elesize += sdsAllocSize(element);
+                /* Inline integer members have no allocation of their own. */
+                if (!setEntryIsInt(next)) elesize += sdsAllocSize((sds)next);
                 samples++;
             }
             hashtableCleanupIterator(&iter);

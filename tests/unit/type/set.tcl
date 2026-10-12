@@ -1173,6 +1173,105 @@ foreach type {single multiple single_multiple} {
         $r2 close
     }
 
+    test {Hashtable set stores integers inline: boundaries and canonical form} {
+        r del myset
+        r config set set-max-intset-entries 4
+        r config set set-max-listpack-entries 4
+        # Inline range is [-2^62, 2^62). Values outside stay sds. Strings that
+        # are not canonical decimal integers (007, +5, -0) are never integers.
+        set members {1 -7 4611686018427387903 -4611686018427387904 \
+                     4611686018427387904 -4611686018427387905 \
+                     9223372036854775807 -9223372036854775808 \
+                     foo 007 +5 -0 0}
+        assert_equal [llength $members] [r sadd myset {*}$members]
+        assert_encoding hashtable myset
+        # Re-adding every member is a no-op in both forms.
+        assert_equal 0 [r sadd myset {*}$members]
+        assert_equal [llength $members] [r scard myset]
+        foreach m $members {
+            assert_equal 1 [r sismember myset $m] "SISMEMBER $m"
+        }
+        assert_equal [lrepeat [llength $members] 1] [r smismember myset {*}$members]
+        assert_equal {0 0 0 0} [r smismember myset 6 01 00 " 1"]
+        assert_equal [lsort $members] [lsort [r smembers myset]]
+        assert_equal [lsort $members] [lsort [lindex [r sscan myset 0 count 100] 1]]
+        assert_equal {4611686018427387903 4611686018427387904} \
+            [lsort [lindex [r sscan myset 0 match 46* count 100] 1]]
+        assert_equal 4 [r srem myset 1 foo 4611686018427387904 -9223372036854775808]
+        assert_equal 0 [r srem myset 1 foo 4611686018427387904 -9223372036854775808]
+        assert_equal [expr {[llength $members] - 4}] [r scard myset]
+        r config set set-max-intset-entries 512
+        r config set set-max-listpack-entries 128
+    }
+
+    test {Hashtable set with inline integers survives RDB and AOF round trips} {
+        r del myset myset2
+        r config set set-max-intset-entries 4
+        r config set set-max-listpack-entries 4
+        set members {5 -5 4611686018427387903 -4611686018427387904 \
+                     9223372036854775807 str 010}
+        r sadd myset {*}$members
+        assert_encoding hashtable myset
+        r debug reload
+        assert_encoding hashtable myset
+        assert_equal [lsort $members] [lsort [r smembers myset]]
+        foreach m $members { assert_equal 1 [r sismember myset $m] }
+        set dump [r dump myset]
+        r restore myset2 0 $dump
+        assert_encoding hashtable myset2
+        assert_equal [lsort $members] [lsort [r smembers myset2]]
+        r config set set-max-intset-entries 512
+        r config set set-max-listpack-entries 128
+    }
+
+    test {Hashtable set with inline integers: set operations and random access} {
+        r del a{t} b{t} dst{t}
+        r config set set-max-intset-entries 2
+        r config set set-max-listpack-entries 2
+        r sadd a{t} 1 2 3 4 5 x y
+        r sadd b{t} 3 4 5 6 7 y z
+        assert_encoding hashtable a{t}
+        assert_encoding hashtable b{t}
+        assert_equal {3 4 5 y} [lsort [r sinter a{t} b{t}]]
+        assert_equal {1 2 3 4 5 6 7 x y z} [lsort [r sunion a{t} b{t}]]
+        assert_equal {1 2 x} [lsort [r sdiff a{t} b{t}]]
+        assert_equal 4 [r sintercard 2 a{t} b{t}]
+        assert_equal 4 [r sinterstore dst{t} a{t} b{t}]
+        assert_equal {3 4 5 y} [lsort [r smembers dst{t}]]
+        assert_equal 1 [r smove a{t} b{t} 1]
+        assert_equal 1 [r smove a{t} b{t} x]
+        assert_equal 1 [r sismember b{t} 1]
+        assert_equal 0 [r sismember a{t} 1]
+        assert_equal 1 [r copy b{t} dst{t} replace]
+        assert_equal [lsort [r smembers b{t}]] [lsort [r smembers dst{t}]]
+        # Mixed set as a ZUNIONSTORE input: integers must round-trip as members.
+        assert_equal 10 [r zunionstore z{t} 2 a{t} b{t}]
+        assert_equal 2 [r zscore z{t} 3]
+        assert_equal 1 [r zscore z{t} 7]
+        assert_equal 1 [r zscore z{t} x]
+        # Random access returns both forms.
+        set all [lsort [r smembers b{t}]]
+        assert_equal $all [lsort [r srandmember b{t} 100]]
+        assert_equal [llength $all] [llength [r srandmember b{t} -[llength $all]]]
+        set popped [lsort [r spop b{t} [expr {[llength $all] - 1}]]]
+        assert_equal 1 [r scard b{t}]
+        assert_equal $all [lsort [concat $popped [r smembers b{t}]]]
+        r config set set-max-intset-entries 512
+        r config set set-max-listpack-entries 128
+    }
+
+    test {Hashtable set with inline integers uses less memory than sds members} {
+        r del ints strs
+        for {set i 0} {$i < 10000} {incr i} {
+            r sadd ints [expr {$i * 1000003}]
+            r sadd strs "m[expr {$i * 1000003}]"
+        }
+        assert_encoding hashtable ints
+        assert_encoding hashtable strs
+        # Each integer member saves at least the sds allocation.
+        assert_lessthan [r memory usage ints] [expr {[r memory usage strs] * 0.75}]
+    }
+
     tags {slow} {
         test {intsets implementation stress testing} {
             for {set j 0} {$j < 20} {incr j} {

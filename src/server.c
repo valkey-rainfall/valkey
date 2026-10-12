@@ -626,11 +626,7 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
-/* Set hashtable type. Items are SDS strings */
-hashtableType setHashtableType = {
-    .hashFunction = sdsHashConfigurableSeed,
-    .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+/* Set hashtable type: see setHashtableType in t_set.c. */
 
 /* Zset hashtable callbacks for fbtree backend.
  * Stored entries are packed [8B score][element]. Lookup keys are plain sds

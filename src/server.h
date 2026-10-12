@@ -3767,6 +3767,71 @@ unsigned long long dbSize(serverDb *db);
 unsigned long long dbScan(serverDb *db, unsigned long long cursor, kvstoreScanFunction scan_cb, void *privdata);
 
 /* Set data type */
+
+/* Entries of a hashtable-encoded set.
+ *
+ * Each entry is a single machine word holding either an sds pointer or an
+ * integer stored inline. The two are told apart by the most significant bit:
+ * user-space pointers never have bit 63 set on 64-bit platforms, so a set
+ * entry with bit 63 set is an inline integer and the remaining 63 bits hold a
+ * two's complement value in the range [-2^62, 2^62).
+ *
+ * A member is stored inline if and only if it is the canonical decimal
+ * representation of an integer in that range (as accepted by string2ll). This
+ * rule is applied on both the insert and the lookup side, so a given member
+ * string always maps to exactly one form and the hashtable callbacks never
+ * have to compare an sds against an inline integer: the two forms are disjoint
+ * sets of members.
+ *
+ * On 32-bit platforms the tag bit is not available and every member is an
+ * sds, exactly as before inline integers were introduced. */
+#if UINTPTR_MAX == UINT64_MAX
+#define SET_ENTRY_INT_TAG ((uintptr_t)1 << 63)
+#define SET_ENTRY_INT_MIN (-(INT64_C(1) << 62))
+#define SET_ENTRY_INT_MAX ((INT64_C(1) << 62) - 1)
+#else
+#define SET_ENTRY_INT_TAG ((uintptr_t)0)
+#endif
+
+/* Returns 1 if the entry is an inline integer, 0 if it is an sds. */
+static inline int setEntryIsInt(const void *entry) {
+    return SET_ENTRY_INT_TAG != 0 && ((uintptr_t)entry & SET_ENTRY_INT_TAG) != 0;
+}
+
+/* Returns 1 if the integer can be stored inline in a set entry. */
+static inline int setEntryIntFits(long long value) {
+#if UINTPTR_MAX == UINT64_MAX
+    return value >= SET_ENTRY_INT_MIN && value <= SET_ENTRY_INT_MAX;
+#else
+    (void)value;
+    return 0;
+#endif
+}
+
+/* Encodes an integer (which must satisfy setEntryIntFits) as a set entry. */
+static inline void *setEntryFromInt(long long value) {
+    return (void *)(((uintptr_t)(uint64_t)value & ~SET_ENTRY_INT_TAG) | SET_ENTRY_INT_TAG);
+}
+
+/* Decodes an inline integer set entry. Sign-extends from bit 62. */
+static inline long long setEntryToInt(const void *entry) {
+    return (long long)((int64_t)((uint64_t)(uintptr_t)entry << 1) >> 1);
+}
+
+/* Classifies a member. If the member is stored inline in a hashtable-encoded
+ * set, returns its inline entry (never NULL). Otherwise returns NULL and the
+ * member is stored as an sds. This is the single definition of which members
+ * are inline; both inserts and lookups go through it. */
+static inline void *setEntryIntFromString(const char *str, size_t len) {
+    long long value;
+    if (string2ll(str, len, &value) && setEntryIntFits(value)) return setEntryFromInt(value);
+    return NULL;
+}
+
+void setTypeEntryGet(const void *entry, char **str, size_t *len, int64_t *llele);
+const char *setTypeEntryToString(const void *entry, char *buf, size_t *len);
+void *setTypeHashtableLookupKey(sds member);
+
 robj *setTypeCreate(sds value, size_t size_hint);
 int setTypeAdd(robj *subject, sds value);
 int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
@@ -4173,6 +4238,8 @@ void startEvictionTimeProc(void);
 uint8_t *getConfigurableHashSeed(void);
 uint64_t dictSdsHash(const void *key);
 uint64_t dictSdsCaseHash(const void *key);
+uint64_t genHashFunctionConfigurableSeed(const char *buf, size_t len);
+uint64_t sdsHashConfigurableSeed(const void *key);
 uint64_t dictObjHash(const void *key);
 uint64_t dictCStrHash(const void *key);
 uint64_t dictCStrCaseHash(const void *key);

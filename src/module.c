@@ -12199,9 +12199,10 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
     const char *key_ptr = NULL;
     size_t key_len = 0;
 
+    char intbuf[LONG_STR_SIZE];
+
     if (objectGetType(o) == OBJ_SET) {
-        key_ptr = entry;
-        key_len = sdslen(entry);
+        key_ptr = setTypeEntryToString(entry, intbuf, &key_len);
         /* no value */
     } else if (objectGetType(o) == OBJ_ZSET) {
         orderedIndexItemGetElement((const OrderedIndexItem *)entry, &key_ptr, &key_len);
@@ -12360,8 +12361,10 @@ static void moduleScanKeyRawBorrowedHashtableCallback(void *privdata, void *entr
     ScanKeyRawBorrowedCBData *data = privdata;
     robj *o = data->key->value;
     if (objectGetType(o) == OBJ_SET) {
-        sds member = entry;
-        data->fn(data->key, member, sdslen(member), NULL, 0, data->user_data);
+        char intbuf[LONG_STR_SIZE]; /* inline integer members: callback-scoped */
+        size_t mlen;
+        const char *member = setTypeEntryToString(entry, intbuf, &mlen);
+        data->fn(data->key, member, mlen, NULL, 0, data->user_data);
     } else if (objectGetType(o) == OBJ_ZSET) {
         const char *member;
         size_t mlen;
