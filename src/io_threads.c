@@ -29,9 +29,9 @@ static inline void cpuRelax(void) {
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/ioctl.h> /* ioctl(), FIONREAD: needed on every platform, not only where epoll exists */
 #ifdef HAVE_FASTPATH_EPOLL
 #include <sys/epoll.h>
-#include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #else
 #include "fastpath_no_epoll.h"
