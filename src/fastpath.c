@@ -18,10 +18,12 @@
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
 /* Keep crossing-capable records compact: ClientHandle fits without growing the base command entry. */
-static_assert(sizeof(ClientHandle) == 2 * sizeof(void *),
+static_assert(sizeof(ClientHandle) == sizeof(void *) + 2 * sizeof(uint32_t),
               "ClientHandle is a compact {control ref, generation, owner slot}");
 static_assert(_Alignof(ClientHandle) == _Alignof(void *), "ClientHandle needs only pointer alignment");
-static_assert(sizeof(cmdEntry) == 176, "cmdEntry layout changed; re-measure before/after for the report");
+/* cmdEntry size is a tripwire against accidental growth; it differs by pointer width, so pin each. */
+static_assert(sizeof(cmdEntry) == (sizeof(void *) == 8 ? 176 : 144),
+              "cmdEntry layout changed; re-measure before/after for the report");
 static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
               "cmdBatch is its header plus IO_BATCH_MAX inline entries");
 static_assert(offsetof(cmdBatch, pending_next) < offsetof(cmdBatch, e),
