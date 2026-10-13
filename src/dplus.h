@@ -24,10 +24,10 @@
  * same batch.
  */
 
-#include <assert.h> /* S2.2 bracket parity checks */
-
 #ifndef DPLUS_H
 #define DPLUS_H
+
+#include "serverassert.h" /* bracket parity checks */
 
 #include <stdatomic.h>
 #include <stddef.h>
