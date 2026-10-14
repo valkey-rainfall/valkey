@@ -102,6 +102,7 @@ void dplusEnableSpeculativeReads(void) {
  * excluded only after join, preventing slot-reuse ABA during runtime resize. */
 void dplusReaderWorkerOnline(int tid) {
     serverAssert(tid > 0 && tid < DPLUS_MAX_IO_THREADS);
+    dplus_write_tax[tid].history = ~(uint64_t)0; /* a new worker starts out speculating */
     atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_QUIESCENT, memory_order_seq_cst);
     atomic_fetch_or_explicit(&dplus_reader_online[tid / 64], UINT64_C(1) << (tid % 64), memory_order_seq_cst);
 }
