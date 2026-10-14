@@ -111,7 +111,7 @@ proc lc_run_behind_sleep {ctl secs cmds} {
     $ctl flush
 }
 
-start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes}} {
     assert_equal {io-threads 16} [r config get io-threads]
     r select 0
 
@@ -185,7 +185,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
     }
 }
 
-start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
     assert_equal {io-threads 4} [r config get io-threads]
     r select 0
 
