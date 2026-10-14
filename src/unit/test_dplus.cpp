@@ -259,3 +259,134 @@ TEST_F(DplusTest, UnitBracketsAHeldShardOnceAcrossWrites) {
     EXPECT_EQ(version("u"), u0 + 2);
     EXPECT_EQ(version(other), o0 + 2); /* bracketed by its own write */
 }
+
+/* Every pointer a walk handed to entryGetKey, to check it only ever saw entries. */
+static std::vector<const void *> seen_by_getkey;
+
+static const void *recordingGetKey(const void *entry) {
+    seen_by_getkey.push_back(entry);
+    return entry;
+}
+
+/* Entries that are aligned like robj pointers, with distinct high hash bits from 'target'. */
+static std::vector<void *> entriesAvoidingHashOf(hashtable *ht, void *target, size_t n) {
+    std::vector<void *> out;
+    uint8_t h2 = hashtableHashKey(ht, target) >> 56;
+    for (uintptr_t v = 64; out.size() < n; v += 64) {
+        void *e = reinterpret_cast<void *>(v);
+        if (e != target && (uint8_t)(hashtableHashKey(ht, e) >> 56) != h2) out.push_back(e);
+    }
+    return out;
+}
+
+/* A walk that already chose a bucket's last slot as its candidate reads that slot after main
+ * chains the bucket, which puts the child pointer there. It must not take the child for an
+ * entry, and must still find the moved entry in the child. */
+TEST_F(DplusTest, WalkRacingChainConversionNeverTakesTheChildForAnEntry) {
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_AVOID);
+    hashtableType type = {};
+    type.entryGetKey = recordingGetKey;
+    type.speculative_reads = 1;
+    hashtable *ht = hashtableCreate(&type);
+    ASSERT_NE(hashtableGetVersionArray(ht), nullptr);
+
+    void *target = reinterpret_cast<void *>(uintptr_t(1) << 20);
+    std::vector<void *> others = entriesAvoidingHashOf(ht, target, 7);
+    for (int i = 0; i < 6; i++) ASSERT_TRUE(hashtableAdd(ht, others[i]));
+    ASSERT_TRUE(hashtableAdd(ht, target)); /* the last slot of the only bucket */
+    ASSERT_EQ(hashtableBuckets(ht), 1u);
+
+    hashtableIncrementalFindState st;
+    hashtableIncrementalFindInit(&st, ht, target);
+    ASSERT_TRUE(hashtableIncrementalFindStep(&st)); /* bucket chosen */
+    ASSERT_TRUE(hashtableIncrementalFindStep(&st)); /* the last slot is the only candidate */
+
+    ASSERT_TRUE(hashtableAdd(ht, others[6])); /* main chains the full bucket */
+
+    seen_by_getkey.clear();
+    while (hashtableIncrementalFindStep(&st));
+    void *found = NULL;
+    EXPECT_TRUE(hashtableIncrementalFindGetResult(&st, &found));
+    EXPECT_EQ(found, target);
+    for (const void *p : seen_by_getkey) {
+        bool known = p == target;
+        for (void *o : others) known = known || p == o;
+        EXPECT_TRUE(known) << "entryGetKey was given " << p << ", which is no entry";
+    }
+
+    hashtableRelease(ht);
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_ALLOW);
+}
+
+/* Removing an emptied middle bucket from a chain must not free it while a walk may be in it. */
+TEST_F(DplusTest, ChainCompactionDefersTheRemovedBucket) {
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_AVOID);
+    hashtableType type = {};
+    type.speculative_reads = 1;
+    hashtable *ht = hashtableCreate(&type);
+    ASSERT_NE(hashtableGetVersionArray(ht), nullptr);
+
+    /* One chain: 6 entries in the first bucket, 6 in the middle one, 2 in the last. */
+    std::vector<void *> e;
+    for (uintptr_t i = 1; i <= 14; i++) e.push_back(reinterpret_cast<void *>(i * 64));
+    for (void *p : e) ASSERT_TRUE(hashtableAdd(ht, p));
+    ASSERT_EQ(hashtableBuckets(ht), 1u);
+    ASSERT_EQ(hashtableChainedBuckets(ht, 0), 2u);
+
+    uint64_t stats[8];
+    dplusDebugEpochStats(stats);
+    uint64_t retired_before = stats[1] + stats[2];
+
+    /* Empty the middle bucket while a safe iterator pauses compaction; leaving the chain compacts it. */
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, ht, HASHTABLE_ITER_SAFE);
+    void *entry;
+    while (hashtableNext(&iter, &entry)) {
+        for (int i = 6; i < 12; i++) {
+            if (entry == e[i]) {
+                ASSERT_TRUE(hashtableDelete(ht, entry));
+            }
+        }
+    }
+    hashtableCleanupIterator(&iter);
+    EXPECT_EQ(hashtableChainedBuckets(ht, 0), 1u);
+
+    dplusDebugEpochStats(stats);
+    EXPECT_EQ(stats[1] + stats[2], retired_before + 1); /* the removed bucket waits for readers */
+    for (int i = 0; i < 14; i++) {
+        void *found = NULL;
+        EXPECT_EQ(hashtableFind(ht, e[i], &found), i < 6 || i >= 12);
+    }
+
+    hashtableRelease(ht);
+    dplusReclaimRetired();
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_ALLOW);
+}
+
+/* The reader reads a walk's result after the walk ended. If main reused the matched slot in
+ * between, the result must still be the entry that matched, not whatever the slot holds now. */
+TEST_F(DplusTest, WalkResultIsTheEntryThatMatched) {
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_AVOID);
+    hashtableType type = {};
+    type.speculative_reads = 1;
+    hashtable *ht = hashtableCreate(&type);
+
+    void *target = reinterpret_cast<void *>(uintptr_t(1) << 20);
+    std::vector<void *> others = entriesAvoidingHashOf(ht, target, 7);
+    for (int i = 0; i < 6; i++) ASSERT_TRUE(hashtableAdd(ht, others[i]));
+    ASSERT_TRUE(hashtableAdd(ht, target));
+
+    hashtableIncrementalFindState st;
+    hashtableIncrementalFindInit(&st, ht, target);
+    while (hashtableIncrementalFindStep(&st));
+
+    ASSERT_TRUE(hashtableDelete(ht, target));
+    ASSERT_TRUE(hashtableAdd(ht, others[6])); /* takes the freed slot */
+
+    void *found = NULL;
+    EXPECT_TRUE(hashtableIncrementalFindGetResult(&st, &found));
+    EXPECT_EQ(found, target);
+
+    hashtableRelease(ht);
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_ALLOW);
+}

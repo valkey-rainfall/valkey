@@ -258,12 +258,6 @@ static inline void dplusVersionBracketAllEnd(dplusVersionArray *va) {
 }
 #endif
 
-/* Component 2: Read-only find (implemented in hashtable.c) */
-bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
-
-/* Component 2: Speculative find with pre-computed hash (implemented in hashtable.c) */
-bool hashtableFindSpeculative(void *ht, const void *key, void **found, uint64_t hash, unsigned shard, uint64_t *ver_out);
-
 /* Component 2: Hash key accessor (implemented in hashtable.c) */
 uint64_t hashtableHashKey(hashtable *ht, const void *key);
 
