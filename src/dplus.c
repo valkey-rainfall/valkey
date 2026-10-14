@@ -78,6 +78,8 @@ uint64_t dplusStatsSum(size_t field_offset) {
 
 /* --- Component 4: Exclusive mode implementation --- */
 
+static void dplusCheckTouchWord(void);
+
 /* Speculation reads only the keyspace and never in cluster mode, so only keyspace
  * tables carry versions, and only once an IO thread can exist. One way: tables
  * keep their versions when IO threads scale down. Main only, before the first
@@ -86,6 +88,7 @@ void dplusEnableSpeculativeReads(void) {
     static int enabled = 0;
     if (enabled || server.cluster_enabled) return;
     enabled = 1;
+    dplusCheckTouchWord();
     hashtableEnableSpeculativeReads();
     if (!server.db) return;
     for (int i = 0; i < server.dbnum; i++) {
@@ -411,6 +414,56 @@ typedef struct dplusBatchEntry {
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
 } dplusBatchEntry;
 
+/* --- LRU/LFU touch for speculated GETs ---
+ * A GET served here touches its key as lookupKey does on main. The reader never plainly
+ * stores into an object the writer may change at the same time: it swaps the 32-bit word
+ * holding type, encoding and the LRU/LFU field only if the word is still what it read, so
+ * a concurrent writer change makes the touch fail rather than be undone, and a writer that
+ * later overwrites the word only loses the touch. */
+static int dplus_touch_word_ok = 0; /* type, encoding and lru fill exactly the first 32 bits */
+
+static void dplusCheckTouchWord(void) {
+    robj probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.type = 15;
+    probe.encoding = 15;
+    probe.lru = (1u << LRULFU_BITS) - 1;
+    uint32_t word;
+    memcpy(&word, &probe, sizeof(word));
+    int ok = word == UINT32_MAX;
+    const unsigned char *rest = (const unsigned char *)&probe + sizeof(word);
+    for (size_t i = 0; i < sizeof(probe) - sizeof(word); i++) ok = ok && rest[i] == 0;
+    dplus_touch_word_ok = ok;
+}
+
+/* xorshift64*, one generator per IO thread: lrulfu_touch's rand() is not meant for these threads. */
+static _Thread_local uint64_t dplus_touch_rng = 0;
+
+static double dplusTouchRandom(void) {
+    uint64_t x = dplus_touch_rng;
+    if (x == 0) x = ((uint64_t)(uintptr_t)&dplus_touch_rng ^ (uint64_t)getMonotonicUs()) | 1;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    dplus_touch_rng = x;
+    return (double)((x * UINT64_C(0x2545F4914F6CDD1D)) >> 11) / (double)(UINT64_C(1) << 53);
+}
+
+static void dplusTouch(client *c, robj *o) {
+    if (!dplus_touch_word_ok || c->flag.no_touch || hasActiveChildProcess()) return;
+    uint32_t *word = (uint32_t *)(void *)o;
+    uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
+    robj probe;
+    memset(&probe, 0, sizeof(probe));
+    memcpy(&probe, &seen, sizeof(seen));
+    uint32_t lru = lrulfu_touchWithRandom(probe.lru, dplusTouchRandom());
+    if (lru == probe.lru) return;
+    probe.lru = lru;
+    uint32_t touched;
+    memcpy(&touched, &probe, sizeof(touched));
+    __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
 /* Execute the validate+copy+reply phase for a single prefetched entry.
  * Returns 1 on success (reply written), 0 on punt. */
 static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, int resp) {
@@ -525,6 +578,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
     /* Version valid — write reply. */
     int written = dplusWriteBulkReply(c, valbuf, vallen);
     if (written <= 0) return 0;
+    dplusTouch(c, o);
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     DPLUS_STAT_ADD(speculative_hits, 1);
@@ -1488,7 +1542,7 @@ sds dplusInfoString(sds info) {
      * consume the same values for correctness. */
     uint64_t entries = 0, retries = 0, epoch_exclusive_punts = 0, pressure_punts = 0;
     unsigned online = 0, active = 0, quiescent = 0;
-    long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
+    long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0, speculated = 0;
     int debug_reader_holding = 0;
     long long debug_reader_hold_us = 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -1511,9 +1565,11 @@ sds dplusInfoString(sds info) {
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
         punted_replies += dplus_thread_stats[i].punted_replies_written;
+        speculated += dplus_thread_stats[i].commands_processed;
     }
     info = sdscatprintf(info,
                         "# Dplus\r\n"
+                        "dplus_speculated_commands:%lld\r\n"
                         "dplus_reclaim_epoch:%llu\r\n"
                         "dplus_epoch_reader_entries:%llu\r\n"
                         "dplus_epoch_reader_retries:%llu\r\n"
@@ -1540,6 +1596,7 @@ sds dplusInfoString(sds info) {
                         "dplus_doorbell_rings:%llu\r\n"
                         "dplus_doorbell_coalesced:%llu\r\n"
                         "dplus_punted_replies_written:%llu\r\n",
+                        speculated,
                         (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
                         (unsigned long long)entries,
                         (unsigned long long)retries,

@@ -344,4 +344,57 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         $rd close
         assert_equal "PONG" [r ping]
     }
+
+    # Runs n pipelined GETs of key on a fast-path client and returns how many were speculated.
+    proc speculated_gets {r key n} {
+        set rd [dplus_client]
+        ensure_engaged $r $rd touch:warm
+        set before [dplus_field $r dplus_speculated_commands]
+        for {set i 0} {$i < $n} {incr i} { $rd get $key }
+        for {set i 0} {$i < $n} {incr i} { $rd read }
+        set after [dplus_field $r dplus_speculated_commands]
+        $rd close
+        return [expr {$after - $before}]
+    }
+
+    test {T-TOUCH-LRU: speculated GETs refresh the key's idle time} {
+        r set touch:warm w
+        r set touch:lru v
+        set dump [r dump touch:lru]
+        r del touch:lru
+        r restore touch:lru 0 $dump idletime 1000
+        assert {[r object idletime touch:lru] >= 1000}
+        assert_equal 20 [speculated_gets r touch:lru 20] ;# none ran on main
+        assert {[r object idletime touch:lru] < 10}
+    }
+
+    test {T-TOUCH-LFU: speculated GETs raise the key's LFU counter} {
+        r config set maxmemory-policy allkeys-lfu
+        r set touch:warm w
+        r set touch:lfu v
+        set dump [r dump touch:lfu]
+        r del touch:lfu
+        r restore touch:lfu 0 $dump freq 0
+        assert_equal 0 [r object freq touch:lfu]
+        assert_equal 20 [speculated_gets r touch:lfu 20]
+        # Below the initial value an access always counts, so 20 accesses pass it.
+        assert {[r object freq touch:lfu] > 5}
+        r config set maxmemory-policy noeviction
+    }
+
+    test {T-TOUCH-NO-TOUCH: a NO-TOUCH client's GETs leave the key idle} {
+        r set touch:warm w
+        r set touch:nt v
+        set dump [r dump touch:nt]
+        r del touch:nt
+        r restore touch:nt 0 $dump idletime 1000
+        set rd [dplus_client]
+        $rd client no-touch on
+        assert_equal OK [$rd read]
+        ensure_engaged r $rd touch:warm
+        for {set i 0} {$i < 20} {incr i} { $rd get touch:nt }
+        for {set i 0} {$i < 20} {incr i} { $rd read }
+        $rd close
+        assert {[r object idletime touch:nt] >= 1000}
+    }
 }
