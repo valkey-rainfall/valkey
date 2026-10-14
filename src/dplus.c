@@ -3,6 +3,7 @@
 
 #include "server.h"
 #include "dplus.h"
+#include "hotkeys.h"
 #include "io_threads.h"
 
 #include <string.h>
@@ -665,6 +666,10 @@ int dplusSpeculateBatch(client *c, int tid) {
      * every attached monitor. Global, diagnostic-rare gate -- zero cost when no
      * monitor is attached. */
     if (atomic_load_explicit(&dplus_monitor_gate, memory_order_acquire)) return 0;
+
+    /* HOT-KEY GUARD: hot-key detection samples lookups on main; a speculated GET would be
+     * invisible to it. Detection is an operator diagnostic, off by default. */
+    if (hotkeysEnabled()) return 0;
 
     /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
      * the originals outside the limbo hooks — reads racing a move are the
