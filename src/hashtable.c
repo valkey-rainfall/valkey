@@ -1465,8 +1465,8 @@ hashtable *hashtableCreate(hashtableType *type) {
  * to time to indicate progress. */
 void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
     /* This frees both bucket arrays, which a speculative walk may hold. Exclusive
-     * mode is counter based, so it nests inside FLUSHALL's own window and is safe
-     * from the lazyfree thread concurrently with main. */
+     * mode is counter based, so it nests inside FLUSHALL's own window. Off main it
+     * does nothing: a table freed there was unpublished by main first. */
     bool exclusive = ht->versions != NULL;
     if (exclusive) dplusExclusiveEnter();
     if (hashtableIsRehashing(ht)) {

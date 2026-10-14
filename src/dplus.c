@@ -156,10 +156,15 @@ static int dplusReaderEnter(int tid) {
     }
 }
 
-/* Exclusive mode remains a counter because nested main/BIO windows are valid.
- * Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. Scan
- * all slots until runtime-resize ordering is proven under the new lifecycle. */
+/* Main-thread only: depth of exclusive windows main has entered and finished draining. */
+static int dplus_main_exclusive_depth = 0;
+
+/* Exclusive mode is a counter because windows nest. Only main enters it: a table freed on
+ * another thread (BIO, an IO thread) was unpublished by main first, so no reader can reach
+ * it, and a window opened there would let main free retired memory before readers drain.
+ * Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. */
 void dplusExclusiveEnter(void) {
+    if (!onServerMainThread()) return;
     atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     /* Test-only: a debug-held reader models a descheduled thread. ANY
@@ -184,9 +189,13 @@ void dplusExclusiveEnter(void) {
             }
         }
     }
+    dplus_main_exclusive_depth++;
 }
 
 void dplusExclusiveLeave(void) {
+    if (!onServerMainThread()) return;
+    serverAssert(dplus_main_exclusive_depth > 0);
+    dplus_main_exclusive_depth--;
     atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 }
 
@@ -1080,9 +1089,9 @@ static int dplusAppendRetired(void *ptr, int route) {
     /* No configured workers, or no ownership (speculation is gated on it), means
      * no speculative pointer can exist: the caller frees on its own route. */
     if (server.io_threads_num <= 1) return 0;
-    /* Exclusive mode has already drained readers. Immediate free is required
-     * by RENAME/MOVE refcount re-embedding and maxmemory delta accounting. */
-    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0) return 0;
+    /* Main has drained readers in its own exclusive window. Immediate free is required by
+     * RENAME/MOVE refcount re-embedding and maxmemory delta accounting. */
+    if (dplus_main_exclusive_depth > 0) return 0;
     serverAssert(inMainThread());
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     /* Deterministic test handshake: do not begin the armed pressure command
@@ -1274,7 +1283,7 @@ static void dplusTrimRetireFreelists(void) {
 }
 
 void dplusForceReclaimAll(void) {
-    serverAssert(atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0);
+    serverAssert(dplus_main_exclusive_depth > 0);
     dplus_forced_reclaims++;
     dplusSealRetireEpoch();
     dplusReclaimSealed(1);

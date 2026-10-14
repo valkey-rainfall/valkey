@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* D+ speculative readers never wait for main. */
+/* D+ speculative readers never wait for main, and main frees memory a reader can reach
+ * at once only inside an exclusive window main has drained itself. */
 
 #include "generated_wrappers.hpp"
 
@@ -168,4 +169,45 @@ TEST_F(DplusTest, LaterGetOnOddShardEndsThePrefix) {
     EXPECT_FALSE(c->cmd_queue.cmds[0].read_flags & READ_FLAGS_DPLUS_SPECULATED);
     EXPECT_EQ(std::string(c->buf, c->bufpos), "$2\r\nva\r\n");
     freeClient(c);
+}
+
+/* A thread other than main (BIO freeing a table) must not open an exclusive window: main would
+ * take it as proof that readers drained and free retired memory an active reader can still reach. */
+TEST_F(DplusTest, DrainOffMainLeavesMainRetirementsDeferred) {
+    uint64_t epoch;
+    ASSERT_EQ(dplusDebugPinReader(&epoch), C_OK); /* an active reader */
+
+    std::atomic<bool> left{false};
+    std::thread bio([&] {
+        dplusExclusiveEnter();
+        dplusExclusiveLeave();
+        left = true;
+    });
+    waitFor([&] { return left.load() || exclusiveDepth() > 0; }, std::chrono::milliseconds(1000));
+    bool bio_waited_for_reader = !left.load();
+
+    void *p = zmalloc(64);
+    int deferred = dplusDeferFreeRaw(p);
+    ASSERT_EQ(dplusDebugUnpinReader(), C_OK);
+    bio.join();
+    if (!deferred) zfree(p);
+
+    EXPECT_FALSE(bio_waited_for_reader);
+    EXPECT_EQ(deferred, 1);
+    dplusReclaimRetired();
+    uint64_t stats[8];
+    dplusDebugEpochStats(stats);
+    EXPECT_EQ(stats[1], 0u); /* nothing left retired */
+}
+
+/* Inside main's own window every reader has drained, so a retirement frees at once. */
+TEST_F(DplusTest, MainExclusiveWindowFreesAtOnce) {
+    dplusExclusiveEnter();
+    EXPECT_EQ(exclusiveDepth(), 1);
+    void *p = zmalloc(64);
+    int deferred = dplusDeferFreeRaw(p);
+    if (!deferred) zfree(p);
+    dplusExclusiveLeave();
+    EXPECT_EQ(deferred, 0);
+    EXPECT_EQ(exclusiveDepth(), 0);
 }
