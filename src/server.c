@@ -4082,12 +4082,17 @@ void preventCommandReplication(client *c) {
  * The latency unit is nano-seconds.
  * If needed it will allocate the histogram memory and trim the duration to the upper/lower tracking limits*/
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist) {
+    updateCommandLatencyHistogramCount(latency_histogram, duration_hist, 1);
+}
+
+/* Records 'count' commands that took duration_hist nanoseconds each. */
+void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram, int64_t duration_hist, int64_t count) {
     if (duration_hist < LATENCY_HISTOGRAM_MIN_VALUE) duration_hist = LATENCY_HISTOGRAM_MIN_VALUE;
     if (duration_hist > LATENCY_HISTOGRAM_MAX_VALUE) duration_hist = LATENCY_HISTOGRAM_MAX_VALUE;
     if (*latency_histogram == NULL)
         hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
                  latency_histogram);
-    hdr_record_value(*latency_histogram, duration_hist);
+    hdr_record_values(*latency_histogram, duration_hist, count);
 }
 
 /* Handle the alsoPropagate() API to handle commands that want to propagate

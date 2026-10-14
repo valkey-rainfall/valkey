@@ -975,12 +975,14 @@ void dplusAggregateStats(void) {
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
+        long long calls = 0, calls_usec = 0;
         long long n = dplus_thread_stats[i].commands_processed;
         if (n > seen_calls[i]) {
             long long delta = n - seen_calls[i];
             seen_calls[i] = n;
             server.stat_numcommands += delta;
             if (get_cmd) get_cmd->calls += delta;
+            calls = delta;
         }
         /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
          * bypasses main's lookupKey where this is normally incremented). Same
@@ -996,7 +998,11 @@ void dplusAggregateStats(void) {
             long long delta = us - seen_usec[i];
             seen_usec[i] = us;
             if (get_cmd) get_cmd->microseconds += delta;
+            calls_usec = delta;
         }
+        /* Latencystats parity: the folded GETs enter the histogram at their average duration. */
+        if (get_cmd && calls > 0 && server.latency_tracking_enabled)
+            updateCommandLatencyHistogramCount(&get_cmd->latency_histogram, calls_usec * 1000 / calls, calls);
         /* Fix #2 (main-free completion): fold worker-side write completions
          * into the global write stats. Same monotonic-delta scheme. */
         long long w = dplus_thread_stats[i].owned_writes;
