@@ -963,6 +963,7 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         c->parsed_cmd = NULL;
         c->argv_len_sum = 0;
         c->argv_len = 0;
+        c->net_input_bytes_curr_cmd = 0; /* the parser accumulates; resetClient never runs for it */
         c->slot = -1;
         c->commands_processed++;
         consumed++;

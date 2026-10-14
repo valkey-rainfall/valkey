@@ -245,6 +245,8 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         for {set i 0} {$i < 100} {incr i} {
             assert_equal {v} [$rd get fpkey]
         }
+        # A write after the reads runs on main and must not carry their bytes.
+        assert_equal {OK} [$rd set fpkey v]
         assert_equal 0 [r commandlog len large-request]
         $rd close
         r config set commandlog-request-larger-than 1048576
