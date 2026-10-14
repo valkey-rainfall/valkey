@@ -598,6 +598,11 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:s
     proc close_all {clients} {
         foreach v $clients { catch {$v close} }
     }
+    # An empty CLIENT LIST reply: a RESP2 bulk string, or a RESP3 verbatim string when new
+    # connections default to RESP3 (--force-resp3).
+    proc assert_empty_list {line} {
+        assert {$line eq {$0} || $line eq {=4}}
+    }
 
     # The IO thread that owns a fast-path client releases it before main frees it. The killer's next
     # command, pipelined behind CLIENT KILL, must not find the killed clients.
@@ -606,7 +611,9 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:s
         set fd [kill_raw_socket]
         puts -nonewline $fd "CLIENT KILL ID $ids\r\nCLIENT LIST ID $ids\r\n"
         flush $fd
-        assert_equal [list :5 {$0}] [kill_raw_read $fd 2]
+        set reply [kill_raw_read $fd 2]
+        assert_equal :5 [lindex $reply 0]
+        assert_empty_list [lindex $reply 1]
         close $fd
         close_all $clients
     }
@@ -617,7 +624,9 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:s
         set fd [kill_raw_socket]
         puts -nonewline $fd "CLIENT KILL $addr\r\nCLIENT LIST ID $ids\r\n"
         flush $fd
-        assert_equal [list +OK {$0}] [kill_raw_read $fd 2]
+        set reply [kill_raw_read $fd 2]
+        assert_equal +OK [lindex $reply 0]
+        assert_empty_list [lindex $reply 1]
         close $fd
         close_all $clients
     }
