@@ -2027,6 +2027,26 @@ sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
     return news;
 }
 
+/* Holds the shards of the command's keys in c->db until dplusUnitRelease, so readers see
+ * all of its writes there or none. A command that declares no keys holds every shard.
+ * Returns 1 if this call opened the unit, and so must release it. */
+int dbUnitHoldCommandKeys(client *c) {
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, 0); /* speculation runs only outside cluster mode */
+    dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
+    if (va == NULL) return 0;
+    int opening = dplus_unit.va == NULL;
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+    if (numkeys == 0) dplusUnitHoldAll(va);
+    for (int i = 0; i < numkeys; i++) {
+        sds key = objectGetVal(c->argv[result.keys[i].pos]);
+        dplusUnitHoldShard(va, DPLUS_SHARD_INDEX(hashtableHashKey(ht, key)));
+    }
+    getKeysFreeResult(&result);
+    return opening && dplus_unit.va != NULL;
+}
+
 int removeExpire(serverDb *db, robj *key) {
     int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
     void *popped;

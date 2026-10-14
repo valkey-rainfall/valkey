@@ -3569,6 +3569,10 @@ void dbKeyBracketEnd(dbKeyBracket *brk);
  * readers: unchanged sds when capacity suffices, else a published replacement with the old
  * allocation defer-freed. Call INSIDE a bracket. */
 sds dbGrowPublishedStringValue(robj *o, size_t total_len);
+/* Publish news as the value of a RAW string, freeing the old buffer once readers are quiescent. */
+void dbReplacePublishedStringBuffer(robj *o, sds news);
+/* Hold the shards of the command's keys until dplusUnitRelease; see dplusUnit. */
+int dbUnitHoldCommandKeys(client *c);
 robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired);
 robj *objectSetExpireEx(robj *o, long long expire, robj **retired);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)

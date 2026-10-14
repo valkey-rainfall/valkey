@@ -159,6 +159,48 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         assert {$v1 % 2 == 0 && $v1 >= $v0 + 4} ;# del bracket + insert bracket
     }
 
+    test {P1-UNIT-MSET: one bracket for a key MSET writes twice} {
+        r set p1:k old
+        set v0 [shard_version r p1:k]
+        r mset p1:k first p1:k second
+        # Two writes, one bracket: no reader can see "first".
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:k]
+        assert_equal second [r get p1:k]
+    }
+
+    test {P1-UNIT-MSETNX: one bracket for a key MSETNX writes twice} {
+        set v0 [shard_version r p1:l]
+        r msetnx p1:l first p1:l second
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:l]
+        assert_equal second [r get p1:l]
+    }
+
+    test {P1-BRACKET-SETBIT: SETBIT on an existing bitmap brackets} {
+        r setbit p1:m 7 1
+        set v0 [shard_version r p1:m]
+        r setbit p1:m 6 1
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:m]
+        assert_equal 2 [r bitcount p1:m]
+    }
+
+    test {P1-BRACKET-BITFIELD: BITFIELD SET brackets} {
+        r bitfield p1:o set u8 0 1
+        set v0 [shard_version r p1:o]
+        r bitfield p1:o set u8 8 2 incrby u8 0 5
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:o]
+        assert_equal {6 2} [r bitfield p1:o get u8 0 get u8 8]
+    }
+
+    test {P1-BRACKET-PFADD: PFADD and the PFCOUNT cache refresh bracket} {
+        r pfadd p1:p a
+        set v0 [shard_version r p1:p]
+        r pfadd p1:p b
+        set v1 [shard_version r p1:p]
+        assert_equal [expr {$v0 + 2}] $v1
+        r pfcount p1:p                      ;# rewrites the cached cardinality
+        assert_equal [expr {$v1 + 2}] [shard_version r p1:p]
+    }
+
     r debug dict-resizing 1
 
     if {$::dplus_instrumented} {

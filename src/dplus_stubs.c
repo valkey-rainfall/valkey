@@ -10,6 +10,12 @@
  * strong-symbol resolution, silently no-op'ing the server's drains (observed
  * as the expiry-race crash returning). */
 
+#include "sds.h"
+#include "hashtable.h"
+#include "dplus.h"
+
+dplusUnit dplus_unit;
+
 void dplusExclusiveEnter(void) {
 }
 void dplusExclusiveLeave(void) {

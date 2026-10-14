@@ -234,3 +234,28 @@ TEST_F(DplusTest, ModuleThreadHoldingTheGilDrainsReaders) {
     EXPECT_TRUE(entered.load());
     EXPECT_EQ(exclusiveDepth(), 0);
 }
+
+/* A unit gives each held shard one bracket however many writes land in it, and leaves the
+ * other shards to their own brackets. */
+TEST_F(DplusTest, UnitBracketsAHeldShardOnceAcrossWrites) {
+    set("u", "0");
+    std::string other = "o";
+    for (int i = 0; shardOf(other) == shardOf("u"); i++) other = "o" + std::to_string(i);
+    dplusVersionArray *va = hashtableGetVersionArray(keys());
+    auto version = [&](const std::string &k) {
+        unsigned s = shardOf(k);
+        return __atomic_load_n(&va->lines[s / 8].v[s % 8], __ATOMIC_SEQ_CST);
+    };
+    uint64_t u0 = version("u"), o0 = version(other);
+
+    ASSERT_EQ(dplusUnitHoldShard(va, shardOf("u")), 1);
+    EXPECT_EQ(version("u"), u0 + 1); /* odd while held */
+    set("u", "1");
+    set("u", "2");
+    set(other, "x");
+    EXPECT_EQ(version("u"), u0 + 1); /* the writes inside add nothing */
+    dplusUnitRelease();
+
+    EXPECT_EQ(version("u"), u0 + 2);
+    EXPECT_EQ(version(other), o0 + 2); /* bracketed by its own write */
+}

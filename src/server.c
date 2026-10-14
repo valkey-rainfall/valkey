@@ -4335,11 +4335,13 @@ void call(client *c, int flags) {
         }
     }
 
-    /* D+: exclusive mode for commands whose partial state a speculative read must not observe
-     * (multi-key atomic operations). Plain writes are covered by the sharded version bump. Only
-     * the top-level command enters; nested calls (EVAL/EXEC bodies) are already covered. */
-    int dplus_exclusive = 0;
-    if (server.io_threads_num > 1 && server.execution_nesting == 1) {
+    /* D+: a speculative read must not see a unit of work half applied. Scripts, transactions and
+     * the other commands below drain readers for their whole run. Multi-key string writes, in-place
+     * string writers and module write commands hold the shards of their keys instead. Inside an
+     * exclusive window (an EXEC body) readers are already kept out; a nested call inside a unit
+     * adds its shards to it, and the call that opened the unit releases it. */
+    int dplus_exclusive = 0, dplus_unit_opened = 0;
+    if (server.io_threads_num > 1 && !dplusInExclusiveWindow()) {
         serverCommandProc *proc = c->cmd->proc;
         int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
                                      (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
@@ -4350,11 +4352,17 @@ void call(client *c, int flags) {
             (proc == debugCommand && !dplus_epoch_debug_hook)) {
             dplusExclusiveEnter();
             dplus_exclusive = 1;
+        } else if (proc == msetCommand || proc == msetnxCommand || proc == msetexCommand || proc == setbitCommand ||
+                   proc == bitfieldCommand || proc == pfaddCommand || proc == pfmergeCommand ||
+                   proc == pfcountCommand || proc == pfdebugCommand ||
+                   (c->cmd->module_cmd && !(c->cmd->flags & CMD_READONLY))) {
+            dplus_unit_opened = dbUnitHoldCommandKeys(c);
         }
     }
 
     c->cmd->proc(c);
 
+    if (dplus_unit_opened) dplusUnitRelease();
     if (dplus_exclusive) dplusExclusiveLeave();
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {

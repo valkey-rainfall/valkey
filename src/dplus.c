@@ -215,6 +215,59 @@ void dplusExclusiveLeave(void) {
     atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 }
 
+/* True while the writer is inside an exclusive window: readers are drained and kept out. */
+int dplusInExclusiveWindow(void) {
+    return dplus_main_exclusive_depth > 0;
+}
+
+/* --- Units --- */
+
+dplusUnit dplus_unit = {0};
+
+/* Holds one shard of va until dplusUnitRelease. Returns 0 if the unit already holds
+ * another table, whose writes then bracket themselves as usual. */
+int dplusUnitHoldShard(dplusVersionArray *va, unsigned shard) {
+    if (va == NULL || (dplus_unit.va != NULL && dplus_unit.va != va)) return 0;
+    if (dplusShardHeld(va, shard)) return 1;
+    dplusVersionBracketBegin(va, shard);
+    dplus_unit.va = va;
+    dplus_unit.held[shard / 64] |= UINT64_C(1) << (shard % 64);
+    return 1;
+}
+
+/* Holds every shard of va until dplusUnitRelease. */
+int dplusUnitHoldAll(dplusVersionArray *va) {
+    if (va == NULL || (dplus_unit.va != NULL && dplus_unit.va != va)) return 0;
+    if (dplus_unit.all) return 1;
+    dplusVersionBracketAllBegin(va); /* skips the shards already held */
+    dplus_unit.va = va;
+    dplus_unit.all = 1;
+    return 1;
+}
+
+void dplusUnitRelease(void) {
+    dplusUnit unit = dplus_unit;
+    if (unit.va == NULL) return;
+    memset(&dplus_unit, 0, sizeof(dplus_unit)); /* the brackets below must not see the holds */
+    if (unit.all) {
+        dplusVersionBracketAllEnd(unit.va);
+        return;
+    }
+    for (int word = 0; word < DPLUS_VERSION_SHARDS / 64; word++) {
+        uint64_t bits = unit.held[word];
+        while (bits) {
+            int shard = word * 64 + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            dplusVersionBracketEnd(unit.va, shard);
+        }
+    }
+}
+
+/* The writer is unpublishing a table: a unit must not touch its versions afterwards. */
+void dplusUnitForgetTable(dplusVersionArray *va) {
+    if (va != NULL && dplus_unit.va == va) memset(&dplus_unit, 0, sizeof(dplus_unit));
+}
+
 /* --- ACL/AUTH gate for speculation --- */
 
 /* Recompute the per-client speculation ACL gate. MAIN THREAD ONLY.

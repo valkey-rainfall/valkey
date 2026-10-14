@@ -172,9 +172,27 @@ extern _Atomic(int) dplus_client_mem_pressure;
 
 /* --- API declarations --- */
 
+/* A unit holds shards of one table odd for a whole command, so readers see either all of
+ * its writes to those shards or none. A bracket on a shard the unit holds does nothing.
+ * Writer thread only: main, or a module thread holding the GIL. */
+typedef struct dplusUnit {
+    dplusVersionArray *va; /* table whose shards are held, or NULL */
+    int all;               /* every shard of va is held */
+    uint64_t held[DPLUS_VERSION_SHARDS / 64];
+} dplusUnit;
+extern dplusUnit dplus_unit;
+int dplusUnitHoldShard(dplusVersionArray *va, unsigned shard);
+int dplusUnitHoldAll(dplusVersionArray *va);
+void dplusUnitRelease(void);
+void dplusUnitForgetTable(dplusVersionArray *va);
+int dplusInExclusiveWindow(void);
+
 /* Component 1: Version manipulation (implemented in hashtable.c) */
 void dplusVersionArrayInit(dplusVersionArray *va);
 #ifndef __cplusplus /* C11 atomics; unit tests in C++ use the declarations only */
+static inline bool dplusShardHeld(dplusVersionArray *va, unsigned shard) {
+    return dplus_unit.va == va && (dplus_unit.all || ((dplus_unit.held[shard / 64] >> (shard % 64)) & 1));
+}
 static inline uint64_t dplusVersionRead(dplusVersionArray *va, unsigned shard) {
     return atomic_load_explicit(&va->lines[shard / 8].v[shard % 8], memory_order_acquire);
 }
@@ -204,6 +222,7 @@ static inline bool dplusVersionValidate(dplusVersionArray *va, unsigned shard, u
  * ALL bump sites must use brackets; a lone bump leaves odd residue that
  * permanently punts the shard. assert() checks parity at each transition. */
 static inline void dplusVersionBracketBegin(dplusVersionArray *va, unsigned shard) {
+    if (dplusShardHeld(va, shard)) return;
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
     uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
     assert((v & 1) == 0); /* even at rest */
@@ -211,6 +230,7 @@ static inline void dplusVersionBracketBegin(dplusVersionArray *va, unsigned shar
     atomic_thread_fence(memory_order_release);
 }
 static inline void dplusVersionBracketEnd(dplusVersionArray *va, unsigned shard) {
+    if (dplusShardHeld(va, shard)) return;
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
     uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
     assert((v & 1) == 1); /* odd inside a bracket */
@@ -218,6 +238,7 @@ static inline void dplusVersionBracketEnd(dplusVersionArray *va, unsigned shard)
 }
 static inline void dplusVersionBracketAllBegin(dplusVersionArray *va) {
     for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
+        if (dplusShardHeld(va, i)) continue;
         _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
         uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
         assert((v & 1) == 0);
@@ -228,6 +249,7 @@ static inline void dplusVersionBracketAllBegin(dplusVersionArray *va) {
 static inline void dplusVersionBracketAllEnd(dplusVersionArray *va) {
     atomic_thread_fence(memory_order_release);
     for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
+        if (dplusShardHeld(va, i)) continue;
         _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
         uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
         assert((v & 1) == 1);
