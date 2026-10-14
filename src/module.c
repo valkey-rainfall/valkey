@@ -215,6 +215,7 @@ struct ValkeyModuleKey {
     robj *value; /* Value object, or NULL if the key was not found. */
     void *iter;  /* Iterator. */
     int mode;    /* Opening mode. */
+    int dma_exclusive; /* Readers are kept out until close: a write DMA pointer was handed out. */
 
     union {
         struct {
@@ -4340,6 +4341,7 @@ static void moduleInitKey(ValkeyModuleKey *kp, ValkeyModuleCtx *ctx, robj *keyna
     kp->value = value;
     kp->iter = NULL;
     kp->mode = mode;
+    kp->dma_exclusive = 0;
     if (kp->value) moduleInitKeyTypeSpecific(kp);
 }
 
@@ -4439,6 +4441,7 @@ static void moduleCloseKey(ValkeyModuleKey *key) {
         }
     }
     serverAssert(key->iter == NULL);
+    if (key->dma_exclusive) dplusExclusiveLeave();
     decrRefCount(key->key);
 }
 
@@ -4682,6 +4685,13 @@ char *VM_StringDMA(ValkeyModuleKey *key, size_t *len, int mode) {
      * we unshare the string (that has the side effect of decoding it). */
     if ((mode & VALKEYMODULE_WRITE) || objectGetEncoding(key->value) != OBJ_ENCODING_RAW)
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
+
+    /* The module may write through the pointer until the key is closed, with no bracket around
+     * its writes, so speculative readers are kept out until then. */
+    if ((mode & VALKEYMODULE_WRITE) && !key->dma_exclusive) {
+        dplusExclusiveEnter();
+        key->dma_exclusive = 1;
+    }
 
     *len = sdslen(objectGetVal(key->value));
     return objectGetVal(key->value);
