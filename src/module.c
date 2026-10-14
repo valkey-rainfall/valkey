@@ -4714,17 +4714,24 @@ int VM_StringTruncate(ValkeyModuleKey *key, size_t newlen) {
         setKey(key->ctx->client, key->db, key->key, &o, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
         key->value = o;
     } else {
-        /* Unshare and resize. */
+        /* Unshare and resize. A replaced buffer is freed only once speculative readers that may
+         * be copying it are quiescent, and the bytes change inside the key's bracket. */
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
+        dbKeyBracket brk;
+        dbKeyBracketBegin(key->db, key->key, &brk);
         size_t curlen = sdslen(objectGetVal(key->value));
         if (newlen > curlen) {
-            objectSetVal(key->value, sdsgrowzero(objectGetVal(key->value), newlen));
+            sds grown = dbGrowPublishedStringValue(key->value, newlen);
+            objectSetVal(key->value, sdsgrowzero(grown, newlen));
         } else if (newlen < curlen) {
             sdssubstr(objectGetVal(key->value), 0, newlen);
             /* If the string is too wasteful, reallocate it. */
-            if (sdslen(objectGetVal(key->value)) < sdsavail(objectGetVal(key->value)))
-                objectSetVal(key->value, sdsRemoveFreeSpace(objectGetVal(key->value), 0));
+            if (sdslen(objectGetVal(key->value)) < sdsavail(objectGetVal(key->value))) {
+                sds old = objectGetVal(key->value);
+                dbReplacePublishedStringBuffer(key->value, sdsnewlen(old, sdslen(old)));
+            }
         }
+        dbKeyBracketEnd(&brk);
     }
     return VALKEYMODULE_OK;
 }

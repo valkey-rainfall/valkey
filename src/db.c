@@ -2011,19 +2011,25 @@ void dbKeyBracketEnd(dbKeyBracket *brk) {
     brk->va = NULL;
 }
 
+/* Publishes news as the value of the RAW string o. The old buffer stays readable for
+ * in-flight readers and is freed once they are quiescent. */
+void dbReplacePublishedStringBuffer(robj *o, sds news) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
+    sds old = objectGetVal(o);
+    objectSetVal(o, news);
+    if (!dplusDeferFreeRaw(sdsAllocPtr(old))) sdsfree(old);
+}
+
 sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
     serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
     sds s = objectGetVal(o);
     if (sdsalloc(s) >= total_len) return s; /* in-place capacity; bytes mutate under the caller's bracket */
-    /* Replacement publication: same copy a realloc move would perform. The
-     * old buffer stays intact and dereferenceable for in-flight readers and
-     * is freed at quiescence (universal deferred free -- the realloc's
-     * implicit free was the H4/H5 UAF). */
+    /* Same copy a realloc move would perform, but the old buffer is freed only after
+     * readers that may be copying it are quiescent. */
     sds news = sdsnewlen(SDS_NOINIT, total_len);
     memcpy(news, s, sdslen(s));
     sdssetlen(news, sdslen(s));
-    objectSetVal(o, news);
-    if (!dplusDeferFreeRaw(sdsAllocPtr(s))) sdsfree(s);
+    dbReplacePublishedStringBuffer(o, news);
     return news;
 }
 

@@ -159,6 +159,12 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         assert {$v1 % 2 == 0 && $v1 >= $v0 + 4} ;# del bracket + insert bracket
     }
 
+    # Retired plus reclaimed: grows by one for every buffer whose free waits for readers.
+    proc retired_total {r} {
+        set s [$r debug dplus-epoch-stats]
+        return [expr {[lindex $s 1] + [lindex $s 2]}]
+    }
+
     test {P1-UNIT-MSET: one bracket for a key MSET writes twice} {
         r set p1:k old
         set v0 [shard_version r p1:k]
@@ -183,6 +189,16 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         assert_equal 2 [r bitcount p1:m]
     }
 
+    test {P1-BRACKET-SETBIT-GROW: growing a bitmap defers the old buffer's free} {
+        r setbit p1:n 7 1
+        set v0 [shard_version r p1:n]
+        set t0 [retired_total r]
+        r setbit p1:n 80000 1
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:n]
+        assert {[retired_total r] > $t0}
+        assert_equal 10001 [r strlen p1:n]
+    }
+
     test {P1-BRACKET-BITFIELD: BITFIELD SET brackets} {
         r bitfield p1:o set u8 0 1
         set v0 [shard_version r p1:o]
@@ -199,6 +215,17 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         assert_equal [expr {$v0 + 2}] $v1
         r pfcount p1:p                      ;# rewrites the cached cardinality
         assert_equal [expr {$v1 + 2}] [shard_version r p1:p]
+    }
+
+    test {P1-BRACKET-HLL-GROW: growing or promoting an HLL defers the old buffer's free} {
+        r pfadd p1:q a
+        set t0 [retired_total r]
+        for {set i 0} {$i < 200} {incr i} { r pfadd p1:q e$i }  ;# sparse growth
+        set t1 [retired_total r]
+        assert {$t1 > $t0}
+        r pfdebug todense p1:q
+        assert {[retired_total r] > $t1}
+        assert_equal dense [r pfdebug encoding p1:q]
     }
 
     r debug dict-resizing 1
