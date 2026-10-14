@@ -465,6 +465,12 @@ static void dplusTouch(client *c, robj *o) {
     __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
+/* The commandlog threshold of a type, or -1 while that log records nothing. */
+static long long dplusCommandlogThreshold(int type) {
+    if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
+    return server.commandlog[type].threshold;
+}
+
 /* Execute the validate+copy+reply phase for a single prefetched entry.
  * Returns 1 on success (reply written), 0 on punt. */
 static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, int resp) {
@@ -576,6 +582,10 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         return 0;
     }
 
+    /* A reply the large-reply commandlog would record goes to main, which records it. */
+    long long reply_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
+
     /* Version valid — write reply. */
     int written = dplusWriteBulkReply(c, valbuf, vallen);
     if (written <= 0) return 0;
@@ -670,6 +680,12 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* HOT-KEY GUARD: hot-key detection samples lookups on main; a speculated GET would be
      * invisible to it. Detection is an operator diagnostic, off by default. */
     if (hotkeysEnabled()) return 0;
+
+    /* COMMANDLOG GUARD: a GET the commandlog would record goes to main, which records it. With a
+     * slow threshold of 0 it records every command; large requests are checked per GET below. */
+    if (dplusCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
+    long long request_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    if (request_threshold >= 0 && (long long)c->net_input_bytes_curr_cmd >= request_threshold) return 0;
 
     /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
      * the originals outside the limbo hooks — reads racing a move are the
@@ -827,7 +843,8 @@ int dplusSpeculateBatch(client *c, int tid) {
         while (prefix_open && tail - head < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
             if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
-                !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
+                !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd ||
+                (request_threshold >= 0 && (long long)p->input_bytes >= request_threshold)) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
