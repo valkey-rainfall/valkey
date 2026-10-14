@@ -93,9 +93,9 @@ typedef struct fpThread {
     size_t main_clients;     /* main only: clients routed here and not yet taken back */
     size_t detach_pending;   /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;      /* main only: detach requests a full ret ring could not take */
-    cmdBatch *pending_head;  /* main only: FIFO head of batches held for appendfsync-always durability */
+    cmdBatch *pending_head;  /* main only: FIFO head of batches held for an AOF fsync or a BCAST broadcast */
     cmdBatch *pending_tail;  /* main only: FIFO tail of the held-batch list */
-    int pending_count;       /* main only: held batches awaiting the post-fsync release */
+    int pending_count;       /* main only: held batches awaiting release */
     long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals, speculated;
     /* Observability: why a client/command left the fast path, and batch-queue pressure. IO-owner-only,
      * incremented on a decision the owner already makes, so no extra hot-path work. */
@@ -2054,9 +2054,10 @@ static void fpRetFlushOverflow(fpThread *t) {
     if (published) ioThreadWake((int)(t - fp_threads));
 }
 
-/* Hold a fully executed and charged batch in the thread's main-only durability FIFO instead of returning it;
- * released to the owner ring only after the beforeSleep AOF fsync. Ordering holds because once a thread holds
- * one batch every later batch of the same drain is held behind it, so the owner ring stays per-thread FIFO. */
+/* Hold a fully executed and charged batch in the thread's main-only FIFO instead of returning it; released to
+ * the owner ring only after the beforeSleep AOF fsync, or for a BCAST hold once the drain has broadcast. Ordering
+ * holds because once a thread holds one batch every later batch of the same drain is held behind it, so the owner
+ * ring stays per-thread FIFO. */
 static void fpHoldBatch(fpThread *t, cmdBatch *b) {
     b->pending_next = NULL;
     if (t->pending_tail)
@@ -2094,6 +2095,11 @@ int fastpathDrain(void) {
     int gated = !fpDynamicGate();
     int aof_always = (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
                      server.aof_fsync == AOF_FSYNC_ALWAYS;
+    /* BCAST clients get a changed key's invalidation from beforeSleep before any reply is written. A batch
+     * that leaves a key waiting for that broadcast is held, and this drain broadcasts before releasing it.
+     * Under appendfsync always the post-fsync release already follows beforeSleep's broadcast. */
+    int bcast = !aof_always && !ProcessingEventsWhileBlocked && trackingGetTotalPrefixes() > 0;
+    int held = 0;
     /* io-batch-drain-us bounds how long a thin batch waits for amortization. */
     monotime deadline = server.io_batch_drain_us > 0 ? getMonotonicUs() + server.io_batch_drain_us : 0;
     int enough = server.io_batch_commands * 4;
@@ -2146,26 +2152,34 @@ again:
                 /* A read may have observed a write not yet fsynced; its reply waits for the same fsync. */
                 if (aof_always && sdslen(server.aof_buf) > 0) hold = 1;
             }
+            if (bcast && trackingBroadcastPending()) hold = 1;
             fpReplyChargeBatch(b);
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
-            if (hold)
+            if (hold) {
                 fpHoldBatch(t, b);
-            else
+                held = 1;
+            } else {
                 spscEnqueue(&t->ret, b, false);
+            }
         }
         if (spscCommit(&t->ret)) ioThreadWake(tid);
     }
     if (deadline && total < enough && getMonotonicUs() < deadline) goto again;
+    if (bcast && held) {
+        trackingBroadcastInvalidationMessages();
+        fastpathReleaseDurableReplies();
+    }
     return total;
 }
 
 /* See header. Called on main right after the beforeSleep AOF flush/fsync, which already made every held write
  * durable (or, on an always-policy write error, flushAppendOnlyFile exited before returning here); this then
- * mirrors normal reply semantics without inventing stronger behavior. Capacity: a held batch was drained out
- * of the submit ring and still counts in t->inflight, which the design bounds below the ret ring size, so its
- * one deferred enqueue never overflows and main never waits on the IO thread. */
+ * mirrors normal reply semantics without inventing stronger behavior. A drain calls it only outside appendfsync
+ * always, which has no durability hold to keep. Capacity: a held batch was drained out of the submit ring and
+ * still counts in t->inflight, which the design bounds below the ret ring size, so its one deferred enqueue
+ * never overflows and main never waits on the IO thread. */
 void fastpathReleaseDurableReplies(void) {
     for (int tid = 1; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];

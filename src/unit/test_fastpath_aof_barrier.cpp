@@ -9,7 +9,8 @@
  * ring until fastpathReleaseDurableReplies() runs after the beforeSleep AOF fsync. These tests
  * drive one IO thread inline and prove a held write reply never reaches the socket before its
  * release, that ordering is preserved, that other AOF modes deliver immediately, and that a
- * terminal request against a held client discards its batch instead of writing it. */
+ * terminal request against a held client discards its batch instead of writing it. The same hold
+ * keeps a reply off the ring until BCAST tracking clients were sent the invalidations it follows. */
 
 #include "generated_wrappers.hpp"
 
@@ -144,6 +145,26 @@ class FastpathAofBarrierTest : public ::testing::Test {
         char buf[4096];
         ssize_t n = read(peer, buf, sizeof(buf));
         return n > 0 ? std::string(buf, n) : std::string();
+    }
+
+    /* A connected main-path RESP3 client tracking every key in BCAST mode. */
+    static client *newBcastClient(int *peer) {
+        int sv[2];
+        EXPECT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+        conn->state = CONN_STATE_CONNECTED;
+        client *c = createClient(conn);
+        c->resp = 3;
+        ClientFlags options = {};
+        options.tracking_bcast = 1;
+        enableTracking(c, 0, options, NULL, 0);
+        *peer = sv[1];
+        return c;
+    }
+
+    /* Output queued on a main-path client and not yet written. */
+    static std::string queued(client *c) {
+        return std::string(c->buf, c->bufpos);
     }
 
     /* One command becomes one submitted batch: feed it, parse it, publish it. */
@@ -393,4 +414,53 @@ TEST_F(FastpathAofBarrierTest, QuiesceBlockedByHeldBatchUntilRelease) {
     EXPECT_TRUE(fastpathWorkerDrained(1));
     close(peer);
     freeClient(c);
+}
+
+/* The invalidation BCAST clients get for a key a fast-path write changed is queued before the write's reply can
+ * reach the socket, as on the main path, where beforeSleep broadcasts before writing replies. */
+static const char *INVALIDATE_FOO = ">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n";
+
+TEST_F(FastpathAofBarrierTest, BcastInvalidationQueuedBeforeWriteReply) {
+    int tpeer;
+    client *tracker = newBcastClient(&tpeer);
+    int peer;
+    client *c = newFpClient(&peer);
+
+    submitOne(c, peer, SET_FOO_BAR);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(queued(tracker), INVALIDATE_FOO); /* queued while the reply was still held */
+    EXPECT_EQ(fastpathPendingBatches(1), 0u);   /* and the drain then released it */
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(recvNow(peer), "+OK\r\n");
+
+    cleanupOpen(c, peer);
+    freeClient(tracker);
+    close(tpeer);
+}
+
+/* Under appendfsync always the drain neither broadcasts nor releases: the write stays held until the post-fsync
+ * release, which beforeSleep runs after its own broadcast. */
+TEST_F(FastpathAofBarrierTest, BcastDoesNotReleaseDurabilityHold) {
+    server.aof_state = AOF_ON;
+    server.aof_fsync = AOF_FSYNC_ALWAYS;
+    int tpeer;
+    client *tracker = newBcastClient(&tpeer);
+    int peer;
+    client *c = newFpClient(&peer);
+
+    submitOne(c, peer, SET_FOO_BAR);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathPendingBatches(1), 1u);
+    EXPECT_EQ(fastpathProcessReturns(1), 0);
+    EXPECT_EQ(queued(tracker), "");
+
+    trackingBroadcastInvalidationMessages(); /* beforeSleep: broadcast, then flush and fsync, then release */
+    EXPECT_EQ(queued(tracker), INVALIDATE_FOO);
+    fastpathReleaseDurableReplies();
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(recvNow(peer), "+OK\r\n");
+
+    cleanupOpen(c, peer);
+    freeClient(tracker);
+    close(tpeer);
 }

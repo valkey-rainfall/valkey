@@ -243,9 +243,9 @@ void fastpathClientWritable(int tid, client *c);
 void fastpathSubmitPending(int tid);
 int fastpathProcessReturns(int tid);
 
-/* Main-only: publish every batch held for appendfsync-always durability to its owner return ring, in the
- * order held, immediately after the beforeSleep AOF flush/fsync so no write reply is observable before its
- * durability point. Nonblocking and a no-op when nothing is held. */
+/* Main-only: publish every held batch to its owner return ring, in the order held. beforeSleep calls it right
+ * after the AOF flush/fsync so no write reply is observable before its durability point, and a drain calls it
+ * after broadcasting BCAST invalidations its batches waited for. Nonblocking and a no-op when nothing is held. */
 void fastpathReleaseDurableReplies(void);
 
 /* Role transitions driven by main; a quiesce is idempotent and never restarts publication. */
