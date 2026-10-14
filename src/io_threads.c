@@ -401,16 +401,17 @@ static void slabAppendFree(void *ptr, int is_obj) {
 }
 
 /* Slab publication releases client fences and IO state before tagged write/rearm work becomes visible. */
-#define WRITE_SLAB_CAPACITY 1022
 #define SLAB_FLUSH_THRESHOLD 128
-#define SLAB_WRITE ((uintptr_t)1)
-#define SLAB_REARM ((uintptr_t)2)
-#define SLAB_LAZY ((uintptr_t)4)   /* completion needs no response unless something went wrong */
-#define SLAB_NOTIFY ((uintptr_t)8) /* set by the IO thread: this entry does need main */
-#define SLAB_TAGS (SLAB_WRITE | SLAB_REARM | SLAB_LAZY | SLAB_NOTIFY)
+#define WRITE_SLAB_CAPACITY SLAB_FLUSH_THRESHOLD /* a slab is flushed once it holds this many entries */
+#define SLAB_WRITE ((uint8_t)1)
+#define SLAB_REARM ((uint8_t)2)
+#define SLAB_LAZY ((uint8_t)4)   /* completion needs no response unless something went wrong */
+#define SLAB_NOTIFY ((uint8_t)8) /* set by the IO thread: this entry does need main */
+/* Tags are kept beside the clients: zmalloc guarantees only 8-byte alignment, too few spare bits for them. */
 typedef struct writeSlab {
     size_t count;
-    uintptr_t entries[];
+    client *clients[WRITE_SLAB_CAPACITY];
+    uint8_t tags[WRITE_SLAB_CAPACITY];
 } writeSlab;
 
 static writeSlab *cur_write_slab = NULL;   /* accumulating; main-thread only */
@@ -421,7 +422,7 @@ static writeSlab *allocWriteSlab(void) {
     if (s) {
         spare_write_slab = NULL;
     } else {
-        s = zmalloc(sizeof(writeSlab) + WRITE_SLAB_CAPACITY * sizeof(uintptr_t));
+        s = zmalloc(sizeof(writeSlab));
     }
     s->count = 0;
     return s;
@@ -461,27 +462,29 @@ void flushWriteSlab(void) {
     }
     if (likely(submitSlabJob(s, JOB_SPSC_WRITE_SLAB))) return;
     for (size_t i = 0; i < s->count; i++) {
-        client *c = (client *)(s->entries[i] & ~SLAB_TAGS);
-        if (s->entries[i] & SLAB_WRITE) {
-            unstageWriteClient(c, s->entries[i] & SLAB_LAZY);
+        client *c = s->clients[i];
+        if (s->tags[i] & SLAB_WRITE) {
+            unstageWriteClient(c, s->tags[i] & SLAB_LAZY);
             putClientInPendingWriteQueue(c);
         }
-        if (s->entries[i] & SLAB_REARM) unstageRearmClient(c);
+        if (s->tags[i] & SLAB_REARM) unstageRearmClient(c);
     }
     recycleWriteSlab(s);
 }
 
-static void stageSlabEntry(client *c, uintptr_t tag) {
+static void stageSlabEntry(client *c, uint8_t tag) {
     if (cur_write_slab == NULL) cur_write_slab = allocWriteSlab();
+    writeSlab *s = cur_write_slab;
     /* One entry preserves write-before-rearm ordering for the same client. */
-    if (cur_write_slab->count > 0 &&
-        (cur_write_slab->entries[cur_write_slab->count - 1] & ~SLAB_TAGS) == (uintptr_t)c) {
-        cur_write_slab->entries[cur_write_slab->count - 1] |= tag;
+    if (s->count > 0 && s->clients[s->count - 1] == c) {
+        s->tags[s->count - 1] |= tag;
         return;
     }
-    cur_write_slab->entries[cur_write_slab->count++] = (uintptr_t)c | tag;
+    s->clients[s->count] = c;
+    s->tags[s->count] = tag;
+    s->count++;
     /* Early flush keeps IO completions concurrent with main-thread work. */
-    if (cur_write_slab->count >= SLAB_FLUSH_THRESHOLD) flushWriteSlab();
+    if (s->count >= SLAB_FLUSH_THRESHOLD) flushWriteSlab();
 }
 
 static void stageWriteClient(client *c) {
@@ -1226,8 +1229,8 @@ void cleanupThreadResources(void *dummy) {
 static void ioThreadWriteSlab(writeSlab *slab) {
     int notify = 0;
     for (size_t j = 0; j < slab->count; j++) {
-        uintptr_t e = slab->entries[j];
-        client *c = (client *)(e & ~SLAB_TAGS);
+        uint8_t e = slab->tags[j];
+        client *c = slab->clients[j];
         /* Publish write completion only after write and rearm state. */
         int needs_main = 0;
         if (e & SLAB_WRITE) needs_main = ioThreadWriteClientNoSignal(c, 0);
@@ -1242,7 +1245,7 @@ static void ioThreadWriteSlab(writeSlab *slab) {
             atomic_thread_fence(memory_order_release);
             c->io_write_state = CLIENT_COMPLETED_IO;
             if (needs_main) {
-                if (e & SLAB_LAZY) slab->entries[j] = e | SLAB_NOTIFY;
+                if (e & SLAB_LAZY) slab->tags[j] = e | SLAB_NOTIFY;
                 notify = 1;
             }
         }
@@ -2575,9 +2578,9 @@ static int processOutboxBatch(mpscQueue *outbox) {
                 writeSlab *slab = (writeSlab *)data;
                 size_t written = 0;
                 for (size_t j = 0; j < slab->count; j++) {
-                    uintptr_t e = slab->entries[j];
+                    uint8_t e = slab->tags[j];
                     if (!(e & SLAB_WRITE)) continue;
-                    client *wc = (client *)(e & ~SLAB_TAGS);
+                    client *wc = slab->clients[j];
                     if (e & SLAB_LAZY) {
                         if (e & SLAB_NOTIFY) {
                             serverAssert(wc->io_write_state == CLIENT_COMPLETED_IO);
@@ -2587,9 +2590,9 @@ static int processOutboxBatch(mpscQueue *outbox) {
                         continue;
                     }
                     serverAssert(wc->io_write_state == CLIENT_COMPLETED_IO);
-                    slab->entries[written++] = (uintptr_t)wc;
+                    slab->clients[written++] = wc;
                 }
-                if (written) handleWriteJobs((client **)slab->entries, (int)written);
+                if (written) handleWriteJobs(slab->clients, (int)written);
                 recycleWriteSlab(slab);
             } else if (job_type == JOB_RES_CLUSTER_READ) {
                 serverAssert(cluster_io_pending_responses > 0);
