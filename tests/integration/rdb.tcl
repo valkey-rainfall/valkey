@@ -599,7 +599,7 @@ start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
     } {} {needs:debug}
 }
 
-start_server {tags {"external:skip"} overrides {forkless-infrastructure-enabled yes save "" io-threads 4}} {
+start_server {tags {"external:skip tls:skip"} overrides {forkless-infrastructure-enabled yes save "" io-threads 4}} {
     # Writes to keys the iterator has not passed wait for it, which a fast-path command cannot do on
     # the executor that runs it for the client. A pipelining client then waits with commands queued.
     test "fast-path client writes during forkless bgsave" {

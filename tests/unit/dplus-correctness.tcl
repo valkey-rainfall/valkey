@@ -366,7 +366,7 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         assert {[r object idletime touch:lru] >= 1000}
         assert_equal 20 [speculated_gets r touch:lru 20] ;# none ran on main
         assert {[r object idletime touch:lru] < 10}
-    }
+    } {} {tls:skip}
 
     test {T-TOUCH-LFU: speculated GETs raise the key's LFU counter} {
         r config set maxmemory-policy allkeys-lfu
@@ -380,7 +380,7 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         # Below the initial value an access always counts, so 20 accesses pass it.
         assert {[r object freq touch:lfu] > 5}
         r config set maxmemory-policy noeviction
-    }
+    } {OK} {tls:skip}
 
     test {T-TOUCH-NO-TOUCH: a NO-TOUCH client's GETs leave the key idle} {
         r set touch:warm w

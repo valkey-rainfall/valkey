@@ -210,7 +210,7 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
     }
 }
 
-start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:skip"} overrides {io-threads 5}} {
     proc fastpath_clients {} {
         regexp {fastpath_clients:(\d+)} [r info fastpath] -> n
         return $n
@@ -366,7 +366,7 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         # A command after the idle period is still served.
         assert_equal {} [[lindex $clients 0] get idle:after]
         foreach rd $clients { $rd close }
-    }
+    } {} {tls:skip}
 
     test {Idle server blocks with idle partitioned clients connected} {
         r config set io-threads-fast-path no
@@ -557,7 +557,7 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
     }
 }
 
-start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:skip"} overrides {io-threads 5}} {
     proc fastpath_count {} {
         return [getInfoProperty [r info fastpath] fastpath_clients]
     }

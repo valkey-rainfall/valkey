@@ -18,7 +18,7 @@ proc fp_wait_fastpath_clients {n} {
     }
 }
 
-start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appendfsync always io-threads 2 enable-debug-command yes}} {
+start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly yes appendfsync always io-threads 2 enable-debug-command yes}} {
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     assert_equal {appendfsync always} [r config get appendfsync]

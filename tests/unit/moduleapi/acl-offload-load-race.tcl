@@ -44,7 +44,7 @@ alr_write_aclfile [file join $server_path "users.acl"] {
 }
 start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-threads" 4 \
         "io-threads-always-active" "yes" "acl-offload" "yes" "enable-module-command" "yes" \
-        "loadmodule" $modpath] tags [list "acl acl-offload modules external:skip tls:skip"]] {
+        "loadmodule" $modpath] tags [list acl acl-offload modules external:skip tls:skip]] {
 
     set aclfile [file join $server_path "users.acl"]
 

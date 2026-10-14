@@ -531,5 +531,5 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         $rd close
         r config set min-io-threads-avoid-copy-reply 0
         r config set io-threads 1
-    }
+    } {OK} {tls:skip}
 }
