@@ -4874,9 +4874,9 @@ static void prefetchCommandQueueKeys(client *c) {
 
     /* Prefetching states */
     const int max_keys = server.prefetch_batch_max_size;
+    if (max_keys <= 1) return; /* No point to prefetch a single key */
     int num_keys = 0;
     hashtableIncrementalFindState key_incr_states[max_keys];
-    if (max_keys <= 1) return; /* No point to prefetch a single key */
 
     /* If the command is valid, add keys to incremental find batch. */
     if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
