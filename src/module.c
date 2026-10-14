@@ -215,7 +215,8 @@ struct ValkeyModuleKey {
     robj *value; /* Value object, or NULL if the key was not found. */
     void *iter;  /* Iterator. */
     int mode;    /* Opening mode. */
-    int dma_exclusive; /* Readers are kept out until close: a write DMA pointer was handed out. */
+    /* Readers are kept out until close: a write DMA pointer was handed out. */
+    int dma_exclusive;
 
     union {
         struct {
