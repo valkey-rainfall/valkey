@@ -27,9 +27,10 @@
 #ifndef DPLUS_H
 #define DPLUS_H
 
+#ifndef __cplusplus
 #include "serverassert.h" /* bracket parity checks */
-
 #include <stdatomic.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -66,7 +67,9 @@ struct dplusVersionArray {
 /* Global exclusive_mode flag. Set by commands that require full atomicity
  * (EVAL, MULTI-EXEC, KEYS, DEBUG, FLUSHALL/FLUSHDB, active defrag start).
  * Readers check this before speculating. */
+#ifndef __cplusplus
 extern _Atomic(int) dplus_exclusive_mode;
+#endif
 
 /* Epoch/QSBR reader states. OFFLINE and QUIESCENT never hold speculative
  * pointers; every other value is the epoch announced by an active reader. */
@@ -163,12 +166,15 @@ uint64_t dplusStatsSum(size_t field_offset);
 
 /* D5: owned-client over-limit signal (correctness machinery — present in
  * flagless builds, NOT gated on IO_LOOKUP_OFFLOAD_STATS). */
-extern _Atomic int dplus_client_mem_pressure;
+#ifndef __cplusplus
+extern _Atomic(int) dplus_client_mem_pressure;
+#endif
 
 /* --- API declarations --- */
 
 /* Component 1: Version manipulation (implemented in hashtable.c) */
 void dplusVersionArrayInit(dplusVersionArray *va);
+#ifndef __cplusplus /* C11 atomics; unit tests in C++ use the declarations only */
 static inline uint64_t dplusVersionRead(dplusVersionArray *va, unsigned shard) {
     return atomic_load_explicit(&va->lines[shard / 8].v[shard % 8], memory_order_acquire);
 }
@@ -225,33 +231,7 @@ static inline void dplusVersionBracketAllEnd(dplusVersionArray *va) {
         atomic_store_explicit(slot, v + 1, memory_order_relaxed);
     }
 }
-static inline void dplusVersionBumpShard(dplusVersionArray *va, unsigned shard) {
-    /* Release store — single writer (main thread), so non-RMW load+store is
-     * safe. Release is REQUIRED here, not optional: the reader validates by
-     * acquire-reloading this slot, and without release the mutation's prior
-     * stores may become visible AFTER the bump on weakly-ordered targets
-     * (ARM64/Graviton), letting a reader observe the old version alongside
-     * torn data and validate successfully. The earlier claim that ordering
-     * rides other sync points does not hold for the validation window (see
-     * sharded-version-safety-audit-sep4.md). Free on x86-TSO; str→stlr on
-     * ARM64. */
-    _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
-    atomic_store_explicit(slot, atomic_load_explicit(slot, memory_order_relaxed) + 1, memory_order_release);
-}
-static inline void dplusVersionBumpAll(dplusVersionArray *va) {
-    /* Structural mutation (rehash/resize): publish prior writes, then bump
-     * all shards. The release fence must be SEQUENCED BEFORE the relaxed
-     * stores (C11 fence–store pairing: an acquire load that observes one of
-     * these stores synchronizes with the fence). The previous placement —
-     * fence AFTER the stores — provided no synchronizes-with edge for the
-     * bumps at all. One fence + relaxed stores is cheaper than 256 release
-     * stores on ARM; rare operation either way. */
-    atomic_thread_fence(memory_order_release);
-    for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
-        _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
-        atomic_store_explicit(slot, atomic_load_explicit(slot, memory_order_relaxed) + 1, memory_order_relaxed);
-    }
-}
+#endif
 
 /* Component 2: Read-only find (implemented in hashtable.c) */
 bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
