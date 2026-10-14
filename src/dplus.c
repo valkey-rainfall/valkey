@@ -700,11 +700,14 @@ int dplusSpeculateBatch(client *c, int tid) {
             e->shard = DPLUS_SHARD_INDEX(e->hash);
             e->v_before = dplusVersionRead(va, e->shard);
             if (e->v_before & 1) {
-                /* S2.2a: writer bracket open -- refuse at entry */
+                /* A writer holds this shard: end the prefix here, as for the first GET. Waiting for
+                 * the shard to turn even keeps this reader active, and main can be the writer while
+                 * it drains readers (rehash completion, the retirement hard limit). */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
                 DPLUS_STAT_ADD(bracket_entry_punts, 1);
 #endif
-                continue;
+                prefix_open = 0;
+                break;
             }
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
