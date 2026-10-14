@@ -211,3 +211,26 @@ TEST_F(DplusTest, MainExclusiveWindowFreesAtOnce) {
     EXPECT_EQ(deferred, 0);
     EXPECT_EQ(exclusiveDepth(), 0);
 }
+
+/* A module thread holding the GIL writes the keyspace like main, so its exclusive window must
+ * drain readers like main's. */
+TEST_F(DplusTest, ModuleThreadHoldingTheGilDrainsReaders) {
+    uint64_t epoch;
+    ASSERT_EQ(dplusDebugPinReader(&epoch), C_OK); /* an active reader */
+
+    std::atomic<bool> entered{false};
+    std::thread module_thread([&] {
+        dplusGilWriterBegin();
+        dplusExclusiveEnter();
+        entered = true;
+        dplusExclusiveLeave();
+        dplusGilWriterEnd();
+    });
+    bool entered_before_drain = waitFor([&] { return entered.load(); }, std::chrono::milliseconds(200));
+    ASSERT_EQ(dplusDebugUnpinReader(), C_OK);
+    module_thread.join();
+
+    EXPECT_FALSE(entered_before_drain);
+    EXPECT_TRUE(entered.load());
+    EXPECT_EQ(exclusiveDepth(), 0);
+}

@@ -157,15 +157,30 @@ static int dplusReaderEnter(int tid) {
     }
 }
 
-/* Main-thread only: depth of exclusive windows main has entered and finished draining. */
+/* Writer thread only: depth of exclusive windows the writer has entered and finished draining. */
 static int dplus_main_exclusive_depth = 0;
 
-/* Exclusive mode is a counter because windows nest. Only main enters it: a table freed on
- * another thread (BIO, an IO thread) was unpublished by main first, so no reader can reach
- * it, and a window opened there would let main free retired memory before readers drain.
- * Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. */
+/* Set while a module thread holds the GIL: it is then the keyspace writer, as main is otherwise. */
+static _Thread_local int dplus_gil_writer = 0;
+
+void dplusGilWriterBegin(void) {
+    dplus_gil_writer = 1;
+}
+
+void dplusGilWriterEnd(void) {
+    dplus_gil_writer = 0;
+}
+
+static int dplusOnWriterThread(void) {
+    return dplus_gil_writer || onServerMainThread();
+}
+
+/* Exclusive mode is a counter because windows nest. Only the writer enters it: a table
+ * freed on another thread (BIO, an IO thread) was unpublished by the writer first, so no
+ * reader can reach it, and a window opened there would let the writer free retired memory
+ * before readers drain. Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. */
 void dplusExclusiveEnter(void) {
-    if (!onServerMainThread()) return;
+    if (!dplusOnWriterThread()) return;
     atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     /* Test-only: a debug-held reader models a descheduled thread. ANY
@@ -194,7 +209,7 @@ void dplusExclusiveEnter(void) {
 }
 
 void dplusExclusiveLeave(void) {
-    if (!onServerMainThread()) return;
+    if (!dplusOnWriterThread()) return;
     serverAssert(dplus_main_exclusive_depth > 0);
     dplus_main_exclusive_depth--;
     atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);

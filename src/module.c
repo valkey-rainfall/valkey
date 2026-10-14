@@ -9399,6 +9399,7 @@ void moduleGILAfterLock(void) {
     /* We should never get here if we already inside a module
      * code block which already opened a context. */
     serverAssert(server.execution_nesting == 0);
+    dplusGilWriterBegin();
     /* Bump up the nesting level to prevent immediate propagation
      * of possible VM_Call from th thread */
     enterExecutionUnit(1, 0);
@@ -9441,6 +9442,7 @@ void moduleGILBeforeUnlock(void) {
      * released we have to propagate here). */
     exitExecutionUnit();
     postExecutionUnitOperations();
+    dplusGilWriterEnd();
 }
 
 /* Release the server lock after a thread safe API call was executed. */

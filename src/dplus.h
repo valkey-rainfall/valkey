@@ -249,8 +249,11 @@ uint64_t hashtableHashKey(hashtable *ht, const void *key);
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 
 /* Component 4: Exclusive mode helpers (implemented in dplus.c) */
-void dplusExclusiveEnter(void); /* Main thread: set exclusive + spin-wait */
-void dplusExclusiveLeave(void); /* Main thread: clear exclusive */
+void dplusExclusiveEnter(void); /* Writer thread: set exclusive + spin-wait */
+void dplusExclusiveLeave(void); /* Writer thread: clear exclusive */
+/* A module thread holding the GIL is the keyspace writer while it holds it. */
+void dplusGilWriterBegin(void);
+void dplusGilWriterEnd(void);
 
 /* ACL/AUTH gate for speculation (main-thread writers; workers read the
  * per-client spec_acl_ok byte inside dplusSpeculateBatch). */
