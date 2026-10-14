@@ -196,16 +196,19 @@ static inline bool dplusVersionValidate(dplusVersionArray *va, unsigned shard, u
 /* --- S2.2: odd/even bracket primitives (§5.2 paired protocol) ---
  * Every main-thread mutation of reader-reachable state is bracketed:
  * Begin makes the version ODD (new readers refuse at entry; in-flight
- * readers will fail validation), End makes it EVEN again. Both are release
- * stores (S1.1). Parity is a global invariant: versions are even at rest --
+ * readers will fail validation), End makes it EVEN again. Begin's release
+ * fence orders the odd store before the bracketed data stores, and End's
+ * release orders those stores before the even store; without the fence a
+ * weakly ordered CPU can expose new data under the old even version.
+ * Parity is a global invariant: versions are even at rest --
  * ALL bump sites must use brackets; a lone bump leaves odd residue that
- * permanently punts the shard. assert() (compiled out with NDEBUG) checks
- * parity at each transition. */
+ * permanently punts the shard. assert() checks parity at each transition. */
 static inline void dplusVersionBracketBegin(dplusVersionArray *va, unsigned shard) {
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
     uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
     assert((v & 1) == 0); /* even at rest */
-    atomic_store_explicit(slot, v + 1, memory_order_release);
+    atomic_store_explicit(slot, v + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
 }
 static inline void dplusVersionBracketEnd(dplusVersionArray *va, unsigned shard) {
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
@@ -214,13 +217,13 @@ static inline void dplusVersionBracketEnd(dplusVersionArray *va, unsigned shard)
     atomic_store_explicit(slot, v + 1, memory_order_release);
 }
 static inline void dplusVersionBracketAllBegin(dplusVersionArray *va) {
-    atomic_thread_fence(memory_order_release);
     for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
         _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
         uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
         assert((v & 1) == 0);
         atomic_store_explicit(slot, v + 1, memory_order_relaxed);
     }
+    atomic_thread_fence(memory_order_release);
 }
 static inline void dplusVersionBracketAllEnd(dplusVersionArray *va) {
     atomic_thread_fence(memory_order_release);
