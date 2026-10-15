@@ -37,6 +37,92 @@
 #include "intset.h" /* Compact integer set structure */
 
 /*-----------------------------------------------------------------------------
+ * Hashtable encoding
+ *
+ * A hashtable-encoded set holds its members directly as hashtable entries.
+ * Each entry is either an sds or an inline integer tagged in the top bit; see
+ * the setEntry* helpers in server.h for the representation and the rule that
+ * decides which members are inline. Because the rule is applied on both the
+ * insert and the lookup side, an sds entry never represents an integer that
+ * could have been inline, so a key of one form never equals an entry of the
+ * other form and the compare callback only has to handle like-with-like.
+ *----------------------------------------------------------------------------*/
+
+static uint64_t setHashtableHash(const void *key) {
+    if (setEntryIsInt(key)) {
+        int64_t value = setEntryToInt(key);
+        return genHashFunctionConfigurableSeed((const char *)&value, sizeof(value));
+    }
+    return sdsHashConfigurableSeed(key);
+}
+
+static int setHashtableKeyCompare(const void *key1, const void *key2) {
+    /* Two inline integers are equal iff the words are equal. An inline integer
+     * and an sds are never equal (see above). */
+    if (setEntryIsInt(key1) || setEntryIsInt(key2)) return key1 == key2;
+    return dictSdsKeyCompare(key1, key2);
+}
+
+static void setHashtableEntryDestructor(void *entry) {
+    if (!setEntryIsInt(entry)) sdsfree(entry);
+}
+
+/* Set hashtable type. Entries are sds strings or inline integers. The type is
+ * also used by other code for temporary sets of sds strings; such users never
+ * insert inline integers and see plain sds semantics. */
+hashtableType setHashtableType = {
+    .hashFunction = setHashtableHash,
+    .keyCompare = setHashtableKeyCompare,
+    .entryDestructor = setHashtableEntryDestructor,
+};
+
+/* Decodes a set hashtable entry using the same contract as setTypeNext: for an
+ * sds entry, str and len are set and llele is left untouched; for an inline
+ * integer, str is set to NULL and llele holds the value. */
+void setTypeEntryGet(const void *entry, char **str, size_t *len, int64_t *llele) {
+    if (setEntryIsInt(entry)) {
+        *str = NULL;
+        *llele = setEntryToInt(entry);
+    } else {
+        *str = (char *)entry;
+        *len = sdslen((sds)entry);
+    }
+}
+
+/* Returns the member held by a set hashtable entry as a string. An sds entry
+ * is returned as-is; an inline integer is formatted into buf, which must have
+ * room for LONG_STR_SIZE bytes. */
+const char *setTypeEntryToString(const void *entry, char *buf, size_t *len) {
+    if (setEntryIsInt(entry)) {
+        *len = ll2string(buf, LONG_STR_SIZE, setEntryToInt(entry));
+        return buf;
+    }
+    *len = sdslen((sds)entry);
+    return entry;
+}
+
+/* Returns the key to use when looking up member in a hashtable-encoded set:
+ * the inline integer entry if the member is stored inline, otherwise the sds
+ * itself. */
+void *setTypeHashtableLookupKey(sds member) {
+    void *key = setEntryIntFromString(member, sdslen(member));
+    return key ? key : member;
+}
+
+/* Adds a member, given as a string or (when str is NULL) as an integer, to a
+ * set hashtable. Used by bulk paths (encoding conversion, RDB load) where the
+ * caller does not hold an sds it can donate. Returns 1 if the member was
+ * added, 0 if it was already present. */
+static int setHashtableAddMember(hashtable *ht, const char *str, size_t len, int64_t llval) {
+    void *entry = str ? setEntryIntFromString(str, len) : (setEntryIntFits(llval) ? setEntryFromInt(llval) : NULL);
+    if (entry) return hashtableAdd(ht, entry);
+    sds sdsval = str ? sdsnewlen(str, len) : sdsfromlonglong(llval);
+    if (hashtableAdd(ht, sdsval)) return 1;
+    sdsfree(sdsval);
+    return 0;
+}
+
+/*-----------------------------------------------------------------------------
  * Set Commands
  *----------------------------------------------------------------------------*/
 
@@ -133,6 +219,9 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
             if (success) maybeConvertIntset(set);
             return success;
         }
+        if (set->encoding == OBJ_ENCODING_HASHTABLE && setEntryIntFits(llval)) {
+            return hashtableAdd(objectGetVal(set), setEntryFromInt(llval));
+        }
         /* Convert int to string. */
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
         str = tmpbuf;
@@ -141,9 +230,11 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
 
     serverAssert(str);
     if (set->encoding == OBJ_ENCODING_HASHTABLE) {
+        hashtable *ht = objectGetVal(set);
+        void *intentry = setEntryIntFromString(str, len);
+        if (intentry) return hashtableAdd(ht, intentry);
         /* Avoid duping the string if it is an sds string. */
         sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
-        hashtable *ht = objectGetVal(set);
         hashtablePosition position;
         if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
             /* Key doesn't already exist in the set. Add it but dup the key. */
@@ -174,7 +265,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
             } else {
                 /* Size limit is reached. Convert to hashtable and add. */
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, lpLength(lp) + 1, 1);
-                serverAssert(hashtableAdd(objectGetVal(set), sdsnewlen(str, len)));
+                serverAssert(setHashtableAddMember(objectGetVal(set), str, len, 0));
             }
             return 1;
         }
@@ -214,7 +305,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, intsetLen(objectGetVal(set)) + 1, 1);
                 /* The set *was* an intset and this value is not integer
                  * encodable, so hashtableAdd should always work. */
-                serverAssert(hashtableAdd(objectGetVal(set), sdsnewlen(str, len)));
+                serverAssert(setHashtableAddMember(objectGetVal(set), str, len, 0));
                 return 1;
             }
         }
@@ -244,12 +335,17 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
             objectSetVal(setobj, intsetRemove(objectGetVal(setobj), llval, &success));
             return success;
         }
+        if (setobj->encoding == OBJ_ENCODING_HASHTABLE && setEntryIntFits(llval)) {
+            return hashtableDelete(objectGetVal(setobj), setEntryFromInt(llval));
+        }
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
         str = tmpbuf;
         str_is_sds = 0;
     }
 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
+        void *intentry = setEntryIntFromString(str, len);
+        if (intentry) return hashtableDelete(objectGetVal(setobj), intentry);
         sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
         int deleted = hashtableDelete(objectGetVal(setobj), sdsval);
         if (sdsval != str) sdsfree(sdsval); /* free temp copy */
@@ -293,6 +389,9 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
     char tmpbuf[LONG_STR_SIZE];
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) return intsetFind(objectGetVal(set), llval);
+        if (set->encoding == OBJ_ENCODING_HASHTABLE && setEntryIntFits(llval)) {
+            return hashtableFind(objectGetVal(set), setEntryFromInt(llval), NULL);
+        }
         len = ll2string(tmpbuf, sizeof tmpbuf, llval);
         str = tmpbuf;
         str_is_sds = 0;
@@ -305,9 +404,10 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
     } else if (set->encoding == OBJ_ENCODING_INTSET) {
         long long llval;
         return string2ll(str, len, &llval) && intsetFind(objectGetVal(set), llval);
-    } else if (set->encoding == OBJ_ENCODING_HASHTABLE && str_is_sds) {
-        return hashtableFind(objectGetVal(set), (sds)str, NULL);
     } else if (set->encoding == OBJ_ENCODING_HASHTABLE) {
+        void *intentry = setEntryIntFromString(str, len);
+        if (intentry) return hashtableFind(objectGetVal(set), intentry, NULL);
+        if (str_is_sds) return hashtableFind(objectGetVal(set), (sds)str, NULL);
         sds sdsval = sdsnewlen(str, len);
         int result = hashtableFind(objectGetVal(set), sdsval, NULL);
         sdsfree(sdsval);
@@ -347,12 +447,13 @@ void setTypeReleaseIterator(setTypeIterator *si) {
  * (str and len) or (llele) depending on whether the value is stored as a string
  * or as an integer internally.
  *
- * If OBJ_ENCODING_HASHTABLE is returned, then str points to an sds string and can be
- * used as such. If OBJ_ENCODING_INTSET, then llele is populated and str is
- * pointed to NULL. If OBJ_ENCODING_LISTPACK is returned, the value can be
- * either a string or an integer. If *str is not NULL, then str and len are
- * populated with the string content and length. Otherwise, llele populated with
- * an integer value.
+ * If OBJ_ENCODING_HASHTABLE is returned, the value can be either a string or
+ * an integer. If *str is not NULL, then str points to an sds string and can be
+ * used as such. Otherwise, llele is populated with an integer value. If
+ * OBJ_ENCODING_INTSET, then llele is populated and str is pointed to NULL. If
+ * OBJ_ENCODING_LISTPACK is returned, the value can be either a string or an
+ * integer. If *str is not NULL, then str and len are populated with the string
+ * content and length. Otherwise, llele populated with an integer value.
  *
  * Note that str, len and llele pointers should all be passed and cannot
  * be NULL since the function will try to defensively populate the non
@@ -363,9 +464,8 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
     if (si->encoding == OBJ_ENCODING_HASHTABLE) {
         void *next;
         if (!hashtableNext(si->hashtable_iterator, &next)) return -1;
-        *str = next;
-        *len = sdslen(*str);
-        *llele = -123456789; /* Not needed. Defensive. */
+        *llele = -123456789; /* Not needed for sds entries. Defensive. */
+        setTypeEntryGet(next, str, len, llele);
     } else if (si->encoding == OBJ_ENCODING_INTSET) {
         if (!intsetGet(objectGetVal(si->subject), si->ii++, llele)) return -1;
         *str = NULL;
@@ -413,8 +513,9 @@ sds setTypeNextObject(setTypeIterator *si) {
  * object. The return value of the function is the object->encoding
  * field of the object and can be used by the caller to check if the
  * int64_t pointer or the str and len pointers were populated, as for
- * setTypeNext. If OBJ_ENCODING_HASHTABLE is returned, str is pointed to a
- * string which is actually an sds string and it can be used as such.
+ * setTypeNext. If OBJ_ENCODING_HASHTABLE is returned and str is not NULL, str
+ * points to a string which is actually an sds string and it can be used as
+ * such.
  *
  * Note that both the str, len and llele pointers should be passed and cannot
  * be NULL. If str is set to NULL, the value is an integer stored in llele. */
@@ -422,9 +523,8 @@ int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
         void *entry = NULL;
         hashtableFairRandomEntry(objectGetVal(setobj), &entry);
-        *str = entry;
-        *len = sdslen(*str);
-        *llele = -123456789; /* Not needed. Defensive. */
+        *llele = -123456789; /* Not needed for sds entries. Defensive. */
+        setTypeEntryGet(entry, str, len, llele);
     } else if (setobj->encoding == OBJ_ENCODING_INTSET) {
         *llele = intsetRandom(objectGetVal(setobj));
         *str = NULL; /* Not needed. Defensive. */
@@ -499,7 +599,9 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
 
     if (enc == OBJ_ENCODING_HASHTABLE) {
         hashtable *ht = hashtableCreate(&setHashtableType);
-        sds element;
+        char *str;
+        size_t len;
+        int64_t llele;
 
         /* Presize the hashtable to avoid rehashing */
         if (panic) {
@@ -509,10 +611,10 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
             return C_ERR;
         }
 
-        /* To add the elements we extract integers and create Objects */
+        /* Integers become inline entries, everything else an sds. */
         si = setTypeInitIterator(setobj);
-        while ((element = setTypeNextObject(si)) != NULL) {
-            serverAssert(hashtableAdd(ht, element));
+        while (setTypeNext(si, &str, &len, &llele) != -1) {
+            serverAssert(setHashtableAddMember(ht, str, len, llele));
         }
         setTypeReleaseIterator(si);
 
@@ -585,7 +687,7 @@ robj *setTypeDup(robj *o) {
         size_t len;
         int64_t intobj;
         while (setTypeNext(si, &str, &len, &intobj) != -1) {
-            setTypeAdd(set, (sds)str);
+            setTypeAddAux(set, str, len, intobj, 1);
         }
         setTypeReleaseIterator(si);
     } else {
@@ -715,7 +817,7 @@ static void smismemberReplyWithHashtable(client *c, hashtable *ht, robj **member
         size_t batch = count > SMISMEMBER_FIND_BATCH_SIZE ? SMISMEMBER_FIND_BATCH_SIZE : count;
 
         for (size_t i = 0; i < batch; i++) {
-            keys[i] = objectGetVal(members[i]);
+            keys[i] = setTypeHashtableLookupKey(objectGetVal(members[i]));
         }
 
         uint32_t result = hashtableFindBatch(ht, (int)batch, keys, found_entries);

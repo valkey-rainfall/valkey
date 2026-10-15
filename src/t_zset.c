@@ -1694,7 +1694,11 @@ static int zuiNext(zsetopsrc *op, zsetopval *val) {
         } else if (op->encoding == OBJ_ENCODING_HASHTABLE) {
             void *next;
             if (!hashtableNext(it->ht.iter, &next)) return 0;
-            val->ele = next;
+            if (setEntryIsInt(next)) {
+                val->ell = setEntryToInt(next);
+            } else {
+                val->ele = next;
+            }
             val->score = 1.0;
         } else if (op->encoding == OBJ_ENCODING_LISTPACK) {
             if (it->lp.p == NULL) return 0;

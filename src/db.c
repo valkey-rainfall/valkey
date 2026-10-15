@@ -1047,10 +1047,29 @@ int objectTypeCompare(robj *o, long long target) {
         return 1;
 }
 
+/* An element collected by a scan. buf/len point either into the scanned data
+ * structure (owned == NULL) or into a temporary sds that must be freed after
+ * the reply is written (owned != NULL). */
+typedef struct {
+    const char *buf;
+    size_t len;
+    sds owned;
+} scanItem;
+
+/* Adds an item that points into the data structure being scanned. */
 static void addScanDataItem(vector *result, const char *buf, size_t len) {
-    stringRef *item = vectorPush(result);
+    scanItem *item = vectorPush(result);
     item->buf = buf;
     item->len = len;
+    item->owned = NULL;
+}
+
+/* Adds a temporary sds. It is freed once the reply has been written. */
+static void addScanDataItemOwned(vector *result, sds s) {
+    scanItem *item = vectorPush(result);
+    item->buf = s;
+    item->len = sdslen(s);
+    item->owned = s;
 }
 
 /* Hashtable scan callback used by scanCallback when scanning the keyspace. */
@@ -1090,10 +1109,9 @@ void keysScanCallback(void *privdata, void *entry, int didx) {
  * returned by the dictionary iterator into a list. */
 void hashtableScanCallback(void *privdata, void *entry) {
     scanData *data = (scanData *)privdata;
-    stringRef val = {NULL, 0};
-    sds key = NULL;
-    const char *zset_ptr = NULL;
-    size_t zset_ele_len = 0;
+    const char *key = NULL, *val = NULL;
+    size_t key_len = 0, val_len = 0;
+    char intbuf[LONG_STR_SIZE];
 
     robj *o = data->o;
     data->sampled++;
@@ -1104,48 +1122,45 @@ void hashtableScanCallback(void *privdata, void *entry) {
 
     /* get key, value */
     if (o->type == OBJ_SET) {
-        key = (sds)entry;
+        /* An inline integer member is formatted into intbuf; a string member
+         * is referenced in place. */
+        key = setTypeEntryToString(entry, intbuf, &key_len);
     } else if (o->type == OBJ_ZSET) {
-        orderedIndexItemGetElement((const OrderedIndexItem *)entry, &zset_ptr, &zset_ele_len);
-        /* zset data is copied after filtering */
+        orderedIndexItemGetElement((const OrderedIndexItem *)entry, &key, &key_len);
     } else if (objectGetType(o) == OBJ_HASH) {
         key = entryGetField(entry);
+        key_len = sdslen(entryGetField(entry));
         if (!data->only_keys) {
-            val.buf = entryGetValue(entry, &val.len);
+            val = entryGetValue(entry, &val_len);
         }
     } else {
         serverPanic("Type not handled in hashtable SCAN callback.");
     }
 
     /* Filter element if it does not match the pattern. */
-    if (data->pattern) {
-        const char *match_ptr = (o->type == OBJ_ZSET) ? zset_ptr : key;
-        size_t match_len = (o->type == OBJ_ZSET) ? zset_ele_len : sdslen(key);
-        if (!stringmatchlen(data->pattern, sdslen(data->pattern), match_ptr, match_len, 0)) {
-            return;
-        }
+    if (data->pattern && !stringmatchlen(data->pattern, sdslen(data->pattern), key, key_len, 0)) {
+        return;
     }
 
-    /* zset data must be copied. Do this after filtering to avoid unneeded
-     * allocations. */
+    /* Data that does not live in the data structure as a string (zset items,
+     * inline integers) is copied. This is done after filtering to avoid
+     * unneeded allocations. */
     if (o->type == OBJ_ZSET) {
-        /* zset data is copied */
-        const char *ptr;
-        size_t ele_len;
-        orderedIndexItemGetElement((const OrderedIndexItem *)entry, &ptr, &ele_len);
-        key = sdsnewlen(ptr, ele_len);
+        addScanDataItemOwned(data->result, sdsnewlen(key, key_len));
         if (!data->only_keys) {
             char buf[MAX_LONG_DOUBLE_CHARS];
             int len = ld2string(buf, sizeof(buf), orderedIndexItemGetScore((const OrderedIndexItem *)entry), LD_STR_AUTO);
-            sds tmp = sdsnewlen(buf, len);
-            val.buf = (const char *)tmp;
-            val.len = sdslen(tmp);
+            addScanDataItemOwned(data->result, sdsnewlen(buf, len));
         }
+        return;
     }
-
-    addScanDataItem(data->result, (const char *)key, sdslen(key));
-    if (val.buf) {
-        addScanDataItem(data->result, val.buf, val.len);
+    if (key == intbuf) {
+        addScanDataItemOwned(data->result, sdsnewlen(key, key_len));
+    } else {
+        addScanDataItem(data->result, key, key_len);
+    }
+    if (val) {
+        addScanDataItem(data->result, val, val_len);
     }
 }
 
@@ -1285,27 +1300,21 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
      * just return everything inside the object in a single call, setting the
      * cursor to zero to signal the end of the iteration. */
 
-    /* Handle the case of kvstore, dict or hashtable. */
+    /* Handle the case of kvstore, dict or hashtable. Items collected into
+     * 'result' either point into the data structure or own a temporary sds;
+     * see scanItem. */
     hashtable *ht = NULL;
-    /* Set a free callback for the contents of the collected keys list if they
-     * are deep copied temporary strings. We must not free them if they are just
-     * a shallow copy - a pointer to the actual data in the data structure */
-    void (*free_callback)(sds) = sdsfree;
     if (o == NULL) {
-        free_callback = NULL;
+        /* keyspace scan */
     } else if (o->type == OBJ_SET && o->encoding == OBJ_ENCODING_HASHTABLE) {
         ht = objectGetVal(o);
-        free_callback = NULL;
     } else if (objectGetType(o) == OBJ_HASH && o->encoding == OBJ_ENCODING_HASHTABLE) {
         ht = objectGetVal(o);
-        free_callback = NULL;
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = objectGetVal(o);
         ht = zs->ht;
-        /* scanning ZSET allocates temporary strings even though it's a dict */
-        free_callback = sdsfree;
     }
-    vectorInit(&result, SCAN_VECTOR_INITIAL_ALLOC, sizeof(stringRef));
+    vectorInit(&result, SCAN_VECTOR_INITIAL_ALLOC, sizeof(scanItem));
 
     /* For main hash table scan or scannable data structure. */
     if (!o || ht) {
@@ -1371,8 +1380,7 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
             if (opts->use_pattern && !stringmatchlen(opts->pat, opts->patlen, key, len, 0)) {
                 continue;
             }
-            sds item = sdsnewlen(key, len);
-            addScanDataItem(&result, (const char *)item, sdslen(item));
+            addScanDataItemOwned(&result, sdsnewlen(key, len));
         }
         setTypeReleaseIterator(si);
         cursor = 0;
@@ -1397,13 +1405,11 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
                 continue;
             }
             /* add key object */
-            sds item = sdsnewlen(str, len);
-            addScanDataItem(&result, (const char *)item, sdslen(item));
+            addScanDataItemOwned(&result, sdsnewlen(str, len));
             /* add value object */
             if (!opts->only_keys) {
                 str = lpGet(vptr, &len, intbuf);
-                item = sdsnewlen(str, len);
-                addScanDataItem(&result, (const char *)item, sdslen(item));
+                addScanDataItemOwned(&result, sdsnewlen(str, len));
             }
         }
         cursor = 0;
@@ -1431,11 +1437,9 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
 
     addReplyArrayLen(c, vectorLen(&result));
     for (uint32_t i = 0; i < vectorLen(&result); i++) {
-        stringRef *key = vectorGet(&result, i);
-        addReplyBulkCBuffer(c, key->buf, key->len);
-        if (free_callback) {
-            free_callback((sds)(key->buf));
-        }
+        scanItem *item = vectorGet(&result, i);
+        addReplyBulkCBuffer(c, item->buf, item->len);
+        if (item->owned) sdsfree(item->owned);
     }
 
     vectorCleanup(&result);

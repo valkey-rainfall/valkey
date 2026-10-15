@@ -205,9 +205,16 @@ static void prefetchValueNested(KeyPrefetchInfo *info) {
         /* The zset hashtable stores packed [score][element] items, so a plain sds
          * lookup key must be marked for the callbacks to read it as an element. */
         sds member = objectGetVal(info->member);
-        if (info->inner_is_zset) zsetMarkLookupKey(member);
-        hashtableIncrementalFindInit(&info->inner_hashtab_state, inner_ht, member);
-        if (info->inner_is_zset) zsetUnmarkLookupKey(member);
+        if (info->inner_is_zset) {
+            zsetMarkLookupKey(member);
+            hashtableIncrementalFindInit(&info->inner_hashtab_state, inner_ht, member);
+            zsetUnmarkLookupKey(member);
+        } else if (val->type == OBJ_SET) {
+            /* Integer members are stored inline; look them up the same way. */
+            hashtableIncrementalFindInit(&info->inner_hashtab_state, inner_ht, setTypeHashtableLookupKey(member));
+        } else {
+            hashtableIncrementalFindInit(&info->inner_hashtab_state, inner_ht, member);
+        }
         info->nested_phase = NESTED_PREFETCH_STEP;
         moveToNextKey();
         return;

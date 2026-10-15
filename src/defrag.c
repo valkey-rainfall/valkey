@@ -302,11 +302,14 @@ static void activeDefragSdsDict(dict *d, int val_type) {
     } while (cursor != 0);
 }
 
-static void activeDefragSdsHashtableCallback(void *privdata, void *entry_ref) {
+/* Defrag callback for hashtable-encoded sets. Entries are sds strings or
+ * inline integers; the latter have no allocation to defrag. */
+static void activeDefragSetHashtableCallback(void *privdata, void *entry_ref) {
     UNUSED(privdata);
-    sds *sds_ref = (sds *)entry_ref;
-    sds new_sds = activeDefragSds(*sds_ref);
-    if (new_sds != NULL) *sds_ref = new_sds;
+    void **ref = (void **)entry_ref;
+    if (setEntryIsInt(*ref)) return;
+    sds new_sds = activeDefragSds((sds)*ref);
+    if (new_sds != NULL) *ref = new_sds;
 }
 
 /* Defrag a list of ptr, sds or robj string values */
@@ -406,7 +409,7 @@ static void scanHashtableCallbackCountScanned(void *privdata, void *elemref) {
 static void scanLaterSet(robj *ob, unsigned long *cursor) {
     serverAssert(ob->type == OBJ_SET && ob->encoding == OBJ_ENCODING_HASHTABLE);
     hashtable *ht = objectGetVal(ob);
-    *cursor = hashtableScanDefrag(ht, *cursor, activeDefragSdsHashtableCallback, NULL, activeDefragAlloc, HASHTABLE_SCAN_EMIT_REF);
+    *cursor = hashtableScanDefrag(ht, *cursor, activeDefragSetHashtableCallback, NULL, activeDefragAlloc, HASHTABLE_SCAN_EMIT_REF);
 }
 
 static void scanLaterHash(robj *ob, unsigned long *cursor) {
@@ -480,7 +483,7 @@ static void defragSet(robj *ob) {
     } else {
         unsigned long cursor = 0;
         do {
-            cursor = hashtableScanDefrag(ht, cursor, activeDefragSdsHashtableCallback, NULL, activeDefragAlloc, HASHTABLE_SCAN_EMIT_REF);
+            cursor = hashtableScanDefrag(ht, cursor, activeDefragSetHashtableCallback, NULL, activeDefragAlloc, HASHTABLE_SCAN_EMIT_REF);
         } while (cursor != 0);
     }
     /* defrag the hashtable struct and tables */
