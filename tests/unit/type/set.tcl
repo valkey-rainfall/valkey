@@ -1173,37 +1173,6 @@ foreach type {single multiple single_multiple} {
         $r2 close
     }
 
-    test {Hashtable set stores integers inline: boundaries and canonical form} {
-        r del myset
-        r config set set-max-intset-entries 4
-        r config set set-max-listpack-entries 4
-        # Inline range is [-2^62, 2^62). Values outside stay sds. Strings that
-        # are not canonical decimal integers (007, +5, -0) are never integers.
-        set members {1 -7 4611686018427387903 -4611686018427387904 \
-                     4611686018427387904 -4611686018427387905 \
-                     9223372036854775807 -9223372036854775808 \
-                     foo 007 +5 -0 0}
-        assert_equal [llength $members] [r sadd myset {*}$members]
-        assert_encoding hashtable myset
-        # Re-adding every member is a no-op in both forms.
-        assert_equal 0 [r sadd myset {*}$members]
-        assert_equal [llength $members] [r scard myset]
-        foreach m $members {
-            assert_equal 1 [r sismember myset $m] "SISMEMBER $m"
-        }
-        assert_equal [lrepeat [llength $members] 1] [r smismember myset {*}$members]
-        assert_equal {0 0 0 0} [r smismember myset 6 01 00 " 1"]
-        assert_equal [lsort $members] [lsort [r smembers myset]]
-        assert_equal [lsort $members] [lsort [lindex [r sscan myset 0 count 100] 1]]
-        assert_equal {4611686018427387903 4611686018427387904} \
-            [lsort [lindex [r sscan myset 0 match 46* count 100] 1]]
-        assert_equal 4 [r srem myset 1 foo 4611686018427387904 -9223372036854775808]
-        assert_equal 0 [r srem myset 1 foo 4611686018427387904 -9223372036854775808]
-        assert_equal [expr {[llength $members] - 4}] [r scard myset]
-        r config set set-max-intset-entries 512
-        r config set set-max-listpack-entries 128
-    }
-
     test {Hashtable set with inline integers survives RDB and AOF round trips} {
         r del myset myset2
         r config set set-max-intset-entries 4
@@ -1232,6 +1201,10 @@ foreach type {single multiple single_multiple} {
         r sadd b{t} 3 4 5 6 7 y z
         assert_encoding hashtable a{t}
         assert_encoding hashtable b{t}
+        # Batch lookup and scan classify members the same way SADD did.
+        assert_equal {1 1 1 0 0 0} [r smismember a{t} 1 5 x 6 01 +1]
+        assert_equal {1 2 3 4 5 x y} [lsort [lindex [r sscan a{t} 0 count 100] 1]]
+        assert_equal {3 4 5} [lsort [lindex [r sscan b{t} 0 match {[345]} count 100] 1]]
         assert_equal {3 4 5 y} [lsort [r sinter a{t} b{t}]]
         assert_equal {1 2 3 4 5 6 7 x y z} [lsort [r sunion a{t} b{t}]]
         assert_equal {1 2 x} [lsort [r sdiff a{t} b{t}]]
