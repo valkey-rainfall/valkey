@@ -550,7 +550,8 @@ start_server {tags {"other"}} {
     }
 }
 
-start_server {tags {"other external:skip"}} {
+# Measures the single main hashtable of a db, so keep the keyspace unsharded.
+start_server {tags {"other external:skip"} overrides {keyspace-shard-bits 0}} {
     test {Don't rehash if server has child process} {
         r config set save ""
         r config set rdb-key-save-delay 1000000
@@ -700,7 +701,8 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
     } {*ERR Unknown node*}
 }
 
-start_server {tags {"other external:skip"}} {
+# Measures the single main hashtable of a db, so keep the keyspace unsharded.
+start_server {tags {"other external:skip"} overrides {keyspace-shard-bits 0}} {
     test "Server can resize empty dict" {
         # Write and then delete 128 keys, creating an empty dict
         r flushall
