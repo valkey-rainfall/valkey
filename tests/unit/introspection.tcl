@@ -1345,6 +1345,8 @@ start_server {tags {"introspection"}} {
             databases
             cluster-databases
             io-threads
+            keyspace-shard-bits
+            acl-offload
             logfile
             unixsocketperm
             unixsocketgroup
