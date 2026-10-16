@@ -34,6 +34,7 @@
 #include "sds.h"
 #include "server.h"
 #include "hotkeys.h"
+#include "cronstats.h"
 #include "cluster.h"
 #include "connection.h"
 #include "bio.h"
@@ -4025,6 +4026,7 @@ void configResetStatCommand(client *c) {
     resetClusterStats();
     resetCommandTableStats(server.commands);
     resetErrorTableStats();
+    cronStatsReset();
     addReply(c, shared.ok);
 }
 
