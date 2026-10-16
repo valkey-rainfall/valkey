@@ -4213,6 +4213,8 @@ int setModuleUnsignedNumericConfig(ModuleConfig *config, unsigned long long val,
 /* db.c -- Keyspace access API */
 int removeExpire(serverDb *db, robj *key);
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index);
+void dbLanePhaseBegin(void);
+void dbLanePhaseEnd(void);
 robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index);
 void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index);
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
