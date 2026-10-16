@@ -1379,6 +1379,7 @@ start_server {tags {"introspection"}} {
             rdma-bind
             rdma-port
             forkless-infrastructure-enabled
+            acl-offload
         }
 
         if {!$::tls} {
@@ -2136,8 +2137,9 @@ start_server {overrides {forkless-infrastructure-enabled yes} tags {"introspecti
     foreach bgsave_type {"fork" "forkless"} {
         test "CLIENT KILL close the client connection during bgsave - $bgsave_type" {
             r flushall
-            r set k v
-            r config set rdb-key-save-delay 10000000
+            r debug populate 1000
+            # Many short per-key delays, so a cancelled forkless save stops at the next key.
+            r config set rdb-key-save-delay 100000
             r config set forkless-policy [expr {$bgsave_type eq "forkless" ? "prefer-forkless" : "require-fork"}]
             r bgsave
             wait_for_condition 1000 10 {
@@ -2158,10 +2160,10 @@ start_server {overrides {forkless-infrastructure-enabled yes} tags {"introspecti
 
             r config set rdb-key-save-delay 0
             r flushall
-            # The forkless save is only cleaned up after the 10s key delay
-            # (started at bgsave) ends, and then the close job and the 200ms
-            # cleanup tick run. The budget must cover that, not just the
-            # cleanup, so it is larger than the key delay.
+            # The forkless save is only cleaned up after the delay of the key
+            # it is on ends, and then the close job and the 200ms cleanup tick
+            # run. The budget must cover that, not just the cleanup, so it is
+            # larger than the key delay.
             wait_for_condition 3000 10 {
                 [s rdb_bgsave_in_progress] eq 0
             } else {

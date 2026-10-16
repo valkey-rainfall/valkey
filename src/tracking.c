@@ -50,6 +50,7 @@ uint64_t TrackingTableTotalItems = 0; /* Total number of IDs stored across
                                          a hint about the total memory we
                                          are using server side for CSC. */
 robj *TrackingChannelName;
+static int TrackingBroadcastKeysPending = 0; /* Some prefix holds keys for the next broadcast. */
 
 /* This is the structure that we have as value of the PrefixTable, and
  * represents the list of keys modified, and the list of clients that need
@@ -349,6 +350,7 @@ static int trackingRememberKeyForPrefix(size_t prefix_len, void *data, void *con
      * change to the key, and can avoid sending the notification in the
      * case the client is in NOLOOP mode. */
     raxInsert(bs->keys, (unsigned char *)ctx->keyname, ctx->keylen, ctx->c, NULL);
+    TrackingBroadcastKeysPending = 1;
     return 1;
 }
 
@@ -820,6 +822,9 @@ sds trackingBuildBroadcastReply(client *c, rax *keys) {
 void trackingBroadcastInvalidationMessages(void) {
     raxIterator ri, ri2;
 
+    /* Every queued key is sent below, or was freed with its last client's prefix. */
+    TrackingBroadcastKeysPending = 0;
+
     /* Return ASAP if there is nothing to do here. */
     if (TrackingTable == NULL || raxSize(PrefixesToBroadcast) == 0) return;
 
@@ -1061,4 +1066,9 @@ int unitTestOnly_trackingSweepChecksPerClock(void) {
 uint64_t trackingGetTotalPrefixes(void) {
     if (PrefixTable == NULL) return 0;
     return raxSize(PrefixTable);
+}
+
+/* Whether a changed key waits for the next trackingBroadcastInvalidationMessages(). */
+int trackingBroadcastPending(void) {
+    return TrackingBroadcastKeysPending;
 }
