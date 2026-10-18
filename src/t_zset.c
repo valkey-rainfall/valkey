@@ -1335,7 +1335,7 @@ static void zaddGenericCommand(client *c, int flags) {
         score = newscore;
     }
     if (!reply_err) {
-        server.dirty += (added + updated);
+        ectx->dirty += (added + updated);
     }
     if (added || updated) {
         signalModifiedKey(c, c->db, key);
@@ -1387,7 +1387,7 @@ void zremCommand(client *c) {
         notifyKeyspaceEvent(NOTIFY_ZSET, "zrem", key, c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
         signalModifiedKey(c, c->db, key);
-        server.dirty += deleted;
+        ectx->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 }
@@ -1495,7 +1495,7 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
         signalModifiedKey(c, c->db, key);
         notifyKeyspaceEvent(NOTIFY_ZSET, notify_type, key, c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
-        server.dirty += deleted;
+        ectx->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 
@@ -2292,12 +2292,12 @@ static void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIn
             notifyKeyspaceEvent(NOTIFY_ZSET, (op == SET_OP_UNION) ? "zunionstore" : (op == SET_OP_INTER ? "zinterstore" : "zdiffstore"),
                                 dstkey, c->db->id);
             addReplyLongLong(c, zsetLength(dstobj));
-            server.dirty++;
+            ectx->dirty++;
         } else {
             if (dbDelete(c->db, dstkey)) {
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
-                server.dirty++;
+                ectx->dirty++;
             }
             addReply(c, shared.czero);
             decrRefCount(dstobj);
@@ -2496,13 +2496,13 @@ static void zrangeResultFinalizeStore(zrange_result_handler *handler, size_t res
     if (result_count) {
         setKey(handler->client, handler->client->db, handler->dstkey, &handler->dstobj, 0);
         notifyKeyspaceEvent(NOTIFY_ZSET, "zrangestore", handler->dstkey, handler->client->db->id);
-        server.dirty++;
+        ectx->dirty++;
         addReplyLongLong(handler->client, result_count);
     } else {
         if (dbDelete(handler->client->db, handler->dstkey)) {
             signalModifiedKey(handler->client, handler->client->db, handler->dstkey);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", handler->dstkey, handler->client->db->id);
-            server.dirty++;
+            ectx->dirty++;
         }
         addReply(handler->client, shared.czero);
         decrRefCount(handler->dstobj);
@@ -3457,7 +3457,7 @@ void genericZpopCommand(client *c,
             serverPanic("Unknown sorted set encoding");
         }
 
-        server.dirty++;
+        ectx->dirty++;
 
         if (result_count == 0) { /* Do this only for the first iteration. */
             char *events[2] = {"zpopmin", "zpopmax"};
