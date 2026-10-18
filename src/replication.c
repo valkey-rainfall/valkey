@@ -877,6 +877,43 @@ static void replicationFeedSelectDb(int dictid) {
     server.replicas_eldb = dictid;
 }
 
+/* Any thread: append the frame replicationFeedReplicas sends for argv, without its SELECT. */
+sds replicationCatCommand(sds buf, robj **argv, int argc) {
+    buf = sdscatfmt(buf, "*%i\r\n", argc);
+    for (int j = 0; j < argc; j++) {
+        robj *o = argv[j];
+        if (o->encoding == OBJ_ENCODING_INT) {
+            char aux[LONG_STR_SIZE];
+            size_t dlen = ll2string(aux, sizeof(aux), (long)objectGetVal(o));
+            buf = catReplicationBulkLen(buf, dlen);
+            buf = sdscatlen(buf, aux, dlen);
+        } else {
+            size_t objlen = stringObjectLen(o);
+            buf = catReplicationBulkLen(buf, objlen);
+            buf = sdscatlen(buf, objectGetVal(o), objlen);
+        }
+        buf = sdscatlen(buf, "\r\n", 2);
+    }
+    return buf;
+}
+
+/* Main: feed frames made by replicationCatCommand for commands of db dictid, as replicationFeedReplicas
+ * feeds them one by one, wrapped in MULTI/EXEC when wrap. Only for a top-level primary with a backlog. */
+void replicationFeedFrames(int dictid, const char *buf, size_t len, int wrap) {
+    serverAssert(server.primary_host == NULL && server.repl_backlog != NULL);
+    if (wrap) replicationFeedReplicas(-1, &shared.multi, 1);
+    prepareReplicasToWrite();
+    if (server.replicas_eldb != dictid) {
+        robj *selectcmd = generateSelectCommand(dictid);
+        feedReplicationBufferWithObject(selectcmd);
+        clusterSlotStatsDecrNetworkBytesOutForReplication(sdslen(objectGetVal(selectcmd)));
+        decrRefCount(selectcmd);
+        server.replicas_eldb = dictid;
+    }
+    feedReplicationBuffer((char *)buf, len);
+    if (wrap) replicationFeedReplicas(-1, &shared.exec, 1);
+}
+
 /* Propagate write commands to replication stream.
  *
  * This function is used if the instance is a primary: we use the commands
@@ -3079,7 +3116,7 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
     }
 
     /* Inform about db change, as replication was diskless and didn't cause a save. */
-    server.dirty++;
+    ectx->dirty++;
 
     stopLoading(1);
 
@@ -5176,7 +5213,7 @@ void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disc
         server.primary->flag.dont_cache_primary = full_sync_required;
         /* The primary may be the client running this command, which is still
          * in use until the command returns. */
-        if (server.primary == server.current_client)
+        if (server.primary == ectx->current_client)
             freeClientAsync(server.primary);
         else
             freeClient(server.primary);
@@ -5239,7 +5276,7 @@ void replicationUnsetPrimary(void) {
      * replicationHandlePrimaryDisconnection which can attempt to re-connect. */
     sdsfree(server.primary_host);
     server.primary_host = NULL;
-    if (server.primary && server.primary == server.current_client) {
+    if (server.primary && server.primary == ectx->current_client) {
         /* The primary is running this command, so it is still in use until the
          * command returns. Free it then instead of caching it. */
         server.primary->flag.dont_cache_primary = 1;

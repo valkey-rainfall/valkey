@@ -2339,7 +2339,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
     /* We might be within the context of a command execution.  This happens if the key is found to
      * be expired when attempting to execute the command.  In this case, we should treat the key as
      * missing.  If the key exists after the command executes, we can treat it like a new key. */
-    if (server.in_call) {
+    if (ectx->in_call) {
         robj *oKey = createObject(OBJ_STRING, sdsdup(key));
         listAddNodeHead(curCmdMissingKeys, oKey);
     }
