@@ -267,7 +267,8 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
     test "Active expire with cron-lanes $lanes shrinks keys_with_volatile_items when a hash empties" {
         r flushdb
         r set anchor 1
-        for {set i 0} {$i < 200} {incr i} { r hset vh:$i only 1; r hpexpire vh:$i 100 FIELDS 1 only }
+        # A TTL longer than the loop takes on a loaded host, so all 200 are counted before any expires.
+        for {set i 0} {$i < 200} {incr i} { r hset vh:$i only 1; r hpexpire vh:$i 3000 FIELDS 1 only }
         assert_match "*keys_with_volatile_items=200*" [r info keyspace]
         wait_for_condition 300 50 {[r dbsize] == 1} else { fail "hashes did not empty: [r dbsize]" }
         assert_match "*keys_with_volatile_items=0*" [r info keyspace]
