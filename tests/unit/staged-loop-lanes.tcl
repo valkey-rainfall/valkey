@@ -1,11 +1,26 @@
-# Parallel write lanes (docs/parallel-write-stage.md): the staged write phase runs lane-eligible
-# fast-path commands on main and the IO threads at once, by keyspace shard. Fast-path clients here
-# are raw db-0 sockets; io-threads-parallel-writes-min 1 sends every segment to the lanes.
+# Parallel write lanes: the staged write phase runs lane-eligible fast-path commands on main and the
+# IO threads at once, by keyspace shard. Fast-path clients here are raw db-0 sockets;
+# io-threads-parallel-writes-min 1 sends every segment to the lanes.
+
+# Every raw socket a test opens, with its local port, so a failed test's sockets are closed before the
+# next test waits for the server to have no fast-path clients. Tcl reuses channel names, so a channel is
+# only closed while it still has the local port it was opened with.
+set ::pwl_open {}
 
 proc pwl_socket {host port} {
     set fd [socket $host $port]
     fconfigure $fd -translation {crlf binary} -blocking 1 -buffering full
+    lappend ::pwl_open [list $fd [lindex [fconfigure $fd -sockname] 2]]
     return $fd
+}
+
+proc pwl_close_leftovers {} {
+    foreach entry $::pwl_open {
+        lassign $entry fd lport
+        if {[catch {lindex [fconfigure $fd -sockname] 2} cur] || $cur ne $lport} continue
+        catch {close $fd}
+    }
+    set ::pwl_open {}
 }
 
 proc pwl_resp {args} {
@@ -91,6 +106,7 @@ proc pwl_wait_fastpath_clients {c n} {
 # SET pipelines on nsock fast-path sockets sent at once, so the read phase spreads them over the IO
 # threads; replies read.
 proc pwl_multi_load {c host port prefix nsock n} {
+    pwl_close_leftovers
     pwl_wait_fastpath_clients $c 0
     set fds {}
     for {set s 0} {$s < $nsock} {incr s} {
@@ -117,6 +133,7 @@ proc pwl_multi_load {c host port prefix nsock n} {
 
 # A raw db-0 socket on the fast path, the only one open on that server.
 proc pwl_fast_socket {c host port} {
+    pwl_close_leftovers
     pwl_wait_fastpath_clients $c 0
     set fd [pwl_socket $host $port]
     puts -nonewline $fd [pwl_resp ping]
@@ -224,7 +241,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
 
     test {Write lanes: MSET and MGET across shards run on main and stay atomic} {
         set fd [pwl_fast_socket r $host $port]
-        set barriers [getInfoProperty [r info fastpath] fastpath_write_barriers]
+        set entries [pwl_lane_entries r]
         set buf ""
         for {set i 0} {$i < 20} {incr i} {
             append buf [pwl_resp mset pwl:m$i a pwl:mm$i b pwl:mmm$i c]
@@ -237,7 +254,9 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             assert_equal {*3} [gets $fd]
             assert_equal {a b c} [pwl_read_replies $fd 3]
         }
-        assert {[getInfoProperty [r info fastpath] fastpath_write_barriers] > $barriers}
+        # Main runs them, as barriers between lane segments or, with no lane command in the phase, in
+        # a streamed write phase; no lane runs one.
+        assert_equal $entries [pwl_lane_entries r]
         close $fd
     }
 
@@ -346,7 +365,11 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         r config set io-threads-parallel-writes no
         set failed [catch {
             set lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
-            pwl_multi_load r $host $port pwl:st 8 200
+            # A phase streams only when an IO thread read some of its batches; retry a few loads.
+            for {set try 0} {$try < 5} {incr try} {
+                pwl_multi_load r $host $port pwl:st 8 200
+                if {[getInfoProperty [r info fastpath] staged_stream_phases] > $streams} break
+            }
             assert_equal $lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
             assert {[getInfoProperty [r info fastpath] staged_stream_phases] > $streams}
         } err]
