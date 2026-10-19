@@ -113,9 +113,14 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
             $replica config set notify-keyspace-events ""
             assert_in_sync $primary $replica
             set before [parallel_applied $replica]
-            $primary set note w
+            # Pipelined, so the stream carries them together.
+            set pc [valkey_deferring_client -1]
+            for {set i 0} {$i < 200} {incr i} { $pc set note:$i w }
+            for {set i 0} {$i < 200} {incr i} { assert_equal OK [$pc read] }
+            $pc close
             assert_in_sync $primary $replica
-            assert_equal [parallel_applied $replica] [expr {$before + 1}]
+            # A read too small for a lane phase runs on main, so only check that parallel apply resumed.
+            assert_morethan [parallel_applied $replica] $before
         }
 
         test {Parallel apply: off by config} {
