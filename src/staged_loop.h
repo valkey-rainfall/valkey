@@ -33,9 +33,9 @@
 /* Phase ids opened on the staged barrier. */
 #define STAGED_PHASE_READ 1
 #define STAGED_PHASE_REPLY 2
-#define STAGED_PHASE_SYNC 3  /* workers leave the staged loop and recheck their enrollment */
-#define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
-#define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
+#define STAGED_PHASE_SYNC 3   /* workers leave the staged loop and recheck their enrollment */
+#define STAGED_PHASE_DRAIN 4  /* workers only drain their job inboxes */
+#define STAGED_PHASE_APPLY 5  /* workers apply their lane of held replicated writes */
 #define STAGED_PHASE_MAINT 6  /* workers run their lane of due table maintenance (rehash, resize, expire) */
 #define STAGED_PHASE_STREAM 7 /* workers deliver completed runs while main still executes */
 #define STAGED_PHASE_WRITE 8  /* workers execute their lane of the write phase's current segment */

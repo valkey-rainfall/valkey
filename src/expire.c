@@ -452,11 +452,11 @@ static ustime_t activeExpireCycleJob(enum activeExpiryType jobType, int cycleTyp
 typedef struct {
     unsigned long sampled;
     unsigned long expired;
-    unsigned long freed; /* expired keys the lane freed itself (no observer, no propagation) */
-    unsigned long fields; /* expired hash fields this lane deleted; main bulk-adds to stat_expiredfields */
+    unsigned long freed;    /* expired keys the lane freed itself (no observer, no propagation) */
+    unsigned long fields;   /* expired hash fields this lane deleted; main bulk-adds to stat_expiredfields */
     unsigned long fsampled; /* hashes with volatile fields this lane sampled */
     unsigned long fexpired; /* sampled hashes that had expired fields */
-    long long dirty;      /* dirty increments this lane made (free-inline field path); main bulk-adds */
+    long long dirty;        /* dirty increments this lane made (free-inline field path); main bulk-adds */
     int hit_limit;
 } laneExpireStats;
 
@@ -476,14 +476,14 @@ static int lane_expire_propagate_only = 0;
  * it by the real logged-key count (not a moving-average ratio) holds the stall without the overshoot the
  * pre-divided estimate caused in dense expiry. In free-inline mode no key is logged, so lanes run to the
  * full budget. */
-static uint64_t lane_expire_budget_us = 0;    /* whole-phase budget */
-static monotime lane_expire_phase_start = 0;  /* phase open time, shared by all lanes */
-static double lane_expire_replay_us = 0.0;    /* measured per-key replay cost, 0 when freeing inline */
+static uint64_t lane_expire_budget_us = 0;           /* whole-phase budget */
+static monotime lane_expire_phase_start = 0;         /* phase open time, shared by all lanes */
+static double lane_expire_replay_us = 0.0;           /* measured per-key replay cost, 0 when freeing inline */
 static _Atomic unsigned long lane_expire_logged = 0; /* keys logged for replay so far, all lanes */
 /* Hash fields drive their own, larger per-unit main cost (one HDEL carries every expired field, and an
  * emptied hash adds a DEL), so the budget charges them separately: fields logged this phase times the
  * measured per-field feed-or-replay cost. */
-static double lane_expire_field_us = 0.0;     /* measured per-field feed/replay cost, 0 when freeing inline */
+static double lane_expire_field_us = 0.0;                   /* measured per-field feed/replay cost, 0 when freeing inline */
 static _Atomic unsigned long lane_expire_fields_logged = 0; /* expired fields logged for main, all lanes */
 
 static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
@@ -826,8 +826,7 @@ static void laneFieldScanCallback(void *privdata, void *entry, int didx) {
     }
 }
 
-uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us,
-                                       int *hit_limit) {
+uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit) {
     kvstore *kvs = db->keys_with_volatile_items;
     if (kvstoreHashtableSize(kvs, didx) == 0) return 0;
     unsigned long keys_per_loop =
@@ -855,7 +854,10 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
             *cursor = kvstoreScan(kvs, *cursor, didx, didx, laneFieldScanCallback,
                                   expireShouldSkipTableForSamplingCb, &d);
             checked++;
-            if (*cursor == 0) { done = 1; break; }
+            if (*cursor == 0) {
+                done = 1;
+                break;
+            }
             if (d.budget_spent) break;
         }
         if (d.budget_spent) {

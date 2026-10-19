@@ -63,9 +63,9 @@ static int replApplySharded(void) {
  * run this way is parsed and run the usual way.
  * --------------------------------------------------------------------------------------------- */
 
-#define RP_STOP 2                 /* rpRunOnMain: the client cannot take its next command now */
-#define RP_MAX_CMDS 65000         /* commands of one planned read: the command queue holds 65535 */
-#define RP_MIN_CHUNK (16 * 1024)  /* bytes; a read with fewer is one chunk, parsed by its IO thread */
+#define RP_STOP 2                /* rpRunOnMain: the client cannot take its next command now */
+#define RP_MAX_CMDS 65000        /* commands of one planned read: the command queue holds 65535 */
+#define RP_MIN_CHUNK (16 * 1024) /* bytes; a read with fewer is one chunk, parsed by its IO thread */
 #define RP_IDLE 0
 #define RP_PARSE 1 /* the phase running is the plan's PARSE phase */
 #define RP_APPLY 2 /* ... or one of its APPLY phases */
@@ -97,7 +97,7 @@ typedef struct rpState {
 typedef struct __attribute__((aligned(64))) rpChunk {
     size_t start; /* querybuf offset of its first command */
     int first, n;
-    rpState st; /* before its first command; while parsing, the current state */
+    rpState st;                  /* before its first command; while parsing, the current state */
     int *lane_idx[FP_MAX_LANES]; /* per lane: plan positions of its lane commands, in T order */
     int lane_n[FP_MAX_LANES], lane_cap[FP_MAX_LANES];
     int *bpos; /* plan positions of its barriers */
@@ -122,8 +122,8 @@ static struct {
     int n, cap;
     int *bpos; /* plan positions of all barriers, in T order */
     int nb, bcap;
-    size_t scan_end; /* querybuf offset past the last command of the plan */
-    uint32_t seg;    /* the segment an APPLY phase runs */
+    size_t scan_end;                /* querybuf offset past the last command of the plan */
+    uint32_t seg;                   /* the segment an APPLY phase runs */
     long long read_us, classify_us; /* IO thread: the read job, and the scan and planning in it */
 } rp;
 
@@ -175,8 +175,7 @@ static void rpTrack(rpState *st, const char *name, size_t nlen, const char *arg,
 }
 
 /* The lane of the command at plan position idx, or a barrier. */
-static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **argv, int argc, int read_flags,
-                       int slot, size_t qb_end) {
+static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **argv, int argc, int read_flags, int slot, size_t qb_end) {
     rpEntry *e = &rp.e[idx];
     e->qb_end = qb_end;
     e->db = k->st.db;

@@ -216,8 +216,8 @@ void clusterSlotStatResetAll(void) {
  */
 static int canAddCpuDuration(client *c) {
     return clusterSlotStatsEnabled(c->slot) &&
-           (!ectx->execution_nesting ||         /* Either; */
-            (ectx->execution_nesting &&         /* 1) Command should not be nested, or */
+           (!ectx->execution_nesting ||          /* Either; */
+            (ectx->execution_nesting &&          /* 1) Command should not be nested, or */
              c->realcmd->flags & CMD_BLOCKING)); /* 2) If command is nested, it must be due to unblocking. */
 }
 
