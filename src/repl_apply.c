@@ -15,7 +15,6 @@
 #include "throttle.h"
 #include "module.h"
 
-extern int ProcessingEventsWhileBlocked; /* networking.c */
 
 _Thread_local int repl_apply_in_lane = 0;
 _Thread_local const char *repl_apply_key = NULL;

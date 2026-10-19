@@ -1,9 +1,14 @@
+/*
+ * Copyright Valkey Contributors.
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* Replication stream sender.
  *
  * A dedicated thread that streams the replication backlog to ONLINE plaintext
  * replicas, off the staged event loop, behind the hidden config
- * `repl-stream-sender` (default off). See docs and
- * ../parallel-replies-notes/repl-stream-design.md.
+ * `repl-stream-sender` (default off).
  *
  * Division of labour (the whole safety argument): the sender SENDS, main
  * ACCOUNTS. The sender only reads block bytes in [send_pos .. stable_offset]
@@ -15,7 +20,7 @@
  * add/remove/account for that replica, so a replica the sender is sending is
  * always still in the set and refcount-pinned.
  *
- * This is a prototype: plaintext, ONLINE, non-RDB-channel, uncompressed replicas
+ * The sender serves plaintext, ONLINE, non-RDB-channel, uncompressed replicas
  * only. Everything else (TLS, compression, pre-ONLINE, dual-channel) stays on the
  * existing main/ae path. */
 
@@ -37,7 +42,7 @@ static _Atomic(long long) repl_sender_wake_offset; /* stable offset last publish
 static _Atomic(long long) repl_sender_last_wake_offset; /* stable offset at the sender's last append-mode wake */
 static _Atomic int repl_sender_idle;               /* 1 while the sender is parked in cond_wait */
 
-/* True if this replica can be streamed by the sender thread (prototype subset). */
+/* True if this replica can be streamed by the sender thread. */
 int replStreamSenderEligible(client *replica) {
     if (!server.repl_stream_sender) return 0;
     if (!replica->conn) return 0;

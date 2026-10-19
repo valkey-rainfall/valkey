@@ -233,9 +233,11 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
             r hpexpire dh:$h 300 FIELDS 100 {*}$fields
             incr loaded 100
         }
-        wait_for_condition 400 50 {[r hlen dh:0] == 1 && [r hlen dh:399] == 1} else {
-            fail "dense field expiry did not drain"
+        # Wait for the counter, not for a sample of hashes: other hashes can still hold due fields.
+        wait_for_condition 400 50 {[s expired_fields] >= $loaded} else {
+            fail "dense field expiry did not drain: [s expired_fields] of $loaded"
         }
+        for {set h 0} {$h < 400} {incr h} { assert_equal 1 [r hlen dh:$h] }
         assert_equal $loaded [s expired_fields]
         # The field stale estimate follows the lanes as it follows the serial job.
         assert_morethan [s expired_keys_with_volatile_items_stale_perc] 0

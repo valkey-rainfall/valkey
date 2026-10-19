@@ -113,7 +113,7 @@ void fastpathStagedFinish(void);
 void fastpathStagedReleaseAll(void);
 void fastpathStagedAdoptClients(void);
 
-/* Parallel write phase (docs/parallel-write-stage.md). */
+/* Parallel write phase. */
 #define FP_MAX_LANES 64 /* write lanes; more IO threads than this leave the rest idle in the write phase */
 /* Main, before the read phase: decide whether this iteration's entries are sorted into write lanes. */
 void fastpathStagedPrepareLanes(void);
