@@ -7390,8 +7390,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_size:%lld\r\n", server.repl_backlog_size,
                 "repl_backlog_first_byte_offset:%lld\r\n", server.repl_backlog ? server.repl_backlog->offset : 0,
                 "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
-        /* repl-stream-sender diagnostics: a benchmark can tell from INFO alone that the
-         * sender (not main or an IO thread) sent the replica stream. repl_sender_main_queued
+        /* repl-stream-sender counters: whether the sender, not main or an IO thread, sent the replica
+         * stream. repl_sender_main_queued
          * is the number of online replicas main still has an in-flight IO-thread write for. */
         {
             long long sender_main_queued = 0;
