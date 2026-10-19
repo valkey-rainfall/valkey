@@ -96,10 +96,8 @@ uint64_t maintPhaseDeadline(void) {
     return atomic_load_explicit(&mt_phase_deadline, memory_order_relaxed);
 }
 
-/* EXPIRE cost model, per expired key: lane time summed across threads, and main's replay time. The
- * replay is serial and grows with the number of lanes, so each thread's budget is set for the whole
- * phase, lanes plus replay, to fit the cycle's budget. Moving averages over phases that expired keys. */
-static double mt_expire_lane_us = 1.0;
+/* EXPIRE cost model: main's serial replay time per expired key, a moving average over phases that
+ * expired keys. The shared budget bound charges it per key so lanes plus replay fit the cycle's budget. */
 static double mt_expire_replay_us = 0.5;
 static long mt_replayed = 0;
 static uint64_t mt_replay_us = 0;
@@ -441,19 +439,7 @@ static void maintHandleFields(void) {
     if (hashes) cronStatsRecord(CRON_JOB_MAINT_FIELDS, mt_fields_us);
 }
 
-/* Main: each thread's share of the EXPIRE budget. Threads running for t each expire about
- * n * t / lane_us keys, which main then replays at replay_us each, so t = budget / (1 + n * replay_us /
- * lane_us) keeps lanes plus replay within the budget. */
-static uint64_t maintExpireThreadBudget(uint64_t budget_us, int nlanes) {
-    if (nlanes <= 1) return budget_us;
-    if (server.cron_lanes_split_budget) return budget_us / nlanes;
-    double t = budget_us / (1.0 + nlanes * mt_expire_replay_us / mt_expire_lane_us);
-    double floor = (double)budget_us / (nlanes + 1);
-    if (t < floor) t = floor;
-    return t < 1 ? 1 : (uint64_t)t;
-}
-
-static void maintExpireUpdateCosts(uint64_t lane_us) {
+static void maintExpireUpdateCosts(void) {
     if (mt_fed >= 256) {
         double feed = (double)mt_feed_us / mt_fed;
         mt_expire_feed_us = 0.8 * mt_expire_feed_us + 0.2 * feed;
@@ -463,8 +449,7 @@ static void maintExpireUpdateCosts(uint64_t lane_us) {
         mt_expire_field_us = 0.8 * mt_expire_field_us + 0.2 * field;
     }
     if (mt_replayed < 256) return;
-    double lane = (double)lane_us / mt_replayed, replay = (double)mt_replay_us / mt_replayed;
-    mt_expire_lane_us = 0.8 * mt_expire_lane_us + 0.2 * lane;
+    double replay = (double)mt_replay_us / mt_replayed;
     mt_expire_replay_us = 0.8 * mt_expire_replay_us + 0.2 * replay;
 }
 
@@ -504,16 +489,10 @@ void maintRun(void) {
         /* The shared bound charges the per-key cost main pays after the phase: a full replay normally, or
          * just the propagation feed in propagate-only mode. In free-inline mode nothing is charged. */
         double per_key_us = propagate_only ? mt_expire_feed_us : mt_expire_replay_us;
-        if (server.cron_lanes_split_budget) {
-            /* Override: each thread gets a plain slice of the budget, replay bound off. */
-            mt_budget_us[MAINT_JOB_EXPIRE] = maintExpireThreadBudget(phase_budget, mt_nlanes);
-            activeExpireBudgetBegin(0, 0.0, 0.0);
-        } else {
-            /* Shared replay-bounded budget: lanes get the whole-phase budget as a per-thread safety
-             * ceiling and stop on the shared bound (elapsed + keys * per-key cost + fields * per-field
-             * cost). The per-field cost is far larger per logged unit, so it must be charged separately. */
-            activeExpireBudgetBegin(phase_budget, per_key_us, mt_expire_field_us);
-        }
+        /* Lanes get the whole-phase budget as a per-thread safety ceiling and stop on the shared bound
+         * (elapsed + keys * per-key cost + fields * per-field cost). The per-field cost is far larger per
+         * logged unit, so it is charged separately. */
+        activeExpireBudgetBegin(phase_budget, per_key_us, mt_expire_field_us);
         activeExpireLaneBegin();
     }
 
@@ -552,7 +531,7 @@ void maintRun(void) {
     if (work[MAINT_JOB_RESIZE]) cronStatsRecord(CRON_JOB_MAINT_RESIZE, usec[MAINT_JOB_RESIZE]);
     if (mt_requested[MAINT_JOB_EXPIRE]) {
         if (work[MAINT_JOB_EXPIRE]) cronStatsRecord(CRON_JOB_MAINT_EXPIRE, usec[MAINT_JOB_EXPIRE]);
-        maintExpireUpdateCosts(usec[MAINT_JOB_EXPIRE]);
+        maintExpireUpdateCosts();
         activeExpireLaneEnd(lanes_us, getMonotonicUs() - phase_t0, usec[MAINT_JOB_EXPIRE]);
     }
 
