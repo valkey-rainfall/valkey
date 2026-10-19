@@ -42,7 +42,7 @@ typedef struct {
  * the key name here and freed the value itself, so main feeds DEL/UNLINK to the AOF and replicas without
  * touching the keyspace. Kept in the lane's expiry order so the stream matches the serial path. */
 typedef struct {
-    sds key;  /* owned copy; main frees it after feeding */
+    sds key; /* owned copy; main frees it after feeding */
     int dbid;
     int lazy; /* UNLINK when set, DEL otherwise */
 } maintPropagate;
@@ -58,13 +58,13 @@ typedef struct {
  * name copy and the deleted field-name objects; main frees them. empty means the hash has no fields left,
  * so main also deletes the key (val carries it for the free). */
 typedef struct {
-    sds key;        /* hash key name, owned copy */
-    robj **fields;  /* deleted field-name objects, owned */
+    sds key;       /* hash key name, owned copy */
+    robj **fields; /* deleted field-name objects, owned */
     int n_fields;
     int dbid;
     int didx;
-    int empty;      /* hash emptied: main deletes the key too */
-    robj *val;      /* the emptied hash value to free (NULL unless empty and freed via main) */
+    int empty; /* hash emptied: main deletes the key too */
+    robj *val; /* the emptied hash value to free (NULL unless empty and freed via main) */
 } maintFieldExpired;
 
 typedef struct {
@@ -117,8 +117,8 @@ static long mt_fed = 0;
 static uint64_t mt_feed_us = 0;
 
 /* Field-expiry main-side cost and totals for the phase (replay or feed of hash-field deletes). */
-static long mt_fields_hashes = 0;  /* hashes main handled (replay or feed) */
-static long mt_fields_fields = 0;  /* fields across those hashes */
+static long mt_fields_hashes = 0; /* hashes main handled (replay or feed) */
+static long mt_fields_fields = 0; /* fields across those hashes */
 static uint64_t mt_fields_us = 0;
 /* Measured main cost per expired FIELD (one HDEL carries many; a DEL is added when the hash empties).
  * Moving-averaged over phases that handled fields; the shared budget charges fields at this rate. */
@@ -185,8 +185,7 @@ void maintLogFields(int tid, sds key_copy, robj **fields, int n_fields, int dbid
         l->cap = l->cap ? l->cap * 2 : 512;
         l->e = zrealloc(l->e, sizeof(maintFieldExpired) * l->cap);
     }
-    l->e[l->len++] = (maintFieldExpired){.key = key_copy, .fields = fields, .n_fields = n_fields,
-                                         .dbid = dbid, .didx = didx, .empty = empty, .val = val};
+    l->e[l->len++] = (maintFieldExpired){.key = key_copy, .fields = fields, .n_fields = n_fields, .dbid = dbid, .didx = didx, .empty = empty, .val = val};
 }
 
 /* Return the db's kvstore for slot k (0 keys, 1 expires, 2 keys_with_volatile_items). */

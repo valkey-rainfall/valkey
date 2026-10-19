@@ -118,13 +118,13 @@ typedef struct {
      * and folded into the kvstore-wide fields by kvstoreReconcile on main. dirty marks a table that
      * is on the kvstore's list of tables main must visit. */
     int dirty;
-    int didx;                           /* this table's index in its kvstore */
-    long key_delta;                     /* net key count change */
-    long long bucket_delta;             /* net bucket_count change */
-    ssize_t overhead_lut_delta;         /* net overhead_hashtable_lut change */
-    ssize_t overhead_rehashing_delta;   /* net overhead_hashtable_rehashing change */
-    int alloc_delta;                    /* net allocated_hashtables change (table created this phase) */
-    int defer_free;                     /* became empty under FREE_EMPTY_HASHTABLES; main frees it */
+    int didx;                         /* this table's index in its kvstore */
+    long key_delta;                   /* net key count change */
+    long long bucket_delta;           /* net bucket_count change */
+    ssize_t overhead_lut_delta;       /* net overhead_hashtable_lut change */
+    ssize_t overhead_rehashing_delta; /* net overhead_hashtable_rehashing change */
+    int alloc_delta;                  /* net allocated_hashtables change (table created this phase) */
+    int defer_free;                   /* became empty under FREE_EMPTY_HASHTABLES; main frees it */
 } kvstoreHashtableMetadata;
 
 void kvstoreSetConcurrent(kvstore *kvs, int on) {
@@ -894,8 +894,10 @@ void kvstoreReconcile(kvstore *kvs) {
             } else {
                 long long size = (long long)hashtableSize(ht);
                 long long before = size - m->key_delta;
-                if (size > 0 && before <= 0) kvs->non_empty_hashtables++;
-                else if (size <= 0 && before > 0) kvs->non_empty_hashtables--;
+                if (size > 0 && before <= 0)
+                    kvs->non_empty_hashtables++;
+                else if (size <= 0 && before > 0)
+                    kvs->non_empty_hashtables--;
                 kvs->key_count += m->key_delta;
                 if (kvs->num_hashtables > 1) {
                     int idx = didx + 1; /* BIT is 1-based. */
