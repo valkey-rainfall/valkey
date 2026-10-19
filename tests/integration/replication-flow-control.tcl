@@ -35,4 +35,30 @@ start_server {tags {"repl network external:skip cluster:skip"} overrides {save "
             assert_morethan $client_reads $reads_after
         }
     }
+
+    # With the fast path, the staged loop reads the primary link on an IO thread as main would: up to
+    # REPL_MAX_READS_PER_IO_EVENT reads per event, parsed together.
+    start_server {overrides {save "" io-threads 4 io-threads-always-active yes}} {
+        set replica [srv 0 client]
+        $replica replicaof [srv -1 host] [srv -1 port]
+        wait_for_sync $replica
+
+        test {Primary link is drained with bounded multi-reads on the staged loop} {
+            set jobs_before [getInfoProperty [$replica info stats] io_threaded_primary_drain_jobs]
+            set bytes_before [getInfoProperty [$replica info stats] io_threaded_primary_drain_bytes]
+            set value [string repeat x 32768]
+            for {set i 0} {$i < 128} {incr i} {
+                $primary set flow-control:$i $value
+            }
+            wait_for_condition 50 100 {
+                [status $primary master_repl_offset] eq [status $replica master_repl_offset]
+            } else {
+                fail "replica offset didn't match in time"
+            }
+            assert_equal $value [$replica get flow-control:127]
+            assert_morethan [getInfoProperty [$replica info stats] io_threaded_primary_drain_jobs] $jobs_before
+            set drained [expr {[getInfoProperty [$replica info stats] io_threaded_primary_drain_bytes] - $bytes_before}]
+            assert_morethan_equal $drained [expr {128 * 32768}]
+        }
+    }
 }
