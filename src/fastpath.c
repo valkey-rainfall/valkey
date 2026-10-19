@@ -26,7 +26,6 @@
 #include <sys/uio.h>
 #include <sched.h>
 
-extern int ProcessingEventsWhileBlocked; /* networking.c */
 
 /* arena_used (main writes it per command) and executed (a STREAM worker spins on it) must sit on
  * different cache lines, and the inline entries must start on their own line clear of executed. */
@@ -77,9 +76,8 @@ typedef struct fpThread {
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
 
-/* ---------------------------------------------------------------------------------------------
- * Write lanes. See docs/parallel-write-stage.md.
- * --------------------------------------------------------------------------------------------- */
+/* Write lanes: the write phase runs fast-path commands on IO threads, each lane owning a set of
+ * keyspace shards, and main merges each lane's replies, stats and propagation in command order. */
 
 #define FP_LANE_CHUNK (64 * 1024)    /* reply arena chunk of a lane */
 #define FP_LANE_MIN_ROOM (4 * 1024)  /* below this, a reply starts a new chunk */
@@ -146,7 +144,8 @@ typedef struct __attribute__((aligned(64))) fpLane {
 
 static fpLane fp_lanes[FP_MAX_LANES];
 static _Thread_local fpLane *fp_cur_lane = NULL;
-/* Main writes these before the read phase; IO threads read them in it. */
+/* Main writes these before the read phase; IO threads read them in it. Like every plain variable
+ * shared across a phase, they are ordered by the phase barrier (release on begin, acquire on wait). */
 static int fp_lanes_iter = 0; /* this iteration's entries are sorted into lanes */
 static int fp_nlanes = 0;     /* lanes of this iteration */
 static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
@@ -929,6 +928,14 @@ static _Thread_local cmdEntry *fp_exec_entry = NULL; /* the entry this thread's 
 
 static void fpLanePushClose(fpLane *L, cmdEntry *e);
 
+/* Main: close a client whose executor reply passed the output buffer hard limit. */
+static void fpCloseOverLimit(cmdEntry *e) {
+    freeClientAsync(e->c); /* records the close; main frees it once it took the client back */
+    serverLog(LL_WARNING, "Client id=%llu closed for overcoming of output buffer limits.",
+              (unsigned long long)e->control->client_id);
+    server.stat_client_outbuf_limit_disconnections++;
+}
+
 /* Main, from closeClientOnOutputBufferLimitReached while an executor builds a reply: a reply past the
  * normal class hard limit closes its client, as on the main path. The reply is dropped and commands
  * that build long replies stop at close_asap. A write lane leaves the close to main. */
@@ -943,10 +950,7 @@ int fastpathExecutorOutputLimitReached(client *ec) {
         fpLanePushClose(fp_cur_lane, e);
         return 1;
     }
-    freeClientAsync(e->c); /* records the close; main frees it once it took the client back */
-    serverLog(LL_WARNING, "Client id=%llu closed for overcoming of output buffer limits.",
-              (unsigned long long)e->control->client_id);
-    server.stat_client_outbuf_limit_disconnections++;
+    fpCloseOverLimit(e);
     return 1;
 }
 
@@ -1527,7 +1531,8 @@ static void fpLaneCall(fpLane *L, client *c) {
     cs->calls++;
     cs->usec += duration;
     if (server.latency_tracking_enabled) fpLaneHistogram(L, real_cmd, duration * 1000);
-    /* The lane owns the slot, so its CLUSTER SLOT-STATS counters are the lane's to write. */
+    /* A slot maps to exactly one lane (shard % fp_nlanes), and main runs only its own lane in the
+     * phase, so no other thread writes this slot's CLUSTER SLOT-STATS counters. */
     clusterSlotStatsAddCpuDuration(c, duration);
     clusterSlotStatsAddNetworkBytesOutForUserClient(c);
 
@@ -1762,13 +1767,7 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
         L->nlat = 0;
         for (int i = 0; i < L->nlogs; i++) commandlogPushPrepared(L->logs[i].entry, L->logs[i].type);
         L->nlogs = 0;
-        for (int i = 0; i < L->ncloses; i++) {
-            cmdEntry *e = L->closes[i];
-            freeClientAsync(e->c);
-            serverLog(LL_WARNING, "Client id=%llu closed for overcoming of output buffer limits.",
-                      (unsigned long long)e->control->client_id);
-            server.stat_client_outbuf_limit_disconnections++;
-        }
+        for (int i = 0; i < L->ncloses; i++) fpCloseOverLimit(L->closes[i]);
         L->ncloses = 0;
         fp_stat_lane_entries += L->executed;
         L->executed = 0;
@@ -2044,9 +2043,8 @@ int fastpathStagedRepliesPending(void) {
     return 0;
 }
 
-/* ---- Streaming (overlap) executor ----
- * Main executes runs round-robin across threads so every worker gets replies early, while the
- * STREAM-phase workers deliver completed runs concurrently. See docs/staged-event-loop.md. */
+/* Streaming executor: main executes runs round-robin across threads so every worker gets replies
+ * early, while the STREAM-phase workers deliver completed runs concurrently. */
 
 /* Per-thread streaming cursor: the next run to execute, as a batch index and an entry index. */
 typedef struct fpStreamCursor {
@@ -2137,14 +2135,13 @@ static void fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, in
 }
 
 /* After a chunk is published, open a fresh-line gap in the batch arena so the next reply main
- * writes starts at least staged-stream-arena-guard bytes past the published end, on a 64-byte
- * boundary. A STREAM worker reading the published chunk and its prefetcher then never touch the
- * line main writes next. The skipped bytes are wasted arena; account them. A reply that no longer
- * fits spills to the heap exactly as without the guard. No-op when the guard is 0. */
+ * writes starts at least STREAM_ARENA_GUARD bytes past the published end, on a 64-byte boundary. A
+ * STREAM worker reading the published chunk and its prefetcher then never touch the line main writes
+ * next. The skipped bytes are wasted arena; account them. A reply that no longer fits spills to the heap
+ * exactly as without the guard. */
+#define STREAM_ARENA_GUARD 256
 static void fpStreamArenaGuard(cmdBatch *b) {
-    int guard = server.staged_stream_arena_guard;
-    if (guard <= 0) return;
-    size_t want = b->arena_used + (size_t)guard;
+    size_t want = b->arena_used + STREAM_ARENA_GUARD;
     want = (want + 63) & ~(size_t)63; /* round up to a 64-byte line */
     if (want >= b->arena_cap) return; /* no room: the next reply spills as usual */
     server.stat_staged_stream_arena_guard_bytes += (long long)(want - b->arena_used);
@@ -2176,9 +2173,8 @@ int fastpathStagedExecuteStreaming(void) {
     }
     if (n == 0) return 0;
 
-    int chunk = server.staged_stream_chunk;
-    if (chunk < 1) chunk = 1;
-    int order = server.staged_stream_order;
+    /* Entries main executes for one thread between publishes. */
+    const int chunk = 16;
     cmdBatch *pubb[IO_THREADS_MAX_NUM]; /* batch each thread is currently publishing into */
     int acc[IO_THREADS_MAX_NUM];        /* entries executed in that batch since its last publish */
     for (int i = 0; i < n; i++) {
@@ -2188,37 +2184,6 @@ int fastpathStagedExecuteStreaming(void) {
 
     while (!fpStreamDone(ts, cur, n, d)) {
         if (use_prefetch && !paused) fpStreamPrefetchWindow(ts, cur, n, d, window);
-        if (order == STAGED_STREAM_ORDER_CHUNK) {
-            /* Round-robin across threads a chunk at a time: each visit runs whole runs until this
-             * thread has executed at least a chunk (or its batch ends), publishes, then moves to the
-             * next thread, so every worker has runs to deliver instead of one draining the window. */
-            int progressed = 0;
-            for (int i = 0; i < n; i++) {
-                int turn = 0;
-                while (turn < chunk) {
-                    cmdBatch *b = fpStreamRunAt(ts[i], &cur[i], d);
-                    if (!b) break;
-                    if (b != pubb[i]) {
-                        if (pubb[i]) fpStreamPublish(pubb[i], pubb[i]->count);
-                        pubb[i] = b;
-                        acc[i] = 0;
-                    }
-                    int before = cur[i].ei;
-                    fpStreamExecRun(ecs[i], b, &cur[i]);
-                    int ran = cur[i].ei - before;
-                    turn += ran;
-                    total += ran;
-                    progressed = 1;
-                }
-                if (pubb[i] && turn > 0) {
-                    fpStreamPublish(pubb[i], cur[i].ei);
-                    fpStreamArenaGuard(pubb[i]);
-                    acc[i] = 0;
-                }
-            }
-            if (!progressed) break;
-            continue;
-        }
         for (int w = 0; w < window;) {
             int progressed = 0;
             for (int i = 0; i < n && w < window; i++) {

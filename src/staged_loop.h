@@ -11,7 +11,7 @@
  *
  * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2), one main iteration
  * runs collect -> read -> write -> reply -> crons, and IO threads work only inside the read and reply
- * phases, and in the write phase's lanes (docs/parallel-write-stage.md). Otherwise the loop is stock
+ * phases, and in the write phase's lanes. Otherwise the loop is stock
  * ae. Non-epoll builds are always stock.
  *
  * Invariants:

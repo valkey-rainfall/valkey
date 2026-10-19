@@ -98,7 +98,6 @@ void stagedResetStats(void) {
 #include "phase_barrier.h"
 #include <sched.h>
 
-extern int ProcessingEventsWhileBlocked; /* networking.c */
 
 static poller *sl_poller = NULL;
 static phaseBarrier sl_barrier;

@@ -15,7 +15,6 @@
 #include "repl_apply.h"
 #include "phase_barrier.h"
 
-extern int ProcessingEventsWhileBlocked; /* networking.c */
 
 /* One spin-wait step; a hint to the core on x86 and arm64, a no-op elsewhere. */
 static inline void cpuRelax(void) {
@@ -765,15 +764,11 @@ static void ringReadEnd(client *c) {
 /* Command-ring drains stop at the prefetch budget or RING_BATCH. */
 #define RING_CHUNK 8
 static size_t ringAddChunkToPrefetch(uintptr_t *ents, size_t from, size_t to, getKeysResult *result, int *room) {
-    /* prefetch-ring-stride trades key extraction cost for cache-miss coverage. */
-    static unsigned stride_pos = 0;
-    int stride = server.prefetch_ring_stride;
     for (size_t i = from; i < to && *room; i++) {
         if (!(ents[i] & RING_CMD)) continue;
         client *c = (client *)(ents[i] & ~RING_TAGS);
         if (c->io_read_state != CLIENT_COMPLETED_IO) continue;
         int k = c->ring_seen++;
-        if (stride > 1 && (stride_pos++ % (unsigned)stride) != 0) continue;
         struct serverCommand *cmd;
         robj **argv;
         int argc, slot, flags;
@@ -799,24 +794,6 @@ static void ringPrefetchClients(uintptr_t *ents, size_t from, size_t to) {
         valkey_prefetch(&c->cmd_queue);
         valkey_prefetch((const void *)&c->io_read_state);
     }
-}
-
-/* Thin ring backlogs wait briefly to amortize main-loop fixed costs. */
-static void ringCoalesce(void) {
-    int budget_us = server.io_ring_coalesce_us;
-    if (budget_us <= 0 || partitioned_clients == 0) return;
-    size_t backlog = 0;
-    for (int t = 1; t < io_worker_hwm; t++)
-        if (io_cmd_ring[t].buffer) backlog += spscBacklog(&io_cmd_ring[t]);
-    if (backlog == 0 || backlog >= RING_BATCH / 2) return;
-    monotime deadline = getMonotonicUs() + budget_us;
-    do {
-        for (int i = 0; i < 64; i++) cpuRelax();
-        backlog = 0;
-        for (int t = 1; t < io_worker_hwm; t++)
-            if (io_cmd_ring[t].buffer) backlog += spscBacklog(&io_cmd_ring[t]);
-        if (backlog >= RING_BATCH / 2) return;
-    } while (getMonotonicUs() < deadline);
 }
 
 /* Entries taken off a command ring and not yet run. A command run from here can start a busy script,
@@ -878,7 +855,6 @@ static int processCommandRingOne(int t, int use_prefetch) {
 static int processCommandRing(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
-    ringCoalesce();
     while (total < IO_PARTITION_COMPLETIONS_PER_CALL) {
         int got_any = 0;
         for (int t = 1; t < io_worker_hwm; t++) {

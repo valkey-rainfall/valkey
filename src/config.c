@@ -117,11 +117,6 @@ configEnum staged_reply_overlap_enum[] = {
     {"exec", STAGED_REPLY_OVERLAP_EXEC},
     {NULL, 0}};
 
-configEnum staged_stream_order_enum[] = {
-    {"thread", STAGED_STREAM_ORDER_THREAD},
-    {"chunk", STAGED_STREAM_ORDER_CHUNK},
-    {NULL, 0}};
-
 configEnum repl_stream_sender_enum[] = {
     {"no", REPL_STREAM_SENDER_NO},
     {"iteration", REPL_STREAM_SENDER_ITERATION},
@@ -3534,7 +3529,6 @@ standardConfig static_configs[] = {
     createIntConfig("keyspace-shard-bits", NULL, IMMUTABLE_CONFIG, -1, CLUSTER_SLOT_MASK_BITS, server.keyspace_shard_bits_config, -1, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
-    createBoolConfig("cron-lanes-split-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes_split_budget, 0, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes", NULL, MODIFIABLE_CONFIG, server.io_threads_parallel_writes, 1, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
@@ -3616,12 +3610,7 @@ standardConfig static_configs[] = {
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
     createEnumConfig("avoid-copy-reply-mode", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, copy_avoid_mode_enum, server.copy_avoid_mode, COPY_AVOID_MODE_STATIC, NULL, NULL),
     createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
-    createIntConfig("staged-stream-chunk", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, IO_BATCH_MAX, server.staged_stream_chunk, 16, INTEGER_CONFIG, NULL, NULL),
-    createEnumConfig("staged-stream-order", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_stream_order_enum, server.staged_stream_order, STAGED_STREAM_ORDER_THREAD, NULL, NULL),
-    createIntConfig("staged-stream-arena-guard", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 4096, server.staged_stream_arena_guard, 256, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
-    createIntConfig("prefetch-ring-stride", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.prefetch_ring_stride, 1, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-ring-coalesce-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 10000, server.io_ring_coalesce_us, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),

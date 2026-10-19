@@ -1401,7 +1401,7 @@ typedef struct ClientReplicationData {
      * (ref_repl_buf_node/ref_block_pos) and advances it from sent_offset for accounting. */
     int stream_via_sender;               /* 1 while the sender streams this replica. */
     int stream_ineligible;               /* 1 to keep this replica on the main path (diskless/socket
-                                          * RDB transfer): the prototype streams only disk/inline-sync
+                                          * RDB transfer): the sender streams only disk/inline-sync
                                           * replicas. */
     listNode *send_node;                 /* Sender-owned: block the sender is sending from. */
     size_t send_pos;                     /* Sender-owned: position within send_node. */
@@ -2001,8 +2001,6 @@ typedef enum childInfoType {
 /* Staged loop reply overlap mode (staged-reply-overlap). */
 #define STAGED_REPLY_OVERLAP_NONE 0 /* Base behavior: exec then a separate reply phase. */
 #define STAGED_REPLY_OVERLAP_EXEC 1 /* Workers stream replies while main executes, closed before crons. */
-#define STAGED_STREAM_ORDER_THREAD 0 /* Execute each thread's batches as the window allows (thread-major at depth). */
-#define STAGED_STREAM_ORDER_CHUNK 1  /* Round-robin across threads a chunk at a time, so every worker delivers at once. */
 struct valkeyServer {
     execContext exec_ctx; /* main's execution context; see ectx */
     /* General */
@@ -2106,22 +2104,17 @@ struct valkeyServer {
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
-    int cron_lanes_split_budget;              /* Split each MAINT job's time budget across the threads instead of giving each thread all of it. */
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
-    int prefetch_ring_stride;                 /* Command ring: prefetch keys of one command in N (1 = every command) */
     int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
     int io_threads_idle_us;                   /* An idle IO thread, and main with only offloaded clients, block after this long without work */
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int staged_reply_overlap;                 /* Staged loop: overlap reply delivery with exec, see STAGED_REPLY_OVERLAP_* */
-    int staged_stream_chunk;                  /* Staged loop: entries main executes between executed publishes while streaming. */
-    int staged_stream_order;                  /* Staged loop: STREAM execution order, see STAGED_STREAM_ORDER_* */
-    int staged_stream_arena_guard;            /* Staged loop: bytes of fresh-line gap left after a published chunk (0 = off). */
     int repl_stream_sender;                   /* Hidden: stream the backlog to ONLINE plaintext replicas from a
                                                * dedicated sender thread, off the staged loop. One of
                                                * REPL_STREAM_SENDER_* (no/iteration/append). Default no. */
@@ -2129,7 +2122,6 @@ struct valkeyServer {
                                                * many bytes were published since its last wake (0 = every append). */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
-    int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
     int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
@@ -3094,7 +3086,7 @@ struct serverCommand {
                          ACLs. A connection is able to execute a given command if
                          the user associated to the connection has this command
                          bit set in the bitmap of allowed commands. */
-    int write_lane;   /* A parallel write lane may run it (docs/parallel-write-stage.md). */
+    int write_lane;   /* A parallel write lane may run it. */
     sds fullname;     /* Includes parent name if any: "parentcmd|childcmd". Unchanged if command is renamed. */
     sds current_name; /* Same as fullname, becomes a separate string if command is renamed. */
     struct hdr_histogram
@@ -3440,6 +3432,7 @@ mstime_t getPausedActionTimeout(uint32_t action, pause_purpose *purpose);
 void updatePausedActions(void);
 void unblockPostponedClients(void);
 void processEventsWhileBlocked(void);
+extern int ProcessingEventsWhileBlocked;
 void whileBlockedCron(void);
 void blockingOperationStarts(void);
 void blockingOperationEnds(void);

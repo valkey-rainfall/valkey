@@ -2488,9 +2488,9 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
                  * after such final EOF. So we don't want to glue the end of
                  * the RDB transfer with the start of the other replication
                  * data. */
-                /* repl-stream-sender prototype: diskless (socket) RDB transfer glues the end
-                 * of the RDB to the start of the command stream through a deferred ack-driven
-                 * handoff the sender does not yet model, so keep these replicas on the main
+                /* A diskless (socket) RDB transfer joins the end of the RDB to the start of the
+                 * command stream through a deferred ack-driven handoff the repl stream sender does
+                 * not model, so keep these replicas on the main
                  * path. Set before replicaPutOnline so the sender never even briefly registers
                  * this replica. */
                 replica->repl_data->stream_ineligible = 1;
