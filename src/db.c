@@ -2152,8 +2152,7 @@ void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index) {
  * and when the hash emptied the key's DEL/UNLINK and del event. The fields are already removed and, when
  * empty, the key is already unlinked and its value is val (freed here). The lane owns fields[0..n) and
  * frees them after this returns; this function propagates and signals only. */
-void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int n_fields, int dict_index,
-                                       int empty, robj *val) {
+void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int n_fields, int dict_index, int empty, robj *val) {
     robj *keyobj = createStringObject(key, sdslen(key));
     enterExecutionUnit(1, 0);
     /* HDEL (or whatever propagateFieldsDeletion emits) for the deleted fields, then the hexpired event,

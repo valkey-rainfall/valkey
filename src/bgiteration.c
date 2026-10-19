@@ -1605,8 +1605,8 @@ static void receiveItemsBackFromIterators(bool blocking) {
 
 
 static long long bgIteration_feedIterators_taskImpl(struct aeEventLoop *eventLoop,
-                                                long long id,
-                                                void *clientData) {
+                                                    long long id,
+                                                    void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
     UNUSED(clientData);

@@ -53,8 +53,7 @@ void maintLogPropagate(int tid, sds key_copy, int dbid, int lazy);
 /* Lane: record a hash whose expired fields it deleted, for main to replay or feed after the phase. The
  * lane owns and passes key_copy and the fields array; empty means the hash emptied and val (if non-NULL)
  * is the hash value for main to free. */
-void maintLogFields(int tid, sds key_copy, struct serverObject **fields, int n_fields, int dbid, int didx,
-                    int empty, struct serverObject *val);
+void maintLogFields(int tid, sds key_copy, struct serverObject **fields, int n_fields, int dbid, int didx, int empty, struct serverObject *val);
 
 /* Main: a MAINT job is pending for this iteration. */
 int maintPending(void);

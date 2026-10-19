@@ -1399,17 +1399,17 @@ typedef struct ClientReplicationData {
     /* repl-stream-sender: set when main has handed this ONLINE plaintext replica to the
      * dedicated sender thread. The sender owns send_node/send_pos; main owns the cursor
      * (ref_repl_buf_node/ref_block_pos) and advances it from sent_offset for accounting. */
-    int stream_via_sender;               /* 1 while the sender streams this replica. */
-    int stream_ineligible;               /* 1 to keep this replica on the main path (diskless/socket
-                                          * RDB transfer): the sender streams only disk/inline-sync
-                                          * replicas. */
-    listNode *send_node;                 /* Sender-owned: block the sender is sending from. */
-    size_t send_pos;                     /* Sender-owned: position within send_node. */
-    int send_seeded;                     /* Main-only: send_node has been given its first non-NULL block. */
-    _Atomic(long long) sent_offset;      /* Sender -> main: primary_repl_offset put on the wire. */
-    _Atomic(int) send_error;             /* Sender -> main: a write error occurred; main disconnects. */
-    _Atomic(int) send_busy;              /* 1 while the sender is writing this replica outside the mutex;
-                                          * main waits for 0 before delinking or freeing it. */
+    int stream_via_sender;          /* 1 while the sender streams this replica. */
+    int stream_ineligible;          /* 1 to keep this replica on the main path (diskless/socket
+                                     * RDB transfer): the sender streams only disk/inline-sync
+                                     * replicas. */
+    listNode *send_node;            /* Sender-owned: block the sender is sending from. */
+    size_t send_pos;                /* Sender-owned: position within send_node. */
+    int send_seeded;                /* Main-only: send_node has been given its first non-NULL block. */
+    _Atomic(long long) sent_offset; /* Sender -> main: primary_repl_offset put on the wire. */
+    _Atomic(int) send_error;        /* Sender -> main: a write error occurred; main disconnects. */
+    _Atomic(int) send_busy;         /* 1 while the sender is writing this replica outside the mutex;
+                                     * main waits for 0 before delinking or freeing it. */
 } ClientReplicationData;
 
 typedef struct ClientModuleData {
@@ -1776,21 +1776,21 @@ typedef struct serverOpArray {
  * points at main's context (server.exec_ctx) except on a lane thread inside a parallel write
  * phase, which runs with its lane's own context. */
 typedef struct execContext {
-    long long dirty;                 /* Changes to DB from the last save (lanes: in this phase) */
-    struct client *current_client;   /* The client that triggered the command execution (External or AOF). */
-    struct client *executing_client; /* The client executing the current command (possibly script or module). */
-    int execution_nesting;           /* Execution nesting level: call(), async module stuff, cron stuff */
-    int in_call;                     /* Nesting level within the call() function. */
-    mstime_t cmd_time_snapshot;      /* Time snapshot of the root execution nesting. */
-    serverOpArray also_propagate;    /* Additional command to propagate. */
-    int lazy_expire_disabled;        /* If > 0, don't trigger lazy expire */
-    long long stat_numcommands;      /* Number of processed commands */
-    long long stat_keyspace_hits;    /* Number of successful lookups of keys */
-    long long stat_keyspace_misses;  /* Number of failed lookups of keys */
-    long long stat_expiredkeys;      /* Number of expired keys */
-    long long stat_expiredfields;    /* Number of expired hash fields */
+    long long dirty;                    /* Changes to DB from the last save (lanes: in this phase) */
+    struct client *current_client;      /* The client that triggered the command execution (External or AOF). */
+    struct client *executing_client;    /* The client executing the current command (possibly script or module). */
+    int execution_nesting;              /* Execution nesting level: call(), async module stuff, cron stuff */
+    int in_call;                        /* Nesting level within the call() function. */
+    mstime_t cmd_time_snapshot;         /* Time snapshot of the root execution nesting. */
+    serverOpArray also_propagate;       /* Additional command to propagate. */
+    int lazy_expire_disabled;           /* If > 0, don't trigger lazy expire */
+    long long stat_numcommands;         /* Number of processed commands */
+    long long stat_keyspace_hits;       /* Number of successful lookups of keys */
+    long long stat_keyspace_misses;     /* Number of failed lookups of keys */
+    long long stat_expiredkeys;         /* Number of expired keys */
+    long long stat_expiredfields;       /* Number of expired hash fields */
     long long stat_total_error_replies; /* Total number of issued error replies ( command + rejected errors ) */
-    long long prev_err_count;        /* stat_total_error_replies seen by incrCommandStatsOnError */
+    long long prev_err_count;           /* stat_total_error_replies seen by incrCommandStatsOnError */
 } execContext;
 
 extern _Thread_local execContext *ectx;
@@ -2386,7 +2386,7 @@ struct valkeyServer {
     int child_info_pipe[2]; /* Pipe used to write the child_info_data. */
     int child_info_nread;   /* Num of bytes of the last read from pipe */
     /* Propagation of commands in AOF / replication */
-    int replication_allowed;      /* Are we allowed to replicate? */
+    int replication_allowed; /* Are we allowed to replicate? */
     /* Logging */
     char *logfile;            /* Path of log file */
     int syslog_enabled;       /* Is syslog enabled? */
@@ -2407,12 +2407,12 @@ struct valkeyServer {
     int shutdown_on_sigterm; /* Shutdown flags configured for SIGTERM. */
 
     /* Replication (primary) */
-    char replid[CONFIG_RUN_ID_SIZE + 1];              /* My current replication ID. */
-    char replid2[CONFIG_RUN_ID_SIZE + 1];             /* replid inherited from primary*/
-    long long primary_repl_offset;                    /* My current replication offset */
-    _Atomic(long long) repl_stable_offset;            /* repl-stream-sender: bytes of backlog main has finished
-                                                       * appending (and fsynced under appendfsync always) that the
-                                                       * sender thread may stream. Published with release. */
+    char replid[CONFIG_RUN_ID_SIZE + 1];   /* My current replication ID. */
+    char replid2[CONFIG_RUN_ID_SIZE + 1];  /* replid inherited from primary*/
+    long long primary_repl_offset;         /* My current replication offset */
+    _Atomic(long long) repl_stable_offset; /* repl-stream-sender: bytes of backlog main has finished
+                                            * appending (and fsynced under appendfsync always) that the
+                                            * sender thread may stream. Published with release. */
     /* repl-stream-sender counters. The sender thread writes stat_repl_sender_* with
      * release; main reads them with acquire for INFO, and never writes them, so no
      * counter is written non-atomically from two threads. stat_repl_sender_main_queued
@@ -4273,8 +4273,7 @@ void dbLanePhaseEnd(void);
 robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index);
 robj *dbUnlinkExpiredHashInLane(serverDb *db, robj *val, int dict_index);
 void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index);
-void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int n_fields, int dict_index,
-                                       int empty, robj *val);
+void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int n_fields, int dict_index, int empty, robj *val);
 void propagateFieldsDeletionReplay(serverDb *db, robj *keyobj, robj **fields, int n_fields, int didx);
 #define EXPIRE_BULK_LIMIT ((size_t)1024) /* max fields active-expired per replicated HDEL command */
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);

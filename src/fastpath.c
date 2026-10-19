@@ -79,8 +79,8 @@ static fpThread fp_threads[IO_THREADS_MAX_NUM];
 /* Write lanes: the write phase runs fast-path commands on IO threads, each lane owning a set of
  * keyspace shards, and main merges each lane's replies, stats and propagation in command order. */
 
-#define FP_LANE_CHUNK (64 * 1024)    /* reply arena chunk of a lane */
-#define FP_LANE_MIN_ROOM (4 * 1024)  /* below this, a reply starts a new chunk */
+#define FP_LANE_CHUNK (64 * 1024)   /* reply arena chunk of a lane */
+#define FP_LANE_MIN_ROOM (4 * 1024) /* below this, a reply starts a new chunk */
 
 /* Propagation one entry's execution unit produced on a lane; main replays it in T order. */
 typedef struct laneProp {
@@ -166,12 +166,12 @@ static int fp_prop_mode = FP_PROP_OPS;
 /* INFO, main only. */
 static long long fp_stat_lane_phases = 0, fp_stat_lane_entries = 0, fp_stat_barriers = 0, fp_stat_serial_segments = 0;
 
-#define FP_GROW(arr, n, cap, init)                                     \
-    do {                                                               \
-        if ((n) == (cap)) {                                            \
-            (cap) = (cap) ? (cap) * 2 : (init);                        \
-            (arr) = zrealloc((arr), sizeof(*(arr)) * (size_t)(cap));   \
-        }                                                              \
+#define FP_GROW(arr, n, cap, init)                                   \
+    do {                                                             \
+        if ((n) == (cap)) {                                          \
+            (cap) = (cap) ? (cap) * 2 : (init);                      \
+            (arr) = zrealloc((arr), sizeof(*(arr)) * (size_t)(cap)); \
+        }                                                            \
     } while (0)
 
 /* acl-offload admission seqlock, one per thread, written only by that thread: odd while the thread
@@ -548,8 +548,7 @@ static void fpResetLaneVectors(fpThread *t) {
     t->mcur_b = t->mcur_e = 0;
 }
 
-static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
-                          unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
+static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
     e->c = c;
     e->control = c->control;
@@ -1887,8 +1886,7 @@ void fastpathStreamLaneEnter(int lane) {
     exec_lane = 1;
 }
 
-void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len,
-                            size_t argv_len_sum, unsigned long long input_bytes, int shard) {
+void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard) {
     fpLane *L = &fp_lanes[lane];
     client *ec = L->sec;
     ec->argv = argv;

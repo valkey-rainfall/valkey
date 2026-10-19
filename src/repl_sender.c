@@ -38,9 +38,9 @@ static pthread_cond_t repl_sender_cond = PTHREAD_COND_INITIALIZER;
 static list *repl_sender_replicas = NULL; /* client* of streamed replicas */
 static int repl_sender_running = 0;
 static int repl_sender_stop = 0;
-static _Atomic(long long) repl_sender_wake_offset; /* stable offset last published */
+static _Atomic(long long) repl_sender_wake_offset;      /* stable offset last published */
 static _Atomic(long long) repl_sender_last_wake_offset; /* stable offset at the sender's last append-mode wake */
-static _Atomic int repl_sender_idle;               /* 1 while the sender is parked in cond_wait */
+static _Atomic int repl_sender_idle;                    /* 1 while the sender is parked in cond_wait */
 
 /* True if this replica can be streamed by the sender thread. */
 int replStreamSenderEligible(client *replica) {
@@ -201,7 +201,10 @@ static void *replStreamSenderMain(void *arg) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 1000000; /* 1ms backstop so partial writes retry */
-            if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            if (ts.tv_nsec >= 1000000000) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000;
+            }
             atomic_store_explicit(&repl_sender_idle, 1, memory_order_release);
             pthread_cond_timedwait(&repl_sender_cond, &repl_sender_mutex, &ts);
             atomic_store_explicit(&repl_sender_idle, 0, memory_order_release);
@@ -266,7 +269,7 @@ void replStreamSenderRemove(client *replica) {
     if (!repl_sender_running) return;
     pthread_mutex_lock(&repl_sender_mutex);
     if (replica->repl_data->stream_via_sender) {
-        /* Do not delink while the sender is mid-write on this replica. */
+        /* Do not unlink while the sender is mid-write on this replica. */
         replStreamSenderWaitQuiescent(replica);
         listNode *ln = listSearchKey(repl_sender_replicas, replica);
         if (ln) listDelNode(repl_sender_replicas, ln);
@@ -436,16 +439,35 @@ void replStreamSenderStop(void) {
 
 #else /* !HAVE_FASTPATH_EPOLL */
 
-int replStreamSenderEligible(client *replica) { UNUSED(replica); return 0; }
-void replStreamSenderPublishStable(long long offset) { UNUSED(offset); }
-void replStreamSenderPublishAppend(long long offset) { UNUSED(offset); }
-void replStreamSenderAdd(client *replica) { UNUSED(replica); }
-void replStreamSenderRemove(client *replica) { UNUSED(replica); }
-void replStreamSenderAccount(void) {}
-int replStreamSenderActive(void) { return 0; }
-void replStreamSenderTick(void) {}
-void replStreamSenderInit(void) {}
-void replStreamSenderStop(void) {}
-unsigned long replStreamSenderOwnedReplicas(void) { return 0; }
+int replStreamSenderEligible(client *replica) {
+    UNUSED(replica);
+    return 0;
+}
+void replStreamSenderPublishStable(long long offset) {
+    UNUSED(offset);
+}
+void replStreamSenderPublishAppend(long long offset) {
+    UNUSED(offset);
+}
+void replStreamSenderAdd(client *replica) {
+    UNUSED(replica);
+}
+void replStreamSenderRemove(client *replica) {
+    UNUSED(replica);
+}
+void replStreamSenderAccount(void) {
+}
+int replStreamSenderActive(void) {
+    return 0;
+}
+void replStreamSenderTick(void) {
+}
+void replStreamSenderInit(void) {
+}
+void replStreamSenderStop(void) {
+}
+unsigned long replStreamSenderOwnedReplicas(void) {
+    return 0;
+}
 
 #endif /* HAVE_FASTPATH_EPOLL */

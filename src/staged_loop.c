@@ -32,9 +32,9 @@ enum {
     SL_T_CRONS,
     SL_T_COUNT
 };
-static const char *const sl_t_names[SL_T_COUNT] = {"beforesleep", "poll",   "read",   "exec",  "streamwait",
-                                                   "events",      "aof",    "reply",  "finish", "crons"};
-static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none",  "read",  "reply", "sync",  "drain",
+static const char *const sl_t_names[SL_T_COUNT] = {"beforesleep", "poll", "read", "exec", "streamwait",
+                                                   "events", "aof", "reply", "finish", "crons"};
+static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none", "read", "reply", "sync", "drain",
                                                                "apply", "maint", "stream", "write"};
 static uint64_t sl_main_ns[SL_T_COUNT];
 static uint64_t sl_iterations;
