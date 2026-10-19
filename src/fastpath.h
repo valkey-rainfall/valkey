@@ -44,18 +44,18 @@ typedef struct cmdEntry {
     uint32_t reply_len;
     uint32_t reply_big_len;
     uint8_t resp;
-    uint8_t requeued;     /* Main did not execute it; the IO thread hands it back for the main path. */
-    uint8_t readonly;     /* The client sent READONLY: a cluster replica serves its reads. */
-    uint8_t obuf_close;   /* A write lane found its reply past the output buffer limit; main closes the client. */
-    CommandOrigin origin; /* Written by the IO thread with the entry; main reads it only to attribute events. */
-    char *reply_base;     /* Reply bytes are at reply_base + reply_off; NULL means the batch arena. */
+    uint8_t requeued;      /* Main did not execute it; the IO thread hands it back for the main path. */
+    uint8_t readonly;      /* The client sent READONLY: a cluster replica serves its reads. */
+    uint8_t obuf_close;    /* A write lane found its reply past the output buffer limit; main closes the client. */
+    CommandOrigin origin;  /* Written by the IO thread with the entry; main reads it only to attribute events. */
+    char *reply_base;      /* Reply bytes are at reply_base + reply_off; NULL means the batch arena. */
     struct laneProp *prop; /* Propagation a write lane captured as ops; main replays it in T order. */
     uint32_t frames_off;   /* Replication frames a write lane formatted for it, in that lane's buffer. */
     uint32_t frames_len;
-    int32_t lane;          /* Write lane, or -1: executed by main alone (a barrier, or lanes off). */
-    int32_t shard;         /* Keyspace hashtable index of every key of a lane entry. */
-    uint32_t seg;          /* Barriers this IO thread harvested before this entry, in this iteration. */
-    uint8_t frames_wrap;   /* The frames go out inside MULTI/EXEC. */
+    int32_t lane;        /* Write lane, or -1: executed by main alone (a barrier, or lanes off). */
+    int32_t shard;       /* Keyspace hashtable index of every key of a lane entry. */
+    uint32_t seg;        /* Barriers this IO thread harvested before this entry, in this iteration. */
+    uint8_t frames_wrap; /* The frames go out inside MULTI/EXEC. */
 } cmdEntry;
 
 typedef struct cmdBatch {
@@ -63,12 +63,12 @@ typedef struct cmdBatch {
     int io_tid;
     char *arena;
     size_t arena_cap;
-    size_t arena_used;     /* main writes this per executed command while a STREAM worker reads the arena. */
+    size_t arena_used; /* main writes this per executed command while a STREAM worker reads the arena. */
     /* executed and delivered are the streaming hand-off and sit on their own cache line, away from
      * arena_used: a worker spins on executed (and reads delivered) while main advances arena_used per
      * command, so sharing a line would bounce it to main on every reply byte. */
-    _Alignas(CACHE_LINE_SIZE) _Atomic(int) executed; /* entries main has finished executing; published release at client-run boundaries. */
-    int delivered;        /* worker-owned: entries this thread has already written in STREAM/REPLY. */
+    _Alignas(CACHE_LINE_SIZE) _Atomic(int) executed;    /* entries main has finished executing; published release at client-run boundaries. */
+    int delivered;                                      /* worker-owned: entries this thread has already written in STREAM/REPLY. */
     _Alignas(CACHE_LINE_SIZE) cmdEntry e[IO_BATCH_MAX]; /* own line so the first entries never share the polled line. */
 } cmdBatch;
 
@@ -132,8 +132,7 @@ int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int 
 void fastpathStreamLanesPrepare(int nlanes, int main_lane);
 /* Lane thread, APPLY phase: enter the lane, apply commands of the stream on it, leave. */
 void fastpathStreamLaneEnter(int lane);
-void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len,
-                            size_t argv_len_sum, unsigned long long input_bytes, int shard);
+void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard);
 void fastpathStreamLaneLeave(void);
 /* Main, after an APPLY phase of the stream: fold what lanes [0, nlanes) accumulated. */
 void fastpathStreamLanesMerge(int nlanes);
