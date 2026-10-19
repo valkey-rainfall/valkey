@@ -4567,7 +4567,8 @@ int processCommandAndResetClient(client *c) {
 }
 
 /* A replica's stream plan (repl_apply.c): run the client's current command, popped from its queue first
- * when pop is set, as processInputBuffer runs one. Returns C_ERR when the client is gone, C_OK when it can
+ * when pop is set, as processInputBuffer runs one: a plain SET may be held for a parallel apply phase,
+ * and anything else first applies the held ones. Returns C_ERR when the client is gone, C_OK when it can
  * take its next command, and 1 when it cannot now. */
 int processPlannedCommand(client *c, int pop) {
     if (pop) {
@@ -4577,6 +4578,11 @@ int processPlannedCommand(client *c, int pop) {
     }
     if (handleParseResults(c) != PARSE_OK) return 1;
     if (c->argc == 0) return C_OK;
+    if (replApplyDefer(c)) {
+        commandProcessed(c);
+        return canParseCommand(c) ? C_OK : 1;
+    }
+    replApplyFlush(c);
     c->flag.pending_command = 1;
     if (processCommandAndResetClient(c) == C_ERR) return C_ERR;
     return canParseCommand(c) ? C_OK : 1;

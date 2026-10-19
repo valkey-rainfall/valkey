@@ -471,18 +471,20 @@ static void rpApplySegment(uint32_t s, int count) {
     server.stat_repl_lane_apply_usec += getMonotonicUs() - start;
 }
 
-/* Main: the plan, segment by segment. C_ERR: the client is gone. */
-static int rpRun(client *c) {
+/* Main: the plan, segment by segment. Commands of a segment too small for a lane phase run the usual way,
+ * where plain SETs are held for one parallel apply phase. C_ERR: the client is gone. */
+static int rpRunSegments(client *c) {
     int qlen = c->cmd_queue.len;
     int pos = 0;
     for (int s = 0;; s++) {
         int end = s < rp.nb ? rp.bpos[s] : rp.n;
         if (end - pos >= server.io_threads_parallel_writes_min) {
             if (!rpQueueAt(c, pos, qlen)) return C_OK;
+            replApplyFlush(c); /* writes held from earlier segments land first */
             rpApplySegment((uint32_t)s, end - pos);
             rpConsume(c, pos, end);
         } else {
-            /* Too few to pay for a phase: on main, in order; the lanes skip them. */
+            /* Too few to pay for a lane phase: on main, in order; the lanes skip them. */
             for (int i = pos; i < end; i++) {
                 int r = rpRunOnMain(c, i, qlen);
                 if (r != C_OK) return r == C_ERR ? C_ERR : C_OK;
@@ -497,6 +499,15 @@ static int rpRun(client *c) {
         if (!fastpathStreamLanesAllowed()) return C_OK;
     }
     return C_OK;
+}
+
+static int rpRun(client *c) {
+    int rc = rpRunSegments(c);
+    if (rc == C_OK)
+        replApplyFlush(c);
+    else
+        serverAssert(!replApplyPending());
+    return rc;
 }
 
 int replApplyRunPlan(client *c) {
