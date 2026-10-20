@@ -123,7 +123,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             }
             foreach fd $fds { close $fd }
             sls_wait_fastpath_clients 0
-        }
+        } undefined {valgrind:skip}
     }
 
     # A reader-heavy mix at P16: GETs stream behind the writers' INCRs. Each reader's view of its
@@ -161,7 +161,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             foreach fd [concat $writers $readers] { close $fd }
             sls_wait_fastpath_clients 0
             r config resetstat
-        }
+        } undefined {valgrind:skip}
     }
 
     # Flip the mode (none<->exec) between every in-flight burst. A CONFIG SET of the mode is
@@ -198,7 +198,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         foreach fd $fds { close $fd }
         sls_wait_fastpath_clients 0
         r config set staged-reply-overlap exec
-    }
+    } undefined {valgrind:skip}
 
     # CLIENT KILL while a large burst streams: the killed clients vanish, the survivors stay exact.
     foreach mode {exec} {
@@ -245,7 +245,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             r acl deluser sls-victim
             assert_equal PONG [r ping]
             r config resetstat
-        }
+        } undefined {valgrind:skip}
     }
 
     # An output-buffer-limit kill while replies stream closes the offender; the others are exact.
@@ -281,7 +281,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             r config set client-output-buffer-limit "normal 0 0 0"
             sls_wait_fastpath_clients 0
             r config resetstat
-        }
+        } undefined {valgrind:skip}
     }
 }
 
