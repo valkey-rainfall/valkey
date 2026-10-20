@@ -52,10 +52,13 @@ typedef struct cmdEntry {
     struct laneProp *prop; /* Propagation a write lane captured as ops; main replays it in T order. */
     uint32_t frames_off;   /* Replication frames a write lane formatted for it, in that lane's buffer. */
     uint32_t frames_len;
-    int32_t lane;        /* Write lane, or -1: executed by main alone (a barrier, or lanes off). */
-    int32_t shard;       /* Keyspace hashtable index of every key of a lane entry. */
-    uint32_t seg;        /* Barriers this IO thread harvested before this entry, in this iteration. */
-    uint8_t frames_wrap; /* The frames go out inside MULTI/EXEC. */
+    int32_t lane;          /* Write lane, or -1: executed by main alone (a barrier, or lanes off). */
+    int32_t shard;         /* Keyspace hashtable index of every key of a lane entry. */
+    uint32_t seg;          /* Barriers this IO thread harvested before this entry, in this iteration. */
+    uint8_t frames_wrap;   /* The frames go out inside MULTI/EXEC. */
+    uint8_t part;          /* One lane's share of a split entry, not an entry of a batch. */
+    uint8_t part_extra;    /* A part after the first: the command is counted once, by the first. */
+    struct fpSplit *split; /* Keys on several lanes: the parts the lanes run, assembled at delivery. */
 } cmdEntry;
 
 typedef struct cmdBatch {
