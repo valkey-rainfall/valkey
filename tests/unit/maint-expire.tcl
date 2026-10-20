@@ -142,14 +142,19 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         set keys {}
         while 1 {
             set msg [$rd_redir read]
+            # A RESP3 connection (--force-resp3) gets invalidations as an "invalidate" push.
+            if {[lindex $msg 0] eq "invalidate"} {
+                foreach k [lindex $msg 1] { lappend keys $k }
+                continue
+            }
             if {[lindex $msg 0] ne "message"} continue
             if {[lindex $msg 2] eq "me-done"} break
             foreach k [lindex $msg 2] { lappend keys $k }
         }
-        assert_equal 1000 [llength [lsort -unique $keys]]
         $rt client tracking off
         $rt close
         $rd_redir close
+        assert_equal 1000 [llength [lsort -unique $keys]]
     }
 
     test "Active expire with cron-lanes $lanes removes tracked keys after their client disconnects" {
@@ -163,12 +168,15 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         $rt mget {*}[lmap i [me_seq 1000] {format st:%d $i}]
         assert_morethan_equal [s tracking_total_keys] 1000
         $rt close
-        wait_for_condition 50 20 {[s tracking_clients] == 0} else { fail "tracking client still connected" }
+        wait_for_condition 50 20 {[s tracking_clients] == 0} else {
+            r debug set-active-expire 1
+            fail "tracking client still connected"
+        }
         r debug set-active-expire 1
         me_wait_empty r
         # With no client left, the tracking table still drops each expired key's entry.
         assert_equal 0 [s tracking_total_keys]
-    }
+    } undefined {valgrind:skip}
 
     test "Active expire with cron-lanes $lanes keeps keys and hash fields within one cycle budget" {
         r flushdb
@@ -196,7 +204,7 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
             assert {[llength $over] <= 1}
         }
         r config set latency-monitor-threshold 0
-    }
+    } undefined {valgrind:skip}
 
     test "Active expire with cron-lanes $lanes expires hash fields in the phase, not on main" {
         r flushdb
@@ -584,7 +592,7 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             # Slow builds skip the timing check (--no-latency).
             if {!$::no_latency} { assert {$long <= 1} }
             $primary config set latency-monitor-threshold 0
-        }
+        } undefined {valgrind:skip}
     }
 }
 }

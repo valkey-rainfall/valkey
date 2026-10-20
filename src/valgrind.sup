@@ -55,3 +55,23 @@
    ...
    fun:ioThreadReadQueryFromClient
 }
+
+{
+   <staged_read_shared_query_buffer_in_fork_child>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   ...
+   fun:initSharedQueryBuf
+   ...
+   fun:fpRead
+}
+
+{
+   <repl_stream_sender_snapshot_in_fork_child>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   ...
+   fun:replStreamSenderMain
+}

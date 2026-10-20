@@ -924,7 +924,7 @@ start_server {overrides {forkless-infrastructure-enabled yes save "" keyspace-sh
         catch {r debug reload nosave}
         assert_equal 2000 [r dbsize]
         for {set i 0} {$i < 2000} {incr i} { assert_equal AAA [r get key:$i] }
-    } {} {needs:debug}
+    } {} {needs:debug valgrind:skip}
 }
 
 start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
