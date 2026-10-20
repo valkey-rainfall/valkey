@@ -35,6 +35,7 @@ static_assert(offsetof(cmdBatch, executed) / CACHE_LINE_SIZE != offsetof(cmdBatc
               "the inline entries must not share the polled executed/delivered cache line");
 
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
+#define FP_ARENA_MAX (256 * 1024) /* an arena grows up to this when its batch's replies spill */
 #define FP_FREELIST_MAX 64
 
 struct fpBarrier {
@@ -257,6 +258,7 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     b->count = 0;
     b->io_tid = tid;
     b->arena_used = 0;
+    b->arena_spilled = 0;
     atomic_store_explicit(&b->executed, 0, memory_order_relaxed);
     b->delivered = 0;
     return b;
@@ -264,6 +266,20 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
 
 static void fpRecycleBatch(fpThread *t, cmdBatch *b) {
     if (t->nfree < FP_FREELIST_MAX) {
+        /* Size the arena to what this batch's replies needed: replies that spill are each copied
+         * into their own allocation on main. Shrink back once a batch uses a small part of it. */
+        size_t need = b->arena_used + b->arena_spilled;
+        size_t cap = b->arena_cap;
+        if (b->arena_spilled && cap < FP_ARENA_MAX) {
+            while (cap < need && cap < FP_ARENA_MAX) cap *= 2;
+        } else if (!b->arena_spilled && cap > FP_ARENA_SIZE && need < cap / 8) {
+            cap = FP_ARENA_SIZE;
+        }
+        if (cap != b->arena_cap) {
+            zfree(b->arena);
+            b->arena = zmalloc(cap);
+            b->arena_cap = cap;
+        }
         t->freelist[t->nfree++] = b;
     } else {
         zfree(b->arena);
@@ -1045,6 +1061,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         listEmpty(ec->reply);
         ec->reply_bytes = 0;
         b->arena_used -= ec->bufpos;
+        b->arena_spilled += total;
         e->reply_off = 0;
         e->reply_len = 0;
         e->reply_big = big;
