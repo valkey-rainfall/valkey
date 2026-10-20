@@ -105,6 +105,6 @@ start_server {tags {"maint external:skip tls:skip"} overrides {
         assert_equal 1000 [r dbsize]
         assert_match "*db9:keys=1000*" [r info keyspace]
         r config set hz 10
-    }
+    } undefined {valgrind:skip}
 }
 }
