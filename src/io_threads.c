@@ -258,6 +258,7 @@ int inMainThread(void) {
 
 typedef struct freeSlab {
     size_t count;
+    size_t bytes; /* pending-free bytes main accounted for these entries; subtracted once freed */
     void *entries[];
 } freeSlab;
 
@@ -361,14 +362,16 @@ static void submitFreeSlab(freeSlab *slab) {
     pending_free_slabs[pending_free_slabs_len++] = slab;
 }
 
-static void slabAppendFree(void *ptr, int is_obj) {
+static void slabAppendFree(void *ptr, int is_obj, size_t bytes) {
     if (cur_free_slab == NULL) {
         cur_free_slab = zmalloc(sizeof(freeSlab) + FREE_SLAB_CAPACITY * sizeof(void *));
         cur_free_slab->count = 0;
+        cur_free_slab->bytes = 0;
         cur_free_slab_ms = server.mstime;
     }
     freeSlab *s = cur_free_slab;
     s->entries[s->count++] = (void *)((uintptr_t)ptr | (is_obj ? FREE_ENTRY_OBJ_BIT : 0));
+    s->bytes += bytes;
     if (s->count == FREE_SLAB_CAPACITY) {
         cur_free_slab = NULL;
         submitFreeSlab(s);
@@ -1239,13 +1242,12 @@ static void ioThreadFreeSlab(freeSlab *slab) {
         uintptr_t e = (uintptr_t)slab->entries[j];
         void *p = (void *)(e & ~FREE_ENTRY_OBJ_BIT);
         if (e & FREE_ENTRY_OBJ_BIT) {
-            offloadFreeAccountSub(offloadObjFreeBytes((robj *)p));
             decrRefCount(p);
         } else {
-            offloadFreeAccountSub(zmalloc_size(p));
             zfree(p);
         }
     }
+    if (slab->bytes) offloadFreeAccountSub(slab->bytes);
     zfree(slab);
 }
 
@@ -2346,8 +2348,11 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
         return C_ERR;
     }
 
-    offloadFreeAccountAdd(offloadObjFreeBytes(obj));
-    slabAppendFree(obj, 1);
+    /* Only maxmemory reads the pending-free bytes; sizing a value reads its allocation metadata
+     * and header, which main would otherwise never touch on an overwrite. */
+    size_t bytes = server.maxmemory ? offloadObjFreeBytes(obj) : 0;
+    if (bytes) offloadFreeAccountAdd(bytes);
+    slabAppendFree(obj, 1, bytes);
     server.stat_io_freed_objects++;
     return C_OK;
 }
@@ -2358,8 +2363,9 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
     if (inline_reclaim_depth) return C_ERR; /* emergency reclaim frees inline */
     if (server.active_io_threads_num <= 1 || (exec_lane && !inMainThread())) return C_ERR;
 
-    offloadFreeAccountAdd(zmalloc_size(ptr));
-    slabAppendFree(ptr, 0);
+    size_t bytes = server.maxmemory ? zmalloc_size(ptr) : 0;
+    if (bytes) offloadFreeAccountAdd(bytes);
+    slabAppendFree(ptr, 0, bytes);
     return C_OK;
 }
 
@@ -2426,7 +2432,6 @@ void drainPendingMainFrees(void) {
             void *ptr = (void *)(e & ~FREE_ENTRY_OBJ_BIT);
             if (e & FREE_ENTRY_OBJ_BIT) {
                 robj *o = ptr;
-                offloadFreeAccountSub(offloadObjFreeBytes(o));
                 if (o->refcount == 1) {
                     freeObjAsyncForce(o);
                 } else {
@@ -2434,10 +2439,10 @@ void drainPendingMainFrees(void) {
                 }
             } else {
                 /* bio has no generic raw-buffer free. */
-                offloadFreeAccountSub(zmalloc_size(ptr));
                 zfree(ptr);
             }
         }
+        if (s->bytes) offloadFreeAccountSub(s->bytes);
         zfree(s);
     }
     pending_free_slabs_len = 0;
