@@ -328,7 +328,10 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         } else {
             fail "server did not exit after the crash report"
         }
-        assert_equal 1 [count_log_message 0 "Fast memory test PASSED"]
+        # Every IO thread was cancelled and joined, so the report reached the memory test. Its result is not
+        # checked: under ThreadSanitizer the test walks the sanitizer's shadow mappings and does not finish.
+        assert_equal 1 [count_log_message 0 "FAST MEMORY TEST"]
+        assert_equal 3 [count_log_message 0 "IO thread(tid:.*) terminated"]
         close $fd
     }
 }
