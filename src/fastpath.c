@@ -75,7 +75,35 @@ typedef struct fpThread {
     int pf_barrier;
     /* Main, merge after a lane phase: where the walk over this thread's entries in T order resumes. */
     int mcur_b, mcur_e;
+    /* Split entries of this iteration and the arena their parts live in, both reset by the next read
+     * phase: written by this thread in the read phase, read by the lanes and main in the write phase,
+     * and by this thread again when it delivers. */
+    struct fpSplitChunk *sa;
+    int sa_n, sa_cap, sa_cur;
+    size_t sa_used;
+    struct fpSplit **splits;
+    int nsplits, splits_cap;
 } fpThread;
+
+/* A multi-key command whose keys belong to several lanes runs as one part per lane, each with the keys
+ * that lane owns. Every lane runs its entries in T order, so any two commands meet in the same order on
+ * every lane they share, and the result is the same as running them one after the other. */
+typedef struct fpPart {
+    cmdEntry e;     /* first member: the lane runs the part as an entry */
+    cmdEntry *orig; /* the batch entry the part belongs to */
+    int *orig_idx;  /* orig_idx[j]: the index in orig->argv of the part's argv[j], j >= 1 */
+} fpPart;
+
+typedef struct fpSplit {
+    int nparts, nkeys, mset;
+    fpPart **parts;   /* in the order of the lanes of the command's first keys */
+    uint8_t *keypart; /* keypart[i]: the part that holds the command's i-th key */
+} fpSplit;
+
+typedef struct fpSplitChunk {
+    char *p;
+    size_t size;
+} fpSplitChunk;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
 
@@ -461,6 +489,10 @@ static const char *fp_lane_commands[] = {
     "lpush", "rpush", "lpushx", "rpushx", "linsert", "lset", "lrem", "ltrim", "lpop", "rpop", "lmpop",
     "lindex", "llen", "lrange", "lpos", "lmove", "rpoplpush", NULL};
 
+/* Command names of the parts: shared, so lanes running parts of one command at once never touch a
+ * common refcount. Created by main with the lane commands. */
+static robj *fp_part_name_mget = NULL, *fp_part_name_mset = NULL;
+
 /* Main: mark the lane commands, once (command renames apply first, so a renamed one stays off). */
 static void fpMarkLaneCommands(void) {
     static int done = 0;
@@ -469,6 +501,8 @@ static void fpMarkLaneCommands(void) {
         struct serverCommand *cmd = lookupCommandByCString(fp_lane_commands[i]);
         if (cmd) cmd->write_lane = 1;
     }
+    fp_part_name_mget = makeObjectShared(createStringObject("MGET", 4));
+    fp_part_name_mset = makeObjectShared(createStringObject("MSET", 4));
     done = 1;
 }
 
@@ -517,10 +551,16 @@ static int fpKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int
     return shard;
 }
 
+/* IO thread: the client may run this command on a lane at all. */
+static int fpLaneAuthOk(client *c, int read_flags) {
+    if (read_flags & (READ_FLAGS_ERROR_MASK | READ_FLAGS_BAD_ARITY)) return 0;
+    if ((c->user->flags & USER_FLAG_RETIRED) || authRequired(c)) return 0;
+    if (!(read_flags & READ_FLAGS_ACL_ALLOWED) && !ACLUserUnrestricted(c->user)) return 0;
+    return 1;
+}
+
 static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int read_flags, int *shard) {
-    if (read_flags & (READ_FLAGS_ERROR_MASK | READ_FLAGS_BAD_ARITY)) return -1;
-    if ((c->user->flags & USER_FLAG_RETIRED) || authRequired(c)) return -1;
-    if (!(read_flags & READ_FLAGS_ACL_ALLOWED) && !ACLUserUnrestricted(c->user)) return -1;
+    if (!fpLaneAuthOk(c, read_flags)) return -1;
     if (cmd->proc == pingCommand) {
         *shard = -1;
         return (int)(c->id % (uint64_t)fp_nlanes);
@@ -530,6 +570,124 @@ static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc,
     if (*shard < 0) return -1;
     if (server.cluster_enabled && !clusterServesSlotStably(*shard)) return -1; /* main produces the redirect */
     return *shard % fp_nlanes;
+}
+
+#define FP_SPLIT_CHUNK (64 * 1024)
+
+/* IO thread, read phase: memory for this iteration's split entries, 16-byte aligned. */
+static void *fpSplitAlloc(fpThread *t, size_t size) {
+    size = (size + 15) & ~(size_t)15;
+    while (t->sa_cur < t->sa_n) {
+        fpSplitChunk *ch = &t->sa[t->sa_cur];
+        if (ch->size - t->sa_used >= size) {
+            void *p = ch->p + t->sa_used;
+            t->sa_used += size;
+            return p;
+        }
+        t->sa_cur++;
+        t->sa_used = 0;
+    }
+    FP_GROW(t->sa, t->sa_n, t->sa_cap, 4);
+    size_t cs = size > FP_SPLIT_CHUNK ? size : FP_SPLIT_CHUNK;
+    t->sa[t->sa_n++] = (fpSplitChunk){.p = zmalloc(cs), .size = cs};
+    t->sa_cur = t->sa_n - 1;
+    t->sa_used = size;
+    return t->sa[t->sa_cur].p;
+}
+
+/* IO thread, read phase: put an MGET or MSET (standalone, keyspace shards on) whose keys belong to
+ * several lanes on each of those lanes as one part, or on one lane when they all belong to it. Returns
+ * 0 when the command stays a barrier. */
+static int fpTrySplit(fpThread *t, cmdEntry *e, client *c) {
+    if (server.cluster_enabled || !server.keyspace_shard_bits || !e->cmd->write_lane) return 0;
+    int mset = e->cmd->proc == msetCommand;
+    if (!mset && e->cmd->proc != mgetCommand) return 0;
+    int step = mset ? 2 : 1;
+    if (mset && (e->argc - 1) % 2) return 0; /* the arity error comes from main */
+    int nkeys = (e->argc - 1) / step;
+    if (nkeys < 2 || !fpLaneAuthOk(c, e->read_flags)) return 0;
+    int checks = fp_check_blocked || fp_check_watched;
+    uint8_t *keypart = fpSplitAlloc(t, (size_t)nkeys);
+    int count[FP_MAX_LANES];
+    int8_t part_of[FP_MAX_LANES];
+    memset(count, 0, sizeof(int) * fp_nlanes);
+    memset(part_of, -1, sizeof(part_of));
+    int lanes[FP_MAX_LANES];
+    int nparts = 0;
+    for (int i = 0; i < nkeys; i++) {
+        robj *k = e->argv[1 + i * step];
+        if (checks && fpKeyObserved(e->db, k)) return 0;
+        int lane = getKVStoreIndexForKey(objectGetVal(k)) % fp_nlanes;
+        if (part_of[lane] < 0) {
+            part_of[lane] = (int8_t)nparts;
+            lanes[nparts++] = lane;
+        }
+        count[lane]++;
+        keypart[i] = (uint8_t)part_of[lane];
+    }
+    if (nparts == 1) {
+        /* One lane owns every key; the keys are in several of its hashtables, so the executor carries no
+         * shard and each key finds its own. */
+        e->lane = lanes[0];
+        e->shard = -1;
+        FP_GROW(t->lane_ents[e->lane], t->lane_n[e->lane], t->lane_cap[e->lane], 64);
+        t->lane_ents[e->lane][t->lane_n[e->lane]++] = e;
+        t->seg_count[t->nbarriers]++;
+        return 1;
+    }
+    fpSplit *s = fpSplitAlloc(t, sizeof(*s));
+    s->nparts = nparts;
+    s->nkeys = nkeys;
+    s->mset = mset;
+    s->keypart = keypart;
+    s->parts = fpSplitAlloc(t, sizeof(fpPart *) * (size_t)nparts);
+    for (int p = 0; p < nparts; p++) {
+        int n = count[lanes[p]];
+        fpPart *pt = fpSplitAlloc(t, sizeof(*pt));
+        pt->e = *e;
+        pt->orig = e;
+        pt->e.argv = fpSplitAlloc(t, sizeof(robj *) * (size_t)(1 + n * step));
+        pt->orig_idx = fpSplitAlloc(t, sizeof(int) * (size_t)(1 + n * step));
+        pt->e.argv[0] = mset ? fp_part_name_mset : fp_part_name_mget;
+        pt->orig_idx[0] = -1;
+        pt->e.argc = 1; /* filled below */
+        pt->e.argv_len = 1 + n * step;
+        pt->e.argv_len_sum = 0;
+        pt->e.input_bytes = p == 0 ? e->input_bytes : 0;
+        pt->e.lane = lanes[p];
+        pt->e.shard = -1;
+        pt->e.part = 1;
+        pt->e.part_extra = p > 0;
+        pt->e.split = NULL;
+        pt->e.reply_big = NULL;
+        pt->e.reply_base = NULL;
+        pt->e.reply_off = pt->e.reply_len = pt->e.reply_big_len = 0;
+        pt->e.prop = NULL;
+        pt->e.frames_off = pt->e.frames_len = 0;
+        pt->e.frames_wrap = 0;
+        s->parts[p] = pt;
+    }
+    for (int i = 0; i < nkeys; i++) {
+        fpPart *pt = s->parts[keypart[i]];
+        for (int j = 0; j < step; j++) {
+            int src = 1 + i * step + j;
+            pt->orig_idx[pt->e.argc] = src;
+            pt->e.argv[pt->e.argc++] = e->argv[src];
+        }
+    }
+    for (int p = 0; p < nparts; p++) {
+        int lane = lanes[p];
+        FP_GROW(t->lane_ents[lane], t->lane_n[lane], t->lane_cap[lane], 64);
+        t->lane_ents[lane][t->lane_n[lane]++] = &s->parts[p]->e;
+        t->seg_count[t->nbarriers]++;
+    }
+    /* Run serially, main executes the entry whole: its lane is only what places it in a segment. */
+    e->lane = lanes[0];
+    e->shard = -1;
+    e->split = s;
+    FP_GROW(t->splits, t->nsplits, t->splits_cap, 16);
+    t->splits[t->nsplits++] = s;
+    return 1;
 }
 
 /* IO thread, read phase: put the entry on its lane's vector, or record it as a barrier. A barrier
@@ -545,12 +703,28 @@ static void fpClassify(fpThread *t, int tid, cmdBatch *b, cmdEntry *e, client *c
         FP_GROW(t->lane_ents[lane], t->lane_n[lane], t->lane_cap[lane], 64);
         t->lane_ents[lane][t->lane_n[lane]++] = e;
         t->seg_count[t->nbarriers]++;
-    } else {
+    } else if (!fpTrySplit(t, e, c)) {
         FP_GROW(t->barriers, t->nbarriers, t->barriers_cap, 16);
         t->barriers[t->nbarriers++] = (struct fpBarrier){.e = e, .b = b};
         FP_GROW(t->seg_count, t->nbarriers, t->seg_cap, 16);
         t->seg_count[t->nbarriers] = 0;
     }
+}
+
+/* IO thread: free what this iteration's split parts still hold. Their replies were assembled at
+ * delivery; this catches parts of entries that were not delivered. */
+static void fpReleaseSplits(fpThread *t) {
+    for (int i = 0; i < t->nsplits; i++) {
+        fpSplit *s = t->splits[i];
+        for (int p = 0; p < s->nparts; p++) {
+            cmdEntry *pe = &s->parts[p]->e;
+            if (pe->reply_big) zfree(pe->reply_big);
+            pe->reply_big = NULL;
+        }
+    }
+    t->nsplits = 0;
+    t->sa_cur = 0;
+    t->sa_used = 0;
 }
 
 /* IO thread, start of a depth-0 read phase: forget the previous iteration's lane vectors. */
@@ -565,6 +739,7 @@ static void fpResetLaneVectors(fpThread *t) {
     t->scur_b = t->scur_e = 0;
     t->mcur_b = t->mcur_e = 0;
     t->pf_barrier = 0;
+    fpReleaseSplits(t);
 }
 
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
@@ -604,6 +779,8 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->seg = 0;
     e->frames_off = e->frames_len = 0;
     e->frames_wrap = 0;
+    e->part = e->part_extra = 0;
+    e->split = NULL;
     if (fp_lanes_iter && fpDepth() == 0) fpClassify(&fp_threads[fp_cur_tid], fp_cur_tid, b, e, c);
     c->fp_inflight++;
 }
@@ -893,6 +1070,73 @@ static void fpFreeEntries(cmdEntry *e, int n) {
     }
 }
 
+/* The reply bytes an entry holds, or NULL when it has none. */
+static const char *fpEntryReply(cmdBatch *b, cmdEntry *e, size_t *len) {
+    if (e->reply_big) {
+        *len = e->reply_big_len;
+        return e->reply_big;
+    }
+    *len = e->reply_len;
+    if (!e->reply_len) return NULL;
+    return (e->reply_base ? e->reply_base : b->arena) + e->reply_off;
+}
+
+/* Length of the RESP line at p (through its CRLF). */
+static size_t fpRespLineLen(const char *p, const char *end) {
+    const char *nl = memchr(p, '\n', (size_t)(end - p));
+    serverAssert(nl);
+    return (size_t)(nl - p) + 1;
+}
+
+/* IO thread, delivery: build a split entry's reply from its parts' replies, as the command run whole
+ * would have replied. Leaves the entry without a reply when a part has none (its client is closing). */
+static void fpSplitAssemble(cmdBatch *b, cmdEntry *e) {
+    fpSplit *s = e->split;
+    e->split = NULL;
+    const char *cur[FP_MAX_LANES], *end[FP_MAX_LANES];
+    size_t total = 0;
+    int complete = 1;
+    for (int p = 0; p < s->nparts; p++) {
+        size_t len;
+        const char *r = fpEntryReply(b, &s->parts[p]->e, &len);
+        if (!r) complete = 0;
+        cur[p] = r;
+        end[p] = r ? r + len : NULL;
+        total += len;
+    }
+    if (complete && s->mset) {
+        /* Every part replied +OK. */
+        static const char ok[] = "+OK\r\n";
+        e->reply_base = (char *)ok;
+        e->reply_off = 0;
+        e->reply_len = sizeof(ok) - 1;
+    } else if (complete) {
+        /* MGET: one array of the parts' elements, in the command's key order. Each part's reply is an
+         * array header followed by its keys' elements in order: a bulk string or a null. */
+        for (int p = 0; p < s->nparts; p++) cur[p] += fpRespLineLen(cur[p], end[p]);
+        char *out = zmalloc(total + 32);
+        size_t o = (size_t)snprintf(out, 32, "*%d\r\n", s->nkeys);
+        for (int i = 0; i < s->nkeys; i++) {
+            int p = s->keypart[i];
+            const char *q = cur[p];
+            size_t n = fpRespLineLen(q, end[p]);
+            if (q[0] == '$' && q[1] != '-') n += (size_t)strtoll(q + 1, NULL, 10) + 2;
+            serverAssert(q[0] == '$' || q[0] == '_');
+            serverAssert(q + n <= end[p]);
+            memcpy(out + o, q, n);
+            o += n;
+            cur[p] = q + n;
+        }
+        e->reply_big = out;
+        e->reply_big_len = (uint32_t)o;
+    }
+    for (int p = 0; p < s->nparts; p++) {
+        cmdEntry *pe = &s->parts[p]->e;
+        if (pe->reply_big) zfree(pe->reply_big);
+        pe->reply_big = NULL;
+    }
+}
+
 /* Deliver the entries [from, to) of a batch. from and to must each fall on a client-run boundary,
  * so a run is never split across two calls. Consecutive entries for one client share a writev.
  * Shared by the STREAM phase (runs as main finishes them, to = b->executed) and the REPLY phase
@@ -907,6 +1151,7 @@ static void fpDeliverRange(fpThread *t, cmdBatch *b, int from, int to) {
         int requeued = 0;
         while (j < to && b->e[j].c == c) {
             cmdEntry *e = &b->e[j];
+            if (e->split) fpSplitAssemble(b, e);
             if (e->requeued) {
                 requeued++;
             } else if (e->reply_big) {
@@ -992,6 +1237,8 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
+    /* Main runs the command whole; its parts do not run. */
+    e->split = NULL;
     if (fpControlDetaching(e->control)) goto release_argv; /* no reply: the IO thread is closing it */
     if (fpMustRunOnMain()) {
         e->requeued = 1; /* handed back for the main path */
@@ -1535,9 +1782,11 @@ static void fpLaneCall(fpLane *L, client *c) {
     if (dirty < 0) dirty = 0;
 
     laneCmdStat *cs = fpLaneCmdStat(L, real_cmd);
+    /* A split command is one call: its first part counts it, every part adds its time. */
+    int counted = !(fp_exec_entry && fp_exec_entry->part_extra);
     if (ectx->stat_total_error_replies > errors || c->deferred_reply_errors) cs->failed++;
     latencyAddSampleIfNeeded((real_cmd->flags & CMD_FAST) ? "fast-command" : "command", duration);
-    if (ectx->execution_nesting == 0) {
+    if (ectx->execution_nesting == 0 && counted) {
         L->dur_cnt++;
         L->dur_sum += duration;
         if (duration > L->dur_max) L->dur_max = duration;
@@ -1545,13 +1794,13 @@ static void fpLaneCall(fpLane *L, client *c) {
     c->duration = duration;
     void *entries[3];
     int types[3];
-    int n = commandlogPrepareCurrentCommand(c, real_cmd, entries, types);
+    int n = counted ? commandlogPrepareCurrentCommand(c, real_cmd, entries, types) : 0;
     for (int i = 0; i < n; i++) {
         FP_GROW(L->logs, L->nlogs, L->logs_cap, 4);
         L->logs[L->nlogs++] = (laneLog){.entry = entries[i], .type = types[i]};
     }
     c->duration = 0;
-    cs->calls++;
+    if (counted) cs->calls++;
     cs->usec += duration;
     if (server.latency_tracking_enabled) fpLaneHistogram(L, real_cmd, duration * 1000);
     /* A slot maps to exactly one lane (shard % fp_nlanes), and main runs only its own lane in the
@@ -1573,7 +1822,7 @@ static void fpLaneCall(fpLane *L, client *c) {
     c->flag.force_aof = 0;
     c->flag.force_repl = 0;
     c->flag.prevent_prop = 0;
-    ectx->stat_numcommands++;
+    if (counted) ectx->stat_numcommands++;
     ectx->executing_client = NULL;
     ectx->in_call--;
 }
@@ -1697,14 +1946,19 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     ec->buf = saved_buf;
     ec->buf_usable_size = saved_usable;
 release_argv:
-    /* IO threads receive only sole-reference argv objects for terminal frees. */
+    /* IO threads receive only sole-reference argv objects for terminal frees. A part's objects are
+     * its batch entry's, which the IO thread frees: hand the entry what the part's argv now holds, as
+     * a command may have replaced an argument object (an encoded or key-embedded value). */
     for (int j = 0; j < e->argc; j++) {
         robj *o = e->argv[j];
-        if (!o) continue;
-        unsigned rc = objectGetRefcount(o);
-        if (rc == 1) continue; /* sole reference: freed by the IO thread */
-        if (rc < OBJ_FIRST_SPECIAL_REFCOUNT) decrRefCount(o);
-        e->argv[j] = NULL;
+        if (o) {
+            unsigned rc = objectGetRefcount(o);
+            if (rc > 1) { /* rc == 1: sole reference, freed by the IO thread */
+                if (rc < OBJ_FIRST_SPECIAL_REFCOUNT) decrRefCount(o);
+                e->argv[j] = NULL;
+            }
+        }
+        if (e->part && ((fpPart *)e)->orig_idx[j] >= 0) ((fpPart *)e)->orig->argv[((fpPart *)e)->orig_idx[j]] = e->argv[j];
     }
 }
 
@@ -1801,6 +2055,56 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
     }
 }
 
+/* Main, merge after a write phase: propagate a split entry's parts as one transaction, in part order.
+ * Returns 0 when no part propagated anything. The propagation mode is the phase's, so either every
+ * part formatted frames or every part captured ops. */
+static int fpFeedSplitPropagation(cmdEntry *e) {
+    static sds frames = NULL;
+    fpSplit *s = e->split;
+    int nframes = 0, nprop = 0, nops = 0;
+    for (int p = 0; p < s->nparts; p++) {
+        cmdEntry *pe = &s->parts[p]->e;
+        if (pe->frames_len) {
+            nframes++;
+        } else if (pe->prop) {
+            nprop++;
+            nops += pe->prop->numops;
+        }
+    }
+    if (!nframes && !nprop) return 0;
+    serverAssert(!nframes || !nprop);
+    ectx->current_client = fp_lanes[e->lane].ec;
+    if (nframes) {
+        if (!frames) frames = sdsempty();
+        sdsclear(frames);
+        int wrap = nframes > 1;
+        for (int p = 0; p < s->nparts; p++) {
+            cmdEntry *pe = &s->parts[p]->e;
+            if (!pe->frames_len) continue;
+            frames = sdscatlen(frames, fp_lanes[pe->lane].frames + pe->frames_off, pe->frames_len);
+            wrap |= pe->frames_wrap;
+        }
+        replicationFeedFrames(e->db->id, frames, sdslen(frames), wrap);
+    } else {
+        serverOp *ops = zmalloc(sizeof(serverOp) * (size_t)nops);
+        int n = 0, wrap = nprop > 1;
+        for (int p = 0; p < s->nparts; p++) {
+            cmdEntry *pe = &s->parts[p]->e;
+            if (!pe->prop) continue;
+            memcpy(ops + n, pe->prop->ops, sizeof(serverOp) * (size_t)pe->prop->numops);
+            n += pe->prop->numops;
+            wrap |= pe->prop->wrap;
+            zfree(pe->prop->ops);
+            zfree(pe->prop);
+            pe->prop = NULL;
+        }
+        replayLanePropagation(ops, n, wrap);
+        zfree(ops);
+    }
+    ectx->current_client = NULL;
+    return 1;
+}
+
 /* Main, after a write phase: fold what the lanes accumulated and replay their propagation in T order. */
 static void fpMergeLanes(void) {
     fpFoldLaneStats(fp_nlanes, 0);
@@ -1819,23 +2123,28 @@ static void fpMergeLanes(void) {
                 cmdEntry *e = &b->e[t->mcur_e];
                 if (e->seg > s) goto next_part;
                 t->mcur_e++;
-                if (e->seg < s || e->lane < 0 || (!e->frames_len && !e->prop)) continue;
+                if (e->seg < s || e->lane < 0) continue;
                 long long offset = server.primary_repl_offset;
-                /* CLUSTER SLOT-STATS attributes replication bytes to the current client's slot. */
-                client *attr = fp_lanes[e->lane].ec;
-                attr->slot = e->shard;
-                ectx->current_client = attr;
-                if (e->frames_len) {
-                    replicationFeedFrames(e->db->id, fp_lanes[e->lane].frames + e->frames_off, e->frames_len,
-                                          e->frames_wrap);
+                if (e->split) {
+                    if (!fpFeedSplitPropagation(e)) continue;
                 } else {
-                    replayLanePropagation(e->prop->ops, e->prop->numops, e->prop->wrap);
-                    zfree(e->prop->ops);
-                    zfree(e->prop);
-                    e->prop = NULL;
+                    if (!e->frames_len && !e->prop) continue;
+                    /* CLUSTER SLOT-STATS attributes replication bytes to the current client's slot. */
+                    client *attr = fp_lanes[e->lane].ec;
+                    attr->slot = e->shard;
+                    ectx->current_client = attr;
+                    if (e->frames_len) {
+                        replicationFeedFrames(e->db->id, fp_lanes[e->lane].frames + e->frames_off, e->frames_len,
+                                              e->frames_wrap);
+                    } else {
+                        replayLanePropagation(e->prop->ops, e->prop->numops, e->prop->wrap);
+                        zfree(e->prop->ops);
+                        zfree(e->prop);
+                        e->prop = NULL;
+                    }
+                    ectx->current_client = NULL;
+                    attr->slot = -1;
                 }
-                ectx->current_client = NULL;
-                attr->slot = -1;
                 /* WAIT and WAITAOF on the client wait for its last write's replication offset. */
                 if (server.primary_repl_offset != offset && e->c) {
                     if (last && last != e->c) last->woff = last_woff;
