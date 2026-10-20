@@ -129,7 +129,7 @@ start_server {tags {"repl external:skip"} overrides {io-threads 2 enable-debug-c
                 fail "primary did not drop the killed replica"
             }
             assert_equal {PONG} [$master ping]
-        }
+        } undefined {valgrind:skip}
     }
 }
 

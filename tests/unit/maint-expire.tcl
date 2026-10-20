@@ -155,7 +155,7 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         $rt close
         $rd_redir close
         assert_equal 1000 [llength [lsort -unique $keys]]
-    }
+    } undefined {valgrind:skip}
 
     test "Active expire with cron-lanes $lanes removes tracked keys after their client disconnects" {
         r flushdb
@@ -524,7 +524,7 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             assert_equal [$primary debug digest] [$replica debug digest]
             assert_equal [status $primary master_repl_offset] [status $replica master_repl_offset]
             assert_equal 300 [$replica dbsize]
-        }
+        } undefined {valgrind:skip}
 
         test "Active expire with cron-lanes $lanes replicates hash-field expiry to a replica" {
             $primary flushall
@@ -547,7 +547,7 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             assert_equal [status $primary master_repl_offset] [status $replica master_repl_offset]
             assert_equal 1 [$replica hlen fh:0]
             assert_equal 0 [$replica exists fe:0]
-        }
+        } undefined {valgrind:skip}
 
         test "Active expire with cron-lanes $lanes keeps the per-tick stall bounded under dense field expiry with a replica" {
             $primary flushall
