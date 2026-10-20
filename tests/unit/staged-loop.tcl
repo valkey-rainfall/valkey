@@ -306,7 +306,7 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
             exec taskset -pc $io1_cpus $io1
             exec taskset -pc $main_cpus $pid
         }
-    }
+    } undefined {valgrind:skip}
 }
 }
 

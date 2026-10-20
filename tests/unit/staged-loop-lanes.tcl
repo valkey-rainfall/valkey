@@ -11,6 +11,12 @@ proc pwl_socket {host port} {
     set fd [socket $host $port]
     fconfigure $fd -translation {crlf binary} -blocking 1 -buffering full
     lappend ::pwl_open [list $fd [lindex [fconfigure $fd -sockname] 2]]
+    # The replies below are matched as RESP2; a --force-resp3 run makes RESP3 the default.
+    if {$::force_resp3} {
+        puts -nonewline $fd [pwl_resp hello 2]
+        flush $fd
+        pwl_read_reply $fd
+    }
     return $fd
 }
 
@@ -375,7 +381,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         } err]
         r config set io-threads-parallel-writes yes
         if {$failed} { error $err $::errorInfo }
-    }
+    } undefined {valgrind:skip}
 
     test {Write lanes: hash, set, sorted set and list commands run on the lanes with stock semantics} {
         r flushall
