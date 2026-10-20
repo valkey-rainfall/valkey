@@ -275,6 +275,16 @@ int fastGetSpeculateBatch(client *c, int tid) {
     if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
     if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 0;
 
+    /* Answer the read here only when every complete command in it is a GET. A prefix of GETs answered
+     * here while the rest waits for main splits one pipeline's replies into two writes; the client
+     * then refills its pipeline in pieces, the next reads are smaller, and under load the server
+     * settles into serving fragments of a couple of commands per read. */
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        parsedCommand *p = &c->cmd_queue.cmds[i];
+        if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break; /* the trailing partial */
+        if (p->cmd != fastget_get_cmd || p->argc != 2) return 0;
+    }
+
     /* In cluster mode only a GET this node answers without a redirect: the same check main runs, on
      * cluster state main changes only outside the read phase. A slot being migrated or imported needs
      * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. With per-slot stats on,
