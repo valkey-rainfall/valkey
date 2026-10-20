@@ -386,4 +386,21 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         set phases_distinct [getInfoProperty [r info fastpath] staged_stream_phases]
         assert {$phases_distinct > 0}
     }
+
+    test {Lane recheck: a process confined to a few CPUs, as by a container cpuset, still streams} {
+        set ncpu [exec nproc]
+        set pid [srv 0 pid]
+        if {$ncpu < 6 || [catch {exec taskset -cp 0 $pid}]} {
+            skip "needs taskset and at least 6 CPUs"
+        }
+        r config set staged-reply-overlap exec
+        r flushall
+        # Every thread on the same CPUs 0-4: no thread is pinned apart from the others.
+        exec taskset -acp 0-4 $pid
+        after 1200 ;# let one periodic pinning read run
+        r config resetstat
+        sls_drive_incr [srv 0 port] 40 16 8
+        assert {[getInfoProperty [r info fastpath] staged_stream_phases] > 0}
+        exec taskset -acp 0-[expr {$ncpu - 1}] $pid
+    }
 }

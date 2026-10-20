@@ -260,21 +260,24 @@ static void stagedPlaceEpollThread(void) {
         serverLog(LL_WARNING, "Staged event loop: cannot set the epoll thread's CPU affinity");
 }
 
-/* Main is pinned to CPUs a worker also runs on, so a lane on main would only take turns with it. */
+/* Main is pinned to CPUs a worker also runs on, so a lane on main would only take turns with it.
+ * A cpuset or taskset that confines the whole process confines every thread alike and counts as
+ * unpinned, as on a host of that many CPUs, unless it leaves them all one CPU. */
 static int stagedMainSharesWorkerCpu(void) {
-    cpu_set_t mine;
+    cpu_set_t mine, all;
     CPU_ZERO(&mine);
     if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) != 0) return 0;
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu <= 0 || CPU_COUNT(&mine) >= ncpu) return 0;
+    all = mine;
+    int overlap = 0;
     for (int tid = 1; tid <= sl_workers; tid++) {
         cpu_set_t one, both;
         CPU_ZERO(&one);
         if (ioThreadGetAffinity(tid, &one, sizeof(one)) != 0) continue;
+        CPU_OR(&all, &all, &one);
         CPU_AND(&both, &one, &mine);
-        if (CPU_COUNT(&both) > 0) return 1;
+        if (CPU_COUNT(&both) > 0) overlap = 1;
     }
-    return 0;
+    return overlap && (CPU_COUNT(&mine) < CPU_COUNT(&all) || CPU_COUNT(&all) == 1);
 }
 
 /* Main: a worker pinned to the one CPU main is pinned to only takes turns with main, so neither
