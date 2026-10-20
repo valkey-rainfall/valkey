@@ -11,12 +11,6 @@ proc pwl_socket {host port} {
     set fd [socket $host $port]
     fconfigure $fd -translation {crlf binary} -blocking 1 -buffering full
     lappend ::pwl_open [list $fd [lindex [fconfigure $fd -sockname] 2]]
-    # The replies below are matched as RESP2; a --force-resp3 run makes RESP3 the default.
-    if {$::force_resp3} {
-        puts -nonewline $fd [pwl_resp hello 2]
-        flush $fd
-        pwl_read_reply $fd
-    }
     return $fd
 }
 
@@ -42,13 +36,21 @@ proc pwl_read_reply {fd} {
             if {$line eq {$-1}} { return {(nil)} }
             return [gets $fd]
         }
-        {*} {
+        {*} - {~} - {>} {
             set n [string range $line 1 end]
             if {$n < 0} { return {(nil)} }
             set out {}
             for {set i 0} {$i < $n} {incr i} { lappend out [pwl_read_reply $fd] }
             return $out
         }
+        {%} {
+            # RESP3 (a --force-resp3 run makes it the default): a map reads as RESP2's flat array.
+            set out {}
+            for {set i 0} {$i < 2 * [string range $line 1 end]} {incr i} { lappend out [pwl_read_reply $fd] }
+            return $out
+        }
+        {_} { return {(nil)} }
+        {,} { return [string range $line 1 end] }
         default { return $line }
     }
 }

@@ -576,6 +576,12 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:s
     }
     # Clients that send no SELECT stay on the fast path; CLIENT ID leaves it and the client rejoins after.
     proc fastpath_victims {n} {
+        # The previous test's closed clients leave the fast path asynchronously; start from a settled count.
+        wait_for_condition 100 20 {
+            [set before [fastpath_count]] == [after 20; fastpath_count]
+        } else {
+            fail "fast-path client count did not settle"
+        }
         set base [fastpath_count]
         set clients {}
         set ids {}
