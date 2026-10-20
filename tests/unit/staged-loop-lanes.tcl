@@ -247,24 +247,102 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         close $fd
     }
 
-    test {Write lanes: MSET and MGET across shards run on main and stay atomic} {
+    test {Write lanes: MSET and MGET across shards run on the lanes, one part per lane} {
         set fd [pwl_fast_socket r $host $port]
         set entries [pwl_lane_entries r]
+        set barriers [getInfoProperty [r info fastpath] fastpath_write_barriers]
+        set msets [pwl_calls r mset]
+        set mgets [pwl_calls r mget]
         set buf ""
         for {set i 0} {$i < 20} {incr i} {
-            append buf [pwl_resp mset pwl:m$i a pwl:mm$i b pwl:mmm$i c]
-            append buf [pwl_resp mget pwl:m$i pwl:mm$i pwl:mmm$i]
+            append buf [pwl_resp mset pwl:m$i a pwl:mm$i b pwl:mmm$i c pwl:m$i d]
+            append buf [pwl_resp mget pwl:m$i pwl:nokey$i pwl:mm$i pwl:mmm$i pwl:m$i]
         }
         puts -nonewline $fd $buf
         flush $fd
         for {set i 0} {$i < 20} {incr i} {
             assert_equal {+OK} [pwl_read_reply $fd]
-            assert_equal {*3} [gets $fd]
-            assert_equal {a b c} [pwl_read_replies $fd 3]
+            assert_equal {*5} [gets $fd]
+            assert_equal {d (nil) b c d} [pwl_read_replies $fd 5]
         }
-        # Main runs them, as barriers between lane segments or, with no lane command in the phase, in
-        # a streamed write phase; no lane runs one.
-        assert_equal $entries [pwl_lane_entries r]
+        assert_morethan [pwl_lane_entries r] $entries
+        assert_equal $barriers [getInfoProperty [r info fastpath] fastpath_write_barriers]
+        # Each command is one call, however many lanes ran a part of it.
+        assert_equal [expr {$msets + 20}] [pwl_calls r mset]
+        assert_equal [expr {$mgets + 20}] [pwl_calls r mget]
+        close $fd
+    }
+
+    test {Write lanes: a split MSET is atomic for split MGETs on other connections} {
+        set nkeys 16
+        set keys {}
+        for {set k 0} {$k < $nkeys} {incr k} { lappend keys pwl:at$k }
+        set fds {}
+        pwl_close_leftovers
+        pwl_wait_fastpath_clients r 0
+        for {set c 0} {$c < 4} {incr c} {
+            set fd [pwl_socket $host $port]
+            puts -nonewline $fd [pwl_resp ping]
+            flush $fd
+            assert_equal {+PONG} [pwl_read_reply $fd]
+            lappend fds $fd
+        }
+        pwl_wait_fastpath_clients r 4
+        set entries [pwl_lane_entries r]
+        set rounds 200
+        # Connections 0 and 1 write every key with one version per MSET; 2 and 3 read them all.
+        for {set c 0} {$c < 4} {incr c} {
+            set buf ""
+            for {set i 0} {$i < $rounds} {incr i} {
+                if {$c < 2} {
+                    set args {}
+                    foreach k $keys { lappend args $k $c.$i }
+                    append buf [pwl_resp mset {*}$args]
+                } else {
+                    append buf [pwl_resp mget {*}$keys]
+                }
+            }
+            puts -nonewline [lindex $fds $c] $buf
+            flush [lindex $fds $c]
+        }
+        for {set c 0} {$c < 4} {incr c} {
+            set fd [lindex $fds $c]
+            for {set i 0} {$i < $rounds} {incr i} {
+                if {$c < 2} {
+                    assert_equal {+OK} [pwl_read_reply $fd]
+                } else {
+                    set got [pwl_read_reply $fd]
+                    assert_equal $nkeys [llength $got]
+                    assert_equal [llength [lsort -unique $got]] 1
+                }
+            }
+            close $fd
+        }
+        assert_morethan [pwl_lane_entries r] $entries
+    }
+
+    test {Write lanes: a split MGET replies RESP3 nulls} {
+        set fd [pwl_fast_socket r $host $port]
+        puts -nonewline $fd [pwl_resp hello 3]
+        flush $fd
+        pwl_read_reply $fd
+        r set pwl:r3a x
+        r set pwl:r3b y
+        set entries [pwl_lane_entries r]
+        set buf ""
+        for {set i 0} {$i < 20} {incr i} { append buf [pwl_resp mget pwl:r3a pwl:r3none$i pwl:r3b pwl:r3none] }
+        puts -nonewline $fd $buf
+        flush $fd
+        for {set i 0} {$i < 20} {incr i} {
+            assert_equal {*4} [gets $fd]
+            assert_equal {$1} [gets $fd]
+            assert_equal x [gets $fd]
+            assert_equal {_} [gets $fd]
+            assert_equal {$1} [gets $fd]
+            assert_equal y [gets $fd]
+            assert_equal {_} [gets $fd]
+        }
+        assert_morethan [pwl_lane_entries r] $entries
         close $fd
     }
 
@@ -589,6 +667,25 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             } else {
                 fail "primary and replica differ: [$primary dbsize] vs [$replica dbsize]"
             }
+        }
+
+        test {Write lanes: split MSETs replicate as one transaction each, to the same dataset} {
+            set fd [pwl_fast_socket $primary $primary_host $primary_port]
+            set before_multi [pwl_calls $replica multi]
+            set buf ""
+            for {set i 0} {$i < 200} {incr i} {
+                set args {}
+                for {set k 0} {$k < 12} {incr k} { lappend args pwl:sm[expr {($i * 7 + $k * 13) % 300}] $i.$k }
+                append buf [pwl_resp mset {*}$args]
+            }
+            puts -nonewline $fd $buf
+            flush $fd
+            pwl_read_replies $fd 200
+            close $fd
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            # Each MSET split over several lanes reaches the replica as MULTI, its parts, EXEC.
+            assert_morethan [pwl_calls $replica multi] $before_multi
         }
 
         test {Write lanes: the replication stream has the bytes the serial write phase produces} {
