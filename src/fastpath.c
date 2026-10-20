@@ -248,7 +248,7 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     if (t->nfree > 0) {
         b = t->freelist[--t->nfree];
     } else {
-        b = zmalloc(sizeof(cmdBatch));
+        b = zmalloc_cache_aligned(sizeof(cmdBatch)); /* cmdBatch has cache-line-aligned members */
         b->arena = zmalloc(FP_ARENA_SIZE);
         b->arena_cap = FP_ARENA_SIZE;
     }
