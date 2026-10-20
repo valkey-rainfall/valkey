@@ -70,6 +70,8 @@ typedef struct fpThread {
     int seg_cap;
     /* Main, write phase: where serial execution of this thread's batches resumes. */
     int scur_b, scur_e;
+    /* Main, write phase: the first barrier whose keys are not prefetched yet. */
+    int pf_barrier;
     /* Main, merge after a lane phase: where the walk over this thread's entries in T order resumes. */
     int mcur_b, mcur_e;
 } fpThread;
@@ -546,6 +548,7 @@ static void fpResetLaneVectors(fpThread *t) {
     t->seg_count[0] = 0;
     t->scur_b = t->scur_e = 0;
     t->mcur_b = t->mcur_e = 0;
+    t->pf_barrier = 0;
 }
 
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
@@ -1062,13 +1065,16 @@ release_argv:
     }
 }
 
-/* Prefetch the keys a batch touches before main executes it. */
-static void fpPrefetchBatch(cmdBatch *b) {
+/* Prefetch the keys of b's entries from `from` on, until `to` or the prefetch batch is full.
+ * Returns the index past the last entry added, at least from + 1, so a caller executing up to it
+ * always makes progress. */
+static int fpPrefetchRange(cmdBatch *b, int from, int to) {
     getKeysResult result;
     initGetKeysResult(&result);
     int room = 1;
+    int k = from;
     ClientControl *last_control = NULL;
-    for (int k = 0; k < b->count && room; k++) {
+    for (; k < to && room; k++) {
         cmdEntry *e = &b->e[k];
         ClientControl *cc = e->control;
         if (cc != last_control) {
@@ -1081,6 +1087,7 @@ static void fpPrefetchBatch(cmdBatch *b) {
     getKeysFreeResult(&result);
     prefetchBatchRun();
     prefetchBatchReset();
+    return k > from ? k : from + 1;
 }
 
 /* Main records a close; the write phase skips the client's entries and main unmaps it after the reply
@@ -1922,19 +1929,21 @@ static int fpSerialSegment(int tid, uint32_t s, int use_prefetch) {
     fpThread *t = &fp_threads[tid];
     client *ec = fpExecutor(tid);
     int n = 0;
+    int pf_end = 0;
     while (t->scur_b < t->sbn[0]) {
         cmdBatch *b = t->sb[0][t->scur_b];
-        if (t->scur_e == 0 && use_prefetch) fpPrefetchBatch(b);
         while (t->scur_e < b->count) {
             cmdEntry *e = &b->e[t->scur_e];
             if (e->seg > s || (e->lane < 0 && e->seg == s)) goto done; /* the next segment, or this one's barrier */
             t->scur_e++;
             if (e->seg < s) continue; /* ran earlier: on a lane, or as a barrier */
+            if (use_prefetch && t->scur_e > pf_end) pf_end = fpPrefetchRange(b, t->scur_e - 1, b->count);
             fpExecute(ec, b, e);
             n++;
         }
         t->scur_b++;
         t->scur_e = 0;
+        pf_end = 0;
     }
 done:
     ec->origin = NULL;
@@ -1979,6 +1988,23 @@ static void fpAddPart(int tid, uint32_t seg) {
     fp_parts[fp_nparts++] = (fpSegPart){.tid = tid, .seg = seg};
 }
 
+/* Main: prefetch the keys of thread t's barriers from barrier s on, up to the prefetch batch size. */
+static void fpPrefetchBarriers(fpThread *t, int s) {
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int room = 1;
+    int k = s;
+    for (; k < t->nbarriers && room; k++) {
+        cmdEntry *e = t->barriers[k].e;
+        if (!e->cmd || (e->read_flags & READ_FLAGS_BAD_ARITY)) continue;
+        room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
+    }
+    t->pf_barrier = k;
+    getKeysFreeResult(&result);
+    prefetchBatchRun();
+    prefetchBatchReset();
+}
+
 /* Main, write phase with lanes: T split by the barrier entries into segments; each segment runs on the
  * lanes in parallel, each barrier alone on main between them. */
 static int fpExecuteWithLanes(void) {
@@ -1997,6 +2023,7 @@ static int fpExecuteWithLanes(void) {
             if (s == t->nbarriers) break;
             total += fpRunSegment(pending, serial, use_prefetch);
             pending = 0;
+            if (use_prefetch && s >= t->pf_barrier) fpPrefetchBarriers(t, s);
             struct fpBarrier *br = &t->barriers[s];
             client *ec = fpExecutor(tid);
             fpExecute(ec, br->b, br->e);
@@ -2024,8 +2051,14 @@ int fastpathStagedExecute(void) {
         client *ec = fpExecutor(tid);
         for (int i = 0; i < t->sbn[d]; i++) {
             cmdBatch *b = t->sb[d][i];
-            if (use_prefetch && !paused) fpPrefetchBatch(b);
-            for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
+            if (use_prefetch && !paused) {
+                for (int k = 0; k < b->count;) {
+                    int end = fpPrefetchRange(b, k, b->count);
+                    for (; k < end; k++) fpExecute(ec, b, &b->e[k]);
+                }
+            } else {
+                for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
+            }
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
@@ -2077,15 +2110,20 @@ static cmdBatch *fpStreamRunAt(fpThread *t, fpStreamCursor *c, int d) {
  * The caller publishes b->executed at chunk granularity (always on a run boundary, since a run runs
  * whole), so a STREAM worker that reads executed with acquire sees every reply byte of the runs in
  * [prev published, executed). Prefetch is done by the caller window. */
-static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c) {
+static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c, int max) {
     int from = c->ei;
     client *cl = b->e[from].c;
     int j = from;
-    while (j < b->count && b->e[j].c == cl) {
+    while (j < b->count && b->e[j].c == cl && j - from < max) {
         fpExecute(ec, b, &b->e[j]);
         j++;
     }
     c->ei = j;
+}
+
+/* True when the cursor sits at the start of a run (or the end of its batch). */
+static int fpStreamAtRunStart(cmdBatch *b, int ei) {
+    return ei == 0 || ei >= b->count || b->e[ei].c != b->e[ei - 1].c;
 }
 
 /* Publish b->executed up to the executor cursor with a release store, so the STREAM worker can
@@ -2095,24 +2133,24 @@ static void fpStreamPublish(cmdBatch *b, int upto) {
         atomic_store_explicit(&b->executed, upto, memory_order_release);
 }
 
-/* Prefetch a window of up to prefetch-batch-max-size entries, in the same round-robin run order the
- * executor will run them, without disturbing the executor cursors. */
-static void fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, int d, int window) {
+/* Prefetch the keys of up to `window` entries, in the order the executor runs them (one run per
+ * thread per round), without disturbing the executor cursors. Stops when the prefetch batch is
+ * full; returns how many entries it covered, at least 1, which the executor then runs. */
+static int fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, int d, int window) {
     getKeysResult result;
     initGetKeysResult(&result);
     fpStreamCursor look[IO_THREADS_MAX_NUM];
     for (int i = 0; i < n; i++) look[i] = cur[i];
-    int added = 0, active = 1;
+    int added = 0, active = 1, room = 1;
     ClientControl *last_control = NULL;
-    while (active && added < window) {
+    while (active && room && added < window) {
         active = 0;
-        for (int i = 0; i < n && added < window; i++) {
+        for (int i = 0; i < n && room && added < window; i++) {
             cmdBatch *b = fpStreamRunAt(ts[i], &look[i], d);
             if (!b) continue;
             active = 1;
             client *cl = b->e[look[i].ei].c;
             int j = look[i].ei;
-            int room = 1;
             while (j < b->count && b->e[j].c == cl && room && added < window) {
                 cmdEntry *e = &b->e[j];
                 if (e->control != last_control) {
@@ -2130,6 +2168,7 @@ static void fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, in
     getKeysFreeResult(&result);
     prefetchBatchRun();
     prefetchBatchReset();
+    return added ? added : 1;
 }
 
 /* After a chunk is published, open a fresh-line gap in the batch arena so the next reply main
@@ -2181,10 +2220,12 @@ int fastpathStagedExecuteStreaming(void) {
     }
 
     while (!fpStreamDone(ts, cur, n, d)) {
-        if (use_prefetch && !paused) fpStreamPrefetchWindow(ts, cur, n, d, window);
-        for (int w = 0; w < window;) {
+        /* Run exactly the entries whose keys were just prefetched: with multi-key commands the
+         * prefetch batch fills before `window` entries. */
+        int run_window = (use_prefetch && !paused) ? fpStreamPrefetchWindow(ts, cur, n, d, window) : window;
+        for (int w = 0; w < run_window;) {
             int progressed = 0;
-            for (int i = 0; i < n && w < window; i++) {
+            for (int i = 0; i < n && w < run_window; i++) {
                 cmdBatch *b = fpStreamRunAt(ts[i], &cur[i], d);
                 if (!b) continue;
                 /* A new batch for this thread: finish publishing the previous one so no run is left
@@ -2195,13 +2236,13 @@ int fastpathStagedExecuteStreaming(void) {
                     acc[i] = 0;
                 }
                 int before = cur[i].ei;
-                fpStreamExecRun(ecs[i], b, &cur[i]);
+                fpStreamExecRun(ecs[i], b, &cur[i], run_window - w);
                 int ran = cur[i].ei - before;
                 acc[i] += ran;
                 w += ran;
                 total += ran;
-                /* Publish a chunk's worth at a run boundary (cur[i].ei always is one). */
-                if (acc[i] >= chunk) {
+                /* Publish a chunk's worth, only at a run boundary: a run is delivered whole. */
+                if (acc[i] >= chunk && fpStreamAtRunStart(b, cur[i].ei)) {
                     fpStreamPublish(b, cur[i].ei);
                     fpStreamArenaGuard(b);
                     acc[i] = 0;
