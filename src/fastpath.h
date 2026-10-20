@@ -63,7 +63,8 @@ typedef struct cmdBatch {
     int io_tid;
     char *arena;
     size_t arena_cap;
-    size_t arena_used; /* main writes this per executed command while a STREAM worker reads the arena. */
+    size_t arena_used;    /* main writes this per executed command while a STREAM worker reads the arena. */
+    size_t arena_spilled; /* main: reply bytes that did not fit the arena; sizes the arena when recycled. */
     /* executed and delivered are the streaming hand-off and sit on their own cache line, away from
      * arena_used: a worker spins on executed (and reads delivered) while main advances arena_used per
      * command, so sharing a line would bounce it to main on every reply byte. */
