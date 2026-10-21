@@ -77,8 +77,11 @@ start_server {tags {"querybuf slow"}} {
         set rd [valkey_client]
         $rd client setname test_client
 
-        # Create a large query buffer (more than PROTO_RESIZE_THRESHOLD - 32k)
-        $rd set x [string repeat A 400000]
+        # Create a large query buffer (more than PROTO_RESIZE_THRESHOLD - 32k).
+        # The value is below PROTO_MBULK_BIG_ARG (32k) so the big-arg path is
+        # not used: the command does not fit the first 16k read, so the client
+        # takes a private buffer which grows greedily to hold the whole command.
+        $rd set x [string repeat A 30000]
 
         # Make sure query buff is larger than the peak resize threshold (PROTO_RESIZE_THRESHOLD) 32k
         set orig_test_client_qbuf [client_query_buffer test_client]
@@ -127,4 +130,22 @@ start_server {tags {"querybuf slow"}} {
         $rd close
     }
 
+    test "query buffer is not preallocated after a big argument is taken over" {
+        # Pause cron so the buffer is not shrunk before we look at it.
+        r debug pause-cron 1
+
+        set rd [valkey_client]
+        $rd client setname test_client
+
+        # A bulk >= PROTO_MBULK_BIG_ARG (32k) is read into a buffer of exactly
+        # its size, which then becomes the argument itself. The client must
+        # not be left holding another buffer of that size for the next
+        # command: the next read would then pull most of the next value into
+        # it and the parser would have to memmove it to the buffer start.
+        $rd set x [string repeat A 1000000]
+        assert {[client_query_buffer test_client] < 32768}
+
+        r debug pause-cron 0
+        $rd close
+    } {0} {needs:debug}
 }

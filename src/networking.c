@@ -4297,10 +4297,17 @@ static int parseMultibulk(client *c,
                 (*argv)[(*argc)++] = createObject(OBJ_STRING, c->querybuf);
                 *argv_len_sum += c->bulklen;
                 sdsIncrLen(c->querybuf, -2); /* remove CRLF */
-                /* Assume that if we saw a fat argument we'll see another one
-                 * likely... */
-                c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
-                sdsclear(c->querybuf);
+                /* Start the next command from an empty buffer rather than
+                 * preallocating another bulklen+2 bytes. A large preallocated
+                 * buffer makes the greedy read in readToQueryBuf() pull the
+                 * next command's header plus as much of its value as has
+                 * arrived, all of which the realign above then has to memmove
+                 * to offset 0 before that value can be taken over without a
+                 * copy. With an empty buffer the next read is bounded by
+                 * PROTO_IOBUF_LEN, so the realign moves at most that much, and
+                 * the big-arg path grows the buffer to exactly bulklen+2 once
+                 * it has parsed the length. */
+                c->querybuf = sdsempty();
             } else {
                 (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
