@@ -4579,6 +4579,13 @@ int processPlannedCommand(client *c, int pop) {
     if (handleParseResults(c) != PARSE_OK) return 1;
     if (c->argc == 0) return C_OK;
     if (replApplyDefer(c)) {
+        /* Replicated client, command deferred to an apply lane: processCommand
+         * never ran, so c->cmd is NULL. The lane parse assigned c->slot, which
+         * upstream never does for a client that must be obeyed (no cluster
+         * redirection), and commandProcessed's slot-stats hook would then
+         * dereference c->cmd->proc. Clear the slot: replicated bytes are not
+         * user traffic and are not accounted per slot upstream either. */
+        c->slot = -1;
         commandProcessed(c);
         return canParseCommand(c) ? C_OK : 1;
     }
