@@ -13,6 +13,7 @@
 #include "bgiteration.h"
 #include "hotkeys.h"
 #include "throttle.h"
+#include "cluster_slot_stats.h"
 #include "module.h"
 
 
@@ -599,13 +600,9 @@ int replApplyDefer(client *c) {
     c->argv_len_sum = 0;
     c->commands_processed++;
 
-    /* Every caller follows a deferral with commandProcessed(c) and processCommand
-     * never ran, so c->cmd is NULL. The parse assigned c->slot, which upstream
-     * never does for a client that must be obeyed (no cluster redirection), and
-     * the slot-stats hook in commandProcessed would dereference c->cmd->proc.
-     * Clear the slot here so all three deferral sites are covered: replicated
-     * bytes are not user traffic and are not accounted per slot upstream. */
-    c->slot = -1;
+    /* commandProcessed() follows, with c->cmd NULL since processCommand never ran. c->slot stays as the
+     * parse assigned it so the slot-stats hook accounts the command's bytes to its slot, as call() does
+     * on the main path; the lane accounts the CPU time. */
 
     if (ra_pending >= 16384) replApplyFlush(c);
     return 1;
@@ -641,7 +638,27 @@ void replApplyRunLane(int tid) {
     if (!l->len) return;
     repl_apply_in_lane = 1;
     monotime start = getMonotonicUs();
-    for (int i = 0; i < l->len; i++) replApplyOne(&l->ops[i]);
+    if (server.cluster_enabled && server.cluster_slot_stats_enabled) {
+        /* Per-slot CPU, as call() accounts it on the main path. In cluster mode op->shard is the slot and
+         * one slot maps to one lane, so no two threads touch the same counter. A lane op is sub-microsecond,
+         * so count nanoseconds and credit whole microseconds as they accrue (a sub-microsecond residue
+         * may land on the next op's slot); the final residual rounds up once so a lone op is not free. */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t prev = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec, carry = 0;
+        for (int i = 0; i < l->len; i++) {
+            replApplyOne(&l->ops[i]);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+            carry += now - prev;
+            prev = now;
+            clusterSlotStatsAddCpuDurationForSlot(l->ops[i].shard, carry / 1000);
+            carry %= 1000;
+        }
+        if (carry && l->len) clusterSlotStatsAddCpuDurationForSlot(l->ops[l->len - 1].shard, 1);
+    } else {
+        for (int i = 0; i < l->len; i++) replApplyOne(&l->ops[i]);
+    }
     l->usec = getMonotonicUs() - start;
     repl_apply_in_lane = 0;
 }
