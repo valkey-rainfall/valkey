@@ -599,6 +599,14 @@ int replApplyDefer(client *c) {
     c->argv_len_sum = 0;
     c->commands_processed++;
 
+    /* Every caller follows a deferral with commandProcessed(c) and processCommand
+     * never ran, so c->cmd is NULL. The parse assigned c->slot, which upstream
+     * never does for a client that must be obeyed (no cluster redirection), and
+     * the slot-stats hook in commandProcessed would dereference c->cmd->proc.
+     * Clear the slot here so all three deferral sites are covered: replicated
+     * bytes are not user traffic and are not accounted per slot upstream. */
+    c->slot = -1;
+
     if (ra_pending >= 16384) replApplyFlush(c);
     return 1;
 }
