@@ -83,6 +83,17 @@ typedef struct fpThread {
     size_t sa_used;
     struct fpSplit **splits;
     int nsplits, splits_cap;
+    /* Throttle budget of this iteration's read phase. Main sets thr_budget before the read phase
+     * (fpThrottlePublish) and settles all three after it; the thread spends thr_budget per write
+     * command it harvests (negative = overshoot of the client it was already reading), counts the
+     * writes, and counts the clients it held back for lack of budget. */
+    long long thr_budget, thr_writes, thr_deferred;
+    /* fds this thread left unread for lack of budget. Posting them back to the poller at once would
+     * make the next buffer non-empty, so the loop would run iteration after iteration without sleeping
+     * (and keep running the barrier at full CPU) while the bucket refills. The thread parks them here
+     * and main re-posts them between phases once there is budget again (fpThrottlePublish). */
+    int *thr_parked;
+    int thr_nparked, thr_parked_cap;
 } fpThread;
 
 /* A multi-key command whose keys belong to several lanes runs as one part per lane, each with the keys
@@ -180,6 +191,21 @@ static _Thread_local fpLane *fp_cur_lane = NULL;
 static int fp_lanes_iter = 0; /* this iteration's entries are sorted into lanes */
 static int fp_nlanes = 0;     /* lanes of this iteration */
 static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
+/* Throttle budget of the read phase (fpThrottlePublish). A throttler's bucket, queue and timer are
+ * main's; the read phase is the IO threads'. So main draws this iteration's tokens from the strictest
+ * bucket before the read phase and hands every reading thread an equal guaranteed share; what the
+ * shares do not cover sits in fp_thr_pool, from which a thread that spent its share takes a chunk at
+ * a time. A thread with no budget left stops reading its clients (the fd is requeued for the next
+ * iteration) but still finishes the client it had started: at most one read of overshoot per client.
+ * Tokens nobody spent carry into the next publish, and an overshoot is paid back from it. Main writes
+ * these between phases; the threads read fp_thr_on and fp_thr_chunk and race only on fp_thr_pool. */
+static int fp_thr_on = 0;                  /* this iteration's read phase is budgeted */
+static long long fp_thr_chunk = 1;         /* what a thread takes from the pool at a time */
+static _Atomic long long fp_thr_pool = 0;  /* shared remainder of this iteration's tokens */
+static long long fp_thr_carry = 0;         /* tokens handed out and not spent, less overshoot */
+static long long fp_thr_debt = 0;          /* overshoot not yet paid back from later tokens */
+static long long fp_stat_thr_deferred = 0; /* client reads held back for lack of budget, cumulative */
+static long long fp_stat_thr_tokens = 0;   /* tokens taken from the bucket for lane budgets, cumulative */
 /* Main writes these before each write phase; the lanes read them in it. */
 typedef struct fpSegPart {
     int tid;
@@ -330,6 +356,7 @@ void fastpathInitThread(int tid) {
 }
 
 /* Destruction preconditions: no batch or leaving client may still name this thread. */
+static void fpThrottleRepost(fpThread *t);
 void fastpathFreeThread(int tid) {
     fpThread *t = &fp_threads[tid];
     if (!t->ready) return;
@@ -344,6 +371,10 @@ void fastpathFreeThread(int tid) {
     for (int l = 0; l < FP_MAX_LANES; l++) zfree(t->lane_ents[l]);
     zfree(t->barriers);
     zfree(t->seg_count);
+    fpThrottleRepost(t); /* its parked clients are read by whoever remains */
+    zfree(t->thr_parked);
+    t->thr_parked = NULL;
+    t->thr_parked_cap = 0;
     while (t->nfree > 0) {
         cmdBatch *b = t->freelist[--t->nfree];
         zfree(b->arena);
@@ -362,12 +393,12 @@ void fastpathFreeThread(int tid) {
 }
 
 /* Server-wide conditions that keep every client off the fast path for a while and then lift again:
- * a client pause, a forkless save, a replication throttler. None of them is about the client, so a
- * client turned away by one of these keeps fp_readmit and rejoins once the gate lifts. */
+ * a client pause, a forkless save. None of them is about the client, so a client turned away by one
+ * of these keeps fp_readmit and rejoins once the gate lifts. A replication throttler is not a gate:
+ * the read phase admits writes against its budget (fpThrottlePublish). */
 static int fpGlobalGate(void) {
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 1; /* paused clients are postponed on main */
     if (bgIteration_iterationActive()) return 1;                                        /* a forkless save may block commands on keys in use */
-    if (throttle_anyThrottlers()) return 1;                                             /* a throttler may hold a command; main runs the check */
     return 0;
 }
 
@@ -799,6 +830,11 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->frames_wrap = 0;
     e->part = e->part_extra = 0;
     e->split = NULL;
+    if (fp_thr_on && fpDepth() == 0 && (cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE))) {
+        fpThread *t = &fp_threads[fp_cur_tid];
+        t->thr_budget--; /* may go negative: the client was already being read when the share ran out */
+        t->thr_writes++;
+    }
     if (fp_lanes_iter && fpDepth() == 0) fpClassify(&fp_threads[fp_cur_tid], fp_cur_tid, b, e, c);
     c->fp_inflight++;
 }
@@ -1242,7 +1278,7 @@ static int fpMustRunOnMain(void) {
     if (server.failover_state != NO_FAILOVER) return 1;                                 /* coordinated failover owns writes */
     if (moduleHasCommandFilters()) return 1;                                            /* a filter may rewrite argv, which the executor borrows */
     if (bgIteration_iterationActive()) return 1;                                        /* a forkless save may block it on a key in use */
-    if (throttle_anyThrottlers()) return 1;                                             /* a throttler may hold the command */
+    /* A throttler does not send it to main: the read phase admitted it against the throttle budget. */
     if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
         !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS))
         return 1; /* a yielding module postpones commands until it returns */
@@ -1515,10 +1551,12 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_lane_phases:%lld\r\n"
                          "fastpath_write_lane_entries:%lld\r\n"
                          "fastpath_write_barriers:%lld\r\n"
-                         "fastpath_write_serial_segments:%lld\r\n",
+                         "fastpath_write_serial_segments:%lld\r\n"
+                         "fastpath_throttle_deferred_reads:%lld\r\n"
+                         "fastpath_throttle_tokens:%lld\r\n",
                          fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments);
+                         fp_stat_serial_segments, fp_stat_thr_deferred, fp_stat_thr_tokens);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1539,6 +1577,7 @@ void fastpathStagedSetDepth(int depth) {
 }
 
 static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity affinity);
+static int fpThrottleAdmit(fpThread *t);
 
 /* Main, between phases or in the write phase. */
 int fastpathAttach(client *c) {
@@ -1551,6 +1590,7 @@ int fastpathAttach(client *c) {
     c->flag.fastpath = 1;
     c->fp_inflight = 0;
     c->fp_held = 0;
+    c->fp_throttle_held = 0;
     c->fp_out = NULL;
     listInitNode(&c->fp_stage_node, c);
     listInitNode(&c->io_owner_node, c);
@@ -1591,7 +1631,22 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
         if (fpFlushOut(t, c)) fpEnableWriteInterest(c, 0);
         if (c->control->lifecycle != FP_ACTIVE) return;
     }
-    if (mask & POLLER_READABLE) fpRead(t, tid, c);
+    if (!(mask & POLLER_READABLE)) return;
+    /* Throttled: a thread out of budget leaves the client's bytes in the socket and parks the fd;
+     * main re-posts it once there is budget. Nothing is parsed, so the client's order is untouched;
+     * it only waits. */
+    if (fp_thr_on && fpDepth() == 0 && !fpThrottleAdmit(t)) {
+        if (t->thr_nparked == t->thr_parked_cap) {
+            t->thr_parked_cap = t->thr_parked_cap ? t->thr_parked_cap * 2 : 64;
+            t->thr_parked = zrealloc(t->thr_parked, sizeof(int) * t->thr_parked_cap);
+        }
+        t->thr_parked[t->thr_nparked++] = fd;
+        c->fp_throttle_held = 1;
+        t->thr_deferred++;
+        return;
+    }
+    c->fp_throttle_held = 0;
+    fpRead(t, tid, c);
 }
 
 /* Read phase, on each IO thread and on main (tid 0): claim ready client fds until none are left, then
@@ -1636,7 +1691,7 @@ static int fpLanesAllowed(void) {
     if (server.paused_actions || listLength(server.monitors)) return 0;
     if (!trackingIsIdle()) return 0;
     if (server.notify_keyspace_events || moduleObservesWrites()) return 0;
-    if (bgIteration_iterationActive() || throttle_anyThrottlers()) return 0;
+    if (bgIteration_iterationActive()) return 0; /* a throttler is not a reason: lane writes were budgeted at read */
     if (server.maxmemory || server.maxmemory_clients) return 0;
     /* A module can block a client on any key and wake it by its own rules. */
     if (server.blocked_clients_by_type[BLOCKED_MODULE]) return 0;
@@ -1648,8 +1703,110 @@ static int fpLanesAllowed(void) {
     return 1;
 }
 
+/* Main, between phases: post a thread's parked fds back to the poller so the next read phase claims
+ * them again. A client freed meanwhile has deregistered its fd (pollerRequeue ignores it) or the fd
+ * now belongs to a new registration, which gets one spurious level-triggered readable: harmless. */
+static void fpThrottleRepost(fpThread *t) {
+    poller *p = stagedPoller();
+    for (int i = 0; i < t->thr_nparked; i++) pollerRequeue(p, t->thr_parked[i], POLLER_READABLE);
+    t->thr_nparked = 0;
+}
+
+static int fp_thr_parked_total = 0; /* main: parked fds left waiting for budget after the last publish */
+
+/* Main, before sleeping: how long until budget for a parked client may exist, in us; -1 if nothing is
+ * parked or no budget will come (no throttler, or a halted rate the policy loop must lift first). */
+long long fastpathThrottleWakeUs(void) {
+    if (!fp_thr_parked_total) return -1;
+    long long us = throttle_usUntilTokens(fp_thr_debt + 1); /* the debt is paid before anything is admitted */
+    return us < 0 ? -1 : us;
+}
+
+/* Main, before the read phase: settle the previous iteration's budget and publish this one's. The
+ * bucket is drawn down by at most 100 ms of the strictest rate per iteration (the bucket's own burst
+ * window) so the budget never outruns the policy loop, which adjusts the rate every 100 ms. Unspent
+ * tokens carry over, bounded to the same window, so a quiet iteration does not bank a later burst. */
+static void fpThrottlePublish(void) {
+    long long left = 0, writes = 0, deferred = 0;
+    int parked = 0;
+    if (fp_thr_on) {
+        left = atomic_load_explicit(&fp_thr_pool, memory_order_relaxed);
+        for (int tid = 0; tid < fp_slots; tid++) {
+            fpThread *t = &fp_threads[tid];
+            left += t->thr_budget; /* negative: the thread overshot on the client it was reading */
+            writes += t->thr_writes;
+            deferred += t->thr_deferred;
+            parked += t->thr_nparked;
+            t->thr_writes = t->thr_deferred = 0;
+        }
+        left -= fp_thr_debt; /* overshoot from earlier iterations, still owed */
+        fp_thr_debt = 0;
+        if (left < 0) {
+            fp_thr_debt = -left;
+            left = 0;
+        }
+        fp_stat_thr_deferred += deferred;
+        throttle_recordIncoming(writes);
+        throttle_setLaneDeferredClients((int)deferred);
+    }
+    if (!throttle_anyThrottlers()) {
+        if (fp_thr_on) throttle_setLaneDeferredClients(0);
+        fp_thr_on = 0;
+        fp_thr_carry = fp_thr_debt = 0;
+        for (int tid = 0; tid < fp_slots; tid++) fpThrottleRepost(&fp_threads[tid]); /* no budget needed any more */
+        fp_thr_parked_total = 0;
+        return;
+    }
+    long long window = (long long)(throttle_strictestRate() / 10.0); /* 100 ms of the rate */
+    if (window < 1) window = 1;
+    long long take = throttle_takeTokens(window);
+    fp_stat_thr_tokens += take;
+    long long total = left + take - fp_thr_debt; /* new tokens pay the debt first */
+    if (total < 0) {
+        fp_thr_debt = -total;
+        total = 0;
+    } else {
+        fp_thr_debt = 0;
+    }
+    if (total > window) total = window;
+    fp_thr_carry = total;
+    int n = fp_slots;
+    long long share = total / n;
+    long long pool = total - share * n;
+    for (int tid = 0; tid < n; tid++) fp_threads[tid].thr_budget = share;
+    /* A thread past its share takes the pool in chunks the size of a share, or, when shares are zero
+     * because the rate is low, one token at a time so every thread can still make progress. */
+    fp_thr_chunk = share > 0 ? share : 1;
+    atomic_store_explicit(&fp_thr_pool, pool, memory_order_relaxed);
+    fp_thr_on = 1;
+    /* Parked clients come back only when there is something to admit them with; otherwise they stay
+     * parked, the loop sleeps (fastpathThrottleWakeUs bounds the sleep) and nothing spins. */
+    if (total > 0) {
+        for (int tid = 0; tid < n; tid++) fpThrottleRepost(&fp_threads[tid]);
+        parked = 0;
+    }
+    fp_thr_parked_total = parked;
+}
+
+/* Reading thread: may it read another client? Yes while its share lasts; past that it takes a chunk
+ * of the shared pool. 0 means the client's fd is requeued for the next iteration unread. */
+static int fpThrottleAdmit(fpThread *t) {
+    if (t->thr_budget > 0) return 1;
+    long long cur = atomic_load_explicit(&fp_thr_pool, memory_order_relaxed);
+    while (cur > 0) {
+        long long take = cur < fp_thr_chunk ? cur : fp_thr_chunk;
+        if (atomic_compare_exchange_weak_explicit(&fp_thr_pool, &cur, cur - take, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            t->thr_budget += take;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void fastpathStagedPrepareLanes(void) {
     int n = 0;
+    if (fpDepth() == 0) fpThrottlePublish();
     if (fpDepth() == 0 && server.io_threads_parallel_writes) {
         fpMarkLaneCommands();
         n = stagedWorkerCount() + stagedMainTakesLane();

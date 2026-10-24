@@ -1569,6 +1569,7 @@ typedef struct client {
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     int8_t fp_conn_type;                  /* Fast path: origin connection type (CONN_TYPE_*) captured at admission, copied into each command entry */
+    uint8_t fp_throttle_held;             /* Fast path: the last read phase left this client unread for lack of throttle budget (IO thread writes it in the read phase; main reads it between phases, for CLIENT LIST) */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
     struct ClientControl *control;        /* Fast-path control: allocated at the first fast-path admission, reclaimed at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of

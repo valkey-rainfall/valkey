@@ -48,4 +48,9 @@ bool tokenBucket_tryConsume(tokenBucket *bucket, double tokens, bool force_consu
  * Returns 0 if already available, or -1 if rate is 0 (never reached). */
 double tokenBucket_msUntilAvailable(tokenBucket *bucket, double tokens);
 
+/* Consume up to max_tokens of what is available now, in whole tokens, and return the amount taken (0
+ * when less than one token is available or the bucket is in debt). Never drives the bucket negative;
+ * fractions stay in the bucket and accumulate, so a low rate still yields a token per period. */
+double tokenBucket_consumeUpTo(tokenBucket *bucket, double max_tokens);
+
 #endif

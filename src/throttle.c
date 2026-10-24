@@ -305,6 +305,55 @@ bool throttle_anyThrottlers(void) {
     return throttler_list != NULL && listLength(throttler_list) > 0;
 }
 
+/* The live throttler with the lowest rate, or NULL. Without a client there is no criteria to apply, so
+ * the lane budget is drawn from the strictest throttler of all: a write admitted on a lane is one every
+ * installed throttler would have had to pass. */
+static throttler *strictestThrottler(void) {
+    if (!throttle_anyThrottlers()) return NULL;
+    throttler *strictest = NULL;
+    listNode *ln;
+    listIter li;
+    listRewind(throttler_list, &li);
+    while ((ln = listNext(&li))) {
+        throttler *t = ln->value;
+        if (t->cleanup) continue;
+        if (strictest == NULL || tokenBucket_getRate(t->bucket) < tokenBucket_getRate(strictest->bucket)) strictest = t;
+    }
+    return strictest;
+}
+
+static int lane_deferred_clients = 0;
+
+long long throttle_takeTokens(long long max_tokens) {
+    throttler *t = strictestThrottler();
+    if (!t || max_tokens <= 0) return 0;
+    return (long long)tokenBucket_consumeUpTo(t->bucket, (double)max_tokens);
+}
+
+double throttle_strictestRate(void) {
+    throttler *t = strictestThrottler();
+    return t ? tokenBucket_getRate(t->bucket) : 0.0;
+}
+
+long long throttle_usUntilTokens(long long n) {
+    throttler *t = strictestThrottler();
+    if (!t) return -1;
+    double ms = tokenBucket_msUntilAvailable(t->bucket, (double)(n < 1 ? 1 : n));
+    if (ms < 0) return -1;
+    long long us = (long long)(ms * 1000.0) + 1; /* round up: waking a hair late beats waking early and finding nothing */
+    return us;
+}
+
+void throttle_recordIncoming(long long n) {
+    throttler *t = strictestThrottler();
+    if (!t || n <= 0) return;
+    tpsCalculator_record(t->metrics->incoming_tps, (unsigned long)n);
+}
+
+void throttle_setLaneDeferredClients(int n) {
+    lane_deferred_clients = n;
+}
+
 bool throttle_throttleClientIfNeeded(client *c) {
     /* Skip internal clients and clients already checked for this command.
      * Prevents re-throttling after unblocking. */
@@ -353,7 +402,7 @@ bool throttle_throttleClientIfNeeded(client *c) {
 void throttle_getMetrics(const char *metrics_name, throttleMetrics *metrics) {
     metricsEntry *m = findMetrics(metrics_name);
 
-    metrics->num_clients_throttled = m->num_clients_throttled;
+    metrics->num_clients_throttled = m->num_clients_throttled + lane_deferred_clients;
     metrics->num_commands_throttled = m->num_commands_throttled;
     metrics->incoming_tps = tpsCalculator_averageTps(m->incoming_tps);
     metrics->ops_per_sec = 0.0;

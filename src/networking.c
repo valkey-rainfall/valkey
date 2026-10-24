@@ -430,6 +430,7 @@ client *createClient(connection *conn) {
     c->throttler = NULL;
     c->throttle_node = NULL;
     c->throttle_start = 0;
+    c->fp_throttle_held = 0;
     c->cob_trend = NULL;
     c->bstate = NULL;
     c->pubsub_data = NULL;
@@ -5274,7 +5275,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (client->flag.readonly) *p++ = 'r';
     if (client->flag.no_evict) *p++ = 'e';
     if (client->flag.no_touch) *p++ = 'T';
-    if (client->flag.throttled) *p++ = 'h';
+    if (client->flag.throttled || client->fp_throttle_held) *p++ = 'h';
     if (client->flag.import_source) *p++ = 'I';
     if (client->slot_migration_job && isImportSlotMigrationJob(client->slot_migration_job)) *p++ = 'i';
     if (client->slot_migration_job && !isImportSlotMigrationJob(client->slot_migration_job)) *p++ = 'E';
@@ -5958,7 +5959,7 @@ static int clientMatchesFlagFilter(client *c, sds flag_filter) {
             if (!c->flag.no_touch) return 0;
             break;
         case 'h': /* client is throttled */
-            if (!c->flag.throttled) return 0;
+            if (!c->flag.throttled && !c->fp_throttle_held) return 0;
             break;
         case 'I': /* Import source flag */
             if (!c->flag.import_source) return 0;

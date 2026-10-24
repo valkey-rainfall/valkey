@@ -122,6 +122,10 @@ void fastpathStagedAdoptClients(void);
 #define FP_MAX_LANES 64 /* write lanes; more IO threads than this leave the rest idle in the write phase */
 /* Main, before the read phase: decide whether this iteration's entries are sorted into write lanes. */
 void fastpathStagedPrepareLanes(void);
+/* Main, before sleeping: us until a client parked for lack of throttle budget may be readmitted; -1 if
+ * none is parked or no budget is coming. Bounds the loop's sleep so parked clients are not left until
+ * some unrelated fd fires. */
+long long fastpathThrottleWakeUs(void);
 /* Main, after the read phase: the write phase will run lane phases on the IO threads. */
 int fastpathStagedLanesWillRun(void);
 /* Thread tid (0 = main): run its lane of the current write segment. */

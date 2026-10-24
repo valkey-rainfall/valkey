@@ -116,6 +116,22 @@ bool throttle_throttleClientIfNeeded(client *c);
 /* Any throttler is registered. */
 bool throttle_anyThrottlers(void);
 
+/* Lane budgets (fastpath.c). The staged read phase admits write commands against a budget main takes
+ * from the strictest throttler's bucket ahead of each iteration, instead of parking each client in the
+ * throttler's queue on main. Main only, between phases. */
+/* Take up to max_tokens from the strictest live throttler's bucket; 0 when none is installed. */
+long long throttle_takeTokens(long long max_tokens);
+/* Rate of the strictest live throttler, ops/s; 0 when none is installed. */
+double throttle_strictestRate(void);
+/* Microseconds until the strictest live throttler's bucket holds n tokens (at least 1); 0 if it does
+ * now, -1 when no throttler is installed or the rate is halted (none will come without a rate change). */
+long long throttle_usUntilTokens(long long n);
+/* Count n write commands admitted on lanes as incoming traffic of the strictest throttler, so a rate
+ * reduction toward the measured incoming rate sees the lane traffic too. */
+void throttle_recordIncoming(long long n);
+/* Clients whose reads the lanes held back in the last iteration; reported with the queued clients. */
+void throttle_setLaneDeferredClients(int n);
+
 /* Get the metrics associated with a given metrics name.
  * The caller provides the metrics structure. */
 void throttle_getMetrics(const char *metrics_name, throttleMetrics *metrics);
