@@ -121,6 +121,10 @@ bool throttle_anyThrottlers(void);
  * throttler's queue on main. Main only, between phases. */
 /* Take up to max_tokens from the strictest live throttler's bucket; 0 when none is installed. */
 long long throttle_takeTokens(long long max_tokens);
+/* Strictest live throttler's bucket tokens (negative in debt) and queued clients, for INFO; 0/0 when none. */
+void throttle_strictestState(double *tokens, int *queued);
+/* Return n tokens taken with throttle_takeTokens and not spent by the lanes. */
+void throttle_refundTokens(long long n);
 /* Rate of the strictest live throttler, ops/s; 0 when none is installed. */
 double throttle_strictestRate(void);
 /* Microseconds until the strictest live throttler's bucket holds n tokens (at least 1); 0 if it does
@@ -129,8 +133,6 @@ long long throttle_usUntilTokens(long long n);
 /* Count n write commands admitted on lanes as incoming traffic of the strictest throttler, so a rate
  * reduction toward the measured incoming rate sees the lane traffic too. */
 void throttle_recordIncoming(long long n);
-/* Clients whose reads the lanes held back in the last iteration; reported with the queued clients. */
-void throttle_setLaneDeferredClients(int n);
 
 /* Get the metrics associated with a given metrics name.
  * The caller provides the metrics structure. */

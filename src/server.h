@@ -1562,6 +1562,8 @@ typedef struct client {
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
     uint32_t fp_inflight;                 /* Fast path: commands of this client batched for main and not yet replied */
+    uint8_t fp_thr_stop;                  /* Fast path, IO thread only: this read stopped at a write with no throttle budget; the leave rejoins */
+    uint8_t fp_thr_writer;                /* Fast path, IO thread only: the last read appended a budgeted write; the next read is admitted before parsing */
     uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue */
     sds fp_out;                           /* Fast path: output not yet written */
     listNode io_owner_node;               /* Link in main's list of staged fast-path clients, or of the IO thread a partitioned client is routed to */
@@ -1569,7 +1571,6 @@ typedef struct client {
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     int8_t fp_conn_type;                  /* Fast path: origin connection type (CONN_TYPE_*) captured at admission, copied into each command entry */
-    uint8_t fp_throttle_held;             /* Fast path: the last read phase left this client unread for lack of throttle budget (IO thread writes it in the read phase; main reads it between phases, for CLIENT LIST) */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
     struct ClientControl *control;        /* Fast-path control: allocated at the first fast-path admission, reclaimed at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -2107,6 +2108,7 @@ struct valkeyServer {
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
+    int io_threads_throttle_lane_share;       /* Percent of a throttler's rate reserved for writes admitted on the fast path; the rest serves main's queue */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */

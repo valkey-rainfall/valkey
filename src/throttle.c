@@ -322,12 +322,34 @@ static throttler *strictestThrottler(void) {
     return strictest;
 }
 
-static int lane_deferred_clients = 0;
-
 long long throttle_takeTokens(long long max_tokens) {
     throttler *t = strictestThrottler();
     if (!t || max_tokens <= 0) return 0;
+    /* Two consumers share this bucket: the lanes, drawing a window at a time here, and main's queue,
+     * drawing one unit per released client from its timer. With nothing queued on main the lanes may
+     * take everything available. With a queue, they leave main its share of what the bucket holds:
+     * neither side waits for the other's queue to empty (a queue that is never empty would starve the
+     * other side for good), and both advance in the configured proportion. */
+    if (listLength(t->client_queue) > 0) {
+        double avail = tokenBucket_getTokens(t->bucket) * server.io_threads_throttle_lane_share / 100.0;
+        if (avail < 1.0) return 0;
+        if ((double)max_tokens > avail) max_tokens = (long long)avail;
+    }
     return (long long)tokenBucket_consumeUpTo(t->bucket, (double)max_tokens);
+}
+
+void throttle_strictestState(double *tokens, int *queued) {
+    throttler *t = strictestThrottler();
+    *tokens = t ? tokenBucket_getTokens(t->bucket) : 0.0;
+    *queued = t ? (int)listLength(t->client_queue) : 0;
+}
+
+void throttle_refundTokens(long long n) {
+    throttler *t = strictestThrottler();
+    if (!t || n <= 0) return;
+    tokenBucket_refund(t->bucket, (double)n);
+    /* A queue waiting on an empty bucket is woken by its timer at the rate's cadence; the refund may
+     * let it release sooner, which the timer picks up on its next tick. */
 }
 
 double throttle_strictestRate(void) {
@@ -348,10 +370,6 @@ void throttle_recordIncoming(long long n) {
     throttler *t = strictestThrottler();
     if (!t || n <= 0) return;
     tpsCalculator_record(t->metrics->incoming_tps, (unsigned long)n);
-}
-
-void throttle_setLaneDeferredClients(int n) {
-    lane_deferred_clients = n;
 }
 
 bool throttle_throttleClientIfNeeded(client *c) {
@@ -402,7 +420,7 @@ bool throttle_throttleClientIfNeeded(client *c) {
 void throttle_getMetrics(const char *metrics_name, throttleMetrics *metrics) {
     metricsEntry *m = findMetrics(metrics_name);
 
-    metrics->num_clients_throttled = m->num_clients_throttled + lane_deferred_clients;
+    metrics->num_clients_throttled = m->num_clients_throttled;
     metrics->num_commands_throttled = m->num_commands_throttled;
     metrics->incoming_tps = tpsCalculator_averageTps(m->incoming_tps);
     metrics->ops_per_sec = 0.0;

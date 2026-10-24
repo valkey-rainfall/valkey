@@ -430,7 +430,6 @@ client *createClient(connection *conn) {
     c->throttler = NULL;
     c->throttle_node = NULL;
     c->throttle_start = 0;
-    c->fp_throttle_held = 0;
     c->cob_trend = NULL;
     c->bstate = NULL;
     c->pubsub_data = NULL;
@@ -2682,6 +2681,10 @@ void beforeNextClient(client *c) {
      * So whenever we change the code here we need to consider if we need this change on module
      * blocked client as well */
 
+    /* Rejoined the fast path mid-pipeline (processInputBufferLoop): its buffer, replies and read
+     * interest are the IO threads' from here. */
+    if (c->flag.fastpath) return;
+
     /* Trim the query buffer to the current position. */
     if (isReplicatedClient(c)) {
         /* If the client is replicated, trim the querybuf to repl_applied,
@@ -4874,6 +4877,13 @@ static int processInputBufferLoop(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
+        /* A fast-path client sent here for throttle budget (fp_readmit) goes back as soon as main has run
+         * what it came with; the rest of its pipeline is parsed and paced on the fast path. Done before
+         * parsing the next command, which would otherwise be main's to run (and to queue again). */
+        if (c->flag.fp_readmit && c->argc == 0 && !c->flag.pending_command &&
+            c->cmd_queue.off >= c->cmd_queue.len && fastpathReadmitAuthenticated(c))
+            return C_OK;
+
         if (!canParseCommand(c)) {
             break;
         }
@@ -5275,7 +5285,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (client->flag.readonly) *p++ = 'r';
     if (client->flag.no_evict) *p++ = 'e';
     if (client->flag.no_touch) *p++ = 'T';
-    if (client->flag.throttled || client->fp_throttle_held) *p++ = 'h';
+    if (client->flag.throttled) *p++ = 'h';
     if (client->flag.import_source) *p++ = 'I';
     if (client->slot_migration_job && isImportSlotMigrationJob(client->slot_migration_job)) *p++ = 'i';
     if (client->slot_migration_job && !isImportSlotMigrationJob(client->slot_migration_job)) *p++ = 'E';
@@ -5959,7 +5969,7 @@ static int clientMatchesFlagFilter(client *c, sds flag_filter) {
             if (!c->flag.no_touch) return 0;
             break;
         case 'h': /* client is throttled */
-            if (!c->flag.throttled && !c->fp_throttle_held) return 0;
+            if (!c->flag.throttled) return 0;
             break;
         case 'I': /* Import source flag */
             if (!c->flag.import_source) return 0;

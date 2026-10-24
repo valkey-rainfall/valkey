@@ -90,3 +90,14 @@ double tokenBucket_consumeUpTo(tokenBucket *bucket, double max_tokens) {
     bucket->token_count -= take;
     return take;
 }
+
+double tokenBucket_getTokens(tokenBucket *bucket) {
+    replenishTokenBucket(bucket);
+    return bucket->token_count;
+}
+
+void tokenBucket_refund(tokenBucket *bucket, double tokens) {
+    replenishTokenBucket(bucket);
+    bucket->token_count += tokens;
+    trimTokenBucket(bucket); /* a refund never exceeds what the bucket could have held */
+}
