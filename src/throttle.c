@@ -367,9 +367,16 @@ long long throttle_usUntilTokens(long long n) {
 }
 
 void throttle_recordIncoming(long long n) {
+    if (n <= 0 || metrics_table == NULL) return;
     throttler *t = strictestThrottler();
-    if (!t || n <= 0) return;
-    tpsCalculator_record(t->metrics->incoming_tps, (unsigned long)n);
+    if (t) {
+        tpsCalculator_record(t->metrics->incoming_tps, (unsigned long)n);
+        return;
+    }
+    /* No throttler installed: the lanes' writes are replication traffic all the same, and the replication
+     * throttler's first rate cut after install is clamped to this measurement. Its metrics entry outlives
+     * the throttler (findMetrics by name), so the window is warm when it installs. */
+    tpsCalculator_record(findMetrics("repl_throttle")->incoming_tps, (unsigned long)n);
 }
 
 bool throttle_throttleClientIfNeeded(client *c) {

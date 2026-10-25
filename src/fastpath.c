@@ -218,7 +218,8 @@ static long long fp_thr_debt = 0;          /* overshoot not yet paid back from l
 static long long fp_stat_thr_stops = 0;    /* writes sent to main's throttle queue for lack of budget, cumulative */
 static long long fp_stat_thr_parked = 0;   /* writer reads left in the socket for lack of budget, cumulative */
 static int fp_thr_parked_total = 0;        /* main: parked fds left waiting for budget after the last publish */
-static long long fp_stat_thr_tokens = 0;   /* tokens taken from the bucket for lane budgets, cumulative */
+static long long fp_stat_thr_tokens = 0;   /* tokens taken from the bucket for lane budgets, net of refunds, cumulative */
+#define FP_THR_REPOST_WRITES_PER_READ 4    /* writes one re-posted parked writer is assumed to spend in its next read */
 /* Main writes these before each write phase; the lanes read them in it. */
 typedef struct fpSegPart {
     int tid;
@@ -370,6 +371,7 @@ void fastpathInitThread(int tid) {
 
 /* Destruction preconditions: no batch or leaving client may still name this thread. */
 static void fpThrottleRepost(fpThread *t);
+static int fpThrottleRepostN(fpThread *t, long long k);
 void fastpathFreeThread(int tid) {
     fpThread *t = &fp_threads[tid];
     if (!t->ready) return;
@@ -843,10 +845,10 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->frames_wrap = 0;
     e->part = e->part_extra = 0;
     e->split = NULL;
-    if (fp_thr_on && fpDepth() == 0 && (cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE))) {
+    if (fpDepth() == 0 && (cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE))) {
         fpThread *t = &fp_threads[fp_cur_tid];
-        t->thr_budget--; /* fpThrottleStop found budget for it */
-        t->thr_writes++;
+        if (fp_thr_on) t->thr_budget--; /* fpThrottleStop found budget for it */
+        t->thr_writes++;                /* counted even unthrottled: the incoming rate a throttler starts from */
     }
     if (fp_lanes_iter && fpDepth() == 0) fpClassify(&fp_threads[fp_cur_tid], fp_cur_tid, b, e, c);
     c->fp_inflight++;
@@ -1762,16 +1764,25 @@ static int fpLanesAllowed(void) {
 static void fpThrottlePublish(void) {
     long long left = 0, writes = 0, stops = 0, parked_reads = 0;
     int parked = 0;
+    for (int tid = 0; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        writes += t->thr_writes;
+        t->thr_writes = 0;
+    }
+    /* Lane writes feed the incoming-rate measurement whether or not a throttler is installed. A
+     * throttler's first rate cut is clamped to the measured incoming rate; measured only from main's
+     * path, that rate is near zero when the lanes carry the traffic, and the cut would halt writes for
+     * the seconds the policy loop needs to climb back (observed: 6 M -> 16 K ops/s for ~10 s). */
+    throttle_recordIncoming(writes);
     if (fp_thr_on) {
         left = atomic_load_explicit(&fp_thr_pool, memory_order_relaxed);
         for (int tid = 0; tid < fp_slots; tid++) {
             fpThread *t = &fp_threads[tid];
             left += t->thr_budget; /* negative: an admitted writer's read overshot */
-            writes += t->thr_writes;
             stops += t->thr_stops;
             parked_reads += t->thr_parked_reads;
             parked += t->thr_nparked;
-            t->thr_writes = t->thr_stops = t->thr_parked_reads = 0;
+            t->thr_stops = t->thr_parked_reads = 0;
         }
         left -= fp_thr_debt; /* overshoot from earlier iterations, still owed */
         fp_thr_debt = 0;
@@ -1781,7 +1792,6 @@ static void fpThrottlePublish(void) {
         }
         fp_stat_thr_stops += stops;
         fp_stat_thr_parked += parked_reads;
-        throttle_recordIncoming(writes);
     }
     if (!throttle_anyThrottlers()) {
         fp_thr_on = 0;
@@ -1801,6 +1811,7 @@ static void fpThrottlePublish(void) {
      * capacity, so a quiet iteration cannot bank a later burst. */
     if (left > 0) {
         throttle_refundTokens(left);
+        fp_stat_thr_tokens -= left;
         left = 0;
     }
     /* Draw the window less the debt still owed (the draw pays it first). */
@@ -1825,10 +1836,15 @@ static void fpThrottlePublish(void) {
     atomic_store_explicit(&fp_thr_pool, pool, memory_order_relaxed);
     fp_thr_on = 1;
     /* Parked writers come back only when there is something to admit them with; otherwise they stay
-     * parked, the loop sleeps (fastpathThrottleWakeUs bounds the sleep) and nothing spins. */
+     * parked, the loop sleeps (fastpathThrottleWakeUs bounds the sleep) and nothing spins. With budget,
+     * only as many come back as a read each could spend (one pipelined read is at least a few writes),
+     * oldest first; the rest wait for a later publish. Re-posting every parked fd when the budget covers
+     * a fraction of them made the read phase park most of them again at once: 3 parks per useful read in
+     * a 2400-client storm. */
     if (total > 0) {
-        for (int tid = 0; tid < n; tid++) fpThrottleRepost(&fp_threads[tid]);
-        parked = 0;
+        long long admit = total / FP_THR_REPOST_WRITES_PER_READ;
+        if (admit < (long long)n) admit = n; /* at least one per thread, or a low rate never reads anyone */
+        for (int tid = 0; tid < n; tid++) parked -= fpThrottleRepostN(&fp_threads[tid], admit / n + 1);
     }
     fp_thr_parked_total = parked;
 }
@@ -1870,6 +1886,16 @@ static void fpThrottleRepost(fpThread *t) {
     poller *p = stagedPoller();
     for (int i = 0; i < t->thr_nparked; i++) pollerRequeue(p, t->thr_parked[i], POLLER_READABLE);
     t->thr_nparked = 0;
+}
+
+/* Main, between phases: post back the oldest k parked fds of a thread; returns how many it posted. */
+static int fpThrottleRepostN(fpThread *t, long long k) {
+    poller *p = stagedPoller();
+    int n = t->thr_nparked < k ? t->thr_nparked : (int)k;
+    for (int i = 0; i < n; i++) pollerRequeue(p, t->thr_parked[i], POLLER_READABLE);
+    if (n > 0 && n < t->thr_nparked) memmove(t->thr_parked, t->thr_parked + n, sizeof(int) * (t->thr_nparked - n));
+    t->thr_nparked -= n;
+    return n;
 }
 
 /* Main, before sleeping: how long until budget for a parked writer may exist, in us; -1 if nothing is
