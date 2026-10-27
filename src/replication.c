@@ -346,26 +346,45 @@ char *replicationGetReplicaName(client *c) {
  * send buffer, so with the kernel default (tcp_wmem max, 4 MB on most hosts)
  * the stream to a lagging replica caps at iterations/s x 4 MB. A larger
  * per-socket buffer raises that cap without a host-wide sysctl on tcp_wmem.
- * The request is still clamped by net.core.wmem_max, so the effective value is
- * logged and a clamp is reported as a warning. 0 leaves the kernel default and
- * autotuning untouched. */
+ *
+ * Setting SO_SNDBUF also stops the kernel autotuning this socket, and the
+ * request is clamped to net.core.wmem_max, so on a host whose wmem_max is
+ * small (208 KB is a common default) the clamped buffer would be far below
+ * what autotuning reaches on its own. Where the host limits are readable, a
+ * request the kernel would clamp below the autotune ceiling is skipped and
+ * the link keeps the kernel default. 0 disables the option entirely. */
 void replicationApplyReplicaSndbuf(client *c) {
     if (server.repl_sndbuf_bytes <= 0) return;
     int requested = (int)server.repl_sndbuf_bytes;
+    int wmem_max = 0, autotune_max = 0;
+    int limits_known = anetSendBufferHostLimits(&wmem_max, &autotune_max) == ANET_OK;
+    if (limits_known) {
+        /* Linux sets the buffer to twice min(request, wmem_max); the kernel
+         * reports that doubled value and autotuning is measured in the same
+         * units. */
+        int clamped = requested < wmem_max ? requested : wmem_max;
+        if (2 * (long long)clamped < autotune_max) {
+            serverLog(LL_WARNING,
+                      "Not setting SO_SNDBUF on replica %s link: net.core.wmem_max %d would clamp the %d request "
+                      "to %d, below the %d autotuning can reach; keeping the kernel default (raise net.core.wmem_max "
+                      "to at least %d)",
+                      replicationGetReplicaName(c), wmem_max, requested, 2 * clamped, autotune_max, requested);
+            return;
+        }
+    }
     int effective = 0;
     if (connSetSendBuffer(c->conn, requested, &effective) != C_OK) {
         serverLog(LL_WARNING, "Could not set SO_SNDBUF to %d on replica %s link: %s", requested,
                   replicationGetReplicaName(c), strerror(errno));
         return;
     }
-    /* Linux reports twice the usable size (the other half is overhead
-     * accounting), so a value below 2 x requested means net.core.wmem_max
-     * clamped the request. */
     if (effective < 2 * requested) {
-        serverLog(LL_WARNING,
-                  "SO_SNDBUF on replica %s link clamped by the kernel: requested %d, kernel reports %d "
-                  "(raise net.core.wmem_max to at least %d)",
-                  replicationGetReplicaName(c), requested, effective, requested);
+        /* Clamped, but still at or above the autotune ceiling (or the limits
+         * were unreadable), so the link is no worse than the default. */
+        serverLog(LL_NOTICE,
+                  "SO_SNDBUF on replica %s link set to %d (requested %d, clamped by net.core.wmem_max; raise it to at "
+                  "least %d for the full request)",
+                  replicationGetReplicaName(c), effective, requested, requested);
     } else {
         serverLog(LL_NOTICE, "SO_SNDBUF on replica %s link set to %d (kernel reports %d)",
                   replicationGetReplicaName(c), requested, effective);
