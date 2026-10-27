@@ -1,0 +1,50 @@
+name: lsan-2604-targeted
+
+# Targeted reproduction of the LeakSanitizer exit hang on ubuntu-26.04 by
+# looping the three test units that actually hit it in the field, each with
+# ptrace_scope=1 then =0 to A/B that knob against the real trigger.
+# One job per unit (parallel). Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-targeted
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    strategy:
+      fail-fast: false
+      matrix:
+        unit:
+          - integration/shutdown
+          - unit/introspection
+          - integration/rdb
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+
+      - name: Build ASan valkey
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config tcl8.6 tclx
+          make -j4 all SANITIZER=address
+
+      - name: Loop ${{ matrix.unit }} x60 (ptrace_scope=1)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=1 2>/dev/null || true
+          chmod +x lsan-probe/unitloop.sh
+          lsan-probe/unitloop.sh "${{ matrix.unit }}" 60 scope1 "$RUNNER_TEMP"
+
+      - name: Loop ${{ matrix.unit }} x60 (ptrace_scope=0)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+          lsan-probe/unitloop.sh "${{ matrix.unit }}" 60 scope0 "$RUNNER_TEMP"
