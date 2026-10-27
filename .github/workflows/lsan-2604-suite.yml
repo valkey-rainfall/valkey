@@ -1,0 +1,66 @@
+name: lsan-2604-suite
+
+# Instrumented full-suite reproduction wave. The only thing shown to exhibit
+# the LeakSanitizer exit hang is the real ./runtest --tags -slow suite under
+# real runner load (~10% per run), so run 12 of them in parallel on
+# ubuntu-26.04 with a watchdog that captures the stuck process state the
+# moment the ptrace warning appears, before the harness kills it.
+# gcc-15 (image default). Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-suite
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1; nproc; free -m | head -2
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+          echo "apparmor_restrict_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config tcl8.6 tclx gdb
+
+      - name: Build ASan valkey
+        run: make -j4 all SANITIZER=address && ./src/valkey-server --version
+
+      - name: Full suite with capture watchdog
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0 2>/dev/null || true   # for gdb capture only; proven not the fix
+          chmod +x lsan-probe/suite_watchdog.sh
+          mkdir -p tests/tmp
+          CAP=$RUNNER_TEMP/captures
+          lsan-probe/suite_watchdog.sh tests/tmp "$CAP" &
+          wd=$!
+          set +e
+          timeout 3000 ./runtest --verbose --tags -slow --dump-logs > $RUNNER_TEMP/runtest.out 2>&1
+          rc=$?
+          set -e
+          sleep 2; kill $wd 2>/dev/null || true
+          echo "===== shard ${{ matrix.shard }} summary ====="
+          echo "runtest exit=$rc"
+          if grep -q "ptrace appears to be blocked" $RUNNER_TEMP/runtest.out tests/tmp -r 2>/dev/null; then
+            echo "REPRODUCED=yes (ptrace/LSan warning seen)"
+          else
+            echo "REPRODUCED=no"
+          fi
+          echo "sanitizer/err lines in runtest.out:"; grep -nE "ptrace appears to be blocked|LeakSanitizer|Sanitizer error|Child exited with signal" $RUNNER_TEMP/runtest.out | head -20 || true
+          echo "===== captures ====="
+          for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
+          echo "(captures: $(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l))"
