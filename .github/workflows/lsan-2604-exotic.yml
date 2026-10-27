@@ -1,0 +1,54 @@
+name: lsan-2604-exotic
+
+# Targeted reproduction of the LeakSanitizer exit hang on ubuntu-26.04, by
+# driving the primary into the exotic exit state the field failures shared
+# (many io-threads + replica mid-full-sync + bgsave fork child + blocked
+# clients + loaded data), then SHUTDOWN. Captures the stuck state with gdb +
+# /proc when it hangs. gcc-15 (image default) vs gcc-13 splits the
+# compiler-vs-kernel confound in one wave. Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-exotic
+
+permissions:
+  contents: read
+
+jobs:
+  exotic:
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc15-default, gcc13]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+          echo "apparmor_restrict_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config gdb
+          if [ "${{ matrix.compiler }}" = "gcc13" ]; then sudo apt-get install -y gcc-13 g++-13; fi
+
+      - name: Build ASan valkey
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc13" ]; then
+            make -j4 all SANITIZER=address CC=gcc-13 CXX=g++-13
+          else
+            make -j4 all SANITIZER=address
+          fi
+          ./src/valkey-server --version
+
+      - name: Exotic exit-state loop x100
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0 2>/dev/null || true   # make gdb capture reliable; not the fix under test
+          chmod +x lsan-probe/exotic_repro.sh
+          lsan-probe/exotic_repro.sh "${{ matrix.compiler }}" 100 src/valkey-server src/valkey-cli "$RUNNER_TEMP"
