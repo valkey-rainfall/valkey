@@ -1,0 +1,72 @@
+name: lsan-2604-repro
+
+# Heavier reproduction of the LeakSanitizer exit-time hang on ubuntu-26.04.
+# Builds the real ASan valkey-server and loops the exact field exit path
+# (SHUTDOWN NOSAVE -> exit() -> LSan leak scan). 26.04 is the target;
+# 24.04 is a control to confirm the reproducer matches the field asymmetry.
+# Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-repro
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-26.04, ubuntu-24.04]
+    runs-on: ${{ matrix.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Environment
+        run: |
+          echo "== image =="; echo "${{ matrix.image }}"
+          uname -a; gcc --version | head -1
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+
+      - name: Build ASan valkey
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config tcl8.6 tclx
+          make -j4 all SANITIZER=address
+
+      - name: Direct SHUTDOWN loop x250 (default ptrace_scope)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=1 2>/dev/null || true
+          chmod +x lsan-probe/reproloop.sh
+          OUT=$RUNNER_TEMP/out-default
+          lsan-probe/reproloop.sh default 250 src/valkey-server src/valkey-cli "$OUT"
+
+      - name: Direct SHUTDOWN loop x250 (ptrace_scope=0)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+          OUT=$RUNNER_TEMP/out-scope0
+          lsan-probe/reproloop.sh scope0 250 src/valkey-server src/valkey-cli "$OUT"
+
+      - name: Faithful shutdown.tcl loop x20 (default scope, 26.04 only)
+        if: matrix.image == 'ubuntu-26.04'
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=1 2>/dev/null || true
+          pass=0; sanitizer=0; otherfail=0
+          for i in $(seq 1 20); do
+            log=$RUNNER_TEMP/rt.$i.log
+            if ./runtest --single integration/shutdown --dump-logs >"$log" 2>&1; then
+              pass=$((pass+1))
+            elif grep -q "ptrace appears to be blocked\|Sanitizer error" "$log"; then
+              sanitizer=$((sanitizer+1)); cp "$log" $RUNNER_TEMP/SANITIZER.$i.log
+            else
+              otherfail=$((otherfail+1))
+            fi
+          done
+          echo "SHUTDOWN_TCL iters=20 pass=$pass sanitizer_hang=$sanitizer other_fail=$otherfail"
+          for f in $RUNNER_TEMP/SANITIZER.*.log; do
+            [ -f "$f" ] || continue
+            echo "----- $f (tail)"; tail -n 40 "$f"
+          done
