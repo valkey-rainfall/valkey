@@ -1,0 +1,71 @@
+name: lsan-2604-cap
+
+# Final capture wave: reproduce the LeakSanitizer exit hang at full-suite
+# scale on ubuntu-26.04 (CI-faithful ASan build, ptrace_scope left at the CI
+# default) and grab the HUNG server's own per-thread stacks + its forked LSan
+# tracer child, using the sharpened watchdog that parses ==PID== and dumps that
+# process first. 20 shards for ~93% odds of at least one clean catch.
+# Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-cap
+
+permissions:
+  contents: read
+
+jobs:
+  cap:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+
+      - name: Build libbacktrace
+        run: cd libbacktrace && ./configure && make && sudo make install
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1; nproc; free -m | head -2
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libzstd-dev libssl-dev tcl8.6 tclx gdb
+
+      - name: Build ASan valkey (CI-faithful)
+        run: |
+          make -j4 all SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module BUILD_ZSTD=yes USE_LIBBACKTRACE=yes
+          ./src/valkey-server --version
+
+      - name: Full suite with sharpened capture watchdog
+        run: |
+          chmod +x lsan-probe/suite_watchdog2.sh
+          mkdir -p tests/tmp
+          CAP=$RUNNER_TEMP/captures
+          lsan-probe/suite_watchdog2.sh tests/tmp "$CAP" &
+          wd=$!
+          set +e
+          timeout 3000 ./runtest --verbose --tags -slow --dump-logs > $RUNNER_TEMP/runtest.out 2>&1
+          rc=$?
+          set -e
+          sleep 2; kill $wd 2>/dev/null || true
+          hang=no; if [ $rc -ne 0 ] && grep -qE "ptrace appears to be blocked|Sanitizer error" "$RUNNER_TEMP/runtest.out" 2>/dev/null; then hang=yes; fi
+          echo "===== shard ${{ matrix.shard }} ====="
+          echo "RUNTEST_EXIT=$rc"
+          echo "LSAN_HANG=$hang"
+          echo "CAPTURES=$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)"
+          for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
