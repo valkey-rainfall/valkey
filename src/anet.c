@@ -321,6 +321,29 @@ int anetSendTimeout(char *err, int fd, long long ms) {
     return ANET_OK;
 }
 
+/* Set the socket send buffer (SO_SNDBUF) to 'bytes'. The kernel clamps the
+ * request to its per-socket ceiling (net.core.wmem_max on Linux) and, on
+ * Linux, stops autotuning the buffer for this socket. If 'effective' is not
+ * NULL it receives the value the kernel reports back through getsockopt, which
+ * on Linux is twice the usable payload size (the extra half accounts for
+ * socket overhead). */
+int anetSetSendBuffer(char *err, int fd, int bytes, int *effective) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) == -1) {
+        anetSetError(err, "setsockopt SO_SNDBUF: %s", strerror(errno));
+        return ANET_ERR;
+    }
+    if (effective) {
+        int val = 0;
+        socklen_t len = sizeof(val);
+        if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, &len) == -1) {
+            anetSetError(err, "getsockopt SO_SNDBUF: %s", strerror(errno));
+            return ANET_ERR;
+        }
+        *effective = val;
+    }
+    return ANET_OK;
+}
+
 /* Set the socket receive timeout (SO_RCVTIMEO socket option) to the specified
  * number of milliseconds, or disable it if the 'ms' argument is zero. */
 int anetRecvTimeout(char *err, int fd, long long ms) {
