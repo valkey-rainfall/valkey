@@ -2055,54 +2055,133 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
     }
 }
 
-/* Main, merge after a write phase: propagate a split entry's parts as one transaction, in part order.
- * Returns 0 when no part propagated anything. The propagation mode is the phase's, so either every
- * part formatted frames or every part captured ops. */
-static int fpFeedSplitPropagation(cmdEntry *e) {
-    static sds frames = NULL;
+/* Main, merge after a write phase, FP_PROP_FRAMES: the frames of the phase's entries are gathered in T
+ * order and fed to the replication buffer in one call at the end of the merge, so the per-call feed
+ * work (replica walk, tail lookup, SELECT check, backlog accounting) is paid once per phase rather
+ * than once per command. The byte stream is exactly what feeding each entry through
+ * replicationFeedFrames produced: MULTI, the SELECT the stock feed would insert, the frames, EXEC.
+ * An entry that captured ops instead of frames (multi-db propagation) flushes the gather first so
+ * the order is kept, and goes through the ops path. */
+static replFeedSeg *fp_gather = NULL;
+static int fp_ngather = 0, fp_gather_cap = 0;
+static size_t fp_gather_bytes = 0;
+
+#define FP_MULTI_FRAME "*1\r\n$5\r\nMULTI\r\n"
+#define FP_EXEC_FRAME "*1\r\n$4\r\nEXEC\r\n"
+
+static inline void fpGatherSeg(const char *p, size_t len) {
+    FP_GROW(fp_gather, fp_ngather, fp_gather_cap, 1024);
+    fp_gather[fp_ngather++] = (replFeedSeg){.p = p, .len = len};
+    fp_gather_bytes += len;
+}
+
+static void fpGatherFlush(void) {
+    if (!fp_ngather) return;
+    serverAssert(server.primary_host == NULL && server.repl_backlog != NULL);
+    /* Write handlers on every replica before the bytes exist, as replicationFeedReplicas does. */
+    prepareReplicasToWrite();
+    feedReplicationBufferGather(fp_gather, fp_ngather, fp_gather_bytes);
+    fp_ngather = 0;
+    fp_gather_bytes = 0;
+}
+
+/* The SELECT the stock feed inserts when the stream's db changes. Shared frames are gathered by
+ * pointer; a db past the shared set is fed at once (rare, keeps the gather pointer-only). */
+static size_t fpGatherSelect(int dictid) {
+    if (server.replicas_eldb == dictid) return 0;
+    size_t gathered = 0;
+    if (dictid >= 0 && dictid < PROTO_SHARED_SELECT_CMDS) {
+        sds s = objectGetVal(shared.select[dictid]);
+        fpGatherSeg(s, sdslen(s));
+        gathered = sdslen(s);
+    } else {
+        fpGatherFlush();
+        robj *selectcmd = generateSelectCommand(dictid);
+        prepareReplicasToWrite();
+        feedReplicationBufferWithObject(selectcmd);
+        clusterSlotStatsDecrNetworkBytesOutForReplication(sdslen(objectGetVal(selectcmd)));
+        decrRefCount(selectcmd);
+    }
+    server.replicas_eldb = dictid;
+    return gathered;
+}
+
+/* Gather one entry's frames (a split entry's parts in part order, as one transaction). Returns the
+ * bytes attributed to the entry: frames and wrap, not the SELECT. 0 when it has none. */
+static size_t fpGatherEntryFrames(cmdEntry *e) {
+    size_t before = fp_gather_bytes;
+    size_t select_bytes = 0;
+    int wrap;
+    if (e->split) {
+        fpSplit *s = e->split;
+        int nframes = 0;
+        wrap = 0;
+        for (int p = 0; p < s->nparts; p++) {
+            cmdEntry *pe = &s->parts[p]->e;
+            if (!pe->frames_len) continue;
+            nframes++;
+            wrap |= pe->frames_wrap;
+        }
+        if (!nframes) return 0;
+        wrap |= nframes > 1;
+        if (wrap) fpGatherSeg(FP_MULTI_FRAME, sizeof(FP_MULTI_FRAME) - 1);
+        select_bytes = fpGatherSelect(e->db->id);
+        for (int p = 0; p < s->nparts; p++) {
+            cmdEntry *pe = &s->parts[p]->e;
+            if (!pe->frames_len) continue;
+            fpGatherSeg(fp_lanes[pe->lane].frames + pe->frames_off, pe->frames_len);
+        }
+    } else {
+        if (!e->frames_len) return 0;
+        wrap = e->frames_wrap;
+        if (wrap) fpGatherSeg(FP_MULTI_FRAME, sizeof(FP_MULTI_FRAME) - 1);
+        select_bytes = fpGatherSelect(e->db->id);
+        fpGatherSeg(fp_lanes[e->lane].frames + e->frames_off, e->frames_len);
+    }
+    if (wrap) fpGatherSeg(FP_EXEC_FRAME, sizeof(FP_EXEC_FRAME) - 1);
+    /* A SELECT gathered for this entry is the stream's, not the entry's. A SELECT fed directly (rare
+     * path) flushed the gather, so it is already outside [before, now). */
+    return fp_gather_bytes - before - select_bytes;
+}
+
+/* Main, merge: propagate a split entry's captured ops as one transaction, in part order. Returns 0
+ * when no part captured anything. (Frames go through fpGatherEntryFrames.) */
+static int fpReplaySplitOps(cmdEntry *e) {
     fpSplit *s = e->split;
-    int nframes = 0, nprop = 0, nops = 0;
+    int nprop = 0, nops = 0;
     for (int p = 0; p < s->nparts; p++) {
         cmdEntry *pe = &s->parts[p]->e;
-        if (pe->frames_len) {
-            nframes++;
-        } else if (pe->prop) {
+        if (pe->prop) {
             nprop++;
             nops += pe->prop->numops;
         }
     }
-    if (!nframes && !nprop) return 0;
-    serverAssert(!nframes || !nprop);
+    if (!nprop) return 0;
     ectx->current_client = fp_lanes[e->lane].ec;
-    if (nframes) {
-        if (!frames) frames = sdsempty();
-        sdsclear(frames);
-        int wrap = nframes > 1;
-        for (int p = 0; p < s->nparts; p++) {
-            cmdEntry *pe = &s->parts[p]->e;
-            if (!pe->frames_len) continue;
-            frames = sdscatlen(frames, fp_lanes[pe->lane].frames + pe->frames_off, pe->frames_len);
-            wrap |= pe->frames_wrap;
-        }
-        replicationFeedFrames(e->db->id, frames, sdslen(frames), wrap);
-    } else {
-        serverOp *ops = zmalloc(sizeof(serverOp) * (size_t)nops);
-        int n = 0, wrap = nprop > 1;
-        for (int p = 0; p < s->nparts; p++) {
-            cmdEntry *pe = &s->parts[p]->e;
-            if (!pe->prop) continue;
-            memcpy(ops + n, pe->prop->ops, sizeof(serverOp) * (size_t)pe->prop->numops);
-            n += pe->prop->numops;
-            wrap |= pe->prop->wrap;
-            zfree(pe->prop->ops);
-            zfree(pe->prop);
-            pe->prop = NULL;
-        }
-        replayLanePropagation(ops, n, wrap);
-        zfree(ops);
+    serverOp *ops = zmalloc(sizeof(serverOp) * (size_t)nops);
+    int n = 0, wrap = nprop > 1;
+    for (int p = 0; p < s->nparts; p++) {
+        cmdEntry *pe = &s->parts[p]->e;
+        if (!pe->prop) continue;
+        memcpy(ops + n, pe->prop->ops, sizeof(serverOp) * (size_t)pe->prop->numops);
+        n += pe->prop->numops;
+        wrap |= pe->prop->wrap;
+        zfree(pe->prop->ops);
+        zfree(pe->prop);
+        pe->prop = NULL;
     }
+    replayLanePropagation(ops, n, wrap);
+    zfree(ops);
     ectx->current_client = NULL;
     return 1;
+}
+
+/* True when the entry (or any part of a split) captured ops rather than frames. */
+static inline int fpEntryHasOps(cmdEntry *e) {
+    if (!e->split) return e->prop != NULL;
+    for (int p = 0; p < e->split->nparts; p++)
+        if (e->split->parts[p]->e.prop) return 1;
+    return 0;
 }
 
 /* Main, after a write phase: fold what the lanes accumulated and replay their propagation in T order. */
@@ -2114,6 +2193,9 @@ static void fpMergeLanes(void) {
     if (fp_prop_mode == FP_PROP_NONE) return;
     client *last = NULL;
     long long last_woff = 0;
+    /* CLUSTER SLOT-STATS attributes replication bytes to the current client's slot; only then is the
+     * per-entry attribution worth its cost. */
+    int slot_stats = server.cluster_enabled;
     for (int p = 0; p < fp_nparts; p++) {
         fpThread *t = &fp_threads[fp_parts[p].tid];
         uint32_t s = fp_parts[p].seg;
@@ -2124,32 +2206,44 @@ static void fpMergeLanes(void) {
                 if (e->seg > s) goto next_part;
                 t->mcur_e++;
                 if (e->seg < s || e->lane < 0) continue;
-                long long offset = server.primary_repl_offset;
-                if (e->split) {
-                    if (!fpFeedSplitPropagation(e)) continue;
-                } else {
-                    if (!e->frames_len && !e->prop) continue;
-                    /* CLUSTER SLOT-STATS attributes replication bytes to the current client's slot. */
-                    client *attr = fp_lanes[e->lane].ec;
-                    attr->slot = e->shard;
-                    ectx->current_client = attr;
-                    if (e->frames_len) {
-                        replicationFeedFrames(e->db->id, fp_lanes[e->lane].frames + e->frames_off, e->frames_len,
-                                              e->frames_wrap);
+                /* The stream offset this entry's bytes end at, gathered bytes included. */
+                long long offset = server.primary_repl_offset + (long long)fp_gather_bytes;
+                if (fpEntryHasOps(e)) {
+                    fpGatherFlush();
+                    offset = server.primary_repl_offset;
+                    if (e->split) {
+                        if (!fpReplaySplitOps(e)) continue;
                     } else {
+                        client *attr = fp_lanes[e->lane].ec;
+                        attr->slot = e->shard;
+                        ectx->current_client = attr;
                         replayLanePropagation(e->prop->ops, e->prop->numops, e->prop->wrap);
                         zfree(e->prop->ops);
                         zfree(e->prop);
                         e->prop = NULL;
+                        ectx->current_client = NULL;
+                        attr->slot = -1;
                     }
-                    ectx->current_client = NULL;
-                    attr->slot = -1;
+                    if (server.primary_repl_offset == offset) continue;
+                    offset = server.primary_repl_offset;
+                } else {
+                    size_t bytes = fpGatherEntryFrames(e);
+                    if (!bytes) continue;
+                    if (slot_stats) {
+                        client *attr = fp_lanes[e->lane].ec;
+                        attr->slot = e->shard;
+                        ectx->current_client = attr;
+                        clusterSlotStatsIncrNetworkBytesOutForReplication((long long)bytes);
+                        ectx->current_client = NULL;
+                        attr->slot = -1;
+                    }
+                    offset = server.primary_repl_offset + (long long)fp_gather_bytes;
                 }
                 /* WAIT and WAITAOF on the client wait for its last write's replication offset. */
-                if (server.primary_repl_offset != offset && e->c) {
+                if (e->c) {
                     if (last && last != e->c) last->woff = last_woff;
                     last = e->c;
-                    last_woff = server.primary_repl_offset;
+                    last_woff = offset;
                 }
             }
             t->mcur_b++;
@@ -2157,6 +2251,7 @@ static void fpMergeLanes(void) {
         }
     next_part:;
     }
+    fpGatherFlush();
     if (last) last->woff = last_woff;
 }
 

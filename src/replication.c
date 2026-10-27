@@ -717,38 +717,37 @@ void replStreamAccountCursor(client *c, long long sent) {
  * all replica clients use replication buffers collectively, this function replace
  * 'addReply*', 'feedReplicationBacklog' for replicas and replication backlog,
  * First we add buffer into global replication buffer block list, and then
- * update replica / replication-backlog referenced node and block position. */
-void feedReplicationBuffer(char *s, size_t len) {
+ * update replica / replication-backlog referenced node and block position.
+ *
+ * The bytes arrive as a list of segments. The stream and the block layout are
+ * exactly those of appending the segments' concatenation one byte run at a time
+ * (feedReplicationBuffer does that with one segment), so a caller that already
+ * holds many frames can feed them in one call and pay the per-call work (tail
+ * lookup, replica walk, backlog accounting) once per call instead of once per
+ * frame. Slot-stats attribution is the caller's; this function only moves bytes. */
+void feedReplicationBufferGather(const replFeedSeg *segs, int nsegs, size_t total) {
     static long long repl_block_id = 0;
 
-    if (server.repl_backlog == NULL) return;
+    if (server.repl_backlog == NULL || total == 0) return;
 
-    clusterSlotStatsIncrNetworkBytesOutForReplication(len);
+    listNode *ln = listLast(server.repl_buffer_blocks);
+    replBufBlock *tail = ln ? listNodeValue(ln) : NULL;
+    int empty_backlog = (tail == NULL);
+    size_t start_pos = 0;        /* The position of referenced block to start sending. */
+    listNode *start_node = NULL; /* Replica/backlog starts referenced node. */
+    int add_new_block = 0;       /* At least one block was created by this call. */
+    if (tail && tail->size > tail->used) {
+        start_node = ln;
+        start_pos = tail->used;
+    }
 
-    while (len > 0) {
-        size_t start_pos = 0;        /* The position of referenced block to start sending. */
-        listNode *start_node = NULL; /* Replica/backlog starts referenced node. */
-        int add_new_block = 0;       /* Create new block if current block is total used. */
-        listNode *ln = listLast(server.repl_buffer_blocks);
-        replBufBlock *tail = ln ? listNodeValue(ln) : NULL;
-        int empty_backlog = (tail == NULL);
-
-        /* Append to tail string when possible. */
-        if (tail && tail->size > tail->used) {
-            start_node = listLast(server.repl_buffer_blocks);
-            start_pos = tail->used;
-            /* Copy the part we can fit into the tail, and leave the rest for a
-             * new node */
-            size_t avail = tail->size - tail->used;
-            size_t copy = (avail >= len) ? len : avail;
-            memcpy(tail->buf + tail->used, s, copy);
-            tail->used += copy;
-            s += copy;
-            len -= copy;
-            server.primary_repl_offset += copy;
-            server.repl_backlog->histlen += copy;
-        }
-        if (len) {
+    size_t remaining = total;
+    int si = 0;
+    const char *sp = NULL;
+    size_t sl = 0;
+    while (remaining > 0) {
+        int created = 0; /* this iteration allocated the block it fills */
+        if (tail == NULL || tail->used == tail->size) {
             /* Create a new node, make sure it is allocated to at
              * least PROTO_REPLY_CHUNK_BYTES */
             size_t usable_size;
@@ -756,32 +755,52 @@ void feedReplicationBuffer(char *s, size_t len) {
              * and also avoid creating nodes bigger than repl_backlog_size / 16, so that we won't have huge nodes that
              * can't trim when we only still need to hold a small portion from them. */
             size_t limit = max((size_t)server.repl_backlog_size / 16, (size_t)PROTO_REPLY_CHUNK_BYTES);
-            size_t size = min(max(len, (size_t)PROTO_REPLY_CHUNK_BYTES), limit);
+            size_t size = min(max(remaining, (size_t)PROTO_REPLY_CHUNK_BYTES), limit);
             tail = zmalloc_usable(size + sizeof(replBufBlock), &usable_size);
             /* Take over the allocation's internal fragmentation */
             tail->size = usable_size - sizeof(replBufBlock);
-            size_t copy = (tail->size >= len) ? len : tail->size;
-            tail->used = copy;
+            tail->used = 0;
             tail->refcount = 0;
             tail->repl_offset = server.primary_repl_offset + 1;
             tail->id = repl_block_id++;
-            memcpy(tail->buf, s, copy);
             listAddNodeTail(server.repl_buffer_blocks, tail);
             /* We also count the list node memory into replication buffer memory. */
             server.repl_buffer_mem += (usable_size + sizeof(listNode));
             add_new_block = 1;
+            created = 1;
             if (start_node == NULL) {
                 start_node = listLast(server.repl_buffer_blocks);
                 start_pos = 0;
             }
-            s += copy;
-            len -= copy;
-            server.primary_repl_offset += copy;
-            server.repl_backlog->histlen += copy;
         }
+
+        /* Fill the tail from the segments, in order, as far as it goes. */
+        size_t avail = tail->size - tail->used;
+        size_t filled = 0;
+        while (avail > 0 && remaining > 0) {
+            if (sl == 0) {
+                serverAssert(si < nsegs);
+                sp = segs[si].p;
+                sl = segs[si].len;
+                si++;
+                continue;
+            }
+            size_t copy = (avail >= sl) ? sl : avail;
+            memcpy(tail->buf + tail->used, sp, copy);
+            tail->used += copy;
+            sp += copy;
+            sl -= copy;
+            avail -= copy;
+            filled += copy;
+            remaining -= copy;
+        }
+        server.primary_repl_offset += filled;
+        server.repl_backlog->histlen += filled;
+
         if (empty_backlog && raxSize(server.replicas_waiting_psync) > 0) {
             /* Increase refcount for pending replicas. */
             backfillRdbReplicasToPsyncWait();
+            empty_backlog = 0;
         }
 
         /* For output buffer of replicas. */
@@ -799,7 +818,7 @@ void feedReplicationBuffer(char *s, size_t len) {
             }
 
             /* Check output buffer limit only when add new block. */
-            if (add_new_block) closeClientOnOutputBufferLimitReached(replica, 1);
+            if (created) closeClientOnOutputBufferLimitReached(replica, 1);
         }
 
         /* For replication backlog */
@@ -812,7 +831,7 @@ void feedReplicationBuffer(char *s, size_t len) {
              * into replication backlog. */
             serverAssert(add_new_block == 1 && start_pos == 0);
         }
-        if (add_new_block) {
+        if (created) {
             createReplicationBacklogIndex(listLast(server.repl_buffer_blocks));
             /* It is important to trim after adding replication data to keep the backlog size close to
              * repl_backlog_size in the common case. We wait until we add a new block to avoid repeated
@@ -829,6 +848,14 @@ void feedReplicationBuffer(char *s, size_t len) {
     if (server.repl_stream_sender == REPL_STREAM_SENDER_APPEND &&
         !(server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS))
         replStreamSenderPublishAppend(server.primary_repl_offset);
+}
+
+/* Append one byte run, attributed to the current client's slot. */
+void feedReplicationBuffer(char *s, size_t len) {
+    if (server.repl_backlog == NULL) return;
+    clusterSlotStatsIncrNetworkBytesOutForReplication(len);
+    replFeedSeg seg = {.p = s, .len = len};
+    feedReplicationBufferGather(&seg, 1, len);
 }
 
 /* Bulk values larger than this threshold bypass the staging buffer in

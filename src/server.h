@@ -3664,6 +3664,13 @@ void replicationFeedFrames(int dictid, const char *buf, size_t len, int wrap);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
+void feedReplicationBufferWithObject(robj *o);
+/* One byte run of a gathered replication feed. */
+typedef struct replFeedSeg {
+    const char *p;
+    size_t len;
+} replFeedSeg;
+void feedReplicationBufferGather(const replFeedSeg *segs, int nsegs, size_t total);
 void freeReplicaReferencedReplBuffer(client *replica);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
 void updateReplicasWaitingBgsave(int bgsaveerr, int type);
