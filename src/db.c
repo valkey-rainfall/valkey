@@ -48,6 +48,7 @@ static keyStatus expireIfNeeded(serverDb *db, robj *key, robj *val, int flags);
 static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
+static robj *lookupKeyWithRef(serverDb *db, robj *key, int flags, void ***ref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
 
@@ -79,8 +80,18 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * expired on replicas even if the primary is lagging expiring our key via DELs
  * in the replication link. */
 robj *lookupKey(serverDb *db, robj *key, int flags) {
+    return lookupKeyWithRef(db, key, flags, NULL);
+}
+
+/* Like lookupKey(), but additionally returns the location of the entry within
+ * the keys hash table via 'ref' when the key is found (NULL otherwise). The
+ * caller can pass this reference to setKeyWithRef()/dbSetValue() to avoid a
+ * second hash table lookup, PROVIDED no operation that can move entries
+ * (insert, delete, rehash step, defrag) runs on db->keys in between. */
+static robj *lookupKeyWithRef(serverDb *db, robj *key, int flags, void ***ref) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-    robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+    void **valref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
+    robj *val = valref ? *valref : NULL;
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the primary. We forbid it on readonly replicas, but
@@ -95,8 +106,10 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         if (flags & LOOKUP_WRITE && !is_ro_replica) expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
         if (flags & LOOKUP_NOEXPIRE) expire_flags |= EXPIRE_AVOID_DELETE_EXPIRED;
         if (expireIfNeededWithDictIndex(db, key, val, expire_flags, dict_index) != KEY_VALID) {
-            /* The key is no longer valid. */
+            /* The key is no longer valid. The deletion may have moved other
+             * entries, so the reference is no longer valid either. */
             val = NULL;
+            valref = NULL;
         }
     }
 
@@ -122,6 +135,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
+    if (ref) *ref = val ? valref : NULL;
     return val;
 }
 
@@ -157,6 +171,13 @@ robj *lookupKeyWriteWithFlags(serverDb *db, robj *key, int flags) {
 
 robj *lookupKeyWrite(serverDb *db, robj *key) {
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NONE);
+}
+
+/* Like lookupKeyWrite(), but additionally returns the location of the entry
+ * within the keys hash table via 'ref' when the key is found (NULL otherwise).
+ * See lookupKeyWithRef() for the validity constraints of the reference. */
+robj *lookupKeyWriteWithRef(serverDb *db, robj *key, void ***ref) {
+    return lookupKeyWithRef(db, key, LOOKUP_WRITE, ref);
 }
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
@@ -415,6 +436,16 @@ void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
 void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
+    setKeyWithRef(c, db, key, valref, flags, NULL);
+}
+
+/* Like setKey(), but accepts an optional reference to the existing entry's
+ * location in the keys hash table (as returned by lookupKeyWriteWithRef) to
+ * avoid a second hash table lookup on overwrite. 'oldref' may be NULL. It is
+ * only used when the key is known to exist, and it MUST still be valid: no
+ * operation that can move entries (insert, delete, rehash step) may have run
+ * on db->keys since the reference was obtained. */
+void setKeyWithRef(client *c, serverDb *db, robj *key, robj **valref, int flags, void **oldref) {
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
@@ -429,7 +460,14 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else if (keyfound < 0) {
         dbAddInternal(db, key, valref, 1);
     } else {
-        dbSetValue(db, key, valref, 1, NULL);
+        /* When the caller supplied a reference, verify (in debug builds) that
+         * it still points at this key's entry. Note: no hash table find here —
+         * a find would perform an incremental rehash step, which can move
+         * entries and invalidate the very reference we are checking. */
+        debugServerAssertWithInfo(c, key,
+                                  oldref == NULL || (*oldref != NULL && sdscmp(objectGetKey((robj *)*oldref),
+                                                                               objectGetVal(key)) == 0));
+        dbSetValue(db, key, valref, 1, oldref);
     }
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
