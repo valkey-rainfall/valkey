@@ -1,0 +1,81 @@
+name: lsan-2604-ab
+
+# Corrected A/B: does ptrace_scope=0 fix the LeakSanitizer exit hang on
+# ubuntu-26.04? CI-faithful ASan build (TLS module + zstd + libbacktrace +
+# -Werror), full ./runtest --tags -slow under the capture watchdog.
+#   scope1: leave kernel.yama.ptrace_scope at the CI default (untouched)
+#   scope0: set it to 0
+# 16 shards per arm for power at the ~10% field rate. The watchdog runs under
+# sudo so it captures even under scope=1 (root bypasses Yama). Fork-only.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-ab
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [scope1, scope0]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+
+      - name: Build libbacktrace
+        run: cd libbacktrace && ./configure && make && sudo make install
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1; nproc; free -m | head -2
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+          echo "apparmor_restrict_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libzstd-dev libssl-dev tcl8.6 tclx gdb
+
+      - name: Build ASan valkey (CI-faithful)
+        run: |
+          make -j4 all SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module BUILD_ZSTD=yes USE_LIBBACKTRACE=yes
+          ./src/valkey-server --version
+
+      - name: Full suite with capture watchdog
+        run: |
+          if [ "${{ matrix.scope }}" = "scope0" ]; then
+            sudo sysctl -w kernel.yama.ptrace_scope=0
+          fi
+          echo "effective_ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+          chmod +x lsan-probe/suite_watchdog.sh
+          mkdir -p tests/tmp
+          CAP=$RUNNER_TEMP/captures
+          lsan-probe/suite_watchdog.sh tests/tmp "$CAP" &
+          wd=$!
+          set +e
+          timeout 3000 ./runtest --verbose --tags -slow --dump-logs > $RUNNER_TEMP/runtest.out 2>&1
+          rc=$?
+          set -e
+          sleep 2; kill $wd 2>/dev/null || true
+          warn=no; grep -qr "ptrace appears to be blocked" "$RUNNER_TEMP/runtest.out" tests/tmp 2>/dev/null && warn=yes
+          hang=no; if [ $rc -ne 0 ] && grep -qE "ptrace appears to be blocked|Sanitizer error" "$RUNNER_TEMP/runtest.out" 2>/dev/null; then hang=yes; fi
+          echo "===== shard ${{ matrix.shard }} / ${{ matrix.scope }} ====="
+          echo "RUNTEST_EXIT=$rc"
+          echo "WARNING_SEEN=$warn"
+          echo "LSAN_HANG=$hang"
+          echo "CAPTURES=$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)"
+          echo "signature lines:"; grep -nE "ptrace appears to be blocked|LeakSanitizer|Sanitizer error|Child exited with signal" "$RUNNER_TEMP/runtest.out" | head -20 || true
+          for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
