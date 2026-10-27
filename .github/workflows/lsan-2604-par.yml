@@ -1,0 +1,63 @@
+name: lsan-2604-par
+
+# Does reducing test parallelism mitigate the LeakSanitizer exit hang on
+# ubuntu-26.04? A/B the full suite at the default --clients 16 vs a reduced
+# --clients 4, measuring the hang rate per shard. CI-faithful ASan build.
+# 16 shards per arm. Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-par
+
+permissions:
+  contents: read
+
+jobs:
+  par:
+    strategy:
+      fail-fast: false
+      matrix:
+        clients: [16, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+
+      - name: Build libbacktrace
+        run: cd libbacktrace && ./configure && make && sudo make install
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1; nproc
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libzstd-dev libssl-dev tcl8.6 tclx
+
+      - name: Build ASan valkey (CI-faithful)
+        run: |
+          make -j4 all SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module BUILD_ZSTD=yes USE_LIBBACKTRACE=yes
+          ./src/valkey-server --version
+
+      - name: Full suite at --clients ${{ matrix.clients }}
+        run: |
+          set +e
+          timeout 7200 ./runtest --verbose --tags -slow --clients ${{ matrix.clients }} --dump-logs > $RUNNER_TEMP/runtest.out 2>&1
+          rc=$?
+          set -e
+          hang=no; if grep -qE "ptrace appears to be blocked|LeakSanitizer may hang" "$RUNNER_TEMP/runtest.out" 2>/dev/null; then hang=yes; fi
+          echo "===== clients=${{ matrix.clients }} shard=${{ matrix.shard }} ====="
+          echo "CLIENTS=${{ matrix.clients }}"
+          echo "RUNTEST_EXIT=$rc"
+          echo "LSAN_HANG=$hang"
+          grep -nE "ptrace appears to be blocked|LeakSanitizer may hang|Child exited with signal" "$RUNNER_TEMP/runtest.out" | head -5 || true
