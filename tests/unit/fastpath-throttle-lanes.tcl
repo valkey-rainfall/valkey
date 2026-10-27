@@ -110,8 +110,9 @@ start_server {tags {"fastpath throttle lanes external:skip tls:skip"} overrides 
         set a [lindex $clients 0]
         set b [lindex $clients 1]
         assert_equal OK [r debug throttle-rate 10]
-        # At 10/s the bucket holds 3 tokens: the fourth write of this burst has no budget and goes to
-        # main's queue, which releases it at the rate. Meanwhile b's writes queue behind it.
+        # At 10/s the lanes' window is one token, so shares are zero and an admitted writer may not
+        # overshoot: the first write of this burst with no budget goes to main's queue, which releases
+        # it at the rate, whatever the pipeline depth of the read. Meanwhile b's writes queue behind it.
         set stops0 [fpt_info fastpath_throttle_stops]
         for {set i 0} {$i < 6} {incr i} { $a set burst:$i v }
         $a flush

@@ -88,7 +88,9 @@ typedef struct fpThread {
      * command it harvests (negative = overshoot of a writer's read admitted with budget), counts the
      * writes, the clients it sent to main's queue (stops) and the writer reads it parked. */
     long long thr_budget, thr_writes, thr_stops, thr_parked_reads;
-    int thr_read_admitted; /* the read in progress was admitted with budget: its writes may overshoot, never stop */
+    int thr_read_admitted;        /* the read in progress was admitted with budget: it may overshoot, bounded */
+    long long thr_read_overshoot; /* unbudgeted writes the read in progress has appended (<= fp_thr_overshoot) */
+    long long thr_overshoot;      /* unbudgeted writes appended this iteration, all reads (settled by main) */
     /* fds of writers this thread left unread for lack of budget. Posting them back to the poller at once
      * would make the next buffer non-empty, so the loop would run iteration after iteration without
      * sleeping (and keep running the barrier at full CPU) while the bucket refills. The thread parks
@@ -215,6 +217,8 @@ static int fp_thr_on = 0;                  /* this iteration's read phase is bud
 static long long fp_thr_chunk = 1;         /* what a thread takes from the pool at a time */
 static _Atomic long long fp_thr_pool = 0;  /* shared remainder of this iteration's tokens */
 static long long fp_thr_debt = 0;          /* overshoot not yet paid back from later tokens */
+static long long fp_thr_overshoot = 0;     /* unbudgeted writes one admitted writer's read may still append: one share */
+static long long fp_stat_thr_overshoot = 0; /* unbudgeted writes admitted writers appended past their budget, cumulative */
 static long long fp_stat_thr_stops = 0;    /* writes sent to main's throttle queue for lack of budget, cumulative */
 static long long fp_stat_thr_parked = 0;   /* writer reads left in the socket for lack of budget, cumulative */
 static int fp_thr_parked_total = 0;        /* main: parked fds left waiting for budget after the last publish */
@@ -959,8 +963,12 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
 static void fpRead(fpThread *t, int tid, client *c) {
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     /* An established writer was admitted with budget (fastpathStagedEvent); its writes in this read may
-     * overshoot. Any other client's first unbudgeted write stops it (fpThrottleStop). */
+     * overshoot the budget by at most one share (fp_thr_overshoot), then it stops like any other client.
+     * One read can carry an arbitrarily deep pipeline, so an unbounded overshoot let a deep writer run
+     * ahead of clients already queued on main by its whole pipeline (observed under TSan timing, where a
+     * 6-write burst landed in one read and none of writes 2-6 was ever offered to the stop). */
     t->thr_read_admitted = c->fp_thr_writer;
+    t->thr_read_overshoot = 0;
     long long writes0 = t->thr_writes;
     /* The fd is edge-triggered: a read that filled its buffer may have left bytes in the socket that
      * no new edge will report, so the next batch reads the client again. */
@@ -1603,14 +1611,15 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_barriers:%lld\r\n"
                          "fastpath_write_serial_segments:%lld\r\n"
                          "fastpath_throttle_stops:%lld\r\n"
+                         "fastpath_throttle_overshoot:%lld\r\n"
                          "fastpath_throttle_parked_reads:%lld\r\n"
                          "fastpath_throttle_tokens:%lld\r\n"
                          "fastpath_throttle_bucket:%.1f\r\n"
                          "fastpath_throttle_queued:%d\r\n",
                          fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments, fp_stat_thr_stops, fp_stat_thr_parked, fp_stat_thr_tokens, thr_bucket,
-                         thr_queued);
+                         fp_stat_serial_segments, fp_stat_thr_stops, fp_stat_thr_overshoot, fp_stat_thr_parked,
+                         fp_stat_thr_tokens, thr_bucket, thr_queued);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1782,7 +1791,8 @@ static void fpThrottlePublish(void) {
             stops += t->thr_stops;
             parked_reads += t->thr_parked_reads;
             parked += t->thr_nparked;
-            t->thr_stops = t->thr_parked_reads = 0;
+            fp_stat_thr_overshoot += t->thr_overshoot;
+            t->thr_stops = t->thr_parked_reads = t->thr_overshoot = 0;
         }
         left -= fp_thr_debt; /* overshoot from earlier iterations, still owed */
         fp_thr_debt = 0;
@@ -1833,6 +1843,16 @@ static void fpThrottlePublish(void) {
     /* A thread past its share takes the pool in chunks the size of a share, or, when shares are zero
      * because the rate is low, one token at a time so every thread can still make progress. */
     fp_thr_chunk = share > 0 ? share : 1;
+    /* An admitted writer's read may run past the budget by one thread-share of the 100 ms window, no
+     * more; past that it stops and main's queue runs it (upstream's rule). The bound is the window's
+     * share, not this iteration's: publish runs every staged iteration, so at a few thousand ops/s the
+     * iteration share is 0-2 tokens and a bound of that size stops nearly every pipelined read (measured:
+     * 187 stops for 8000 writes at 2000/s, against 4 with the window share). A deep pipeline can thus run
+     * ahead of clients queued on main by at most 100 ms / threads of the rate, paid back as debt; the
+     * previous shape let one read overshoot without bound. Floor of one write: at rates below 10 x
+     * threads the share rounds to zero, and the admitting token may already be spent by then. */
+    fp_thr_overshoot = window / n;
+    if (fp_thr_overshoot < 1) fp_thr_overshoot = 1;
     atomic_store_explicit(&fp_thr_pool, pool, memory_order_relaxed);
     fp_thr_on = 1;
     /* Parked writers come back only when there is something to admit them with; otherwise they stay
@@ -1866,14 +1886,19 @@ static int fpThrottleAdmit(fpThread *t) {
 }
 
 /* Reading thread, per parsed command: must this write wait in main's throttle queue? Not while there is
- * budget. Without it, a read admitted as a writer's overshoots (the share is paid back next publish);
- * any other read stops: the client leaves for main with this command first, main's throttler queues it
- * (upstream's rule: no token, queue), and it rejoins as soon as main has run it, mid-pipeline if need
- * be (processInputBufferLoop). Reads never stop. MULTI is not fast-path eligible, so a transaction
- * body never reaches here. */
+ * budget. Without it, a read admitted as a writer's may overshoot by up to one share (paid back next
+ * publish) and then stops; any other read stops at once: the client leaves for main with this command
+ * first, main's throttler queues it (upstream's rule: no token, queue), and it rejoins as soon as main
+ * has run it, mid-pipeline if need be (processInputBufferLoop). Reads never stop. MULTI is not fast-path
+ * eligible, so a transaction body never reaches here. */
 static int fpThrottleStop(fpThread *t, client *c, struct serverCommand *cmd) {
     if (!fp_thr_on || fpDepth() != 0 || !(cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE))) return 0;
-    if (fpThrottleAdmit(t) || t->thr_read_admitted) return 0;
+    if (fpThrottleAdmit(t)) return 0;
+    if (t->thr_read_admitted && t->thr_read_overshoot < fp_thr_overshoot) {
+        t->thr_read_overshoot++;
+        t->thr_overshoot++;
+        return 0;
+    }
     t->thr_stops++;
     c->fp_thr_stop = 1; /* harvest leaves with FP_LEAVING_REJOIN; main sets fp_readmit on handback (c->flag is main's to write) */
     return 1;
