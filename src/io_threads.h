@@ -87,6 +87,7 @@ void testOnlyFreeIOThreadQueues(void);
 void testOnlyFillIOThreadInbox(void);
 size_t testOnlyGetClusterIOPendingResponses(void);
 void testOnlySetIOThreadReady(int tid, int epfd);
+void testOnlySetPartitionPublishHook(void (*hook)(client *c));
 void testOnlySetCurTid(int tid);
 void trySendPollJobToIOThreads(void);
 int trySendAcceptToIOThreads(connection *conn);

@@ -456,3 +456,57 @@ TEST_F(FastpathExecutorTest, FastpathClientMemoryIsRefreshedByClientsCron) {
     c->client_list_node = NULL;
     fpTestReleaseClient(c, conn, peer);
 }
+
+/* tryPartitionClient: EPOLL_CTL_ADD publishes the client to the IO thread, which may claim and
+ * read it at once. io_tid, flag.partitioned and flag.pending_read must already be stored when the
+ * ADD is made, and a failed ADD must leave the client as it was. */
+static int fp_publish_calls = 0;
+static int fp_publish_tid = -1, fp_publish_partitioned = -1, fp_publish_pending = -1;
+static void fpRecordPublish(client *c) {
+    fp_publish_calls++;
+    fp_publish_tid = c->io_tid;
+    fp_publish_partitioned = c->flag.partitioned;
+    fp_publish_pending = c->flag.pending_read;
+}
+
+TEST_F(FastpathExecutorTest, PartitionedClientStateIsStoredBeforeEpollAdd) {
+    testOnlyStagedStop(); /* partitioning is off while the staged loop runs */
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+
+    /* The socket is already in the IO thread's epoll set, so the ADD fails with EEXIST after the
+     * hook has seen what the IO thread would see. */
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    ASSERT_GE(epfd, 0);
+    testOnlySetIOThreadReady(1, epfd);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, sv[0], &ev), 0);
+
+    fp_publish_calls = 0;
+    testOnlySetPartitionPublishHook(fpRecordPublish);
+    EXPECT_EQ(tryPartitionClient(c), C_ERR);
+    testOnlySetPartitionPublishHook(NULL);
+
+    ASSERT_EQ(fp_publish_calls, 1) << "tryPartitionClient did not reach the EPOLL_CTL_ADD";
+    EXPECT_EQ(fp_publish_tid, 1) << "io_tid is stored after the client is published";
+    EXPECT_EQ(fp_publish_partitioned, 1) << "flag.partitioned is stored after the client is published";
+    EXPECT_EQ(fp_publish_pending, 1) << "flag.pending_read is stored after the client is published";
+    EXPECT_EQ(c->io_tid, 0) << "a failed ADD left io_tid set";
+    EXPECT_EQ(c->flag.partitioned, 0u) << "a failed ADD left the client partitioned";
+    EXPECT_EQ(c->flag.pending_read, 0u) << "a failed ADD left a read pending";
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, sv[0], NULL);
+    close(epfd);
+    testOnlySetIOThreadReady(1, epoll_create1(EPOLL_CLOEXEC));
+    c->conn = NULL;
+    close(sv[1]);
+    close(sv[0]);
+    testOnlyStagedStart();
+}

@@ -480,6 +480,9 @@ static void setClientReadFlagsForOffload(client *c) {
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
 }
 
+/* Unit tests only: called right before the EPOLL_CTL_ADD that publishes a client. */
+static void (*partition_publish_hook)(client *c) = NULL;
+
 /* One-shot readiness serializes IO-thread reads against main-thread command drains. */
 int tryPartitionClient(client *c) {
     if (stagedLoopActive()) return C_ERR; /* IO threads only run staged phases */
@@ -488,14 +491,21 @@ int tryPartitionClient(client *c) {
     int tid = 1 + (int)(partition_rr++ % (unsigned)(io_ready_num - 1));
     if (io_epfd[tid] <= 0) return C_ERR; /* 0 is a never-initialized slot */
     setClientReadFlagsForOffload(c);
-    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
-    if (epoll_ctl(io_epfd[tid], EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
-        c->read_flags = 0;
-        return C_ERR;
-    }
+    int was_pending = c->flag.pending_read;
+    /* EPOLL_CTL_ADD publishes the client: the IO thread can claim and read it before epoll_ctl
+     * returns, so everything it reads must be stored first. */
     c->io_tid = tid;
     c->flag.partitioned = 1;
     c->flag.pending_read = 1;
+    if (partition_publish_hook) partition_publish_hook(c);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
+    if (epoll_ctl(io_epfd[tid], EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
+        c->read_flags = 0;
+        c->io_tid = 0;
+        c->flag.partitioned = 0;
+        c->flag.pending_read = was_pending;
+        return C_ERR;
+    }
     server.stat_io_reads_pending++;
     partitioned_clients++;
     listInitNode(&c->io_owner_node, c);
@@ -1858,6 +1868,10 @@ void testOnlySetIOThreadReady(int tid, int epfd) {
     atomic_store_explicit(&io_worker_state[tid], IO_WORKER_RUNNING, memory_order_release);
     if (io_worker_hwm <= tid) io_worker_hwm = tid + 1;
     if (io_ready_num <= tid) io_ready_num = tid + 1;
+}
+
+void testOnlySetPartitionPublishHook(void (*hook)(client *c)) {
+    partition_publish_hook = hook;
 }
 
 /* Unit tests run IO-thread code on their own threads; this makes the calling thread IO thread tid. */
