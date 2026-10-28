@@ -5159,7 +5159,11 @@ int processCommand(client *c) {
             size_t slack = server.maxmemory_eviction_batch_slack;
             size_t cap = server.maxmemory / 100; /* 1% of maxmemory */
             if (cap && cap < slack) slack = cap;
-            if (used <= server.evict_check_used_memory + slack) run_eviction = 0;
+            /* A cached OOM verdict is stale once memory dropped below the last
+             * check (FLUSHALL, DEL, UNLINK in the same read): check again. */
+            if (used <= server.evict_check_used_memory + slack &&
+                !(server.pre_command_oom_state && used < server.evict_check_used_memory))
+                run_eviction = 0;
         }
 
         if (run_eviction) {
