@@ -1,16 +1,20 @@
-name: lsan-2604-cap2
+name: lsan-2604-cap3
 
-# Bigger, sharper capture wave: reproduce the LeakSanitizer exit hang at
-# full-suite scale on ubuntu-26.04 (CI-faithful ASan build, ptrace_scope
-# default) and grab the HUNG server's own per-thread stacks + its forked LSan
-# tracer child + a liveness timeline proving a genuine multi-second hang.
+# Capture wave + fork-deadlock probe, with PR 4306 (raw frames after the
+# symbolizer timeout) and PR 4993 (libbacktrace warm-up) cherry-picked onto the
+# baseline. Reproduces the LeakSanitizer exit hang at full-suite scale on
+# ubuntu-26.04 (CI-faithful ASan build). On a confirmed hang the watchdog
+# sends the harness's SIGSEGV itself and records whether the crash handler's
+# fork() returns (symbolizer child stuck) or deadlocks in ASan ForkBefore(),
+# and what the two PRs manage to print. valkey-server + /proc/<pid>/maps are
+# uploaded on capture so raw PCs can be symbolized offline.
 # 40 shards for ~96% odds of at least one catch at the observed ~8%/run.
 # Fork-only. Manual + branch push.
 on:
   workflow_dispatch:
   push:
     branches:
-      - rain/lsan-2604-cap2
+      - rain/lsan-2604-cap3
 
 permissions:
   contents: read
@@ -51,21 +55,43 @@ jobs:
           make -j4 all SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module BUILD_ZSTD=yes USE_LIBBACKTRACE=yes
           ./src/valkey-server --version
 
-      - name: Full suite with liveness capture watchdog
+      - name: Full suite with capture + fork-deadlock probe watchdog
+        id: suite
         run: |
-          chmod +x lsan-probe/suite_watchdog3.sh
+          chmod +x lsan-probe/suite_watchdog4.sh
           mkdir -p tests/tmp
           CAP=$RUNNER_TEMP/captures
-          lsan-probe/suite_watchdog3.sh tests/tmp "$CAP" &
+          lsan-probe/suite_watchdog4.sh tests/tmp "$CAP" &
           wd=$!
           set +e
-          timeout 3000 ./runtest --verbose --tags -slow --dump-logs > $RUNNER_TEMP/runtest.out 2>&1
+          timeout 3000 ./runtest --verbose --tags -slow --dump-logs --dont-clean > $RUNNER_TEMP/runtest.out 2>&1
           rc=$?
           set -e
           sleep 2; kill $wd 2>/dev/null || true
           hang=no; if [ $rc -ne 0 ] && grep -qE "ptrace appears to be blocked|Sanitizer error" "$RUNNER_TEMP/runtest.out" 2>/dev/null; then hang=yes; fi
+          echo "captured=$([ -n "$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null)" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
           echo "===== shard ${{ matrix.shard }} ====="
           echo "RUNTEST_EXIT=$rc"
           echo "LSAN_HANG=$hang"
           echo "CAPTURES=$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)"
           for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
+
+      - name: Stage artifacts on capture
+        if: always() && steps.suite.outputs.captured == 'yes'
+        run: |
+          A=$RUNNER_TEMP/artifact; mkdir -p "$A"
+          cp "$RUNNER_TEMP"/captures/* "$A"/ 2>/dev/null || true
+          cp src/valkey-server "$A"/valkey-server
+          for sd in "$RUNNER_TEMP"/captures/serverdir.*.txt; do
+            [ -f "$sd" ] || continue; d=$(cat "$sd"); n=$(basename "$sd" .txt)
+            mkdir -p "$A/$n"; cp "$d"/stdout "$d"/stderr "$A/$n"/ 2>/dev/null || true
+          done
+          ls -la "$A"
+
+      - name: Upload capture artifacts
+        if: always() && steps.suite.outputs.captured == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsan-capture-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/artifact
+          retention-days: 14
