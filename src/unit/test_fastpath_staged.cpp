@@ -545,3 +545,46 @@ TEST_F(FastpathStagedTest, ClientStaysOnMainWhileWatchingOrInMulti) {
     freeClient(c);
 }
 
+/* Two clients leave the fast path in the same iteration, on different IO threads. Stock Valkey runs
+ * commands in the order the server read them; here A's transaction was read first (by thread 2) and
+ * B's second (by thread 1), so A's LPUSH must run before B's and B ends up at the head of the list.
+ * SCRIPT KILL behind the EVAL it targets is the user-visible case of this order. */
+TEST_F(FastpathStagedTest, LeavingClientsHandedBackInArrivalOrderAcrossThreads) {
+    fastpathInitThread(2);
+    testOnlySetIOThreadReady(2, epoll_create1(EPOLL_CLOEXEC));
+    int pa, pb, po;
+    client *a = newStagedClient(&pa);
+    client *b = newStagedClient(&pb);
+    client *o = newStagedClient(&po);
+    /* A arrives first and is read by thread 2. */
+    send(pa, "*1\r\n$5\r\nMULTI\r\n*3\r\n$5\r\nLPUSH\r\n$4\r\nst:o\r\n$1\r\nA\r\n*1\r\n$4\r\nEXEC\r\n");
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(2);
+    EXPECT_EQ(a->control->lifecycle, FP_LEAVING);
+    /* B arrives second and is read by thread 1, in the same iteration. */
+    send(pb, "*1\r\n$5\r\nMULTI\r\n*3\r\n$5\r\nLPUSH\r\n$4\r\nst:o\r\n$1\r\nB\r\n*1\r\n$4\r\nEXEC\r\n");
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    EXPECT_EQ(b->control->lifecycle, FP_LEAVING);
+    fastpathStagedExecute();
+    if (fastpathStagedRepliesPending()) {
+        fastpathStagedReplyPhase(1);
+        fastpathStagedReplyPhase(2);
+    }
+    fastpathStagedFinish();
+    EXPECT_EQ(a->flag.multi, 0u);
+    EXPECT_EQ(b->flag.multi, 0u);
+    /* The observer reads the list: A pushed first, so B is the head. */
+    send(po, "*4\r\n$6\r\nLRANGE\r\n$4\r\nst:o\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+    iteration();
+    std::string out = recv(po);
+    EXPECT_EQ(out, "*2\r\n$1\r\nB\r\n$1\r\nA\r\n") << "handoff order must follow arrival order, not thread id";
+    freeStaged(o, po);
+    close(pa);
+    freeClient(a);
+    close(pb);
+    freeClient(b);
+    iteration();
+    freeClientsInAsyncFreeQueue();
+    fastpathFreeThread(2);
+}

@@ -83,6 +83,7 @@ struct poller {
     pollerBuf buf[2];
     int active;
     _Atomic(int) cursor; /* next unclaimed PRIORITY/IO entry of the active buffer */
+    uint32_t batch_seq;  /* batches handed out so far; read by IO threads during the read phase only */
     pthread_mutex_t lock;
     pthread_cond_t ready_cv; /* main waits for a non-empty next buffer */
     pthread_cond_t ctl_cv;   /* pause/stop handshake */
@@ -388,6 +389,7 @@ int pollerGetNextBatch(poller *p, long long timeout_us) {
         if (ctl) drainEventfd(p);
     }
     p->active ^= 1;
+    p->batch_seq++;
     int total = bufTotal(&p->buf[p->active]);
     pthread_mutex_unlock(&p->lock);
     return rc < 0 ? -1 : total;
@@ -414,8 +416,15 @@ int pollerClaimIO(poller *p, pollerEvent *out) {
         int idx = atomic_fetch_add_explicit(&p->cursor, 1, memory_order_relaxed);
         if (idx >= total) return 0;
         const pollerSlot *s = idx < np ? &b->e[POLLER_AFF_PRIORITY][idx] : &b->e[POLLER_AFF_IO][idx - np];
-        if (resolveSlot(p, s, out)) return 1;
+        if (resolveSlot(p, s, out)) {
+            out->idx = idx;
+            return 1;
+        }
     }
+}
+
+uint32_t pollerBatchSeq(const poller *p) {
+    return p->batch_seq;
 }
 
 int pollerIOCount(const poller *p) {
@@ -623,6 +632,10 @@ void pollerRequeue(poller *p, int fd, int mask) {
 }
 int pollerClaimIO(poller *p, pollerEvent *out) {
     (void)p, (void)out;
+    return 0;
+}
+uint32_t pollerBatchSeq(const poller *p) {
+    (void)p;
     return 0;
 }
 int pollerIOCount(const poller *p) {

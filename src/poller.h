@@ -50,6 +50,7 @@ typedef struct pollerEvent {
     int fd;
     int mask; /* fired mask */
     pollerAffinity affinity;
+    int idx; /* position in the batch: the order the epoll thread collected the fds */
 } pollerEvent;
 
 typedef struct poller poller;
@@ -88,6 +89,7 @@ void pollerRequeue(poller *p, int fd, int mask);
  * Entries whose fd changed generation since they were queued are skipped. Safe from many threads. */
 int pollerClaimIO(poller *p, pollerEvent *out);
 int pollerIOCount(const poller *p); /* PRIORITY plus IO entries in the active buffer */
+uint32_t pollerBatchSeq(const poller *p); /* batches handed out so far (read phase: arrival order across batches) */
 
 /* Active MAIN entries: walked by main. pollerMainAt returns 1 and fills out, 0 for a stale entry
  * or an index out of range. */
