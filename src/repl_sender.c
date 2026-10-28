@@ -429,6 +429,26 @@ void replStreamSenderStop(void) {
     pthread_cond_signal(&repl_sender_cond);
     pthread_mutex_unlock(&repl_sender_mutex);
     pthread_join(repl_sender_thread, NULL);
+    /* Hand every owned replica back to the main path. The thread is gone, so no
+     * replica is busy. Advance main's cursor to what the sender really sent, clear
+     * the ownership, and queue a write so main sends the rest (and the final flush in
+     * finishShutdown sees it). Without this the replicas keep stream_via_sender set,
+     * putClientInPendingWriteQueue skips them and nobody sends to them again. */
+    if (repl_sender_replicas) {
+        listIter li;
+        listNode *ln;
+        listRewind(repl_sender_replicas, &li);
+        while ((ln = listNext(&li))) {
+            client *replica = listNodeValue(ln);
+            ClientReplicationData *rd = replica->repl_data;
+            replStreamAccountCursor(replica, atomic_load_explicit(&rd->sent_offset, memory_order_acquire));
+            rd->stream_via_sender = 0;
+            rd->send_node = NULL;
+            rd->send_pos = 0;
+            rd->send_seeded = 0;
+            putClientInPendingWriteQueue(replica);
+        }
+    }
     repl_sender_running = 0;
     if (repl_sender_replicas) {
         listRelease(repl_sender_replicas);
