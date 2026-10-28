@@ -417,3 +417,42 @@ TEST_F(FastpathExecutorTest, FastpathTrafficIsCountedInServerStats) {
     dbDelete(server.db[0], key);
     decrRefCount(key);
 }
+
+/* OBS-15: with client eviction off (maxmemory-clients 0, the default) clientsCron must still
+ * refresh the memory of a fast-path client into stat_clients_type_memory (INFO mem_clients_normal,
+ * MEMORY STATS clients.normal) and the recent-max output buffer sample
+ * (INFO client_recent_max_output_buffer). */
+TEST_F(FastpathExecutorTest, FastpathClientMemoryIsRefreshedByClientsCron) {
+    server.maxmemory_clients = 0;
+    server.hz = CONFIG_DEFAULT_HZ;
+    server.unixtime = time(NULL);
+    server.stat_clients_type_memory[CLIENT_TYPE_NORMAL] = 0;
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+    ASSERT_EQ(c->flag.fastpath, 1u);
+
+    /* 1 MiB of replies the IO thread could not write yet. */
+    const size_t pending = 1024 * 1024;
+    c->fp_out = sdsnewlen(NULL, pending);
+    listAddNodeTail(server.clients, c);
+    c->client_list_node = listLast(server.clients);
+
+    for (int i = 0; i < 3; i++) clientsTimeProc(server.el, 0, NULL);
+
+    EXPECT_GE(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], pending)
+        << "mem_clients_normal does not include the fast-path client's pending output";
+    size_t in_usage = 0, out_usage = 0;
+    getExpensiveClientsInfo(&in_usage, &out_usage);
+    EXPECT_GE(out_usage, pending) << "client_recent_max_output_buffer ignores the fast-path client";
+
+    /* Settle the accounting before leaving. */
+    sdsfree(c->fp_out);
+    c->fp_out = NULL;
+    updateClientMemoryUsage(c);
+    listDelNode(server.clients, c->client_list_node);
+    c->client_list_node = NULL;
+    fpTestReleaseClient(c, conn, peer);
+}

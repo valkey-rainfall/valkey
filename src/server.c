@@ -1305,7 +1305,10 @@ static void clientsCron(int clients_this_cycle) {
              * after the next reply phase. Nothing else here applies to it. */
             if (fastpathStagedOn()) {
                 if (clientsCronHandleTimeout(c, now)) continue;
-                updateClientMemUsageAndBucket(c);
+                /* As for a stock client: with client eviction off the memory is still refreshed, so
+                 * INFO mem_clients_normal and client_recent_max_* see fast-path clients. */
+                clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot);
+                if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
             }
             continue;
         }
