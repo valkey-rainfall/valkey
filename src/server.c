@@ -3134,6 +3134,7 @@ void resetServerStats(void) {
 
     fastGetAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     stagedResetStats();
+    fastpathResetStats();
     ectx->stat_numcommands = 0;
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
