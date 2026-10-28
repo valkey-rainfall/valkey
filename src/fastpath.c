@@ -1939,6 +1939,10 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     ec->slot = e->shard;
     ec->read_flags = e->read_flags;
     ec->acl_epoch_seen = e->origin.acl_epoch_seen;
+    /* ACL-03: the lane runs cmd->proc without an ACL check and trusts the read phase's ALLOW verdict.
+     * That verdict is valid only while the ACL epoch it was tagged under is still current. */
+    debugServerAssert(ACLUserUnrestricted(e->origin.principal) ||
+                      ((e->read_flags & READ_FLAGS_ACL_ALLOWED) && ec->acl_epoch_seen == aclOffloadEpoch()));
     ec->db = e->db;
     ec->resp = e->resp;
     ec->origin = &e->origin;
