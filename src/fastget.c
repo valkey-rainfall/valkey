@@ -247,6 +247,14 @@ int fastGetSpeculateBatch(client *c, int tid) {
     /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
     if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
 
+    /* Gates processCommand applies to every command, which a GET answered here skips. Main changes
+     * them only outside the read phase (CLIENT PAUSE, FAILOVER and the replication state machine run
+     * on main), so the plain reads are ordered by the phase barrier like the other gates below.
+     * CLIENT PAUSE ALL holds reads too: the client is postponed on main until unpause. */
+    if (server.paused_actions & PAUSE_ACTION_CLIENT_ALL) return 0;
+    /* A replica with a broken primary link and replica-serve-stale-data no answers -MASTERDOWN. */
+    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 0;
+
     /* Inside MULTI a GET must be queued, not run. A blocked or just-unblocked client's replies must
      * follow its unblock reply. The reply is written as plain RESP into c->buf, which would corrupt a
      * buffer in copy-avoidance encoded mode, and would reorder replies if the reply list is not
@@ -254,6 +262,10 @@ int fastGetSpeculateBatch(client *c, int tid) {
     if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
         c->flag.buf_encoded || listLength(c->reply) != 0)
         return 0;
+
+    /* Main wrote into this client's buffer (a tracking push to a REDIRECT target) and owns
+     * that write: sending c->buf from here too would send those bytes twice. */
+    if (c->bufpos != 0 || c->flag.pending_write) return 0;
 
     /* A tracking client must have its keys remembered, which this path skips, or a later write would
      * not invalidate its cache. BCAST tracking invalidates by prefix and is unaffected. Main does not

@@ -4653,6 +4653,9 @@ void aclCommand(client *c) {
         sds error = ACLStringSetRole(r, rolename, temp_argv, c->argc - 3);
         zfree(temp_argv);
         if (error == NULL) {
+            /* Members' effective rules changed: recompute the IO-thread GET gate of every client,
+             * as ACL SETUSER / DELUSER / LOAD do. */
+            fastGetOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {
             addReplyErrorSdsSafe(c, error);
@@ -4679,6 +4682,7 @@ void aclCommand(client *c) {
                 deleted++;
             }
         }
+        if (deleted) fastGetOnAclRulesChanged();
         addReplyLongLong(c, deleted);
     } else if (!strcasecmp(sub, "getrole") && c->argc == 3) {
         sds rolename = objectGetVal(c->argv[2]);

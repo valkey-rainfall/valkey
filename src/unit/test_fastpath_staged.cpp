@@ -28,6 +28,7 @@ extern "C" {
 extern hashtableType commandSetType;
 extern dictType keylistDictType;
 void createSharedObjects(void);
+void fastGetRecomputeSpecAclOk(client *c); /* from fastget.h, declared here to avoid <stdatomic.h> in C++ */
 }
 
 static const char *st_logfile = "/dev/null";
@@ -365,3 +366,131 @@ TEST_F(FastpathStagedTest, ReclaimWithoutControlIsSafe) {
     EXPECT_EQ(fake->control, nullptr);
     freeClient(fake);
 }
+
+/* Fast GET answers a pure-GET read on the IO thread during the read phase, before the write and
+ * reply phases run. This proves the speculate path is exercised, so the pause gate below is a real
+ * gate and not a test that passes because fast GET never engaged. */
+TEST_F(FastpathStagedTest, FastGetServesPureGetInReadPhase) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    fastGetRecomputeSpecAclOk(c); /* default (no) user is unrestricted: gate opens */
+
+    send(peer, "*3\r\n$3\r\nSET\r\n$3\r\nfgk\r\n$1\r\nv\r\n");
+    iteration();
+    EXPECT_EQ(recv(peer), "+OK\r\n");
+
+    /* A pure-GET read: the reply is written straight to the socket in the read phase. */
+    send(peer, "*2\r\n$3\r\nGET\r\n$3\r\nfgk\r\n");
+    readPhase();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+    writeAndReplyPhases();
+    freeStaged(c, peer);
+}
+
+/* CLIENT PAUSE ALL (and FAILOVER, which pauses ALL) must hold a fast-path client's reads too. A
+ * client admitted before the pause keeps its fd on the staged poller, so without a pause gate in
+ * fastGetSpeculateBatch its GET is answered on the IO thread during the pause. Stock holds every
+ * read until unpause. This test fails on the superset binary before the fix (the read phase writes
+ * the reply) and passes after it. A read is not held by PAUSE WRITE, which the last block checks. */
+TEST_F(FastpathStagedTest, ClientPauseAllHoldsFastGet) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    fastGetRecomputeSpecAclOk(c);
+
+    send(peer, "*3\r\n$3\r\nSET\r\n$3\r\npgk\r\n$1\r\nv\r\n");
+    iteration();
+    EXPECT_EQ(recv(peer), "+OK\r\n");
+
+    /* Pause all client actions (isPausedActions reads server.paused_actions directly). */
+    server.paused_actions = PAUSE_ACTION_CLIENT_ALL;
+    send(peer, "*2\r\n$3\r\nGET\r\n$3\r\npgk\r\n");
+    readPhase();
+    EXPECT_EQ(recv(peer), ""); /* held: nothing served in the read phase while paused ALL */
+
+    /* Unpause and finish the iteration: the held GET was harvested for main and now replies. This
+     * also drains the client so the next block starts with nothing in flight (a precondition for
+     * fast GET to speculate again). */
+    server.paused_actions = 0;
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+
+    /* A read is not held by PAUSE WRITE: fast GET serves it in the read phase. */
+    server.paused_actions = PAUSE_ACTION_CLIENT_WRITE;
+    send(peer, "*2\r\n$3\r\nGET\r\n$3\r\npgk\r\n");
+    readPhase();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+
+    server.paused_actions = 0;
+    writeAndReplyPhases();
+    freeStaged(c, peer);
+}
+/* ---- Regression tests added by the superset audit (p4-unit-tests-confirmed) ---- */
+
+extern "C" {
+#include "bio.h"
+}
+#include <pthread.h>
+
+/* SPT-14 / SPT-15: main wrote into c->buf (a tracking push to a REDIRECT target) and owns that
+ * write. A fast GET must not answer this read: sending c->buf from the IO thread too would send
+ * main's bytes twice (97 pushes seen for 50 invalidations). The GET goes to main instead. */
+TEST_F(FastpathStagedTest, FastGetPuntsWhenMainWroteIntoClientBuffer) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*3\r\n$3\r\nSET\r\n$7\r\nst:spt1\r\n$1\r\nv\r\n");
+    iteration();
+    ASSERT_EQ(recv(peer), "+OK\r\n");
+
+    const std::string push = ">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n";
+    ASSERT_LT(push.size(), (size_t)c->buf_usable_size);
+    memcpy(c->buf, push.data(), push.size());
+    c->bufpos = (int)push.size();
+    c->flag.pending_write = 1; /* main queued its own write of these bytes */
+
+    send(peer, "*2\r\n$3\r\nGET\r\n$7\r\nst:spt1\r\n");
+    readPhase();
+    EXPECT_EQ(c->fp_inflight, 1u) << "the GET must be harvested for main, not answered by fast GET";
+    EXPECT_EQ(recv(peer), "") << "the IO thread sent bytes that main owns";
+    EXPECT_EQ(mainBuf(c), push) << "main's bytes were consumed or moved by the IO thread";
+
+    /* Hand main's bytes back so freeStaged sees a clean client. */
+    c->bufpos = 0;
+    c->flag.pending_write = 0;
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+    freeStaged(c, peer);
+}
+
+/* REPL-15: on a replica whose link is down, with replica-serve-stale-data no, a GET must be
+ * refused with -MASTERDOWN, as processCommand does on main. Fast GET must not answer it. */
+TEST_F(FastpathStagedTest, FastGetRefusesStaleDataWhenReplicaLinkIsDown) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*3\r\n$3\r\nSET\r\n$7\r\nst:rpl1\r\n$1\r\nv\r\n");
+    iteration();
+    ASSERT_EQ(recv(peer), "+OK\r\n");
+
+    sds saved_host = server.primary_host;
+    int saved_state = server.repl_state, saved_stale = server.repl_serve_stale_data;
+    server.primary_host = sdsnew("primary.example");
+    server.primary_port = 1;
+    server.repl_state = REPL_STATE_CONNECT;
+    server.repl_serve_stale_data = 0;
+
+    send(peer, "*2\r\n$3\r\nGET\r\n$7\r\nst:rpl1\r\n");
+    readPhase();
+    EXPECT_EQ(c->fp_inflight, 1u) << "the GET must reach main while the link is down";
+    EXPECT_EQ(recv(peer), "") << "fast GET served stale data";
+    writeAndReplyPhases();
+    std::string got = recv(peer);
+    EXPECT_EQ(got.compare(0, 11, "-MASTERDOWN"), 0) << "reply was: " << got;
+
+    sdsfree(server.primary_host);
+    server.primary_host = saved_host;
+    server.repl_state = saved_state;
+    server.repl_serve_stale_data = saved_stale;
+    freeStaged(c, peer);
+}
+
