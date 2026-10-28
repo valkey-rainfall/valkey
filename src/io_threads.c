@@ -2331,6 +2331,18 @@ void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
         return;
     }
 
+    /* A module value's free callback belongs to the module, which may not be thread safe: as
+     * stock, run it on main unless the module's free effort asks for bio. */
+    if (val->type == OBJ_MODULE) {
+        /* Some expire paths have no key object: do not hand a NULL key to the module's
+         * free_effort callback, free on main. */
+        if (key)
+            freeObjAsync(key, val, dbid);
+        else
+            decrRefCount(val);
+        return;
+    }
+
     if (server.active_io_threads_num > 1) {
         armNoMainThreadFree();
         if (tryOffloadFreeObjToIOThreads(val) == C_OK) {

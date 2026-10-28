@@ -610,3 +610,46 @@ TEST(FastpathEntryTest, BigReplyLengthSurvivesThe4GiBBoundary) {
     e.reply_big_len = just_over;
     EXPECT_EQ((size_t)e.reply_big_len, just_over);
 }
+
+/* MOD-01: a module data type value freed by DEL, overwrite or expire must have its free callback
+ * run on the main thread, as stock does for a small free effort (no free_effort callback: effort 1,
+ * below the 64 lazyfree threshold). S1 with io threads sends every sole module value to bio, so
+ * module free callbacks that are not thread safe run concurrently with the module's commands. */
+static int mod01_free_calls = 0;
+static pthread_t mod01_free_thread;
+static void mod01FreeCallback(void *value) {
+    UNUSED(value);
+    mod01_free_calls++;
+    mod01_free_thread = pthread_self();
+}
+
+/* Runs in a child (bio is not initialised in this fixture: on S1 the value is queued for bio and the
+ * child dies in bioCreateLazyFreeJob, which fails the test instead of killing the runner). Exit 0:
+ * the callback ran once, on the calling thread, with nothing queued for bio. Exit 3: it did not. */
+static void mod01FreeSoleModuleValue(void) {
+    moduleType mt;
+    memset(&mt, 0, sizeof(mt));
+    mt.free = mod01FreeCallback;
+    memcpy(mt.name, "p4mod01-t", 9);
+    int marker = 0;
+    robj *key = createStringObject("st:mod1", 7);
+    robj *val = createModuleObject(&mt, &marker);
+    server.active_io_threads_num = 4; /* io threads on: the terminal free path of a sole value */
+    mod01_free_calls = 0;
+    size_t lazy_before = lazyfreeGetPendingObjectsCount();
+
+    freeValueNeverOnMain(key, val, 0);
+
+    int ok = mod01_free_calls == 1 && pthread_equal(mod01_free_thread, pthread_self()) &&
+             lazyfreeGetPendingObjectsCount() == lazy_before;
+    fprintf(stderr, "mod01: calls=%d on_main=%d lazyfree_pending_delta=%zu\n", mod01_free_calls,
+            mod01_free_calls == 1 && pthread_equal(mod01_free_thread, pthread_self()),
+            lazyfreeGetPendingObjectsCount() - lazy_before);
+    decrRefCount(key);
+    exit(ok ? 0 : 3);
+}
+
+TEST_F(FastpathStagedTest, ModuleValueFreeCallbackRunsOnMainWithIoThreads) {
+    EXPECT_EXIT(mod01FreeSoleModuleValue(), ::testing::ExitedWithCode(0), "mod01: calls=1 on_main=1");
+}
+
