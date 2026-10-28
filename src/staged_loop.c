@@ -105,6 +105,7 @@ static int sl_barrier_ready = 0;
 static int sl_on = 0;         /* staged mode is on for this iteration */
 static int sl_want = 0;       /* staged mode is wanted: stock IO offload stops so it can start */
 static int sl_workers = 0;    /* IO threads 1..sl_workers are enrolled; the barrier's participant count */
+static int sl_inline_lanes = 0; /* unit tests: lane phases run inline, no barrier */
 static int sl_depth = 0;      /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
 static int sl_ae_fd = -1;     /* ae's own epoll fd, the single main-affinity entry */
@@ -619,6 +620,11 @@ void stagedRunApplyPhase(int with_workers) {
 }
 
 void stagedRunWritePhase(void) {
+    if (sl_inline_lanes) {
+        /* Unit tests: no worker is enrolled; run every lane here, lane by lane. */
+        for (int tid = sl_main_lane ? 0 : 1; tid <= sl_workers; tid++) fastpathStagedWriteLane(tid);
+        return;
+    }
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
     serverAssert(rc == 0);
@@ -637,6 +643,14 @@ void stagedStopWorkers(void) {
 int stagedResize(int setsize) {
     if (!sl_poller || pollerSetSize(sl_poller) >= setsize) return 0;
     return pollerResize(sl_poller, setsize);
+}
+
+/* Unit tests: pretend n IO workers are enrolled (no thread runs) so lanes are planned, and run every
+ * WRITE lane phase inline on the calling thread, lane by lane, in lane order. */
+void testOnlyStagedSetWorkers(int n, int main_lane) {
+    sl_workers = n;
+    sl_main_lane = main_lane;
+    sl_inline_lanes = 1;
 }
 
 /* Unit tests run the staged phases inline on one thread; no worker is enrolled. */
