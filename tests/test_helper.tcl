@@ -55,6 +55,8 @@ set ::valgrind 0
 set ::durable 0
 set ::tls 0
 set ::io_threads 0
+set ::assert_fastpath 0; # fail a test file whose servers never engaged the fast path
+set ::fastpath_file_engaged 0
 set ::tls_module 0
 set ::leaks 1
 set ::stack_logging 0
@@ -145,7 +147,15 @@ proc execute_test_file __testname {
     set ::curfile $path
     # Reset tags at the start of each test file
     set ::tags {}
+    set ::fastpath_file_engaged 0
     source $path
+    if {$::assert_fastpath && $::fastpath_file_engaged == 0} {
+        # No server of this file saw a lane entry, speculated read, IO-thread read or
+        # batch: with lanes forced on this file tested nothing about the fast path.
+        set msg "file $__testname: fast path never engaged (fastpath counters stayed 0)"
+        send_data_packet $::test_server_fd err $msg
+        incr ::num_failed
+    }
     send_data_packet $::test_server_fd done "$__testname"
 }
 
@@ -778,6 +788,7 @@ proc print_help_screen {} {
         "                   debugger)."
         "--dump-logs        Dump server log on test failure."
         "--io-threads       Run tests with IO threads."
+        "--assert-fastpath  Fail a test file whose servers never engaged the fast path."
         "--tls              Run tests in TLS mode."
         "--tls-module       Run tests in TLS mode with Valkey module."
         "--host <addr>      Run tests against an external host."
@@ -854,6 +865,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::quiet 1
     } elseif {$opt eq {--io-threads}} {
         set ::io_threads 1
+    } elseif {$opt eq {--assert-fastpath}} {
+        set ::assert_fastpath 1
     } elseif {$opt eq {--tls} || $opt eq {--tls-module}} {
         package require tls
         set ::tls 1

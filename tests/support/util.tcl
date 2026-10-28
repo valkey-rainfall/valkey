@@ -162,6 +162,37 @@ proc sanitizer_errors_from_file {filename} {
     return ""
 }
 
+# Fast-path engagement guard (superset). Reads the INFO fastpath counters of a
+# server client and returns their sum: lane entries, speculated reads, IO-thread
+# reads and batches. A superset test that leaves this at its starting value never
+# touched the fast path and proves nothing about it.
+proc fastpath_engagement {{client r}} {
+    set info [$client info fastpath]
+    set sum 0
+    foreach f {fastpath_write_lane_entries fastpath_speculated fastpath_reads fastpath_batches} {
+        set v [getInfoProperty $info $f]
+        if {$v ne {}} { incr sum $v }
+    }
+    return $sum
+}
+
+# Fails the running test unless the fast-path counters moved since $before
+# (a value returned by fastpath_engagement). Use:
+#   set m [fastpath_engagement]
+#   ... workload on a fast-path socket ...
+#   assert_fastpath_engaged $m
+proc assert_fastpath_engaged {before {client r} {detail ""}} {
+    set now [fastpath_engagement $client]
+    if {$now <= $before} {
+        set msg "fast path not engaged: counters $before -> $now ([$client info fastpath])"
+        if {$detail ne ""} { append msg " $detail" }
+        error "assertion:$msg"
+    }
+    # Accumulate for the per-file check in test_helper (assert_fastpath_file).
+    if {[info exists ::fastpath_file_engaged]} { incr ::fastpath_file_engaged [expr {$now - $before}] }
+    return [expr {$now - $before}]
+}
+
 proc getInfoProperty {infostr property} {
     if {[regexp -lineanchor "^$property:(.*?)\r\n" $infostr _ value]} {
         return $value

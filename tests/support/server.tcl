@@ -55,6 +55,16 @@ proc kill_server config {
     # nothing to kill when running against external server
     if {$::external} return
 
+    # Fast-path engagement guard: before the client goes away, add this
+    # server's fast-path counters to the per-file total (see
+    # --assert-fastpath in test_helper.tcl).
+    if {$::assert_fastpath && [dict exists $config "client"] && [is_alive [dict get $config pid]]} {
+        catch {
+            set n [fastpath_engagement [dict get $config "client"]]
+            incr ::fastpath_file_engaged $n
+        }
+    }
+
     # Close client connection if exists
     if {[dict exists $config "client"]} {
         [dict get $config "client"] close
