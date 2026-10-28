@@ -1,20 +1,20 @@
-name: lsan-2604-cap3
+name: lsan-2604-fix
 
-# Capture wave + fork-deadlock probe, with PR 4306 (raw frames after the
-# symbolizer timeout) and PR 4993 (libbacktrace warm-up) cherry-picked onto the
-# baseline. Reproduces the LeakSanitizer exit hang at full-suite scale on
-# ubuntu-26.04 (CI-faithful ASan build). On a confirmed hang the watchdog
-# sends the harness's SIGSEGV itself and records whether the crash handler's
-# fork() returns (symbolizer child stuck) or deadlocks in ASan ForkBefore(),
-# and what the two PRs manage to print. valkey-server + /proc/<pid>/maps are
-# uploaded on capture so raw PCs can be symbolized offline.
-# 40 shards for ~96% odds of at least one catch at the observed ~8%/run.
-# Fork-only. Manual + branch push.
+# Mitigation test for the LeakSanitizer exit hang on ubuntu-26.04. Same ASan
+# binary as the cap3 wave (PRs 4306 and 4993 applied), with two harness
+# changes: kill_server sends SIGCONT only when the process is actually
+# stopped, and the LSan ptrace-probe warning is non-fatal (printed as a note).
+# Measures per shard: LSan warnings in server stderr (the exit window was
+# hit), harness "Forcing process ... to crash" lines (a >10s exit hang, with
+# or without the warning), "Sanitizer error" lines (job-failing sanitizer
+# output), and watchdog captures (confirmed hangs with kernel stacks).
+# Expected if the fix works: warnings still appear at roughly the old rate,
+# hangs and Sanitizer errors drop to zero. Fork-only. Manual + branch push.
 on:
   workflow_dispatch:
   push:
     branches:
-      - rain/lsan-2604-cap3
+      - rain/lsan-2604-fix
 
 permissions:
   contents: read
@@ -68,12 +68,24 @@ jobs:
           rc=$?
           set -e
           sleep 2; kill $wd 2>/dev/null || true
-          hang=no; if [ $rc -ne 0 ] && grep -qE "ptrace appears to be blocked|Sanitizer error" "$RUNNER_TEMP/runtest.out" 2>/dev/null; then hang=yes; fi
+          warnings=$(grep -rl "ptrace appears to be blocked" tests/tmp 2>/dev/null | wc -l)
+          notes=$(grep -c "LeakSanitizer ptrace probe warning" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          sanerr=$(grep -c "Sanitizer error" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          forced=$(grep -c "Forcing process .* to crash" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          waiting=$(grep -c "Waiting for process .* to exit" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          confirmed=$(grep -l "PROBE=sent" "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)
           echo "captured=$([ -n "$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null)" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
           echo "===== shard ${{ matrix.shard }} ====="
           echo "RUNTEST_EXIT=$rc"
-          echo "LSAN_HANG=$hang"
+          echo "LSAN_WARNINGS=$warnings"
+          echo "LSAN_NOTES=$notes"
+          echo "SANITIZER_ERRORS=$sanerr"
+          echo "FORCED_CRASH=$forced"
+          echo "WAITING_LINES=$waiting"
           echo "CAPTURES=$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)"
+          echo "CONFIRMED_HANGS=$confirmed"
+          grep -h "LeakSanitizer ptrace probe warning\|Sanitizer error\|Forcing process" "$RUNNER_TEMP/runtest.out" | head -20
+          grep -B2 -A8 "\[err\]" "$RUNNER_TEMP/runtest.out" | head -60
           for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
 
       - name: Stage artifacts on capture
