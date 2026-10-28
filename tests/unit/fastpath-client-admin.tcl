@@ -37,6 +37,62 @@ proc fpca_alive {c} {
 }
 
 # ---------------------------------------------------------------------------
+# Plan item 2 (ACL-06): CLIENT LIST / KILL USER and NOT-USER after ACL LOAD.
+# ---------------------------------------------------------------------------
+set fpca_acldir [tmpdir fpca-acl]
+set fd [open [file join $fpca_acldir users.acl] w]
+puts $fd "user default on nopass ~* &* +@all"
+puts $fd "user alice on >pw ~* &* +@all"
+close $fd
+
+start_server [list tags {"fastpath client-admin acl external:skip tls:skip"} \
+              overrides [list io-threads 4 io-threads-always-active yes dir $fpca_acldir aclfile users.acl]] {
+    r select 9
+    r select 0
+    r set k v
+    r select 9
+
+    proc fpca_alice {} {
+        set c [fpca_client]
+        $c auth alice pw
+        assert_equal OK [$c read]
+        fpca_engage $c k
+        return $c
+    }
+
+    test {ACL-06: CLIENT LIST USER and CLIENT KILL USER find a fast-path client after ACL LOAD} {
+        set c [fpca_alice]
+        assert_equal 1 [llength [split [string trim [r client list user alice]] "\n"]]
+        assert_equal OK [r acl load]
+        # Keep alice busy on the fast path after the load.
+        fpca_engage $c k
+        assert_equal 1 [fpca_info fastpath_clients]
+        set lines [string trim [r client list user alice]]
+        assert_equal 1 [llength [split $lines "\n"]] "CLIENT LIST USER alice after ACL LOAD: '$lines'"
+        assert_equal 1 [r client kill user alice]
+        wait_for_condition 100 20 { ![fpca_alive $c] } else { fail "alice still alive after CLIENT KILL USER" }
+        $c close
+        fpca_wait_fastpath_clients 0
+    }
+
+    test {ACL-06: CLIENT KILL NOT-USER does not kill a fast-path client of that user after ACL LOAD} {
+        # Drop clients a failed earlier test may have left behind.
+        r client kill user alice
+        r client kill type normal skipme yes
+        fpca_wait_fastpath_clients 0
+        set c [fpca_alice]
+        assert_equal OK [r acl load]
+        fpca_engage $c k
+        assert_equal 1 [fpca_info fastpath_clients]
+        # The only other client is the control connection, skipped by SKIPME.
+        assert_equal 0 [r client kill not-user alice skipme yes]
+        assert_equal 1 [fpca_alive $c]
+        $c close
+        fpca_wait_fastpath_clients 0
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Plan item 10 (CLI-13): a slow reader of a large reply is not idle-closed.
 # The reader pauses between 64 KB reads; the pause shapes the load, it does
 # not synchronise anything. Stock Valkey counts every write as interaction.
