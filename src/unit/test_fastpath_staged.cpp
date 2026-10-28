@@ -588,3 +588,25 @@ TEST_F(FastpathStagedTest, LeavingClientsHandedBackInArrivalOrderAcrossThreads) 
     freeClientsInAsyncFreeQueue();
     fastpathFreeThread(2);
 }
+
+/* STR-12: a reply larger than 4 GiB (MGET of a 512 MiB value 9 times) is sent by the fast path
+ * from cmdEntry.reply_big with length cmdEntry.reply_big_len. The length is computed as a size_t
+ * (bufpos plus every reply block) and must survive the store into the entry; a 32-bit field keeps
+ * only total mod 2^32 and the client receives 536871042 of 4831838338 bytes. No allocation here:
+ * only the arithmetic the executor performs. */
+TEST(FastpathEntryTest, BigReplyLengthSurvivesThe4GiBBoundary) {
+    cmdEntry e;
+    memset(&e, 0, sizeof(e));
+    /* Computed at run time (volatile), as the executor computes it, so the compiler cannot fold the
+     * store and reject the test at compile time: the production store is of a run-time size_t. */
+    volatile size_t blocks = 9, bulk = 512ull << 20;
+    size_t total = blocks * (1 + 9 + 2 + bulk + 2) + 4; /* MGET x9 of a 512 MiB value: 4831838338 */
+    ASSERT_EQ(total, 4831838338ull);
+    e.reply_big_len = total; /* the store src/fastpath.c performs after assembling the reply list */
+    EXPECT_EQ((size_t)e.reply_big_len, total) << "reply_big_len cannot hold a reply above 4 GiB";
+    EXPECT_GE(sizeof(e.reply_big_len), sizeof(size_t));
+    volatile size_t one = 1;
+    size_t just_over = (one << 32) + 1;
+    e.reply_big_len = just_over;
+    EXPECT_EQ((size_t)e.reply_big_len, just_over);
+}

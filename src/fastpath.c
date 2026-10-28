@@ -1155,7 +1155,7 @@ static void fpSplitAssemble(cmdBatch *b, cmdEntry *e) {
             cur[p] = q + n;
         }
         e->reply_big = out;
-        e->reply_big_len = (uint32_t)o;
+        e->reply_big_len = o;
     }
     for (int p = 0; p < s->nparts; p++) {
         cmdEntry *pe = &s->parts[p]->e;
@@ -1339,7 +1339,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         e->reply_off = 0;
         e->reply_len = 0;
         e->reply_big = big;
-        e->reply_big_len = (uint32_t)total;
+        e->reply_big_len = total;
     }
     ec->bufpos = 0;
     ec->buf = saved_buf;
@@ -1973,7 +1973,7 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
         e->reply_off = 0;
         e->reply_len = 0;
         e->reply_big = big;
-        e->reply_big_len = (uint32_t)total;
+        e->reply_big_len = total;
     }
     ec->bufpos = 0;
     ec->buf = saved_buf;
