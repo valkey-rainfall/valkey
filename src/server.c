@@ -5633,6 +5633,25 @@ int finishShutdown(void) {
     /* Handle cluster-related matters when shutdown. */
     if (server.cluster_enabled) clusterHandleServerShutdown(failover);
 
+    /* An IO thread may still own, or may have finished without main accounting it (a lazy
+     * write), an earlier write to a replica. Such a replica is neither in the pending write
+     * queue nor has a write handler, so flushReplicasOutputBuffers would skip the data fed
+     * after that write, which the fast path may already have acknowledged to clients. Wait
+     * for those writes and account them first. */
+    listIter wli;
+    listNode *wln;
+    listRewind(server.replicas, &wli);
+    while ((wln = listNext(&wli)) != NULL) {
+        client *replica = listNodeValue(wln);
+        while (replica->io_write_state != CLIENT_IDLE) {
+            waitForClientIO(replica);
+            if (replica->io_write_state == CLIENT_COMPLETED_IO) {
+                atomic_thread_fence(memory_order_acquire);
+                processClientIOWriteDone(replica);
+            }
+        }
+    }
+
     /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushReplicasOutputBuffers();
