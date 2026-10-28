@@ -376,7 +376,10 @@ static int fpSessionEligible(client *c) {
     if (c->flag.repl_rdb_channel || c->repl_data) return 0; /* a connection on its way to becoming a replica */
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
-    if (c->mstate || c->flag.pubsub || c->flag.tracking || c->name) return 0;
+    /* An open MULTI queues commands on main and a watched key needs touchWatchedKey from main. A finished
+     * transaction leaves c->mstate allocated (freed only at freeClient), which must not keep the client out. */
+    if (c->flag.multi || (c->mstate && listLength(&c->mstate->watched_keys) > 0)) return 0;
+    if (c->flag.pubsub || c->flag.tracking || c->name) return 0;
     if (c->capa) return 0; /* CLIENT CAPA changes replies main builds for this client, e.g. REDIRECT */
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;

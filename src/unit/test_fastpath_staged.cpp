@@ -494,3 +494,54 @@ TEST_F(FastpathStagedTest, FastGetRefusesStaleDataWhenReplicaLinkIsDown) {
     freeStaged(c, peer);
 }
 
+/* A transaction or a WATCH sends the client to main (MULTI, WATCH, EXEC and UNWATCH are not fast-path
+ * commands). Once the transaction is over and nothing is watched, the client is as eligible as it was
+ * before, so main readmits it at handoff, exactly as it does after SELECT. The control case runs first
+ * to prove the harness readmits. */
+TEST_F(FastpathStagedTest, ClientRejoinsAfterSelect) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.fastpath, 1u) << "control: a SELECT client is readmitted at handoff";
+    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE);
+    freeStaged(c, peer);
+}
+
+TEST_F(FastpathStagedTest, ClientRejoinsAfterTransactionEnds) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$4\r\nst:t\r\n$1\r\n1\r\n*1\r\n$4\r\nEXEC\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.multi, 0u);
+    EXPECT_EQ(c->flag.fastpath, 1u) << "a client whose EXEC finished must rejoin the fast path";
+    freeStaged(c, peer);
+}
+
+TEST_F(FastpathStagedTest, ClientRejoinsAfterUnwatch) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$5\r\nWATCH\r\n$4\r\nst:w\r\n*1\r\n$7\r\nUNWATCH\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.fastpath, 1u) << "a client that watches nothing any more must rejoin the fast path";
+    freeStaged(c, peer);
+}
+
+/* While a key is watched or the transaction is open the client must stay on main: WATCH needs
+ * touchWatchedKey from main and MULTI queues commands there. */
+TEST_F(FastpathStagedTest, ClientStaysOnMainWhileWatchingOrInMulti) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$5\r\nWATCH\r\n$4\r\nst:w\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.fastpath, 0u) << "a client with a watched key is not readmitted";
+    EXPECT_EQ(fastpathEligible(c), 0);
+    unwatchAllKeys(c);
+    EXPECT_EQ(fastpathEligible(c), 1) << "nothing watched any more: eligible again";
+    c->flag.multi = 1;
+    EXPECT_EQ(fastpathEligible(c), 0) << "an open MULTI keeps the client on main";
+    c->flag.multi = 0;
+    close(peer);
+    freeClient(c);
+}
+
