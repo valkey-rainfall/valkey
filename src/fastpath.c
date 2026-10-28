@@ -2452,7 +2452,12 @@ static void fpPrefetchBarriers(fpThread *t, int s) {
 static int fpExecuteWithLanes(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
-    int serial = !fpLanesAllowed();
+    /* Audit issue 29, primary side: the ring clients' commands ran on main just before this, after the
+     * read phase classified the lanes with the sampled flags. A WATCH or a blocking command among them
+     * makes the classification stale, so this iteration's lane entries run on main, in order, through
+     * the existing serial path. The per-entry demotion the replica plan does (rpDemoteObserved) is not
+     * done here yet: the per-thread lane vectors and segment counts would have to be rebuilt. */
+    int serial = !fpLanesAllowed() || fastpathKeyObserversChanged();
     for (int l = 0; l < fp_nlanes; l++) memset(fp_lanes[l].cursor, 0, sizeof(int) * fp_slots);
     fp_nparts = 0;
     int pending = 0;
@@ -2473,7 +2478,7 @@ static int fpExecuteWithLanes(void) {
             clientSetUser(ec, DefaultUser, 0);
             total++;
             fp_stat_barriers++;
-            if (!serial && !fpLanesAllowed()) serial = 1;
+            if (!serial && (!fpLanesAllowed() || fastpathKeyObserversChanged())) serial = 1;
         }
     }
     total += fpRunSegment(pending, serial, use_prefetch);

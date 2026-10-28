@@ -572,6 +572,20 @@ int replApplyRunPlan(client *c) {
         c->cmd_queue.off = 0;
         c->qb_pos = rp.scan_end;
     }
+    /* Audit issue 29, design note for the check below.
+     * - Only main bumps the counter (fastpathKeyObserverAdded asserts it). During an APPLY phase main
+     *   runs its own lane or waits at the barrier and runs no client command, so the counter cannot
+     *   move while lanes run. Between segments main runs a barrier; the check after each barrier in
+     *   rpRunSegments covers a barrier that unblocks a client which re-blocks on another key.
+     * - A WATCH that ran before this plan sees every write of the plan as later than itself, in
+     *   stock semantics too: the plan is applied as a unit after the ring commands of the write
+     *   phase, nothing of it ran before the WATCH. A demoted entry runs on main at its own stream
+     *   position, so the WATCH is dirtied by exactly the writes a stock replica would dirty it with,
+     *   and the order of ring commands against stream apply is unchanged: only the thread changes.
+     * - A plan never has entries on both sides of the window: the window closes before rpRun starts.
+     *   Entries of earlier plans ran before the WATCH and are not touched by it, as in stock.
+     * - Expired-key watches (wk->expired) keep stock semantics: a demoted entry goes through
+     *   processPlannedCommand and the usual signalModifiedKey -> touchWatchedKey on main. */
     if (fastpathKeyObserversChanged()) rpDemoteObserved(c);
     rpMerge();
     server.stat_repl_lane_reads++;
