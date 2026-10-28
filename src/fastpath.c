@@ -1497,18 +1497,34 @@ void fastpathHandoffDone(client *c, int closing) {
     beforeNextClient(c);
 }
 
-void fastpathInfo(sds *info) {
-    long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
-              batches = fp_retired[4], speculated = fp_retired[5];
+/* The per-thread counters are written by their IO threads, so CONFIG RESETSTAT cannot zero them in place;
+ * it records the totals at reset time and INFO reports the growth since then. */
+static long long fp_info_base[6];
+
+static void fpInfoTotals(long long *t) {
+    for (int k = 0; k < 6; k++) t[k] = fp_retired[k];
     for (int i = 0; i < fp_slots; i++) {
         if (!fp_threads[i].ready) continue;
-        reads += fp_threads[i].reads;
-        in += fp_threads[i].net_input_bytes;
-        out += fp_threads[i].net_output_bytes;
-        writes += fp_threads[i].writes;
-        batches += fp_threads[i].batches;
-        speculated += fp_threads[i].speculated;
+        t[0] += fp_threads[i].reads;
+        t[1] += fp_threads[i].net_input_bytes;
+        t[2] += fp_threads[i].net_output_bytes;
+        t[3] += fp_threads[i].writes;
+        t[4] += fp_threads[i].batches;
+        t[5] += fp_threads[i].speculated;
     }
+}
+
+/* Main, from resetServerStats: INFO fastpath counters restart from zero. */
+void fastpathResetStats(void) {
+    fpInfoTotals(fp_info_base);
+    fp_stat_lane_phases = fp_stat_lane_entries = fp_stat_barriers = fp_stat_serial_segments = 0;
+}
+
+void fastpathInfo(sds *info) {
+    long long t[6];
+    fpInfoTotals(t);
+    long long reads = t[0] - fp_info_base[0], in = t[1] - fp_info_base[1], out = t[2] - fp_info_base[2],
+              writes = t[3] - fp_info_base[3], batches = t[4] - fp_info_base[4], speculated = t[5] - fp_info_base[5];
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
                          "fastpath_workers_open:%d\r\n"

@@ -90,6 +90,7 @@ int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);
+void fastpathResetStats(void);
 
 /* Allocate and initialize the connection's ClientControl once, on first crossing-capable admission; a
  * no-op if it already has one. Reclaimed only by fastpathControlReclaim at free. */
