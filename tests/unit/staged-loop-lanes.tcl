@@ -78,6 +78,10 @@ proc pwl_repl_applied {c} {
     return [getInfoProperty [$c info stats] repl_parallel_applied]
 }
 
+proc pwl_stat {c name} {
+    return [getInfoProperty [$c info stats] $name]
+}
+
 proc pwl_calls {c cmd} {
     set v [getInfoProperty [$c info commandstats] cmdstat_$cmd]
     if {![regexp {calls=([0-9]+)} $v -> n]} { return 0 }
@@ -831,6 +835,8 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             # The primary's PING would be the first planned chunk; keep it out of the window.
             $primary config set repl-ping-replica-period 1000
             set before [pwl_repl_applied $replica]
+            set rechecks0 [pwl_stat $replica repl_lane_rechecks]
+            set demoted0 [pwl_stat $replica repl_lane_demoted]
             set fired0 [$replica debug staged-window-fired]
             set rd [valkey_deferring_client]
             $rd select 0
@@ -862,12 +868,58 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             $rd close
             assert_equal changed [$replica get pwl:ww]
             assert {[pwl_repl_applied $replica] - $before >= 290}
+            # The plan was re-checked once and exactly the write to the watched key left its lane.
+            assert_equal 1 [expr {[pwl_stat $replica repl_lane_rechecks] - $rechecks0}]
+            assert_equal 1 [expr {[pwl_stat $replica repl_lane_demoted] - $demoted0}]
             assert_equal {} $res
+        }
+
+        test {Replica lanes: a WATCH of an unrelated key in the window demotes no lane entry (issue-29 window)} {
+            set before [pwl_repl_applied $replica]
+            set rechecks0 [pwl_stat $replica repl_lane_rechecks]
+            set demoted0 [pwl_stat $replica repl_lane_demoted]
+            set barriers0 [pwl_stat $replica repl_lane_barriers]
+            set fired0 [$replica debug staged-window-fired]
+            set rd [valkey_deferring_client]
+            $rd select 0
+            assert_equal OK [$rd read]
+            $rd debug staged-window-run watch pwl:unrelated
+            assert_equal OK [$rd read]
+            set fd [pwl_fast_socket $primary $primary_host $primary_port]
+            set buf ""
+            for {set i 0} {$i < 300} {incr i} { append buf [pwl_resp set pwl:wz$i $i] }
+            puts -nonewline $fd $buf
+            flush $fd
+            pwl_read_replies $fd 300
+            close $fd
+            wait_for_ofs_sync $primary $replica
+            wait_for_condition 100 50 {
+                [$replica debug staged-window-fired] == $fired0 + 1
+            } else {
+                fail "the window hook did not run the WATCH"
+            }
+            assert_equal OK [$rd read]
+            $rd multi
+            assert_equal OK [$rd read]
+            $rd get pwl:wz7
+            assert_equal QUEUED [$rd read]
+            $rd exec
+            set res [$rd read]
+            $rd close
+            # The counter moved, so the plan was re-checked, but no key of the stream is watched:
+            # every entry stayed on its lane and nothing became a barrier.
+            assert_equal 1 [expr {[pwl_stat $replica repl_lane_rechecks] - $rechecks0}]
+            assert_equal 0 [expr {[pwl_stat $replica repl_lane_demoted] - $demoted0}]
+            assert_equal 0 [expr {[pwl_stat $replica repl_lane_barriers] - $barriers0}]
+            assert {[pwl_repl_applied $replica] - $before >= 300}
+            assert_equal {7} $res
         }
 
         test {Replica lanes: a BLPOP registered in the read/write window is served once (issue-29 window)} {
             $replica config set replica-read-only no
             set before [pwl_repl_applied $replica]
+            set rechecks0 [pwl_stat $replica repl_lane_rechecks]
+            set demoted0 [pwl_stat $replica repl_lane_demoted]
             set fired0 [$replica debug staged-window-fired]
             set rd [valkey_deferring_client]
             $rd select 0
@@ -893,6 +945,8 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             $rd close
             $replica config set replica-read-only yes
             assert {[pwl_repl_applied $replica] - $before >= 290}
+            assert_equal 1 [expr {[pwl_stat $replica repl_lane_rechecks] - $rechecks0}]
+            assert_equal 1 [expr {[pwl_stat $replica repl_lane_demoted] - $demoted0}]
             assert_equal {pwl:wl a} $res
             assert_equal 0 [$replica llen pwl:wl]
         }
