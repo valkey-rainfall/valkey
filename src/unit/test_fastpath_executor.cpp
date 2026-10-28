@@ -259,3 +259,122 @@ TEST_F(FastpathExecutorTest, ClientInfoOfFastpathClientComesFromAdmissionPeer) {
     close(sv[0]);
     conn->fd = -1;
 }
+
+/* ---- Regression tests added by the superset audit (repro-group-c) ---- */
+
+extern "C" {
+long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
+void updateClientMemoryUsage(client *c);
+void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage);
+}
+
+/* An admitted fast-path client on one end of a socketpair; the test writes requests to *peer_fd. */
+static client *fpTestAdmitClient(int *peer_fd, connection **conn_out) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->fp_out = NULL;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40002);
+    inet_pton(AF_INET, "192.0.2.78", &sa.sin_addr);
+    if (peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)) != C_OK) return NULL;
+    c->fp_local = c->fp_peer;
+    if (fastpathAttach(c) != C_OK) return NULL;
+    *peer_fd = sv[1];
+    *conn_out = conn;
+    return c;
+}
+
+/* Hand the client back to main and release the socket. The client struct is leaked on purpose:
+ * freeClient needs the full server state that this fixture does not build. */
+static void fpTestReleaseClient(client *c, connection *conn, int peer_fd) {
+    testOnlyStagedStop();
+    connSetReadHandler(conn, NULL);
+    fastpathControlReclaim(c);
+    testOnlyStagedStart();
+    close(peer_fd);
+    close(conn->fd);
+    conn->fd = -1;
+}
+
+/* Bytes the peer can read right now, without blocking. */
+static ssize_t fpTestReadNow(int fd, char *buf, size_t cap) {
+    ssize_t n = recv(fd, buf, cap, MSG_DONTWAIT);
+    return n < 0 ? 0 : n;
+}
+
+/* EV-02 / STR-05: a GET answered on the IO thread (fast GET) must update the LRU clock and the
+ * LFU counter of the value, as lookupKey does on main. Otherwise *-lru / *-lfu eviction evicts
+ * the hottest keys first and OBJECT IDLETIME / FREQ are wrong. */
+TEST_F(FastpathExecutorTest, FastGetTouchesLruAndLfu) {
+    server.child_pid = -1; /* no fork in progress: lookupKey would touch as well */
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+    lrulfu_updateClockAndPolicy(mstime(), false);
+
+    robj *key = createStringObject("hot", 3);
+    robj *val = createStringObject("x", 1);
+    dbAdd(server.db[0], key, &val);
+    robj *stored = lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NOTOUCH | LOOKUP_NOSTATS | LOOKUP_NONOTIFY);
+    ASSERT_NE(stored, nullptr);
+    stored->lru = lru_import(100); /* the key looks idle for 100 s */
+    uint32_t idle = 0;
+    lrulfu_getIdleness(stored->lru, &idle);
+    ASSERT_GE(idle, 99u);
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+
+    /* One read whose only complete command is a 2-argument GET: the fast GET path answers it on
+     * the IO thread during the read phase, before main executes anything. */
+    const char *req = "*2\r\n$3\r\nGET\r\n$3\r\nhot\r\n";
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    char buf[64];
+    ssize_t n = fpTestReadNow(peer, buf, sizeof(buf));
+    ASSERT_EQ(n, 7) << "the GET was not answered by fast GET (engagement check)";
+    EXPECT_EQ(memcmp(buf, "$1\r\nx\r\n", 7), 0) << "unexpected fast GET reply";
+    EXPECT_EQ(c->fp_inflight, 0u);
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_EQ(idle, 0u) << "fast GET did not reset the LRU idle time";
+
+    /* LFU: with lfu-log-factor 0 every touch increments the counter. */
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LFU;
+    lfu_config_log_factor = 0;
+    lrulfu_updateClockAndPolicy(mstime(), true);
+    stored->lru = lfu_import(5);
+    uint8_t freq = 0;
+    lfu_getFrequency(stored->lru, &freq);
+    ASSERT_EQ(freq, 5);
+    char many[8 * 24 + 1]; /* 8 GETs of 24 bytes, 8 replies of 7 bytes */
+    many[0] = '\0';
+    for (int i = 0; i < 8; i++) strcat(many, req);
+    ASSERT_EQ(write(peer, many, strlen(many)), (ssize_t)strlen(many));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    n = fpTestReadNow(peer, buf, sizeof(buf));
+    ASSERT_EQ(n, 8 * 7) << "the GET batch was not answered by fast GET (engagement check)";
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    lfu_getFrequency(stored->lru, &freq);
+    EXPECT_GT(freq, 5) << "fast GET did not increment the LFU counter";
+
+    fpTestReleaseClient(c, conn, peer);
+    dbDelete(server.db[0], key);
+    decrRefCount(key);
+    server.maxmemory_policy = 0;
+    lrulfu_updateClockAndPolicy(mstime(), false);
+}

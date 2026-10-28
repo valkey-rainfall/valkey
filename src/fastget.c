@@ -167,6 +167,22 @@ static long long fastGetCommandlogThreshold(int type) {
     return server.commandlog[type].threshold;
 }
 
+/* Update the LRU clock or the LFU counter of a value read by fast GET, as lookupKey does on
+ * main (EV-02 / STR-05). Runs on an IO thread in the read phase, when nothing writes the keyspace.
+ * Two IO threads may touch the same value at once: both write the same word with only the lru bits
+ * changed, so the last write wins and no other field is damaged. LFU needs a random number and
+ * rand() is not thread safe, so a per-thread xorshift generator is used. */
+static void fastGetTouch(robj *o) {
+    if (hasActiveChildProcess()) return; /* no copy-on-write storms while a child runs, as lookupKey */
+    static __thread uint64_t rng;
+    if (rng == 0) rng = ((uint64_t)(uintptr_t)&rng) ^ (uint64_t)ustime() ^ 0x9E3779B97F4A7C15ULL;
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    double r = (double)(rng >> 11) / (double)(1ULL << 53);
+    o->lru = lrulfu_touchWithRandom(o->lru, r);
+}
+
 /* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
  * written), 0 on punt. The keyspace is quiescent while IO threads read: main
  * mutates it only outside the read phase. */
@@ -225,6 +241,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
     if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
     if (fastGetWriteBulkReply(c, val, vallen) <= 0) return 0;
+    fastGetTouch(o);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     FASTGET_STAT_ADD(speculative_hits, 1);
 #endif
