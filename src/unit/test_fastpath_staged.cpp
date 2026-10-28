@@ -653,3 +653,47 @@ TEST_F(FastpathStagedTest, ModuleValueFreeCallbackRunsOnMainWithIoThreads) {
     EXPECT_EXIT(mod01FreeSoleModuleValue(), ::testing::ExitedWithCode(0), "mod01: calls=1 on_main=1");
 }
 
+/* N1: main hands batched entries back (fpMustRunOnMain: a forkless save, a pause, a failover, a
+ * throttler ...) while the client has a trailing partial command whose "*N" header is parsed but no
+ * argument yet (argc 0, multibulklen > 0). The partial's argv must survive the requeue: the parser
+ * continues into c->argv without allocating it again. Here a failover in progress makes main return
+ * the entries; on S1 the partial's argv is dropped and the next parse writes through a NULL argv. */
+TEST_F(FastpathStagedTest, RequeueKeepsTrailingPartialWithNoArgumentYet) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$4\r\nPING\r\n$1\r\na\r\n*2\r\n$4\r\nPING\r\n$1\r\nb\r\n*2\r\n$4\r\n");
+    readPhase();
+    /* The trailing partial: header and first bulk length parsed, no argument yet. */
+    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE);
+    EXPECT_EQ(c->argc, 0);
+    EXPECT_EQ(c->multibulklen, 2);
+    EXPECT_EQ(c->bulklen, 4);
+    ASSERT_NE(c->argv, nullptr);
+
+    server.failover_state = FAILOVER_WAIT_FOR_SYNC; /* fpMustRunOnMain: every entry is requeued */
+    writeAndReplyPhases();
+    server.failover_state = NO_FAILOVER;
+    std::string out = recv(peer) + mainBuf(c);
+    EXPECT_EQ(out, "$1\r\na\r\n$1\r\nb\r\n");
+    /* The parser state and its argv still go together, wherever the client is now. */
+    EXPECT_EQ(c->multibulklen, 2);
+    ASSERT_TRUE(c->multibulklen == 0 || c->argv != nullptr)
+        << "partial parse state with a NULL argv: the next read writes through it";
+
+    c->bufpos = 0;
+    send(peer, "PING\r\n$1\r\nc\r\n");
+    if (c->flag.fastpath) {
+        iteration();
+    } else {
+        readQueryFromClient(c->conn);
+    }
+    out = recv(peer) + mainBuf(c);
+    EXPECT_EQ(out, "$1\r\nc\r\n");
+    EXPECT_EQ(c->multibulklen, 0);
+    if (c->flag.fastpath) {
+        freeStaged(c, peer);
+    } else {
+        close(peer);
+        freeClient(c);
+    }
+}

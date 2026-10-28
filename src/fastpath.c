@@ -1045,7 +1045,9 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
     int rest = q->len - q->off - qheld;
     int first = c->fp_held ? 0 : 1; /* with nothing held, e[0] becomes c->argv */
     parsedCommand cur;
-    int has_cur = !c->fp_held && c->argc > 0; /* a promoted command or a trailing partial, parsed after the entries */
+    /* A promoted command or a trailing partial, parsed after the entries. A partial whose header is parsed but
+     * no argument yet has argc 0 and multibulklen > 0; its argv is where the parser continues. */
+    int has_cur = !c->fp_held && (c->argc > 0 || c->multibulklen > 0);
     if (has_cur) {
         cur = (parsedCommand){.read_flags = c->read_flags,
                               .argc = c->argc,
