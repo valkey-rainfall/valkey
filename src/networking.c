@@ -5822,7 +5822,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->laddr && strcmp(getClientSockname(client), client_filter->laddr) != 0) return 0;
     if (client_filter->type != -1 && getClientType(client) != client_filter->type) return 0;
     if (client_filter->ids && !intsetFind(client_filter->ids, client->id)) return 0;
-    if (client_filter->user && client->user != client_filter->user) return 0;
+    if (client_filter->user && ACLResolveUser(client->user) != client_filter->user) return 0;
     if (client_filter->skipme && client == ectx->current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
     if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
@@ -5843,7 +5843,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->not_laddr && strcmp(getClientSockname(client), client_filter->not_laddr) == 0) return 0;
     if (client_filter->not_type != -1 && getClientType(client) == client_filter->not_type) return 0;
     if (client_filter->not_ids && intsetFind(client_filter->not_ids, client->id)) return 0;
-    if (client_filter->not_user && client->user == client_filter->not_user) return 0;
+    if (client_filter->not_user && ACLResolveUser(client->user) == client_filter->not_user) return 0;
     if (client_filter->not_flags && clientMatchesFlagFilter(client, client_filter->not_flags) != 0) return 0;
     if (client_filter->not_name) {
         if (client->name && objectGetVal(client->name) && strcmp(objectGetVal(client->name), client_filter->not_name) == 0) {
