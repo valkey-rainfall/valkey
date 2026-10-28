@@ -82,6 +82,34 @@ jobs:
       - name: module api test
         run: CFLAGS='-Werror' ./runtest-moduleapi --io-threads --verbose --dump-logs
 
+  test-ubuntu-latest-fastpath-lanes:
+    # --io-threads above starts servers with io-threads 2, where the staged loop and the
+    # write lanes do not engage. This job forces every server to io-threads 4 with the
+    # parallel write lanes on for every segment, so the stock data-type, transaction, sort,
+    # expire, keyspace and scan suites run their commands through the fast path. The
+    # --assert-fastpath flag fails a file whose servers never moved a fast-path counter
+    # (tests/support/util.tcl fastpath_engagement), so a file that silently fell back to
+    # the main path is reported instead of passing for the wrong reason.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: make
+        run: make -j4 SERVER_CFLAGS='-Werror'
+      - name: test with the fast path and write lanes forced on
+        run: |
+          sudo apt-get install tcl8.6 tclx
+          FILES=""
+          for f in tests/unit/type/*.tcl; do FILES="$FILES --single unit/type/$(basename $f .tcl)"; done
+          for f in multi sort expire keyspace scan info-command superset-info-counters; do FILES="$FILES --single unit/$f"; done
+          ./runtest $FILES --config io-threads 4 --config io-threads-parallel-writes-min 1 \
+            --assert-fastpath --verbose --tags -slow --dump-logs
+      - name: module api test with the fast path forced on
+        run: |
+          CFLAGS='-Werror' ./runtest-moduleapi --single unit/moduleapi/keyspace_events \
+            --single unit/moduleapi/commandfilter --single unit/moduleapi/datatype \
+            --config io-threads 4 --config io-threads-parallel-writes-min 1 --assert-fastpath --verbose --dump-logs
+
   test-ubuntu-latest-compatibility:
     runs-on: ubuntu-latest
     strategy:
