@@ -246,7 +246,9 @@ static int canAddNetworkBytesIn(client *c) {
 void clusterSlotStatsAddNetworkBytesInForUserClient(client *c) {
     if (!canAddNetworkBytesIn(c)) return;
 
-    if (c->cmd->proc == execCommand) {
+    /* c->cmd is NULL for a replicated command deferred to an apply lane (replApplyDefer):
+     * processCommand never ran. It is never EXEC, so only the MULTI adjustment is skipped. */
+    if (c->cmd && c->cmd->proc == execCommand) {
         /* Accumulate its corresponding MULTI RESP; *1\r\n$5\r\nmulti\r\n */
         c->net_input_bytes_curr_cmd += 15;
     }
