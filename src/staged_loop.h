@@ -107,4 +107,11 @@ int testOnlyStagedStart(void);
 void testOnlyStagedSetWorkers(int n, int main_lane);
 void testOnlyStagedStop(void);
 
+/* Unit tests: a hook run on the main thread in the window between the read phase (which samples
+ * fp_check_watched / fp_check_blocked and classifies lane routing) and the write phase (which applies
+ * lane writes). NULL in production, so zero cost. A test sets it to register a WATCH or a blocking
+ * client on a key after the lane snapshot, reproducing the issue-29 window deterministically. */
+extern void (*stagedTestBetweenReadAndWrite)(void);
+int stagedTestReadQueued(void);
+
 #endif /* STAGED_LOOP_H */

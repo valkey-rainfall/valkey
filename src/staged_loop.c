@@ -500,6 +500,14 @@ static void crons(aeEventLoop *el) {
     sl_main_ns[SL_T_CRONS] += stagedNowNs() - t0;
 }
 
+/* Test-only hook; see staged_loop.h. NULL in production. */
+void (*stagedTestBetweenReadAndWrite)(void) = NULL;
+
+/* Test-only: 1 while this iteration's read phase handed the primary's stream to the workers. */
+int stagedTestReadQueued(void) {
+    return sl_read_queued;
+}
+
 static void stagedLoopIteration(aeEventLoop *el) {
     monotime t;
     sl_iterations++;
@@ -509,6 +517,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     readPhase();
     cronStatsRecord(CRON_JOB_SL_READ, getMonotonicUs() - t);
     sl_main_ns[SL_T_READ] += stagedNowNs() - t0;
+    if (stagedTestBetweenReadAndWrite) stagedTestBetweenReadAndWrite();
     t = getMonotonicUs();
     writePhase(el);
     cronStatsRecord(CRON_JOB_SL_WRITE, getMonotonicUs() - t);

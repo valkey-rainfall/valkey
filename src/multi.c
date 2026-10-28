@@ -598,6 +598,10 @@ void touchWatchedKey(serverDb *db, robj *key) {
     if (dictSize(db->watched_keys) == 0) return;
     clients = dictFetchValue(db->watched_keys, key);
     if (!clients) return;
+    /* A lane (IO thread) writes a watched key only if the key became watched after the lane plan
+     * sampled watching_clients (the issue-29 window); the flag and list updates below are then
+     * unsynchronized with main and with the other lanes. */
+    debugServerAssert(inMainThread());
 
     /* Mark all the clients watching this key as CLIENT_DIRTY_CAS */
     /* Check if we are already watching for this key */

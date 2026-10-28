@@ -584,6 +584,9 @@ static void signalKeyAsReadyLogic(serverDb *db, robj *key, int type, int deleted
         if (dictFind(db->blocking_keys, key) == NULL) return;
     }
 
+    /* Same window as in touchWatchedKey: a lane reaching a key a client blocks on mutates
+     * db->ready_keys and server.ready_keys without synchronization. */
+    debugServerAssert(inMainThread());
     dictEntry *de, *existing;
     de = dictAddRaw(db->ready_keys, key, &existing);
     if (de) {

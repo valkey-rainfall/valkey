@@ -827,6 +827,76 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             assert_equal changed [$replica get pwl:rw]
         }
 
+        test {Replica lanes: a WATCH registered in the read/write window aborts EXEC (issue-29 window)} {
+            # The primary's PING would be the first planned chunk; keep it out of the window.
+            $primary config set repl-ping-replica-period 1000
+            set before [pwl_repl_applied $replica]
+            set fired0 [$replica debug staged-window-fired]
+            set rd [valkey_deferring_client]
+            $rd select 0
+            assert_equal OK [$rd read]
+            # Arm: WATCH runs on main between the read phase that planned the stream and the write
+            # phase that applies it. The lane plan was classified with watching_clients == 0.
+            $rd debug staged-window-run watch pwl:ww
+            assert_equal OK [$rd read]
+            set fd [pwl_fast_socket $primary $primary_host $primary_port]
+            set buf [pwl_resp set pwl:ww changed]
+            for {set i 0} {$i < 300} {incr i} { append buf [pwl_resp set pwl:wx$i $i] }
+            puts -nonewline $fd $buf
+            flush $fd
+            pwl_read_replies $fd 301
+            close $fd
+            wait_for_ofs_sync $primary $replica
+            wait_for_condition 100 50 {
+                [$replica debug staged-window-fired] == $fired0 + 1
+            } else {
+                fail "the window hook did not run the WATCH"
+            }
+            assert_equal OK [$rd read]
+            $rd multi
+            assert_equal OK [$rd read]
+            $rd get pwl:ww
+            assert_equal QUEUED [$rd read]
+            $rd exec
+            set res [$rd read]
+            $rd close
+            assert_equal changed [$replica get pwl:ww]
+            assert {[pwl_repl_applied $replica] - $before >= 290}
+            assert_equal {} $res
+        }
+
+        test {Replica lanes: a BLPOP registered in the read/write window is served once (issue-29 window)} {
+            $replica config set replica-read-only no
+            set before [pwl_repl_applied $replica]
+            set fired0 [$replica debug staged-window-fired]
+            set rd [valkey_deferring_client]
+            $rd select 0
+            assert_equal OK [$rd read]
+            $rd debug staged-window-run blpop pwl:wl 0
+            assert_equal OK [$rd read]
+            set fd [pwl_fast_socket $primary $primary_host $primary_port]
+            set buf [pwl_resp rpush pwl:wl a]
+            for {set i 0} {$i < 300} {incr i} { append buf [pwl_resp set pwl:wy$i $i] }
+            puts -nonewline $fd $buf
+            flush $fd
+            pwl_read_replies $fd 301
+            close $fd
+            wait_for_ofs_sync $primary $replica
+            wait_for_condition 100 50 {
+                [$replica debug staged-window-fired] == $fired0 + 1
+            } else {
+                fail "the window hook did not run the BLPOP"
+            }
+            set res [$rd read]
+            $rd ping
+            assert_equal PONG [$rd read]
+            $rd close
+            $replica config set replica-read-only yes
+            assert {[pwl_repl_applied $replica] - $before >= 290}
+            assert_equal {pwl:wl a} $res
+            assert_equal 0 [$replica llen pwl:wl]
+        }
+
         test {Replica lanes: a replica client blocked on a stream is served by the stream's write in order} {
             set before [pwl_repl_applied $replica]
             set rd [valkey_deferring_client]

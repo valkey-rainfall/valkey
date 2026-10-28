@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "staged_loop.h"
 #include "ordered_index.h"
 #include "util.h"
 #include "sha1.h" /* SHA1 is used for DEBUG DIGEST */
@@ -404,6 +405,43 @@ void mallctl_string(client *c, robj **argv, int argc) {
         addReply(c, shared.ok);
 }
 #endif
+
+
+/* DEBUG STAGED-WINDOW-RUN <command> [args...]: run <command> as the calling client on the main thread in the
+ * window between the next read phase that planned a chunk of the primary's stream and the write phase that
+ * applies it. This is the issue-29 window: the replica's lane plan was classified with the blocked/watched
+ * snapshot of the read phase, and a WATCH or a blocking command registered here is not seen by that plan.
+ * Test seam only. DEBUG STAGED-WINDOW-FIRED returns how many times the hook ran a command. */
+static uint64_t dbg_win_client_id = 0;
+static robj **dbg_win_argv = NULL;
+static int dbg_win_argc = 0;
+static long long dbg_win_fired = 0;
+
+static void debugStagedWindowDrop(void) {
+    for (int i = 0; i < dbg_win_argc; i++) decrRefCount(dbg_win_argv[i]);
+    zfree(dbg_win_argv);
+    dbg_win_argv = NULL;
+    dbg_win_argc = 0;
+}
+
+static void debugStagedWindowHook(void) {
+    if (!stagedTestReadQueued()) return; /* wait for an iteration whose read phase planned the stream */
+    stagedTestBetweenReadAndWrite = NULL;
+    client *c = lookupClientByID(dbg_win_client_id);
+    if (c == NULL || c->argc != 0 || c->flag.blocked || c->flag.close_asap) {
+        debugStagedWindowDrop();
+        return;
+    }
+    c->argv = dbg_win_argv;
+    c->argc = dbg_win_argc;
+    c->argv_len = dbg_win_argc;
+    c->parsed_cmd = lookupCommand(c->argv, c->argc);
+    dbg_win_argv = NULL;
+    dbg_win_argc = 0;
+    dbg_win_fired++;
+    c->flag.pending_command = 1;
+    processCommandAndResetClient(c);
+}
 
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
@@ -1157,6 +1195,21 @@ void debugCommand(client *c) {
         mallctl_string(c, c->argv + 2, c->argc - 2);
         return;
 #endif
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "staged-window-run") && c->argc >= 3) {
+        if (stagedTestBetweenReadAndWrite != NULL) {
+            addReplyError(c, "a window command is already armed");
+            return;
+        }
+        dbg_win_client_id = c->id;
+        dbg_win_argc = c->argc - 2;
+        dbg_win_argv = zmalloc(sizeof(robj *) * dbg_win_argc);
+        for (int i = 0; i < dbg_win_argc; i++) {
+            dbg_win_argv[i] = createStringObject(objectGetVal(c->argv[i + 2]), sdslen(objectGetVal(c->argv[i + 2])));
+        }
+        stagedTestBetweenReadAndWrite = debugStagedWindowHook;
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "staged-window-fired") && c->argc == 2) {
+        addReplyLongLong(c, dbg_win_fired);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "pause-cron") && c->argc == 3) {
         server.pause_cron = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
