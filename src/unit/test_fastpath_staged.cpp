@@ -697,3 +697,77 @@ TEST_F(FastpathStagedTest, RequeueKeepsTrailingPartialWithNoArgumentYet) {
         freeClient(c);
     }
 }
+
+/* Audit issue 29: the key observer generation and the on-main re-check of a planned command's keys.
+ * A replica plan is re-checked only when the generation moved since the lanes were sampled, and the
+ * re-check demotes exactly the commands with a key that is watched or blocked on now. */
+static void obsAdd(dict *d, const char *k) {
+    robj *key = createStringObject(k, strlen(k));
+    ASSERT_EQ(dictAdd(d, key, listCreate()), DICT_OK);
+}
+
+static int obsCheck(struct serverCommand *cmd, const char *a0, const char *a1 = NULL, const char *a2 = NULL,
+                    const char *a3 = NULL, const char *a4 = NULL) {
+    const char *args[5] = {a0, a1, a2, a3, a4};
+    robj *argv[5];
+    int argc = 0;
+    while (argc < 5 && args[argc]) {
+        argv[argc] = createStringObject(args[argc], strlen(args[argc]));
+        argc++;
+    }
+    int r = fastpathKeysObservedNow(server.db[0], cmd, argv, argc);
+    for (int i = 0; i < argc; i++) decrRefCount(argv[i]);
+    return r;
+}
+
+TEST_F(FastpathStagedTest, KeyObserverGenerationMovesOnEveryAddition) {
+    fastpathKeyObserversRechecked();
+    EXPECT_FALSE(fastpathKeyObserversChanged());
+    fastpathKeyObserverAdded();
+    EXPECT_TRUE(fastpathKeyObserversChanged());
+    fastpathKeyObserverAdded();
+    EXPECT_TRUE(fastpathKeyObserversChanged());
+    fastpathKeyObserversRechecked();
+    EXPECT_FALSE(fastpathKeyObserversChanged());
+}
+
+TEST_F(FastpathStagedTest, KeysObservedNowFindsOnlyWatchedOrBlockedKeys) {
+    serverDb *db = server.db[0];
+    int own_blocking = db->blocking_keys == NULL;
+    if (own_blocking) db->blocking_keys = dictCreate(&keylistDictType);
+    struct serverCommand *set = lookupCommandByCString("set");
+    struct serverCommand *mset = lookupCommandByCString("mset");
+    struct serverCommand *lpush = lookupCommandByCString("lpush");
+    ASSERT_NE(set, nullptr);
+    ASSERT_NE(mset, nullptr);
+    ASSERT_NE(lpush, nullptr);
+
+    /* Nothing observed: no entry is demoted. */
+    EXPECT_EQ(obsCheck(set, "set", "obs:w", "v"), 0);
+    EXPECT_EQ(obsCheck(mset, "mset", "obs:a", "1", "obs:w", "2"), 0);
+
+    obsAdd(db->watched_keys, "obs:w");
+    obsAdd(db->blocking_keys, "obs:b");
+    /* The SET fast form and the generic key-spec form both see an observed key. */
+    EXPECT_EQ(obsCheck(set, "set", "obs:w", "v"), 1);
+    EXPECT_EQ(obsCheck(mset, "mset", "obs:a", "1", "obs:w", "2"), 1);
+    EXPECT_EQ(obsCheck(lpush, "lpush", "obs:b", "x"), 1);
+    EXPECT_EQ(obsCheck(set, "set", "obs:b", "v"), 1);
+    /* An unrelated key stays on its lane (no blanket serialization). */
+    EXPECT_EQ(obsCheck(set, "set", "obs:other", "v"), 0);
+    EXPECT_EQ(obsCheck(mset, "mset", "obs:a", "1", "obs:c", "2"), 0);
+    /* A malformed SET is demoted rather than looked up. */
+    EXPECT_EQ(obsCheck(set, "set"), 1);
+
+    robj *w = createStringObject("obs:w", 5);
+    robj *b = createStringObject("obs:b", 5);
+    dictDelete(db->watched_keys, w);
+    dictDelete(db->blocking_keys, b);
+    decrRefCount(w);
+    decrRefCount(b);
+    EXPECT_EQ(obsCheck(set, "set", "obs:w", "v"), 0);
+    if (own_blocking) {
+        dictRelease(db->blocking_keys);
+        db->blocking_keys = NULL;
+    }
+}
