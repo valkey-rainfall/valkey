@@ -58,10 +58,10 @@ jobs:
       - name: Full suite with capture + fork-deadlock probe watchdog
         id: suite
         run: |
-          chmod +x lsan-probe/suite_watchdog4.sh
+          chmod +x lsan-probe/suite_watchdog5.sh
           mkdir -p tests/tmp
           CAP=$RUNNER_TEMP/captures
-          lsan-probe/suite_watchdog4.sh tests/tmp "$CAP" &
+          lsan-probe/suite_watchdog5.sh tests/tmp "$CAP" "$RUNNER_TEMP/runtest.out" &
           wd=$!
           set +e
           timeout 3000 ./runtest --verbose --tags -slow --dump-logs --dont-clean > $RUNNER_TEMP/runtest.out 2>&1
@@ -85,25 +85,32 @@ jobs:
           echo "CAPTURES=$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)"
           echo "CONFIRMED_HANGS=$confirmed"
           grep -h "LeakSanitizer ptrace probe warning\|Sanitizer error\|Forcing process" "$RUNNER_TEMP/runtest.out" | head -20
-          grep -B2 -A8 "\[err\]" "$RUNNER_TEMP/runtest.out" | head -60
-          for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
+          echo "SLOW_DUMPS=$(ls "$CAP"/SLOW.*.txt 2>/dev/null | wc -l)"
+          echo "----- [err]/[exception] blocks -----"
+          grep -B2 -A12 "\[err\]\|\[exception\]" "$RUNNER_TEMP/runtest.out" | head -120
+          echo "----- context before each forced crash -----"
+          grep -B25 "Forcing process .* to crash" "$RUNNER_TEMP/runtest.out" | grep -v "Waiting for process" | tail -60
+          echo "----- runtest tail -----"
+          tail -n 25 "$RUNNER_TEMP/runtest.out"
+          for c in "$CAP"/SLOW.*.txt "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
 
-      - name: Stage artifacts on capture
-        if: always() && steps.suite.outputs.captured == 'yes'
+      - name: Stage artifacts
+        if: always()
         run: |
           A=$RUNNER_TEMP/artifact; mkdir -p "$A"
+          cp "$RUNNER_TEMP"/runtest.out "$A"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/captures/* "$A"/ 2>/dev/null || true
-          cp src/valkey-server "$A"/valkey-server
+          [ "${{ steps.suite.outputs.captured }}" = yes ] && cp src/valkey-server "$A"/valkey-server || true
           for sd in "$RUNNER_TEMP"/captures/serverdir.*.txt; do
             [ -f "$sd" ] || continue; d=$(cat "$sd"); n=$(basename "$sd" .txt)
             mkdir -p "$A/$n"; cp "$d"/stdout "$d"/stderr "$A/$n"/ 2>/dev/null || true
           done
           ls -la "$A"
 
-      - name: Upload capture artifacts
-        if: always() && steps.suite.outputs.captured == 'yes'
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lsan-capture-shard-${{ matrix.shard }}
+          name: lsan-fix-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/artifact
           retention-days: 14
