@@ -378,3 +378,42 @@ TEST_F(FastpathExecutorTest, FastGetTouchesLruAndLfu) {
     server.maxmemory_policy = 0;
     lrulfu_updateClockAndPolicy(mstime(), false);
 }
+
+/* OBS-08: bytes read and written by fast-path IO threads must be counted in the stock INFO stats
+ * (total_net_input_bytes, total_net_output_bytes, total_reads_processed, total_writes_processed),
+ * as the stock IO threads count them. */
+TEST_F(FastpathExecutorTest, FastpathTrafficIsCountedInServerStats) {
+    server.child_pid = -1;
+    server.stat_net_input_bytes = 0;
+    server.stat_net_output_bytes = 0;
+    server.stat_total_reads_processed = 0;
+    server.stat_total_writes_processed = 0;
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+
+    /* A SET runs on main through the executor; its reply goes out in the reply phase. */
+    const char *req = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(c->fp_inflight, 1u) << "the SET was not harvested by the fast path (engagement check)";
+    EXPECT_EQ(fastpathStagedExecute(), 1);
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    char buf[64];
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 5);
+    EXPECT_EQ(memcmp(buf, "+OK\r\n", 5), 0);
+
+    EXPECT_EQ(server.stat_net_input_bytes, (long long)strlen(req));
+    EXPECT_EQ(server.stat_net_output_bytes, 5);
+    EXPECT_EQ(server.stat_total_reads_processed, 1);
+    EXPECT_EQ(server.stat_total_writes_processed, 1);
+
+    fpTestReleaseClient(c, conn, peer);
+    robj *key = createStringObject("foo", 3);
+    dbDelete(server.db[0], key);
+    decrRefCount(key);
+}

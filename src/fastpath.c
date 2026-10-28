@@ -50,6 +50,7 @@ typedef struct fpThread {
     int nfree;
     long long reads, net_input_bytes, net_output_bytes, writes, batches, speculated;
     long long reads_synced, writes_synced; /* main only: reads/writes already folded into server stats */
+    long long in_synced, out_synced;       /* main only: net bytes already folded into server stats */
     /* Staged loop. Batches this thread published in the read phase, per nesting depth: written by the
      * thread in the read phase, executed by main in the write phase, delivered and recycled by the same
      * thread in the reply phase. staged_leaving holds the clients this thread saw leave; main hands
@@ -293,6 +294,27 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     return b;
 }
 
+/* Fold this thread's network counters into the server stats main renders in INFO (total_net_*_bytes,
+ * total_reads/writes_processed); reads and writes of an IO thread also count as IO-thread work. Called
+ * on main between phases, so the plain counters are stable: the phase barrier orders the IO thread's
+ * stores before main reads them. */
+static void fpFoldNetStats(fpThread *t, int io_thread) {
+    long long reads = t->reads - t->reads_synced, writes = t->writes - t->writes_synced;
+    long long in = t->net_input_bytes - t->in_synced, out = t->net_output_bytes - t->out_synced;
+    if (io_thread) {
+        server.stat_io_reads_processed += reads;
+        server.stat_io_writes_processed += writes;
+    }
+    server.stat_total_reads_processed += reads;
+    server.stat_total_writes_processed += writes;
+    server.stat_net_input_bytes += in;
+    server.stat_net_output_bytes += out;
+    t->reads_synced = t->reads;
+    t->writes_synced = t->writes;
+    t->in_synced = t->net_input_bytes;
+    t->out_synced = t->net_output_bytes;
+}
+
 static void fpRecycleBatch(fpThread *t, cmdBatch *b) {
     if (t->nfree < FP_FREELIST_MAX) {
         /* Size the arena to what this batch's replies needed: replies that spill are each copied
@@ -351,8 +373,7 @@ void fastpathFreeThread(int tid) {
         zfree(b);
     }
     t->ready = 0;
-    server.stat_io_reads_processed += t->reads - t->reads_synced;
-    server.stat_io_writes_processed += t->writes - t->writes_synced;
+    fpFoldNetStats(t, tid > 0);
     fp_retired[0] += t->reads;
     fp_retired[1] += t->net_input_bytes;
     fp_retired[2] += t->net_output_bytes;
@@ -2685,13 +2706,10 @@ static void fpStagedHandoff(client *c) {
  * runs nested iterations that call this again and change the leaving list, so that walk restarts from
  * the head after every handoff instead of keeping a node across it. */
 void fastpathStagedFinish(void) {
-    for (int tid = 1; tid < fp_slots; tid++) { /* main's own share is not IO-threaded */
+    for (int tid = 0; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         if (!t->ready) continue;
-        server.stat_io_reads_processed += t->reads - t->reads_synced;
-        server.stat_io_writes_processed += t->writes - t->writes_synced;
-        t->reads_synced = t->reads;
-        t->writes_synced = t->writes;
+        fpFoldNetStats(t, tid > 0); /* main's own share (tid 0) is not IO-threaded */
     }
     if (!fpStaged()) return;
     /* Hand clients back in the order they left (fp_leave_seq), merging the per-thread lists, so two
