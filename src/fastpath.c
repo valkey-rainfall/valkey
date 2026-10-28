@@ -1018,6 +1018,7 @@ static int fpFlushOut(fpThread *t, client *c) {
         }
         t->net_output_bytes += n;
         c->net_output_bytes += n;
+        c->last_interaction = server.unixtime; /* a write is interaction, as on main */
         t->writes++;
         sdsrange(c->fp_out, n, -1);
     }
@@ -1059,6 +1060,7 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     }
     t->net_output_bytes += n;
     c->net_output_bytes += n;
+    if (n > 0) c->last_interaction = server.unixtime; /* a write is interaction, as on main */
     t->writes++;
     for (int i = 0; i < iovcnt; i++) {
         if ((size_t)n >= iov[i].iov_len) {
