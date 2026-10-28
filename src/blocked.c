@@ -476,6 +476,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     int j;
 
     initClientBlockingState(c);
+    fastpathKeyObserverAdded(); /* a lane plan classified before this call must look these keys up again */
 
     if (!c->flag.reexecuting_command) {
         /* If the client is re-processing the command, we do not set the timeout

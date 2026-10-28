@@ -341,6 +341,44 @@ void replApplyPlanRead(client *c) {
     rp.ready = 1;
 }
 
+/* Main, after the chunks are parsed, before anything of the plan runs (audit issue 29): a key became
+ * watched or blocked on after the lane flags the classification used were sampled, so an entry that
+ * writes such a key may be on a lane. Look every lane entry's keys up again with the dicts as they are
+ * now and make each observed entry a barrier: the chunk's lane vectors and barrier positions are rebuilt
+ * in plan order, so a demoted entry runs on main at its own position in the stream, after every entry
+ * before it and before every entry after it, exactly as a barrier classified in the read phase does.
+ * Entries whose keys are not observed keep their lanes. Nothing runs here. */
+static void rpDemoteObserved(client *c) {
+    server.stat_repl_lane_rechecks++;
+    fastpathKeyObserversRechecked();
+    for (int t = 0; t < rp.nchunks; t++) {
+        rpChunk *k = &rp.ch[t];
+        rpResetChunk(k);
+        /* Chunk 0 also holds position 0, the client's current command, before its first scanned one. */
+        for (int idx = t == 0 ? 0 : k->first; idx < k->first + k->n; idx++) {
+            rpEntry *e = &rp.e[idx];
+            if (e->lane >= 0) {
+                struct serverCommand *cmd = idx == 0 ? c->parsed_cmd : c->cmd_queue.cmds[idx - 1].cmd;
+                robj **argv = idx == 0 ? c->argv : c->cmd_queue.cmds[idx - 1].argv;
+                int argc = idx == 0 ? c->argc : c->cmd_queue.cmds[idx - 1].argc;
+                if (fastpathKeysObservedNow(e->db, cmd, argv, argc)) {
+                    e->lane = -1;
+                    e->shard = -1;
+                    server.stat_repl_lane_demoted++;
+                }
+            }
+            e->seg = (uint32_t)k->nb;
+            if (e->lane >= 0) {
+                RP_GROW(k->lane_idx[e->lane], k->lane_n[e->lane], k->lane_cap[e->lane], 256);
+                k->lane_idx[e->lane][k->lane_n[e->lane]++] = idx;
+            } else {
+                RP_GROW(k->bpos, k->nb, k->bcap, 16);
+                k->bpos[k->nb++] = idx;
+            }
+        }
+    }
+}
+
 /* Main, after the chunks are parsed: the barriers of all chunks in T order. */
 static void rpMerge(void) {
     rp.nb = 0;
@@ -495,8 +533,13 @@ static int rpRunSegments(client *c) {
         int r = rpRunOnMain(c, end, qlen);
         if (r != C_OK) return r == C_ERR ? C_ERR : C_OK;
         pos = end + 1;
-        /* A barrier may turn on something that observes writes: the rest goes the usual way. */
-        if (!fastpathStreamLanesAllowed()) return C_OK;
+        /* A barrier may turn on something that observes writes: the rest goes the usual way. So does a
+         * barrier that made a key watched or blocked on (a client it unblocked re-blocked on another key):
+         * the lane vectors cannot be rebuilt under the lanes' cursors, and the usual way is correct. */
+        if (!fastpathStreamLanesAllowed() || fastpathKeyObserversChanged()) {
+            if (fastpathKeyObserversChanged()) server.stat_repl_lane_rechecks++;
+            return C_OK;
+        }
     }
     return C_OK;
 }
@@ -529,6 +572,7 @@ int replApplyRunPlan(client *c) {
         c->cmd_queue.off = 0;
         c->qb_pos = rp.scan_end;
     }
+    if (fastpathKeyObserversChanged()) rpDemoteObserved(c);
     rpMerge();
     server.stat_repl_lane_reads++;
     server.stat_repl_lane_read_usec += rp.read_us;

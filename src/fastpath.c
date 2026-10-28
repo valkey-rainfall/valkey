@@ -537,6 +537,64 @@ static void fpMarkLaneCommands(void) {
 static int fp_check_blocked = 0; /* clients are blocked on list, sorted set or stream keys */
 static int fp_check_watched = 0; /* clients watch keys */
 
+/* Audit issue 29: the key observer generation.
+ *
+ * Main bumps fp_observers_gen every time a key is added to a db's watched_keys or blocking_keys
+ * (watchForKey, blockForKeys; every blocking command, module key blocking and a client re-blocking
+ * after an unblock go through blockForKeys). fastpathStagedPrepareLanes samples it together with
+ * fp_check_blocked and fp_check_watched, before the read phase classifies commands onto lanes with
+ * those flags. Between that sample and the moment a plan's lane entries run, main may execute
+ * commands (the ring clients' commands at the start of the write phase, the DEBUG seam in tests):
+ * a WATCH or a blocking command there adds a key the classification could not see, and a planned
+ * lane write to that key would reach touchWatchedKey or signalKeyAsReadyLogic on an IO thread.
+ *
+ * A flag comparison is not enough: with one client already watching, fp_check_watched stays 1 and a
+ * new WATCH of another key changes nothing visible. The counter changes on every addition. The plan
+ * owner compares it on main before its lane entries run (one integer compare per plan); only when it
+ * changed are the planned keys looked up again, on main, with fastpathKeysObservedNow, and only the
+ * entries whose keys are observed now are demoted to the barrier path. Removals never need a
+ * re-check: a key that stops being observed makes a barrier out of a command that could have run
+ * on a lane, which is correct, only slower. */
+static uint64_t fp_observers_gen = 0;
+static uint64_t fp_observers_gen_sampled = 0;
+
+void fastpathKeyObserverAdded(void) {
+    debugServerAssert(inMainThread());
+    fp_observers_gen++;
+}
+
+/* Main: a key became watched or blocked on since the lane flags were sampled for this iteration, or
+ * since the plan owner last looked its keys up (fastpathKeyObserversRechecked). */
+int fastpathKeyObserversChanged(void) {
+    return fp_observers_gen != fp_observers_gen_sampled;
+}
+
+/* Main: the plan owner looked every planned key up against the dicts as they are now. */
+void fastpathKeyObserversRechecked(void) {
+    fp_observers_gen_sampled = fp_observers_gen;
+}
+
+/* Main, no other thread running commands: a client blocks on or watches one of the command's keys,
+ * looked up in the dicts as they are now, whatever the sampled flags said. */
+int fastpathKeysObservedNow(serverDb *db, struct serverCommand *cmd, robj **argv, int argc) {
+    debugServerAssert(inMainThread());
+    if (dictSize(db->blocking_keys) == 0 && dictSize(db->watched_keys) == 0) return 0;
+    if (cmd->proc == setCommand || cmd->proc == getCommand) {
+        if (argc < 2) return 1;
+        return dictFind(db->blocking_keys, argv[1]) != NULL || dictFind(db->watched_keys, argv[1]) != NULL;
+    }
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int n = getKeysFromCommand(cmd, argv, argc, &result);
+    int observed = 0;
+    for (int i = 0; i < n && !observed; i++) {
+        robj *k = argv[result.keys[i].pos];
+        if (dictFind(db->blocking_keys, k) || dictFind(db->watched_keys, k)) observed = 1;
+    }
+    getKeysFreeResult(&result);
+    return observed;
+}
+
 /* IO thread, read phase: a client is blocked on the key or watches it, so the command must run at its
  * place on main, which serves or dirties that client. While lanes are on, none of these dicts is
  * rehashing (fpKeyDictsSettled), so the lookups only read. The sets only shrink until the fast path's
@@ -1692,6 +1750,7 @@ void fastpathStagedPrepareLanes(void) {
     fp_check_blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
                        server.blocked_clients_by_type[BLOCKED_STREAM];
     fp_check_watched = server.watching_clients > 0;
+    fp_observers_gen_sampled = fp_observers_gen; /* the observer set the flags above describe */
     /* The previous iteration's replies were delivered in its reply phase. */
     for (int l = 0; l < FP_MAX_LANES; l++) {
         fp_lanes[l].chunk = 0;

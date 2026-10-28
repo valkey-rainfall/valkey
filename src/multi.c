@@ -491,6 +491,7 @@ void watchForKey(client *c, robj *key) {
     watchedKey *wk;
 
     if (listLength(&c->mstate->watched_keys) == 0) server.watching_clients++;
+    fastpathKeyObserverAdded(); /* a lane plan classified before this call must look this key up again */
 
     /* Lazily allocate the per-db hashtable array. */
     if (c->mstate->watched_keys_by_db == NULL) {

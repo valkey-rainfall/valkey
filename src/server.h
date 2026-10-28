@@ -2160,6 +2160,8 @@ struct valkeyServer {
     long long stat_repl_lane_plan_usec;            /* Main's time running those plans, APPLY phases included */
     long long stat_repl_lane_apply_usec;           /* Of which APPLY phases */
     long long stat_repl_lane_barriers;             /* Commands of those plans main ran in their place */
+    long long stat_repl_lane_rechecks;             /* Plans whose keys main looked up again: a key became watched or blocked on after the plan was classified */
+    long long stat_repl_lane_demoted;              /* Lane entries of those plans that became barriers */
     long long stat_numconnections;                 /* Number of connections received */
     double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
     double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */
@@ -3985,6 +3987,8 @@ void fastpathLaneErrorReply(client *c, const char *s, size_t len, int flags);
 void fastpathLaneLatencySample(const char *event, long long latency_us);
 void fastpathFoldLaneHistograms(void);
 void fastpathResetLaneStats(void);
+/* Main: a key was added to a db's watched_keys or blocking_keys (audit issue 29, see fastpath.c). */
+void fastpathKeyObserverAdded(void);
 void postExecutionUnitOperations(void);
 void serverOpArrayFree(serverOpArray *oa);
 void forceCommandPropagation(client *c, int flags);

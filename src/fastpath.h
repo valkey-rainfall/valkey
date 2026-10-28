@@ -133,6 +133,12 @@ int fastpathStreamLanesAllowed(void);
 /* IO thread, read phase: the keyspace hashtable of every key the command declares, or -1 when it has
  * none, they are in several, or a client is blocked on or watches one. */
 int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int slot);
+/* Main: a key became watched or blocked on since fastpathStagedPrepareLanes sampled the flags the
+ * classification used (audit issue 29). The plan must look its lane entries' keys up again. */
+int fastpathKeyObserversChanged(void);
+void fastpathKeyObserversRechecked(void);
+/* Main, no lane running: a client blocks on or watches one of the command's keys, as the dicts are now. */
+int fastpathKeysObservedNow(serverDb *db, struct serverCommand *cmd, robj **argv, int argc);
 /* Main, before an APPLY phase of the stream on lanes [0, nlanes). */
 void fastpathStreamLanesPrepare(int nlanes, int main_lane);
 /* Lane thread, APPLY phase: enter the lane, apply commands of the stream on it, leave. */
