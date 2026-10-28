@@ -60,6 +60,7 @@ typedef struct fpThread {
     int sbcap[STAGED_MAX_DEPTH];
     int sb_streamed[STAGED_MAX_DEPTH]; /* STREAM/REPLY: index of the first batch not fully delivered. */
     list staged_leaving;
+    uint64_t cur_claim_seq; /* read phase: (poller batch seq << 32) | claim index of the client being read */
     /* Write lanes (depth 0). Written by this thread in the read phase: the entries it harvested per
      * lane in harvest order, its barrier entries in order, and the lane entries of each of its
      * segments. Read by the lanes and main in the write phase; reset by the next read phase. */
@@ -525,9 +526,11 @@ static void fpSubmit(fpThread *t) {
 
 /* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
  * the reply phase. */
+
 static void fpBeginLeave(fpThread *t, client *c, int state) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
+    c->fp_leave_seq = t->cur_claim_seq;
     pollerUnregister(stagedPoller(), c->conn->fd);
     listLinkNodeTail(&t->staged_leaving, &c->fp_stage_node);
 }
@@ -1885,7 +1888,7 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
 
 /* Several claimers: claim a few fds per cursor step. Kept out of line so the read phase stays small when
  * main reads alone. */
-static __attribute__((noinline)) void fpClaimBatched(poller *p, int claimers) {
+static __attribute__((noinline)) void fpClaimBatched(fpThread *t, poller *p, int claimers, uint64_t batch) {
     pollerEvent ev;
     pollerClaim cl;
     while (pollerClaimIOBatch(p, &cl, claimers)) {
@@ -1901,8 +1904,11 @@ static __attribute__((noinline)) void fpClaimBatched(poller *p, int claimers) {
             cs[nc++] = c;
         }
         for (int i = 0; i < nc; i++) __builtin_prefetch(cs[i]->control);
-        for (int i = 0; i < cl.n; i++)
-            if (pollerClaimResolve(p, &cl, i, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        for (int i = 0; i < cl.n; i++) {
+            if (!pollerClaimResolve(p, &cl, i, &ev)) continue;
+            t->cur_claim_seq = (batch << 32) | (uint64_t)(uint32_t)ev.idx;
+            ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        }
     }
 }
 
@@ -1916,13 +1922,20 @@ void fastpathStagedReadPhase(int tid) {
     /* The previous iteration's replies, when it deferred them, go out before this thread reads. */
     if (fp_replies_deferred && fpDepth() == 0) fastpathStagedReplyPhase(tid);
     if (fpDepth() == 0) fpResetLaneVectors(t);
+    /* Arrival order inside this read phase is the position in the poller batch (the claim index, the order
+     * the collector threads posted the fds); a client that leaves is stamped with it so main hands leavers
+     * back in that order across threads. */
+    uint64_t batch = pollerBatchSeq(p);
     int claimers = server.active_io_threads_num;
     if (claimers <= 1) {
         /* Main alone: nobody contends on the cursor, and handling an fd overlaps the next one's misses as
          * well as a prefetch pass would. */
-        while (pollerClaimIO(p, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        while (pollerClaimIO(p, &ev)) {
+            t->cur_claim_seq = (batch << 32) | (uint64_t)(uint32_t)ev.idx;
+            ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        }
     } else {
-        fpClaimBatched(p, claimers);
+        fpClaimBatched(t, p, claimers, batch);
     }
     fpSubmit(t);
     if (t->cur && t->cur->count == 0) {
@@ -3350,19 +3363,28 @@ void fastpathStagedFinish(void) {
         t->writes_synced = t->writes;
     }
     if (!fpStaged()) return;
-    for (int tid = 0; tid < fp_slots; tid++) {
-        fpThread *t = &fp_threads[tid];
-        listNode *ln = listFirst(&t->staged_leaving);
-        while (ln) {
-            client *c = listNodeValue(ln);
-            if (c->fp_inflight > 0) { /* entries of an outer iteration still on main */
-                ln = ln->next;
-                continue;
+    /* Hand clients back in the order they left (fp_leave_seq), merging the per-thread lists, so two
+     * clients read in one iteration by different threads keep their arrival order on main (a SCRIPT
+     * KILL read after the EVAL it targets must run after it). Each handoff can run commands that change
+     * the lists, so the scan restarts after every one. */
+    for (;;) {
+        client *next = NULL;
+        fpThread *owner = NULL;
+        for (int tid = 0; tid < fp_slots; tid++) {
+            fpThread *t = &fp_threads[tid];
+            listNode *ln = listFirst(&t->staged_leaving);
+            while (ln) {
+                client *c = listNodeValue(ln);
+                if (c->fp_inflight == 0 && (!next || c->fp_leave_seq < next->fp_leave_seq)) {
+                    next = c;
+                    owner = t;
+                }
+                ln = ln->next; /* entries of an outer iteration still on main are skipped */
             }
-            listUnlinkNode(&t->staged_leaving, &c->fp_stage_node);
-            fpStagedHandoff(c);
-            ln = listFirst(&t->staged_leaving);
         }
+        if (!next) break;
+        listUnlinkNode(&owner->staged_leaving, &next->fp_stage_node);
+        fpStagedHandoff(next);
     }
     if (!fp_staged_closing) return;
     listNode *ln = listFirst(fp_staged_closing);
