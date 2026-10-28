@@ -949,6 +949,11 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             assert_equal 1 [expr {[pwl_stat $replica repl_lane_demoted] - $demoted0}]
             assert_equal {pwl:wl a} $res
             assert_equal 0 [$replica llen pwl:wl]
+            # The BLPOP ran on the writable replica, so the primary still holds the element. Drop it
+            # there too: the later tests compare the two datasets with DEBUG DIGEST.
+            $primary del pwl:wl
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
         }
 
         test {Replica lanes: a replica client blocked on a stream is served by the stream's write in order} {
