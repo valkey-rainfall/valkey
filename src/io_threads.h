@@ -90,6 +90,7 @@ void testOnlySetIOThreadReady(int tid, int epfd);
 void testOnlySetIOThreadSleeping(int tid, int fd);
 int testOnlyIOThreadSleeping(int tid);
 void testOnlyClearIOThreadReady(int tid);
+void testOnlySetPartitionPublishHook(void (*hook)(client *c));
 void testOnlySetCurTid(int tid);
 void trySendPollJobToIOThreads(void);
 int trySendAcceptToIOThreads(connection *conn);
