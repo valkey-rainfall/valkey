@@ -1447,6 +1447,7 @@ static void *IOThreadMain(void *myid) {
     valkey_set_thread_title(thdname);
     serverSetCpuAffinity(server.server_cpulist);
     thread_id = (int)id;
+    zmalloc_bind_thread_arena((int)id);
     initSharedQueryBuf();
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
