@@ -30,6 +30,7 @@ extern "C" {
 #include "staged_loop.h"
 extern hashtableType commandSetType;
 extern dictType keylistDictType;
+extern dictType objToHashtableDictType;
 void createSharedObjects(void);
 }
 
@@ -71,6 +72,10 @@ class FastpathLanesTest : public ::testing::Test {
             kvstoreCreate(&kvstoreExpiresHashtableType, LANE_BITS, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
         server.db[0]->blocking_keys = dictCreate(&keylistDictType);
+        /* ACL SETUSER looks at the pubsub tables to decide whether to kill subscribers. */
+        server.pubsub_channels = kvstoreCreate(&kvstoreChannelHashtableType, 0, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
+        server.pubsub_patterns = dictCreate(&objToHashtableDictType);
+        server.pubsubshard_channels = kvstoreCreate(&kvstoreChannelHashtableType, 0, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
 
         server.clients = listCreate();
         server.clients_to_close = listCreate();
@@ -438,4 +443,92 @@ TEST_F(FastpathLanesTest, MultiKeyLaneCommandsAcrossTwoShardsRunAsBarriersAndMat
         EXPECT_FALSE(reply_two.empty()) << tc.name;
         EXPECT_FALSE(dump_two.empty()) << tc.name;
     }
+}
+
+/* ACL epoch: a lane entry's ALLOW verdict is computed in the read phase and the lane runs cmd->proc
+ * with no check at execution time. A rule change on main between the two (a main-path command before
+ * the write phase, or a barrier entry earlier in the plan) must make the entry run through the full
+ * check again, so the plan's own order (the change, then the entry) is what the client observes. */
+static void aclLaneKeyAbsent(const char *name) {
+    robj *k = createStringObject(name, strlen(name));
+    EXPECT_EQ(lookupKeyRead(server.db[0], k), nullptr) << name << " was written by a stale lane entry";
+    decrRefCount(k);
+}
+
+/* The user's own pipeline revokes SET for itself, then sends a SET. ACL is not a fast-path command, so
+ * the client leaves for main at the ACL entry and the rest of its pipeline (the SET) is requeued and
+ * runs on main after the write phase, through the full check. The plan never holds a lane SET behind a
+ * rule change of the same client; this pins that order, with acl-offload off and on. */
+TEST_F(FastpathLanesTest, PipelineAclRevokeThenSetRefusesTheSet) {
+    const char *unames[2] = {"aclu0", "aclu1"};
+    const char *keys[2] = {"k2", "k3"};
+    for (int acl_offload = 0; acl_offload <= 1; acl_offload++) {
+        const char *uname = unames[acl_offload], *key = keys[acl_offload];
+        server.acl_offload = acl_offload;
+        int pa, pu;
+        client *admin = newStagedClient(&pa);
+        send(pa, cmd(9, "ACL", "SETUSER", uname, "on", "nopass", "~*", "&*", "+@all", "alldbs"));
+        iteration();
+        EXPECT_EQ(recv(pa) + std::string(admin->buf, admin->bufpos), "+OK\r\n");
+        admin->bufpos = 0;
+        user *usr = ACLGetUserByName(uname, strlen(uname));
+        ASSERT_NE(usr, nullptr);
+        EXPECT_TRUE(ACLUserUnrestricted(usr));
+
+        client *u = newStagedClient(&pu);
+        clientSetUser(u, usr, 1);
+        send(pu, cmd(4, "ACL", "SETUSER", uname, "-set") + cmd(3, "SET", key, "v"));
+        iteration();
+        std::string got = recv(pu) + std::string(u->buf, u->bufpos);
+        EXPECT_EQ(got.substr(0, 12), "+OK\r\n-NOPERM") << "acl_offload=" << acl_offload << " replies: " << got;
+        aclLaneKeyAbsent(key);
+
+        close(pu);
+        freeClient(u);
+        close(pa);
+        freeClient(admin);
+        iteration();
+        freeClientsInAsyncFreeQueue();
+        server.acl_offload = 0;
+    }
+}
+
+/* The change lands between the read phase and the write phase, where the ring (main-path) clients'
+ * commands run: the read phase tagged the SET as allowed, then main revokes the permission and bumps
+ * the epoch, exactly what ACL SETUSER from a main-path client does (ACLCopyUser). */
+TEST_F(FastpathLanesTest, LaneEntryTaggedBeforeMainRevokesIsRefused) {
+    server.acl_offload = 1;
+    int pa, pu;
+    client *admin = newStagedClient(&pa);
+    send(pa, cmd(8, "ACL", "SETUSER", "aclu2", "on", "nopass", "~*", "&*", "+set"));
+    iteration();
+    EXPECT_EQ(recv(pa) + std::string(admin->buf, admin->bufpos), "+OK\r\n"); /* ACL runs on main at handoff */
+    admin->bufpos = 0;
+    user *usr = ACLGetUserByName("aclu2", 5);
+    ASSERT_NE(usr, nullptr);
+    EXPECT_FALSE(ACLUserUnrestricted(usr)) << "precondition: only an acl-offload ALLOW tag puts this SET on a lane";
+
+    client *u = newStagedClient(&pu);
+    clientSetUser(u, usr, 1);
+    long long serial = infoStat("fastpath_write_serial_segments");
+    send(pu, cmd(3, "SET", "k9", "v"));
+    fastpathStagedPrepareLanes();
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1); /* the SET is tagged ALLOW under the current epoch and planned on lane 1 */
+    ASSERT_EQ(ACLSetUser(usr, "-set", -1), C_OK);
+    aclOffloadBumpEpoch(); /* as ACLCopyUser does for a published user */
+    fastpathStagedExecute();
+    if (fastpathStagedRepliesPending()) fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    std::string got = recv(pu);
+    EXPECT_EQ(got.substr(0, 7), "-NOPERM") << "reply: " << got;
+    EXPECT_GT(infoStat("fastpath_write_serial_segments"), serial) << "the iteration must have gone serial";
+    aclLaneKeyAbsent("k9");
+
+    freeStaged(u, pu);
+    close(pa);
+    freeClient(admin); /* on main since its ACL command */
+    iteration();
+    freeClientsInAsyncFreeQueue();
+    server.acl_offload = 0;
 }

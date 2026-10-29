@@ -574,6 +574,19 @@ void fastpathKeyObserversRechecked(void) {
     fp_observers_gen_sampled = fp_observers_gen;
 }
 
+/* The ACL epoch the read phase tagged its ALLOW verdicts under. A lane entry runs cmd->proc directly,
+ * with no ACL check at execution time: its verdict was computed in the read phase and is correct only
+ * while no rule set changed since. Main changes rule sets (ACL SETUSER, ACL LOAD, DELUSER, roles,
+ * requirepass, a rebind) only between phases or in a main-path command, and every such change bumps
+ * the epoch. Main samples it with the lane flags and, when it moved, runs the iteration's remaining
+ * lane entries serially: that path goes through processCommand, where aclOffloadConsume rejects the
+ * stale verdict and runs the full check. One load and compare per plan and per barrier. */
+static uint32_t fp_acl_epoch_sampled = 0;
+
+static int fpAclEpochMoved(void) {
+    return aclOffloadEpoch() != fp_acl_epoch_sampled;
+}
+
 /* Main, no other thread running commands: a client blocks on or watches one of the command's keys,
  * looked up in the dicts as they are now, whatever the sampled flags said. */
 int fastpathKeysObservedNow(serverDb *db, struct serverCommand *cmd, robj **argv, int argc) {
@@ -1761,6 +1774,7 @@ void fastpathStagedPrepareLanes(void) {
                        server.blocked_clients_by_type[BLOCKED_STREAM];
     fp_check_watched = server.watching_clients > 0;
     fp_observers_gen_sampled = fp_observers_gen; /* the observer set the flags above describe */
+    fp_acl_epoch_sampled = aclOffloadEpoch();    /* the rule sets the read phase's ACL verdicts describe */
     /* The previous iteration's replies were delivered in its reply phase. */
     for (int l = 0; l < FP_MAX_LANES; l++) {
         fp_lanes[l].chunk = 0;
@@ -2466,8 +2480,10 @@ static int fpExecuteWithLanes(void) {
      * read phase classified the lanes with the sampled flags. A WATCH or a blocking command among them
      * makes the classification stale, so this iteration's lane entries run on main, in order, through
      * the existing serial path. The per-entry demotion the replica plan does (rpDemoteObserved) is not
-     * done here yet: the per-thread lane vectors and segment counts would have to be rebuilt. */
-    int serial = !fpLanesAllowed() || fastpathKeyObserversChanged();
+     * done here yet: the per-thread lane vectors and segment counts would have to be rebuilt.
+     * The ACL epoch gets the same treatment: an ACL change among the ring commands or in a barrier
+     * makes every ALLOW verdict the read phase tagged stale, and the serial path re-checks them. */
+    int serial = !fpLanesAllowed() || fastpathKeyObserversChanged() || fpAclEpochMoved();
     for (int l = 0; l < fp_nlanes; l++) memset(fp_lanes[l].cursor, 0, sizeof(int) * fp_slots);
     fp_nparts = 0;
     int pending = 0;
@@ -2488,7 +2504,7 @@ static int fpExecuteWithLanes(void) {
             clientSetUser(ec, DefaultUser, 0);
             total++;
             fp_stat_barriers++;
-            if (!serial && (!fpLanesAllowed() || fastpathKeyObserversChanged())) serial = 1;
+            if (!serial && (!fpLanesAllowed() || fastpathKeyObserversChanged() || fpAclEpochMoved())) serial = 1;
         }
     }
     total += fpRunSegment(pending, serial, use_prefetch);
