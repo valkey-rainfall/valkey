@@ -33,6 +33,10 @@
 #define POLLER_READABLE 1
 #define POLLER_WRITABLE 2
 #define POLLER_ERROR 4 /* only ever reported to a handler, never requested */
+#define POLLER_HUP 8   /* reported only: the peer closed or the socket failed, so a read returns EOF or an error
+                        * once the pending bytes are drained. An edge-triggered fd reports it together with
+                        * the last data and never again; a handler that stops reading before it sees the
+                        * EOF must hand the fd back with pollerRequeue(). */
 
 /* Which stage consumes a ready fd and on which thread its handler runs. */
 typedef enum {

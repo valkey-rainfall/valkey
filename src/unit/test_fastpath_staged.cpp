@@ -163,6 +163,16 @@ class FastpathStagedTest : public ::testing::Test {
         iteration();
         freeClientsInAsyncFreeQueue();
     }
+
+    /* Runs iterations until the client is gone from server.clients, or gives up. */
+    static bool iterateUntilFreed(client *c, int max_iterations) {
+        for (int i = 0; i < max_iterations; i++) {
+            iteration();
+            freeClientsInAsyncFreeQueue();
+            if (listSearchKey(server.clients, c) == NULL) return true;
+        }
+        return false;
+    }
 };
 
 /* Admission gives the connection one control; batched commands run on main and their replies are
@@ -770,4 +780,61 @@ TEST_F(FastpathStagedTest, KeysObservedNowFindsOnlyWatchedOrBlockedKeys) {
         dictRelease(db->blocking_keys);
         db->blocking_keys = NULL;
     }
+}
+
+/* A client that closes while its last bytes are still unread: the peer's data and its close arrive
+ * before the poller reports the fd, so one edge-triggered report carries both. The read phase must
+ * read the bytes and still notice the close, or the client stays registered forever: no new edge
+ * ever comes for a socket whose state no longer changes. */
+TEST_F(FastpathStagedTest, TrailingBytesAndCloseInOneEdgeFreeTheClient) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk1\r\n$1\r\n1\r\n");
+    iteration();
+    EXPECT_EQ(recv(peer), "+OK\r\n");
+
+    /* The header of a second command with no argument yet, then the close, with no read phase
+     * between them: the fd reports readable and hung up in one edge. */
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk1\r\n");
+    close(peer);
+    bool freed = iterateUntilFreed(c, 4);
+    EXPECT_TRUE(freed) << "closed client with a trailing partial was never freed; fastpath_clients="
+                       << fastpathClientCount();
+    EXPECT_EQ(fastpathClientCount(), 0u);
+    if (!freed) freeClient(c);
+}
+
+/* The same close after the client went to main under CLIENT PAUSE and came back: the paused command is
+ * postponed on main, runs at unpause, and the quiescent client is readmitted to the fast path with
+ * a fresh poller registration. The close must still be noticed. */
+TEST_F(FastpathStagedTest, ClientReadmittedAfterPauseIsFreedOnClose) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk2\r\n$1\r\n1\r\n");
+    readPhase();
+
+    /* Pause all actions: the batch is requeued and the client leaves for main, where the postponed
+     * SET blocks it (BLOCKED_POSTPONE). */
+    server.paused_actions = PAUSE_ACTION_CLIENT_ALL;
+    writeAndReplyPhases();
+    EXPECT_EQ(c->flag.fastpath, 0u) << "client should have been handed back to main under pause";
+    EXPECT_EQ(c->flag.blocked, 1u);
+
+    /* Unpause and run the deferred re-processing, as beforeSleep does: the SET runs on main and the
+     * quiescent client rejoins the fast path. */
+    server.paused_actions = 0;
+    unblockPostponedClients();
+    processUnblockedClients();
+    EXPECT_EQ(c->flag.blocked, 0u);
+    ASSERT_EQ(c->flag.fastpath, 1u) << "control: a quiescent client is readmitted after unpause";
+    EXPECT_EQ(recv(peer) + mainBuf(c), "+OK\r\n");
+
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk2\r\n");
+    close(peer);
+    bool freed = iterateUntilFreed(c, 4);
+    EXPECT_TRUE(freed) << "readmitted client that closed was never freed; fastpath_clients="
+                       << fastpathClientCount();
+    EXPECT_EQ(fastpathClientCount(), 0u);
+    if (!freed) freeClient(c);
 }

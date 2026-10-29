@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <thread>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
@@ -167,7 +168,28 @@ TEST_F(PollerTest, HangupReportsErrorAndBothDirections) {
     ASSERT_EQ(pollerGetNextBatch(p, 0), 1);
     pollerEvent e;
     ASSERT_EQ(pollerClaimIO(p, &e), 1);
-    EXPECT_EQ(e.mask, POLLER_READABLE | POLLER_WRITABLE | POLLER_ERROR);
+    EXPECT_EQ(e.mask, POLLER_READABLE | POLLER_WRITABLE | POLLER_ERROR | POLLER_HUP);
+}
+
+/* A stream peer that writes its last bytes and closes before the fd is reported: the one edge carries
+ * the data and the peer's close, and the mask says so (POLLER_HUP) so the handler knows a read that
+ * returns only the bytes has not seen the EOF yet. */
+TEST_F(PollerTest, PeerCloseWithUnreadDataReportsHangupInTheSameEdge) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    fds.push_back(sv[0]);
+    ASSERT_EQ(pollerRegister(p, sv[0], POLLER_READABLE, noopHandler, nullptr, POLLER_AFF_IO), 0);
+    char c = 'x';
+    ASSERT_EQ(write(sv[1], &c, 1), 1);
+    close(sv[1]);
+    ASSERT_EQ(pollerGetNextBatch(p, 0), 1);
+    pollerEvent e;
+    ASSERT_EQ(pollerClaimIO(p, &e), 1);
+    EXPECT_TRUE(e.mask & POLLER_READABLE);
+    EXPECT_TRUE(e.mask & POLLER_HUP);
+    /* The data is still there to read; the EOF is behind it. */
+    EXPECT_EQ(read(sv[0], &c, 1), 1);
+    EXPECT_EQ(read(sv[0], &c, 1), 0);
 }
 
 static void timeoutSemantics(poller *p, int w) {
