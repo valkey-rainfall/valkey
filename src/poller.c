@@ -500,7 +500,7 @@ int pollerStart(poller *p) {
     return 0;
 }
 
-void pollerStop(poller *p) {
+void pollerStopThread(poller *p) {
     if (!p->started) return;
     pthread_mutex_lock(&p->lock);
     p->ctl = POLLER_CTL_STOP;
@@ -511,6 +511,13 @@ void pollerStop(poller *p) {
     p->started = 0;
     pthread_mutex_lock(&p->lock);
     p->ctl = POLLER_CTL_RUN;
+    pthread_mutex_unlock(&p->lock);
+}
+
+void pollerStop(poller *p) {
+    if (!p->started) return;
+    pollerStopThread(p);
+    pthread_mutex_lock(&p->lock);
     bufClear(&p->buf[0]);
     bufClear(&p->buf[1]);
     atomic_store_explicit(&p->cursor, 0, memory_order_relaxed);
@@ -529,6 +536,11 @@ int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize) {
     p->has_cpuset = 1;
     if (p->started && pthread_setaffinity_np(p->thread, sizeof(cpu_set_t), &p->cpuset) != 0) return -1;
     return 0;
+}
+
+int pollerGetThreadAffinity(const poller *p, void *cpuset, size_t cpusetsize) {
+    if (!p->started || cpusetsize < sizeof(cpu_set_t)) return -1;
+    return pthread_getaffinity_np(p->thread, sizeof(cpu_set_t), cpuset) == 0 ? 0 : -1;
 }
 
 /* Main: hold a running epoll thread outside the buffers until pollerResume. */
@@ -643,6 +655,13 @@ int pollerStart(poller *p) {
 }
 void pollerStop(poller *p) {
     (void)p;
+}
+void pollerStopThread(poller *p) {
+    (void)p;
+}
+int pollerGetThreadAffinity(const poller *p, void *cpuset, size_t cpusetsize) {
+    (void)p, (void)cpuset, (void)cpusetsize;
+    return -1;
 }
 int pollerThreadRunning(const poller *p) {
     (void)p;

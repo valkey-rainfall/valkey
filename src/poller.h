@@ -99,10 +99,15 @@ int pollerMainAt(const poller *p, int i, pollerEvent *out);
 int pollerStart(poller *p);
 /* Main: join the epoll thread and empty both buffers. No-op when not started. */
 void pollerStop(poller *p);
+/* Main, between iterations: join the epoll thread but keep what it queued; pollerGetNextBatch then
+ * waits on epoll inline again. No-op when not started. */
+void pollerStopThread(poller *p);
 int pollerThreadRunning(const poller *p);
 /* Main: CPU set (a cpu_set_t of cpusetsize bytes) for the epoll thread, applied now when it runs
  * and at every later start. 0 on success. */
 int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize);
+/* Main: the running epoll thread's current CPU set. 0 on success, -1 when not started. */
+int pollerGetThreadAffinity(const poller *p, void *cpuset, size_t cpusetsize);
 
 int pollerFd(const poller *p);    /* underlying epoll fd, for debug/nesting */
 int pollerCount(const poller *p); /* number of registered fds */

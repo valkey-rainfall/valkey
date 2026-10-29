@@ -72,6 +72,12 @@ int ioThreadsReadyNum(void) {
     return io_ready_num;
 }
 
+/* Thread slots (main included) the live set converges to: io-threads, less the one the staged loop's
+ * epoll thread takes when it runs, so io-threads N is always N threads in total. */
+int ioThreadsTarget(void) {
+    return server.io_threads_num - stagedEpollThreadWanted();
+}
+
 static inline int ioWorkerState(int tid) {
     return atomic_load_explicit(&io_worker_state[tid], memory_order_acquire);
 }
@@ -1689,7 +1695,7 @@ static void ioWorkerRetire(int tid) {
     if (ioWorkerState(tid) != IO_WORKER_RUNNING) return;
     flushWriteSlab(); /* staged work goes to a thread that is still routable */
     if (io_ready_num > tid) io_ready_num = tid;
-    if (io_ready_num > server.io_threads_num) io_ready_num = server.io_threads_num; /* every slot above retires */
+    if (io_ready_num > ioThreadsTarget()) io_ready_num = ioThreadsTarget(); /* every slot above retires */
     if (server.active_io_threads_num > io_ready_num) server.active_io_threads_num = io_ready_num;
     spscCommit(&io_private_inbox[tid]); /* the last jobs main batched for it */
     ioWorkerUnpark(tid);
@@ -1731,13 +1737,13 @@ static void ioThreadsInitShared(void) {
     io_threads_initialized = 1;
 }
 
-/* One reconciliation pass of the live worker set towards server.io_threads_num: slots above the
+/* One reconciliation pass of the live worker set towards ioThreadsTarget(): slots above the
  * target retire top down and are destroyed once drained; slots below it are created in order,
  * a retiring slot being recreated only after its thread is gone. Returns C_ERR when creating a
  * thread failed; the target is then lowered to the last contiguous running slot. Teardown steps
  * run commands left in a thread's ring, so they are for beforeSleep, not for a CONFIG SET. */
 static int ioThreadsConvergeOnce(int teardown) {
-    int target = server.io_threads_num;
+    int target = ioThreadsTarget();
     int pending = 0;
     int rc = C_OK;
 
@@ -1822,9 +1828,9 @@ void ioThreadsDebugFailCreate(int tid) {
 int updateIOThreads(const char **err) {
     serverAssert(inMainThread());
     ioThreadsInitShared();
-    if (server.io_threads_num > io_ready_num && !io_converging) io_scale_base = io_ready_num;
-    if (server.io_threads_num != io_ready_num || io_converging) {
-        serverLog(LL_NOTICE, "Changing number of IO threads from %d to %d.", io_ready_num, server.io_threads_num);
+    if (ioThreadsTarget() > io_ready_num && !io_converging) io_scale_base = io_ready_num;
+    if (ioThreadsTarget() != io_ready_num || io_converging) {
+        serverLog(LL_NOTICE, "Changing number of IO threads from %d to %d.", io_ready_num, ioThreadsTarget());
     }
     io_converging = 1;
     if (ioThreadsConvergeOnce(0) != C_OK) {
@@ -1855,7 +1861,7 @@ void initIOThreads(int prev_threads_num) {
     ioThreadsInitShared();
 
     /* Spawn and initialize the I/O threads. */
-    for (int i = prev_threads_num; i < server.io_threads_num; i++) {
+    for (int i = prev_threads_num; i < ioThreadsTarget(); i++) {
         if (createIOThread(i) != C_OK) {
             serverLog(LL_WARNING, "Fatal: Can't initialize IO thread %d", i);
             exit(1);

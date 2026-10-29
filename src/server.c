@@ -7482,7 +7482,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscatprintf(info,
                             "used_active_time_main_thread:%lld.%06lld\r\n",
                             active_seconds, active_microseconds);
-        for (int i = 1; i < server.io_threads_num; i++) {
+        for (int i = 1; i < ioThreadsTarget(); i++) {
             ustime_t used_active_time_io_thread = getIOThreadActiveTimeMicroseconds(i);
             info = sdscatprintf(info,
                                 "used_active_time_io_thread_%d:%lld.%06lld\r\n",

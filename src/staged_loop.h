@@ -52,6 +52,15 @@ void stagedMain(struct aeEventLoop *el);
 int stagedLoopActive(void);
 /* Main thread: IO threads enrolled in the staged loop. */
 int stagedWorkerCount(void);
+/* io-threads-epoll-thread on needs io-threads 3 or more. 1 when the pair is valid, else 0 with *err set. */
+int stagedEpollThreadConfigValid(int on, int io_threads, const char **err);
+/* io-threads-epoll-thread-cpu: -1, or a CPU the server may run on that neither main nor an IO thread
+ * is pinned to alone. 1 when valid, else 0 with *err set. */
+int stagedEpollThreadCpuValid(int cpu, const char **err);
+/* Main: re-place a running epoll thread after io-threads-epoll-thread-cpu changed. */
+void stagedEpollThreadReplace(void);
+/* The configuration asks for the epoll thread: io-threads N then runs N-2 IO threads besides main. */
+int stagedEpollThreadWanted(void);
 /* Main, from processEventsWhileBlocked: one nested read/write/reply pass so fast-path clients get
  * their BUSY/LOADING replies while main is blocked. A no-op outside staged mode or when nested. */
 void stagedNestedIteration(void);

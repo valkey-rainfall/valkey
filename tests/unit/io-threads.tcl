@@ -77,6 +77,8 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         activate_io_threads_and_wait
         set info [r info]
         set io_threads_count [dict get [r config get io-threads] io-threads]
+        # The staged epoll thread, when it runs, takes the last IO thread's slot.
+        incr io_threads_count -[getInfoProperty [r info fastpath] staged_epoll_thread]
         for {set i 1} {$i <= $io_threads_count} {incr i} {
             set used_active_time [getInfoProperty $info used_active_time_io_thread_$i]
             if {$i < $io_threads_count} {
