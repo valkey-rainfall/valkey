@@ -110,6 +110,9 @@ int applyIOThreadsFastpathConfig(const char **err);
 void ioThreadsConverge(void);
 void ioThreadsStopForExit(void);
 int ioThreadsReadyNum(void);
+/* Thread slots, main included, that io-threads asks for: one fewer when the configuration runs the
+ * staged epoll thread in place of an IO thread. */
+int ioThreadsTarget(void);
 int ioThreadsRunningNum(void);
 int ioThreadsRetiringNum(void);
 void ioThreadsDebugFailCreate(int tid);

@@ -697,6 +697,8 @@ void loadServerConfigFromString(sds config) {
               "'forkless-infrastructure-enabled yes'";
         goto loaderr;
     }
+    if (!stagedEpollThreadConfigValid(server.io_threads_epoll_thread, server.io_threads_num, &err)) goto loaderr;
+    if (!stagedEpollThreadCpuValid(server.io_threads_epoll_thread_cpu, &err)) goto loaderr;
 
     /* To ensure backward compatibility and work while hz is out of range */
     if (server.hz < CONFIG_MIN_HZ) server.hz = CONFIG_MIN_HZ;
@@ -3010,6 +3012,22 @@ static int applyIOThreadsStrictOffload(const char **err) {
     return applyIOThreadsFastpathConfig(err);
 }
 
+static int applyIOThreadsEpollThread(const char **err) {
+    if (!stagedEpollThreadConfigValid(server.io_threads_epoll_thread, server.io_threads_num, err)) return 0;
+    return applyIOThreadsFastpathConfig(err);
+}
+
+static int applyIOThreadsEpollThreadCpu(const char **err) {
+    if (!stagedEpollThreadCpuValid(server.io_threads_epoll_thread_cpu, err)) return 0;
+    stagedEpollThreadReplace();
+    return 1;
+}
+
+static int applyIOThreads(const char **err) {
+    if (!stagedEpollThreadConfigValid(server.io_threads_epoll_thread, server.io_threads_num, err)) return 0;
+    return updateIOThreads(err);
+}
+
 static int applyTLSPort(const char **err) {
     /* Configure TLS in case it wasn't enabled */
     if (connTypeConfigure(connectionTypeTls(), &server.tls_ctx_config, 0) == C_ERR) {
@@ -3536,6 +3554,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-speculate-reads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculate_reads, 1, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
+    createBoolConfig("io-threads-epoll-thread", NULL, MODIFIABLE_CONFIG, server.io_threads_epoll_thread, 0, NULL, applyIOThreadsEpollThread),
     createEnumConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, repl_stream_sender_enum, server.repl_stream_sender, REPL_STREAM_SENDER_NO, NULL, NULL),
     createIntConfig("repl-stream-sender-wake-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.repl_stream_sender_wake_bytes, 16384, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
@@ -3607,8 +3626,8 @@ standardConfig static_configs[] = {
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases_cluster, 1, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
-    createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, updateIOThreads), /* Single threaded by default */
+    createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                              /* TCP port. */
+    createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, applyIOThreads), /* Single threaded by default */
     createIntConfig("min-io-threads-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_io_threads_copy_avoid, 7, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
@@ -3616,6 +3635,7 @@ standardConfig static_configs[] = {
     createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-epoll-thread-cpu", NULL, MODIFIABLE_CONFIG, -1, 1023, server.io_threads_epoll_thread_cpu, -1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThreadCpu),
     createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-parallel-writes-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_parallel_writes_min, 32, INTEGER_CONFIG, NULL, NULL),
