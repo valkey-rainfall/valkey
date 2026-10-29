@@ -2067,6 +2067,15 @@ static void reclassifyClientsPriority(void) {
         client *c = listNodeValue(ln);
         if (!c->conn) continue;
 
+        /* Replication links get priority at connect (connectWithPrimary) or at PSYNC (syncCommand), not
+         * from the subnet list. Leave them as they are, or a runtime CONFIG SET priority-subnets demotes
+         * the link until the next reconnect. MONITOR clients carry flag.replica too and are ordinary
+         * clients for this purpose. */
+        if (c->flag.primary || (c->flag.replica && !c->flag.monitor)) {
+            if (connIsPriority(c->conn)) count++;
+            continue;
+        }
+
         char ip[CONN_ADDR_STR_LEN];
         int port = 0;
         if (connAddrPeerName(c->conn, ip, sizeof(ip), &port) != C_OK) {
