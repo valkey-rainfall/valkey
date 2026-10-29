@@ -392,7 +392,7 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes io-threads-epoll-thread no}} {
     test {Staged stress: raising io-threads while lowered slots still retire converges} {
         # Lowered to 1 and raised to 5 before any retiring thread stopped: the slots below the
         # new target must finish retiring and be recreated instead of blocking the server.

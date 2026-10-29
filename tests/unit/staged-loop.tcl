@@ -234,7 +234,7 @@ proc sl_affinity {tid} {
 }
 
 if {$::tcl_platform(os) eq "Linux" && ![catch {exec taskset -pc [pid]}]} {
-start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 io-threads-epoll-thread no}} {
     test {Staged loop: main and an IO thread pinned to its CPU sleep at the barrier instead of spinning} {
         set pid [srv 0 pid]
         set io1 [sl_thread_tid $pid io_thd_1]
@@ -312,7 +312,7 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
 
 # The crash report's memory test cancels and joins every IO thread; staged workers wait on the barrier.
 tags {"valgrind:skip"} {
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes crash-memcheck-enabled yes}} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes crash-memcheck-enabled yes io-threads-epoll-thread no}} {
     test {Staged loop: a crash with several workers at the barrier finishes the report and exits} {
         r client setname sl-control
         r select 0
