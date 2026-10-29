@@ -1,0 +1,118 @@
+name: lsan-2604-validate
+
+# 100x validation of the harness fix on the PR branch
+# (fix/test-sigcont-lsan-exit-hang, on top of current unstable). CI-faithful
+# ASan build and runtest invocation from test-sanitizer-address, 100 shards on
+# ubuntu-26.04. Per shard: LSan warnings in server stderr (control: the exit
+# window was still hit), job-failing "Sanitizer error" lines (expect 0),
+# harness forced crashes and the new kill_server [err] (expect 0), watchdog
+# captures and slow-exit dumps. Fork-only. Manual + branch push.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rain/lsan-2604-validate
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+
+      - name: Build libbacktrace
+        run: cd libbacktrace && ./configure && make && sudo make install
+
+      - name: Environment
+        run: |
+          uname -a; gcc --version | head -1; nproc
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libzstd-dev libssl-dev tcl8.6 tclx gdb
+
+      - name: Build ASan valkey (CI-faithful)
+        run: |
+          make -j4 all SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module BUILD_ZSTD=yes USE_LIBBACKTRACE=yes
+          ./src/valkey-server --version
+
+      - name: Full suite with watchdog
+        id: suite
+        run: |
+          chmod +x lsan-probe/suite_watchdog5.sh
+          mkdir -p tests/tmp
+          CAP=$RUNNER_TEMP/captures
+          lsan-probe/suite_watchdog5.sh tests/tmp "$CAP" "$RUNNER_TEMP/runtest.out" &
+          wd=$!
+          set +e
+          timeout 3000 ./runtest --verbose --tags -slow --dump-logs --dont-clean > $RUNNER_TEMP/runtest.out 2>&1
+          rc=$?
+          set -e
+          sleep 2; kill $wd 2>/dev/null || true
+          warnings=$(grep -rl "ptrace appears to be blocked" tests/tmp 2>/dev/null | wc -l)
+          notes=$(grep -c "LeakSanitizer ptrace probe warning" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          sanerr=$(grep -c "Sanitizer error" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          forced=$(grep -c "Forcing process .* to crash" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          forcederr=$(grep -c "did not exit within 10s of SIGTERM" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          waiting=$(grep -c "Waiting for process .* to exit" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          errs=$(grep -c "^\[err\]" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          excs=$(grep -c "^\[exception\]" "$RUNNER_TEMP/runtest.out" 2>/dev/null || true)
+          confirmed=$(grep -l "PROBE=sent" "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)
+          echo "captured=$([ -n "$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null)" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          echo "===== shard ${{ matrix.shard }} ====="
+          echo "RUNTEST_EXIT=$rc"
+          echo "LSAN_WARNINGS=$warnings"
+          echo "LSAN_NOTES=$notes"
+          echo "SANITIZER_ERRORS=$sanerr"
+          echo "FORCED_CRASH=$forced"
+          echo "FORCED_CRASH_ERR=$forcederr"
+          echo "WAITING_LINES=$waiting"
+          echo "ERR_LINES=$errs"
+          echo "EXCEPTION_LINES=$excs"
+          echo "CAPTURES=$(ls "$CAP"/CAPTURE.*.txt 2>/dev/null | wc -l)"
+          echo "CONFIRMED_HANGS=$confirmed"
+          echo "SLOW_DUMPS=$(ls "$CAP"/SLOW.*.txt 2>/dev/null | wc -l)"
+          grep -h "LeakSanitizer ptrace probe warning\|Sanitizer error\|Forcing process\|did not exit within" "$RUNNER_TEMP/runtest.out" | head -20
+          echo "----- [err]/[exception] blocks -----"
+          grep -B2 -A12 "\[err\]\|\[exception\]" "$RUNNER_TEMP/runtest.out" | head -120
+          echo "----- runtest tail -----"
+          tail -n 25 "$RUNNER_TEMP/runtest.out"
+          for c in "$CAP"/CAPTURE.*.txt; do [ -f "$c" ] || continue; echo "########## $c ##########"; cat "$c"; echo; done
+          grep -h "^== SLOW EXIT" "$CAP"/SLOW.*.txt 2>/dev/null | head -40
+
+      - name: Stage artifacts
+        if: always()
+        run: |
+          A=$RUNNER_TEMP/artifact; mkdir -p "$A"
+          cp "$RUNNER_TEMP"/runtest.out "$A"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP"/captures/* "$A"/ 2>/dev/null || true
+          [ "${{ steps.suite.outputs.captured }}" = yes ] && cp src/valkey-server "$A"/valkey-server || true
+          for sd in "$RUNNER_TEMP"/captures/serverdir.*.txt; do
+            [ -f "$sd" ] || continue; d=$(cat "$sd"); n=$(basename "$sd" .txt)
+            mkdir -p "$A/$n"; cp "$d"/stdout "$d"/stderr "$A/$n"/ 2>/dev/null || true
+          done
+          ls -la "$A"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsan-validate-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/artifact
+          retention-days: 14
