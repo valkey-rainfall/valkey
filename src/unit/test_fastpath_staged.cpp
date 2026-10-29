@@ -28,6 +28,7 @@ extern "C" {
 extern hashtableType commandSetType;
 extern dictType keylistDictType;
 void createSharedObjects(void);
+void watchForKey(client *c, robj *key);
 void fastGetRecomputeSpecAclOk(client *c); /* from fastget.h, declared here to avoid <stdatomic.h> in C++ */
 }
 
@@ -837,4 +838,67 @@ TEST_F(FastpathStagedTest, ClientReadmittedAfterPauseIsFreedOnClose) {
                        << fastpathClientCount();
     EXPECT_EQ(fastpathClientCount(), 0u);
     if (!freed) freeClient(c);
+}
+
+/* The generation moves when a key becomes present in watched_keys or blocking_keys, and only then: a
+ * second watcher or blocker of a key already in the dict changes nothing a lane classification could
+ * see, so a plan is not re-checked for it. */
+TEST_F(FastpathStagedTest, KeyObserverGenerationMovesOnlyWhenAKeyBecomesObserved) {
+    serverDb *db = server.db[0];
+    int own_blocking = db->blocking_keys == NULL;
+    if (own_blocking) db->blocking_keys = dictCreate(&keylistDictType);
+    if (!db->blocking_keys_unblock_on_nokey) db->blocking_keys_unblock_on_nokey = dictCreate(&keylistDictType);
+    robj *kw = createStringObject("gen:w", 5);
+    robj *kw2 = createStringObject("gen:w2", 6);
+    robj *kl = createStringObject("gen:l", 5);
+    robj *kl2 = createStringObject("gen:l2", 6);
+
+    client *a = createClient(NULL), *b = createClient(NULL);
+    initClientMultiState(a);
+    initClientMultiState(b);
+    fastpathKeyObserversRechecked();
+    watchForKey(a, kw);
+    EXPECT_TRUE(fastpathKeyObserversChanged()) << "first watcher of a key";
+    fastpathKeyObserversRechecked();
+    watchForKey(b, kw);
+    EXPECT_FALSE(fastpathKeyObserversChanged()) << "second watcher of the same key";
+    watchForKey(b, kw2);
+    EXPECT_TRUE(fastpathKeyObserversChanged()) << "a key no one watched yet";
+    fastpathKeyObserversRechecked();
+    unwatchAllKeys(a);
+    unwatchAllKeys(b);
+    EXPECT_FALSE(fastpathKeyObserversChanged()) << "removals never need a re-check";
+
+    client *c1 = createClient(NULL), *c2 = createClient(NULL), *c3 = createClient(NULL);
+    c1->flag.pending_command = c2->flag.pending_command = c3->flag.pending_command = 1; /* a blocked command is pending */
+    robj *one[1] = {kl};
+    robj *two[2] = {kl, kl2};
+    blockForKeys(c1, BLOCKED_LIST, one, 1, 0, 0);
+    EXPECT_TRUE(fastpathKeyObserversChanged()) << "first blocker of a key";
+    fastpathKeyObserversRechecked();
+    blockForKeys(c2, BLOCKED_LIST, one, 1, 0, 0);
+    EXPECT_FALSE(fastpathKeyObserversChanged()) << "second blocker of the same key";
+    blockForKeys(c3, BLOCKED_LIST, two, 2, 0, 0);
+    EXPECT_TRUE(fastpathKeyObserversChanged()) << "one of the keys is new";
+    fastpathKeyObserversRechecked();
+    unblockClient(c1, 0);
+    unblockClient(c2, 0);
+    unblockClient(c3, 0);
+    EXPECT_FALSE(fastpathKeyObserversChanged());
+    EXPECT_EQ(dictSize(db->blocking_keys), 0u);
+    EXPECT_EQ(dictSize(db->watched_keys), 0u);
+
+    freeClient(a);
+    freeClient(b);
+    freeClient(c1);
+    freeClient(c2);
+    freeClient(c3);
+    decrRefCount(kw);
+    decrRefCount(kw2);
+    decrRefCount(kl);
+    decrRefCount(kl2);
+    if (own_blocking) {
+        dictRelease(db->blocking_keys);
+        db->blocking_keys = NULL;
+    }
 }

@@ -491,7 +491,6 @@ void watchForKey(client *c, robj *key) {
     watchedKey *wk;
 
     if (listLength(&c->mstate->watched_keys) == 0) server.watching_clients++;
-    fastpathKeyObserverAdded(); /* a lane plan classified before this call must look this key up again */
 
     /* Lazily allocate the per-db hashtable array. */
     if (c->mstate->watched_keys_by_db == NULL) {
@@ -511,6 +510,9 @@ void watchForKey(client *c, robj *key) {
     /* This key is not already watched in this DB. Let's add it */
     dictEntry *de = dictFind(c->db->watched_keys, key);
     if (de == NULL) {
+        /* The key becomes observed now: a lane plan classified before this call must look it up again. A
+         * second watcher of a key already in the dict changes nothing a classification could see. */
+        fastpathKeyObserverAdded();
         clients = listCreate();
         dictAdd(c->db->watched_keys, key, clients);
         incrRefCount(key);

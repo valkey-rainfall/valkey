@@ -539,9 +539,14 @@ static int fp_check_watched = 0; /* clients watch keys */
 
 /* Audit issue 29: the key observer generation.
  *
- * Main bumps fp_observers_gen every time a key is added to a db's watched_keys or blocking_keys
+ * Main bumps fp_observers_gen every time a key becomes present in a db's watched_keys or blocking_keys
  * (watchForKey, blockForKeys; every blocking command, module key blocking and a client re-blocking
- * after an unblock go through blockForKeys). fastpathStagedPrepareLanes samples it together with
+ * after an unblock go through blockForKeys). A second watcher or blocker of a key already in the dict
+ * does not bump it: a classification depends only on key presence in the two dicts plus the sampled
+ * flags, and presence with the flag off cannot happen at sample time (watching_clients > 0 whenever a
+ * watched_keys dict is non-empty, blocked_clients_by_type[LIST|ZSET|STREAM] > 0 whenever such a client
+ * has an entry in blocking_keys; both are maintained by the same functions that add and remove the dict
+ * entries, and BLOCKED_MODULE entries exist only with lanes off). fastpathStagedPrepareLanes samples it together with
  * fp_check_blocked and fp_check_watched, before the read phase classifies commands onto lanes with
  * those flags. Between that sample and the moment a plan's lane entries run, main may execute
  * commands (the ring clients' commands at the start of the write phase, the DEBUG seam in tests):
@@ -549,7 +554,7 @@ static int fp_check_watched = 0; /* clients watch keys */
  * lane write to that key would reach touchWatchedKey or signalKeyAsReadyLogic on an IO thread.
  *
  * A flag comparison is not enough: with one client already watching, fp_check_watched stays 1 and a
- * new WATCH of another key changes nothing visible. The counter changes on every addition. The plan
+ * new WATCH of another key changes nothing visible. The counter changes on every new key. The plan
  * owner compares it on main before its lane entries run (one integer compare per plan); only when it
  * changed are the planned keys looked up again, on main, with fastpathKeysObservedNow, and only the
  * entries whose keys are observed now are demoted to the barrier path. Removals never need a

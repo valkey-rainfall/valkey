@@ -476,7 +476,6 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     int j;
 
     initClientBlockingState(c);
-    fastpathKeyObserverAdded(); /* a lane plan classified before this call must look these keys up again */
 
     if (!c->flag.reexecuting_command) {
         /* If the client is re-processing the command, we do not set the timeout
@@ -496,6 +495,11 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
 
         /* In case key[j] did not have blocking clients yet, we need to create a new list */
         if (db_blocked_entry != NULL) {
+            /* The key becomes observed now: a lane plan classified before this call must look it up again.
+             * A key already in the dict (another client blocks on it, or this client re-blocks) changes
+             * nothing a classification could see. blocking_keys_unblock_on_nokey needs no bump of its
+             * own: a key there is always also in blocking_keys. */
+            fastpathKeyObserverAdded();
             l = listCreate();
             dictSetVal(c->db->blocking_keys, db_blocked_entry, l);
             incrRefCount(keys[j]);
