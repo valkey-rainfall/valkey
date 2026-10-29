@@ -111,7 +111,7 @@ proc lc_run_behind_sleep {ctl secs cmds} {
     $ctl flush
 }
 
-start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 16} [r config get io-threads]
     r select 0
 
@@ -198,7 +198,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
     }
 }
 
-start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 4} [r config get io-threads]
     r select 0
 
@@ -507,5 +507,129 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         assert_equal "\$5" [string trim [gets $fd]]
         assert_equal value [string trim [gets $fd]]
         close $fd
+    }
+}
+
+proc lc_epoll {} {
+    return [getInfoProperty [r info fastpath] staged_epoll_thread]
+}
+
+# io-threads N is N threads: main plus N-1 IO threads, or main, N-2 IO threads and the epoll thread.
+proc lc_wait_budget {running epoll} {
+    wait_for_condition 500 20 {
+        [lc_running] == $running && [lc_retiring] == 0 && [lc_epoll] == $epoll
+    } else {
+        fail "expected $running IO threads and epoll thread $epoll: [r info server] [r info fastpath]"
+    }
+}
+
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
+    r select 0
+
+    if {[lsearch -exact $::global_overrides io-threads-epoll-thread] < 0} {
+        test {Thread budget: the epoll thread is off by default} {
+            assert_equal {io-threads-epoll-thread no} [r config get io-threads-epoll-thread]
+            assert_equal {io-threads-epoll-thread-cpu -1} [r config get io-threads-epoll-thread-cpu]
+            lc_wait_budget 3 0
+        }
+    }
+
+    test {Thread budget: the epoll thread takes the place of one IO thread} {
+        assert_equal OK [r config set io-threads-epoll-thread yes]
+        lc_wait_budget 2 1
+        assert_equal OK [r config set io-threads 5]
+        lc_wait_budget 3 1
+        assert_equal OK [r config set io-threads-epoll-thread no]
+        lc_wait_budget 4 0
+        assert_equal OK [r config set io-threads 4]
+        lc_wait_budget 3 0
+        # The smallest io-threads that can give up an IO thread: main, one IO thread and the epoll thread.
+        assert_equal OK [r config set io-threads 3]
+        assert_equal OK [r config set io-threads-epoll-thread yes]
+        lc_wait_budget 1 1
+        # Without the fast path the staged loop and its epoll thread do not run.
+        assert_equal OK [r config set io-threads-fast-path no]
+        lc_wait_budget 2 0
+        assert_equal OK [r config set io-threads-fast-path yes]
+        lc_wait_budget 1 1
+    }
+
+    test {Thread budget: the epoll thread is refused below io-threads 3} {
+        assert_error {*io-threads 3 or more*} {r config set io-threads 2}
+        assert_equal {io-threads 3} [r config get io-threads]
+        assert_equal OK [r config set io-threads-epoll-thread no io-threads 2]
+        lc_wait_budget 1 0
+        assert_error {*io-threads 3 or more*} {r config set io-threads-epoll-thread yes}
+        assert_equal {io-threads-epoll-thread no} [r config get io-threads-epoll-thread]
+        assert_equal OK [r config set io-threads 3 io-threads-epoll-thread yes]
+        lc_wait_budget 1 1
+    }
+
+    test {Thread budget: reply order holds while the epoll thread starts and stops} {
+        assert_equal OK [r config set io-threads 4]
+        set clients [lc_open_counters 8 lc:ep]
+        for {set round 0} {$round < 20} {incr round} {
+            lc_pipeline_incr $clients lc:ep 50
+            assert_equal OK [r config set io-threads-epoll-thread [expr {$round % 2 ? "yes" : "no"}]]
+        }
+        lc_assert_incr_replies $clients lc:ep 1000
+        foreach c $clients { $c close }
+    }
+}
+
+proc lc_thread_tid {pid name} {
+    foreach task [glob -nocomplain /proc/$pid/task/*] {
+        if {[catch {set comm [string trim [exec cat $task/comm]]}]} continue
+        if {$comm eq $name} { return [file tail $task] }
+    }
+    return {}
+}
+
+proc lc_thread_cpus {tid} {
+    return [lindex [split [exec taskset -pc $tid] :] end]
+}
+
+proc lc_cpu_list {spec} {
+    set cpus {}
+    foreach part [split [string trim $spec] ,] {
+        set range [split $part -]
+        for {set c [lindex $range 0]} {$c <= [lindex $range end]} {incr c} { lappend cpus $c }
+    }
+    return $cpus
+}
+
+if {$::tcl_platform(os) eq "Linux" && ![catch {exec taskset -pc [pid]}] && [llength [lc_cpu_list [lc_thread_cpus [pid]]]] >= 2} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-epoll-thread yes}} {
+    test {Thread budget: io-threads-epoll-thread-cpu pins the epoll thread and refuses a taken CPU} {
+        lc_wait_budget 2 1
+        set pid [srv 0 pid]
+        set allowed [lc_thread_cpus $pid]
+        lassign [lc_cpu_list $allowed] cpu_a cpu_b
+        assert_error {*not one of the CPUs*} {r config set io-threads-epoll-thread-cpu 1023}
+        assert_equal OK [r config set io-threads-epoll-thread-cpu $cpu_a]
+        set epoll [lc_thread_tid $pid io_epoll]
+        assert {$epoll ne {}}
+        wait_for_condition 100 10 {
+            [string trim [lc_thread_cpus $epoll]] eq $cpu_a
+        } else {
+            fail "epoll thread not on CPU $cpu_a: [lc_thread_cpus $epoll]"
+        }
+        # A CPU an IO thread is pinned to alone is refused, and the setting keeps its value.
+        set io1 [lc_thread_tid $pid io_thd_1]
+        assert {$io1 ne {}}
+        exec taskset -pc $cpu_b $io1
+        assert_error {*an I/O thread is pinned to*} {r config set io-threads-epoll-thread-cpu $cpu_b}
+        assert_equal "io-threads-epoll-thread-cpu $cpu_a" [r config get io-threads-epoll-thread-cpu]
+        exec taskset -pc $allowed $io1
+        assert_equal OK [r config set io-threads-epoll-thread-cpu -1]
+        assert_equal PONG [r ping]
+    }
+}
+}
+
+start_server {tags {"io-threads-lifecycle external:skip tls:skip"}} {
+    test {Thread budget: the server refuses to start with the epoll thread on below io-threads 3} {
+        catch {exec $::VALKEY_SERVER_BIN --port 0 --io-threads 2 --io-threads-epoll-thread yes 2>@1} msg
+        assert_match {*FATAL CONFIG*io-threads 3 or more*} $msg
     }
 }

@@ -65,9 +65,34 @@ static void stagedAccountPhase(int phase, int nworkers) {
     sl_crit_ns[phase] += max;
 }
 
+/* The smallest io-threads that can give up an IO thread to the epoll thread: main, one IO thread and
+ * the epoll thread. */
+#define STAGED_EPOLL_THREAD_MIN_IO_THREADS 3
+
+static int stagedEpollThreadRunning(void);
+
+int stagedEpollThreadConfigValid(int on, int io_threads, const char **err) {
+    if (on && io_threads < STAGED_EPOLL_THREAD_MIN_IO_THREADS) {
+        *err = "io-threads-epoll-thread needs io-threads 3 or more (the main thread, one I/O thread and the epoll thread)";
+        return 0;
+    }
+    return 1;
+}
+
+int stagedEpollThreadWanted(void) {
+#ifdef HAVE_FASTPATH_EPOLL
+    if (!server.io_threads_epoll_thread) return 0;
+    if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.sentinel_mode) return 0;
+    return server.io_threads_num >= STAGED_EPOLL_THREAD_MIN_IO_THREADS;
+#else
+    return 0;
+#endif
+}
+
 void stagedInfo(char **info) {
     sds s = *info;
     s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
+    s = sdscatprintf(s, "staged_epoll_thread:%d\r\n", stagedEpollThreadRunning());
     s = sdscatprintf(s, "staged_stream_arena_guard_bytes:%lld\r\n",
                      (long long)server.stat_staged_stream_arena_guard_bytes);
     for (int i = 0; i < SL_T_COUNT; i++)
@@ -100,6 +125,10 @@ void stagedResetStats(void) {
 
 
 static poller *sl_poller = NULL;
+
+static int stagedEpollThreadRunning(void) {
+    return sl_poller && pollerThreadRunning(sl_poller);
+}
 static phaseBarrier sl_barrier;
 static int sl_barrier_ready = 0;
 static int sl_on = 0;         /* staged mode is on for this iteration */
@@ -118,13 +147,15 @@ static int sl_stream_open = 0;      /* a STREAM phase is open: workers deliver w
  * can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
 #define STAGED_PINNING_READ_US 1000000
 
-/* With few IO threads main waits on epoll itself: handing each ready batch over from an epoll thread
- * costs a wakeup per iteration that a small pool does not win back. */
-#define STAGED_EPOLL_THREAD_MIN_WORKERS 4
 static int sl_main_spins = 1;     /* no enrolled worker is pinned to main's CPU */
 static int sl_pinned_workers = 0; /* enrolled workers pinned to main's one CPU, as last read */
 static int sl_pinned_cpu = -1;    /* main's one CPU, as last read; -1 when main may run on several */
 static monotime sl_pinning_read = 0;
+static cpu_set_t sl_proc_cpus; /* main's CPUs when staged mode first started: the server's CPUs */
+static int sl_proc_cpus_read = 0;
+static cpu_set_t sl_epoll_placed; /* the epoll thread's CPUs as main last placed it */
+static int sl_epoll_placed_set = 0;
+static int sl_epoll_start_failed = 0;
 
 /* Enrollment: main writes the sequence a newly enrolled worker waits from, then bumps its generation,
  * then sets enrolled, all between phases. A worker adopts the sequence once per generation. */
@@ -219,6 +250,11 @@ static int stagedInit(void) {
     } else if (pollerSetSize(sl_poller) != setsize && pollerResize(sl_poller, setsize) != 0) {
         return 0;
     }
+    if (!sl_proc_cpus_read) {
+        CPU_ZERO(&sl_proc_cpus);
+        if (pthread_getaffinity_np(pthread_self(), sizeof(sl_proc_cpus), &sl_proc_cpus) != 0) CPU_ZERO(&sl_proc_cpus);
+        sl_proc_cpus_read = 1;
+    }
     return 1;
 }
 
@@ -237,27 +273,151 @@ static int stagedWanted(void) {
     return 1;
 }
 
-/* Main: place the epoll thread on the union of the enrolled IO threads' CPUs, minus main's own when
- * main is pinned to fewer CPUs than that union. */
-static void stagedPlaceEpollThread(void) {
-    cpu_set_t all, mine;
-    CPU_ZERO(&all);
+/* The thread pinned to cpu alone: -1 main, an IO thread's id, or 0 when none is. */
+static int stagedCpuPinnedAlone(int cpu) {
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(one), &one) == 0 && CPU_COUNT(&one) == 1 && CPU_ISSET(cpu, &one))
+        return -1;
+    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++) {
+        CPU_ZERO(&one);
+        if (ioThreadGetAffinity(tid, &one, sizeof(one)) != 0) continue;
+        if (CPU_COUNT(&one) == 1 && CPU_ISSET(cpu, &one)) return tid;
+    }
+    return 0;
+}
+
+int stagedEpollThreadCpuValid(int cpu, const char **err) {
+    if (cpu < 0) return 1;
+    cpu_set_t allowed;
+    if (sl_proc_cpus_read) {
+        allowed = sl_proc_cpus;
+    } else {
+        CPU_ZERO(&allowed);
+        if (pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed) != 0) CPU_ZERO(&allowed);
+    }
+    if (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed)) {
+        *err = "io-threads-epoll-thread-cpu is not one of the CPUs the server may run on";
+        return 0;
+    }
+    int owner = stagedCpuPinnedAlone(cpu);
+    if (owner < 0) {
+        *err = "io-threads-epoll-thread-cpu is the CPU the main thread is pinned to";
+        return 0;
+    }
+    if (owner > 0) {
+        *err = "io-threads-epoll-thread-cpu is the CPU an I/O thread is pinned to";
+        return 0;
+    }
+    return 1;
+}
+
+/* Main: the epoll thread's CPUs. It runs in place of an IO thread, so it takes a CPU of its own:
+ * io-threads-epoll-thread-cpu when set and no other thread is pinned to it alone, otherwise the
+ * server's CPUs minus every CPU main or an IO thread is pinned to alone. When pinning leaves none, it
+ * falls back to the IO threads' CPUs minus main's. 0 when no CPU set can be read. */
+static int stagedEpollCpus(cpu_set_t *out) {
+    static int conflict_logged = 0;
+    int cfg = server.io_threads_epoll_thread_cpu;
+    if (cfg >= 0 && cfg < CPU_SETSIZE) {
+        int owner = stagedCpuPinnedAlone(cfg);
+        if (owner == 0) {
+            conflict_logged = 0;
+            CPU_ZERO(out);
+            CPU_SET(cfg, out);
+            return 1;
+        }
+        if (!conflict_logged) {
+            serverLog(LL_WARNING,
+                      "Staged event loop: %s is pinned to io-threads-epoll-thread-cpu %d; the epoll thread is placed "
+                      "on a free server CPU until that changes",
+                      owner < 0 ? "the main thread" : "an I/O thread", cfg);
+            conflict_logged = 1;
+        }
+    }
+    cpu_set_t cand, excl, workers, mine;
+    if (sl_proc_cpus_read)
+        cand = sl_proc_cpus;
+    else
+        CPU_ZERO(&cand);
+    CPU_ZERO(&excl);
+    CPU_ZERO(&workers);
+    CPU_ZERO(&mine);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0) {
+        CPU_OR(&cand, &cand, &mine);
+        if (CPU_COUNT(&mine) == 1) CPU_OR(&excl, &excl, &mine);
+    }
     for (int tid = 1; tid <= sl_workers; tid++) {
         cpu_set_t one;
         CPU_ZERO(&one);
-        if (ioThreadGetAffinity(tid, &one, sizeof(one)) == 0) CPU_OR(&all, &all, &one);
+        if (ioThreadGetAffinity(tid, &one, sizeof(one)) != 0) continue;
+        CPU_OR(&workers, &workers, &one);
+        if (CPU_COUNT(&one) == 1) CPU_OR(&excl, &excl, &one);
     }
-    if (CPU_COUNT(&all) == 0) return;
-    CPU_ZERO(&mine);
-    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) < CPU_COUNT(&all)) {
+    CPU_OR(&cand, &cand, &workers);
+    CPU_ZERO(out);
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        if (CPU_ISSET(cpu, &cand) && !CPU_ISSET(cpu, &excl)) CPU_SET(cpu, out);
+    if (CPU_COUNT(out) > 0) return 1;
+    if (CPU_COUNT(&workers) == 0) return 0;
+    *out = workers;
+    if (CPU_COUNT(&mine) > 0 && CPU_COUNT(&mine) < CPU_COUNT(&workers)) {
         cpu_set_t others;
         CPU_ZERO(&others);
         for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
-            if (CPU_ISSET(cpu, &all) && !CPU_ISSET(cpu, &mine)) CPU_SET(cpu, &others);
-        if (CPU_COUNT(&others) > 0) all = others;
+            if (CPU_ISSET(cpu, &workers) && !CPU_ISSET(cpu, &mine)) CPU_SET(cpu, &others);
+        if (CPU_COUNT(&others) > 0) *out = others;
     }
-    if (pollerSetThreadAffinity(sl_poller, &all, sizeof(all)) != 0)
+    return 1;
+}
+
+/* Main: (re)place the epoll thread. A running thread whose CPUs differ from where main last put it
+ * was pinned by the operator and is left alone. */
+static void stagedPlaceEpollThread(void) {
+    cpu_set_t want, cur;
+    if (!stagedEpollCpus(&want)) return;
+    int running = pollerThreadRunning(sl_poller);
+    if (running && sl_epoll_placed_set && pollerGetThreadAffinity(sl_poller, &cur, sizeof(cur)) == 0) {
+        if (!CPU_EQUAL(&cur, &sl_epoll_placed)) return;
+        if (CPU_EQUAL(&cur, &want)) return;
+    }
+    if (pollerSetThreadAffinity(sl_poller, &want, sizeof(want)) != 0) {
         serverLog(LL_WARNING, "Staged event loop: cannot set the epoll thread's CPU affinity");
+        return;
+    }
+    /* Kept as the kernel reports it, so a cpuset narrowing the request is not mistaken for a pin. */
+    if (!running || pollerGetThreadAffinity(sl_poller, &sl_epoll_placed, sizeof(sl_epoll_placed)) != 0)
+        sl_epoll_placed = want;
+    sl_epoll_placed_set = 1;
+}
+
+void stagedEpollThreadReplace(void) {
+    if (!sl_poller || !pollerThreadRunning(sl_poller)) return;
+    sl_epoll_placed_set = 0; /* an explicit setting overrides an operator's pin */
+    stagedPlaceEpollThread();
+}
+
+/* Main, at the iteration boundary while staged mode is on: run the epoll thread exactly when the
+ * configuration asks for it. Started, it replaces the last IO thread, which the worker set no longer
+ * has; stopped, main waits on epoll itself and keeps what the thread had queued. */
+static void stagedFollowEpollThread(void) {
+    int want = stagedEpollThreadWanted() && sl_workers > 0;
+    if (!want) sl_epoll_start_failed = 0;
+    if (want == pollerThreadRunning(sl_poller) || (want && sl_epoll_start_failed)) return;
+    if (want) {
+        sl_epoll_placed_set = 0;
+        stagedPlaceEpollThread();
+        if (pollerStart(sl_poller) != 0) {
+            serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
+            sl_epoll_start_failed = 1;
+            return;
+        }
+        if (pollerGetThreadAffinity(sl_poller, &sl_epoll_placed, sizeof(sl_epoll_placed)) == 0) sl_epoll_placed_set = 1;
+        serverLog(LL_NOTICE, "Staged event loop: an epoll thread collects ready fds in place of an IO thread (%d IO threads)", sl_workers);
+    } else {
+        pollerStopThread(sl_poller);
+        serverLog(LL_NOTICE, "Staged event loop: epoll thread stopped; main waits on epoll itself (%d IO threads)", sl_workers);
+    }
 }
 
 /* Main is pinned to CPUs a worker also runs on, so a lane on main would only take turns with it.
@@ -382,14 +542,16 @@ static void stagedReconcile(aeEventLoop *el) {
     }
     stagedSetWorkers(ioThreadsReadyNum() - 1);
     if (!sl_on) {
-        if (server.io_threads_num - 1 >= STAGED_EPOLL_THREAD_MIN_WORKERS && pollerStart(sl_poller) != 0)
-            serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
         __atomic_store_n(&sl_on, 1, __ATOMIC_RELAXED);
         fastpathStagedSet(1);
         fastpathStagedAdoptClients();
         serverLog(LL_NOTICE, "Staged event loop started with %d IO threads", sl_workers);
     }
-    if (getMonotonicUs() - sl_pinning_read >= STAGED_PINNING_READ_US) stagedReadCpuPinning();
+    stagedFollowEpollThread();
+    if (getMonotonicUs() - sl_pinning_read >= STAGED_PINNING_READ_US) {
+        stagedReadCpuPinning();
+        if (pollerThreadRunning(sl_poller)) stagedPlaceEpollThread();
+    }
 }
 
 /* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
@@ -652,6 +814,19 @@ void testOnlyStagedStop(void) {
 }
 
 #else /* !HAVE_FASTPATH_EPOLL */
+
+static int stagedEpollThreadRunning(void) {
+    return 0;
+}
+
+int stagedEpollThreadCpuValid(int cpu, const char **err) {
+    UNUSED(cpu);
+    UNUSED(err);
+    return 1;
+}
+
+void stagedEpollThreadReplace(void) {
+}
 
 int stagedResize(int setsize) {
     UNUSED(setsize);
