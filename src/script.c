@@ -48,8 +48,10 @@ static void exitScriptTimedoutMode(scriptRunCtx *run_ctx) {
     serverAssert(scriptIsTimedout());
     run_ctx->flags &= ~SCRIPT_TIMEDOUT;
     blockingOperationEnds();
-    /* if we are a replica and we have an active primary, set it for continue processing */
-    if (server.primary_host && server.primary) queueClientForReprocessing(server.primary);
+    /* if we are a replica and we have an active primary, set it for continue processing.
+     * A blocked primary (e.g. postponed by CLIENT PAUSE WRITE) is queued when it is unblocked. */
+    if (server.primary_host && server.primary && !server.primary->flag.blocked)
+        queueClientForReprocessing(server.primary);
 }
 
 static void enterScriptTimedoutMode(scriptRunCtx *run_ctx) {
