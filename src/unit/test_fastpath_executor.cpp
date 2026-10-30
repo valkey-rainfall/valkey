@@ -483,7 +483,9 @@ TEST_F(FastpathExecutorTest, PartitionedClientStateIsStoredBeforeEpollAdd) {
     connSetPrivateData(conn, c);
 
     /* The socket is already in the IO thread's epoll set, so the ADD fails with EEXIST after the
-     * hook has seen what the IO thread would see. */
+     * hook has seen what the IO thread would see. Close the suite's epoll fd for slot 1 before
+     * replacing it, or the fd stays open for the rest of the process. */
+    testOnlyClearIOThreadReady(1);
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     ASSERT_GE(epfd, 0);
     testOnlySetIOThreadReady(1, epfd);
