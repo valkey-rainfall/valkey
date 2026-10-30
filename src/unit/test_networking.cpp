@@ -554,8 +554,18 @@ TEST_F(NetworkingTest, TestAddRepliesWithOffloadsToList) {
 
     client *c = createTestClient();
 
-    // Mock ACL
+    // Mock ACL. DefaultUser is a process-wide pointer that other suites in the
+    // same binary (any suite that calls createClient after ACLInit) read, so a
+    // stack object must not stay behind in it after this test returns. The
+    // guard restores the previous value on every exit path, including an
+    // early return from a failed ASSERT.
+    struct DefaultUserGuard {
+        user *saved;
+        DefaultUserGuard() : saved(DefaultUser) {}
+        ~DefaultUserGuard() { DefaultUser = saved; }
+    } default_user_guard;
     user u;
+    memset(&u, 0, sizeof(u));
     DefaultUser = &u;
     DefaultUser->flags = USER_FLAG_NOPASS;
     /* Test 1: Add bulk offloads to the reply list */
