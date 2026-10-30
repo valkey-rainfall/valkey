@@ -611,6 +611,12 @@ void stagedRunLane(int phase, int tid) {
 /* Open phase for the enrolled workers, run main's lane when it takes one, and wait. with_workers 0,
  * or no enrolled worker, runs lane 0 on main alone with no barrier. */
 void stagedRunLanePhase(int phase, int with_workers) {
+    if (sl_inline_lanes) {
+        /* Unit tests: no worker is enrolled; run every lane of this phase here, lane by lane, in lane
+         * order (the replica plan's PARSE and APPLY phases included). */
+        for (int tid = sl_main_lane ? 0 : 1; tid <= sl_workers; tid++) stagedRunLane(phase, tid);
+        return;
+    }
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     if (!with_workers) {
         stagedRunLane(phase, 0);
@@ -662,6 +668,12 @@ void testOnlyStagedSetWorkers(int n, int main_lane) {
     sl_inline_lanes = 1;
 }
 
+/* Unit tests: report the staged loop as running (sl_on) so the replica's parallel apply paths, which
+ * refuse to plan or run without it, take the inline lanes above. Only stagedReconcile sets it otherwise. */
+void testOnlyStagedSetOn(int on) {
+    __atomic_store_n(&sl_on, on, __ATOMIC_RELAXED);
+}
+
 /* Unit tests run the staged phases inline on one thread; no worker is enrolled. */
 int testOnlyStagedStart(void) {
     if (!stagedInit()) return -1;
@@ -685,6 +697,9 @@ int testOnlyStagedStart(void) {
     return -1;
 }
 void testOnlyStagedStop(void) {
+}
+void testOnlyStagedSetOn(int on) {
+    UNUSED(on);
 }
 
 void stagedMain(struct aeEventLoop *el) {
