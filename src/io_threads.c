@@ -1218,6 +1218,7 @@ static void ioThreadWriteSlab(writeSlab *slab) {
             c->io_read_state = CLIENT_IDLE;
         }
         if (e & SLAB_WRITE) {
+            debugIOWriteDoneDelay();
             atomic_thread_fence(memory_order_release);
             c->io_write_state = CLIENT_COMPLETED_IO;
             if (needs_main) {
@@ -1947,6 +1948,8 @@ static int sendReadToIOThreads(client *c, int read_flags) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* finishShutdown accounts the one in-flight replica write but must not re-offload the backlog. */
+    if (server.shutdown_no_write_offload) return C_ERR;
     /* Staged workers run jobs only inside phases, which a blocked main does not always open. */
     if (stagedLoopActive() && ProcessingEventsWhileBlocked) return C_ERR;
     if (!c->conn) return C_ERR;
