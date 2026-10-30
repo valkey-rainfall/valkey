@@ -60,6 +60,20 @@ TEST_F(ExampleTest, TestMatchers) {
 // Verify mocking works
 TEST_F(ExampleTest, TestMocking) {
     // verifies that aeCreateTimeEvent() is called at least once in startEvictionTimeProc.
-    EXPECT_CALL(mock, aeCreateTimeEvent(_, _, _, _, _)).Times(AtLeast(1));
+    aeTimeProc *proc = NULL;
+    void *client_data = NULL;
+    EXPECT_CALL(mock, aeCreateTimeEvent(_, _, _, _, _))
+        .Times(AtLeast(1))
+        .WillRepeatedly(DoAll(SaveArg<2>(&proc), SaveArg<3>(&client_data), Return(1)));
     startEvictionTimeProc();
+
+    // startEvictionTimeProc() remembers that the timer is running until the timer
+    // proc reports that there is nothing left to evict; a second call then creates
+    // no event. Run the proc once so the next run of this test, in the same
+    // process, starts from the idle state again. While loading, eviction is not
+    // safe and the proc stops at once without touching the (empty) server state.
+    ASSERT_NE(proc, nullptr);
+    server.loading = 1;
+    EXPECT_EQ(proc(server.el, 1, client_data), AE_NOMORE);
+    server.loading = 0;
 }
