@@ -3875,6 +3875,13 @@ void processClientIOWriteDone(client *c) {
         if (!c || !c->conn) return;
     }
 
+    /* repl-stream-sender: a replica the sender wanted to adopt while this write was in
+     * flight joins it now that the cursor is settled; the sender then sends the rest. */
+    if (c->repl_data && c->repl_data->sender_adopt_pending) {
+        replStreamSenderAdoptSettled(c);
+        if (c->repl_data->stream_via_sender) return;
+    }
+
     if (!clientHasPendingReplies(c)) return;
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
