@@ -48,8 +48,30 @@ class ThrottleTest : public ::testing::Test {
         getMonotonicUs = origGetMonotonicUs;
     }
 
+    /* throttle_getMetrics() reports num_commands_throttled as a cumulative
+     * count per metrics name, kept for the whole process (a throttler's
+     * deregistration does not reset it). Each test here reasons about the
+     * commands it throttles itself, as if it ran in its own process, so the
+     * counts are checked as a difference from the value at the start of the
+     * test. The names are the ones throttle_register() is called with below. */
+    static constexpr const char *metric_names[] = {"fake_throttler", "loose", "strict", "shared", "share", "bad_mult", "neg_rate"};
+    long long commands_at_start[sizeof(metric_names) / sizeof(metric_names[0])];
+
+    long long commandsThrottledSince(const char *metric_name, long long now) {
+        for (size_t i = 0; i < sizeof(metric_names) / sizeof(metric_names[0]); i++) {
+            if (strcmp(metric_names[i], metric_name) == 0) return now - commands_at_start[i];
+        }
+        ADD_FAILURE() << "metrics name not in metric_names: " << metric_name;
+        return now;
+    }
+
     void SetUp() override {
         fakeMonotimeUs = 100;
+        for (size_t i = 0; i < sizeof(metric_names) / sizeof(metric_names[0]); i++) {
+            throttleMetrics m;
+            throttle_getMetrics(metric_names[i], &m);
+            commands_at_start[i] = m.num_commands_throttled;
+        }
         get_cmd = {0};
         get_cmd.fullname = (sds) "get";
         get_cmd.proc = getCommand;
@@ -117,7 +139,7 @@ class ThrottleTest : public ::testing::Test {
         throttleMetrics m;
         throttle_getMetrics(metric_name, &m);
         EXPECT_EQ(m.num_clients_throttled, clients_throttled);
-        EXPECT_EQ(m.num_commands_throttled, cmds_throttled);
+        EXPECT_EQ(commandsThrottledSince(metric_name, m.num_commands_throttled), cmds_throttled);
     }
 };
 
@@ -396,7 +418,7 @@ TEST_F(ThrottleTest, metricsAggregateAcrossSharedName) {
     throttle_getMetrics("shared", &m);
     /* Both clients increment the shared metrics group. */
     EXPECT_EQ(m.num_clients_throttled, 2);
-    EXPECT_EQ(m.num_commands_throttled, 2);
+    EXPECT_EQ(commandsThrottledSince("shared", m.num_commands_throttled), 2);
     /* oldest_client_delay_us tracks the oldest queued client (c1, queued 5s ago). */
     EXPECT_EQ(m.oldest_client_delay_us, 5 * 1000000);
 
