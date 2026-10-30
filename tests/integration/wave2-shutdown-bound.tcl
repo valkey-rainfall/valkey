@@ -20,7 +20,8 @@
 #     burst connection, whose own delayed reply write would keep the main thread from reading a
 #     SHUTDOWN on it until long after the window closed.
 # finishShutdown then finds one in-flight write with the backlog pending behind it:
-#   fixed:  accounts the one in-flight write, does one best-effort flush, drops the rest -> accounted 1.
+#   fixed:  accounts the one in-flight write (if one is in flight at that instant), does one
+#           best-effort flush, drops the rest -> accounted 0 or 1.
 #   broken: re-offloads the pending backlog and keeps accounting write after write -> accounted 2+.
 # The "Accounted N in-flight replica write(s)" log line carries N, so the mutation shows as N >= 2.
 
@@ -138,12 +139,16 @@ start_server {tags {"wave2 repl shutdown external:skip tls:skip"} overrides {io-
         regexp {Accounted (\d+) in-flight replica write} $log -> accounted
         puts "    SHUTDOWN NOW to exit: $elapsed ms, accounted in-flight writes: $accounted"
         assert_match {*ready to exit*} $log
-        # The fix accounts exactly the one in-flight write and does not re-offload the backlog, so
-        # the drain is bounded by one in-flight write per replica. The broken loop re-offloads the
-        # pending backlog and keeps accounting writes while the slow replica dribbles it out. The
-        # count is the signal; elapsed is dominated by the write delay, so only a loose hang guard
-        # is asserted on it.
-        assert_equal 1 $accounted
+        # The fix accounts at most the one write that was in flight and does not re-offload the
+        # backlog, so the drain is bounded by one in-flight write per replica. The broken loop
+        # re-offloads the pending backlog and keeps accounting writes while the slow replica
+        # dribbles it out, so 2 or more is the mutation signal here. Whether a write is in flight
+        # at the exact shutdown instant depends on how much of the backlog the kernel send buffer
+        # absorbed, so 0 is a valid outcome of a correct server and is not a failure; the exact
+        # once-per-replica count is pinned without timing by the ShutdownBoundTest unit tests
+        # (src/unit/test_shutdown_bound.cpp). Elapsed is dominated by the write delay, so only a
+        # loose hang guard is asserted on it.
+        assert_lessthan $accounted 2
         assert_lessthan $elapsed 30000
     }
 }
