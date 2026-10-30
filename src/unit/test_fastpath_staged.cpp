@@ -10,6 +10,7 @@
  * the reply barrier. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <cstring>
 #include <string>
@@ -48,7 +49,7 @@ class FastpathStagedTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
         populateCommandTable();

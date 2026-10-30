@@ -10,6 +10,7 @@
  * cannot fault, and origin data must still be intact. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -49,7 +50,7 @@ class FastpathExecutorTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
         populateCommandTable();

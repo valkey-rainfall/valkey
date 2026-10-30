@@ -5,6 +5,7 @@
  */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 #include <vector>
 
 using namespace ::testing;
@@ -219,7 +220,7 @@ class BgIterationTest : public ::testing::Test {
         server.logfile = const_cast<char *>(logfile);
         createSharedObjects();
 
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
 
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
