@@ -31,6 +31,7 @@ extern "C" {
 extern hashtableType commandSetType;
 extern dictType keylistDictType;
 extern dictType objToHashtableDictType;
+extern dictType objectKeyPointerValueDictType;
 void createSharedObjects(void);
 }
 
@@ -72,6 +73,8 @@ class FastpathLanesTest : public ::testing::Test {
             kvstoreCreate(&kvstoreExpiresHashtableType, LANE_BITS, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
         server.db[0]->blocking_keys = dictCreate(&keylistDictType);
+        server.db[0]->blocking_keys_unblock_on_nokey = dictCreate(&objectKeyPointerValueDictType);
+        server.db[0]->ready_keys = dictCreate(&objectKeyPointerValueDictType);
         /* ACL SETUSER looks at the pubsub tables to decide whether to kill subscribers. */
         server.pubsub_channels = kvstoreCreate(&kvstoreChannelHashtableType, 0, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
         server.pubsub_patterns = dictCreate(&objToHashtableDictType);
@@ -580,4 +583,102 @@ TEST_F(FastpathLanesTest, KeyObserverShardRecordLimitsTheRecheckToAffectedShards
 
     decrRefCount(a);
     decrRefCount(b);
+}
+
+/* Issue 29, primary side, with debug asserts off: the oracle is the result a client sees, not an assert.
+ * A main-path client runs a WATCH or a blocking command in the window between the read phase that
+ * classified the lanes and the write phase that runs them. The lane entries classified before it must
+ * run as if they came after it, in the stock order: the pushed element serves the blocked client at once,
+ * and the EXEC of the watcher aborts. */
+static client *newMainClient(void) {
+    int sv[2];
+    EXPECT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(conn);
+    close(sv[1]); /* its replies stay in c->buf; the peer is never read */
+    return c;
+}
+
+/* Run one command as a main-path client, as the ring clients' commands run before the write phase. */
+static void runOnMain(client *c, std::initializer_list<const char *> args) {
+    ASSERT_EQ(c->argc, 0);
+    c->argv = static_cast<robj **>(zmalloc(sizeof(robj *) * args.size()));
+    c->argc = 0;
+    for (const char *a : args) c->argv[c->argc++] = createStringObject(a, strlen(a));
+    c->argv_len = c->argc;
+    c->parsed_cmd = lookupCommand(c->argv, c->argc);
+    c->flag.pending_command = 1;
+    processCommandAndResetClient(c);
+}
+
+static std::string mainReply(client *c) {
+    std::string out(c->buf, c->bufpos);
+    c->bufpos = 0;
+    return out;
+}
+
+TEST_F(FastpathLanesTest, BlockingPopInTheWindowIsServedBeforeTheNextLaneEntry) {
+    int pf;
+    client *f = newStagedClient(&pf);
+    client *b = newMainClient();
+    long long serial = infoStat("fastpath_write_serial_segments");
+
+    /* Read phase: RPUSH and LLEN are lane entries of one segment; nothing blocks on the key yet. */
+    fastpathStagedPrepareLanes();
+    send(pf, cmd(3, "RPUSH", "wl", "a") + cmd(2, "LLEN", "wl"));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+
+    /* The window: a main-path client blocks on the key the planned RPUSH writes. */
+    runOnMain(b, {"BLPOP", "wl", "0"});
+    ASSERT_EQ(b->flag.blocked, 1u);
+
+    fastpathStagedExecute();
+    if (fastpathStagedRepliesPending()) fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+
+    /* Stock order: the push serves the blocked client at once, so the same pipeline's LLEN sees 0. A lane
+     * running the RPUSH would only queue the key as ready and reply 1 to LLEN. */
+    EXPECT_EQ(recv(pf), ":1\r\n:0\r\n");
+    EXPECT_EQ(b->flag.blocked, 0u) << "the blocked client was not served in the iteration";
+    EXPECT_EQ(mainReply(b), "*2\r\n$2\r\nwl\r\n$1\r\na\r\n");
+    robj *k = createStringObject("wl", 2);
+    EXPECT_EQ(lookupKeyRead(server.db[0], k), nullptr) << "the popped list must be gone";
+    decrRefCount(k);
+    EXPECT_GT(infoStat("fastpath_write_serial_segments"), serial) << "the iteration must have gone serial";
+
+    freeClient(b);
+    freeStaged(f, pf);
+}
+
+TEST_F(FastpathLanesTest, WatchInTheWindowAbortsTheExecAfterTheLaneWrite) {
+    int pf;
+    client *f = newStagedClient(&pf);
+    client *w = newMainClient();
+    long long serial = infoStat("fastpath_write_serial_segments");
+
+    fastpathStagedPrepareLanes();
+    send(pf, cmd(3, "SET", "ww", "1"));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+
+    /* The window: a main-path client watches the key the planned SET writes. */
+    runOnMain(w, {"WATCH", "ww"});
+    EXPECT_EQ(mainReply(w), "+OK\r\n");
+
+    fastpathStagedExecute();
+    if (fastpathStagedRepliesPending()) fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    EXPECT_EQ(recv(pf), "+OK\r\n");
+
+    /* The write came after the WATCH in the plan's order, so the transaction must abort. */
+    runOnMain(w, {"MULTI"});
+    runOnMain(w, {"GET", "ww"});
+    runOnMain(w, {"EXEC"});
+    EXPECT_EQ(mainReply(w), "+OK\r\n+QUEUED\r\n*-1\r\n");
+    EXPECT_GT(infoStat("fastpath_write_serial_segments"), serial) << "the iteration must have gone serial";
+
+    freeClient(w);
+    freeStaged(f, pf);
 }
