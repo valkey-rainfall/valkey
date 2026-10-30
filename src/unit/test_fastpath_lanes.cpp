@@ -104,7 +104,7 @@ class FastpathLanesTest : public ::testing::Test {
         server.io_threads_parallel_writes = 1;
         server.io_threads_parallel_writes_min = 1; /* every segment runs on the lanes */
         server.io_batch_commands = 16;
-        connTypeInitialize();
+        unitTestConnTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
         fastpathInitThread(1);

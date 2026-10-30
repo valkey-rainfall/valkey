@@ -63,4 +63,15 @@ inline void unitTestPopulateCommandTable(void) {
     }
 }
 
+/* connTypeInitialize() registers each connection type in the static connTypes[]
+ * array, and connTypeRegister() asserts that the slot is still empty. A second
+ * call in the same process aborts. The registry does not live in the server
+ * struct, so memset(&server) does not clear it: register once per process. */
+inline void unitTestConnTypeInitialize(void) {
+    static bool initialized = false;
+    if (initialized) return;
+    connTypeInitialize();
+    initialized = true;
+}
+
 #endif
