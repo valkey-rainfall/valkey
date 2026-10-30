@@ -21,6 +21,7 @@ extern "C" {
 void replStreamSenderInit(void);
 void replStreamSenderStop(void);
 void replStreamSenderAdd(client *replica);
+void replStreamSenderAdoptSettled(client *replica);
 void replStreamSenderTick(void);
 int replStreamSenderActive(void);
 unsigned long replStreamSenderOwnedReplicas(void);
@@ -85,25 +86,78 @@ TEST_F(ReplSenderTest, DisableHandsOwnedReplicaBackToMain) {
     freeReplica(c);
 }
 
+/* Re-enable must adopt the ONLINE replicas by itself. replicaPutOnline runs once per
+ * connection, so production never calls replStreamSenderAdd again for a replica that
+ * was handed back: replStreamSenderInit has to walk server.replicas. */
 TEST_F(ReplSenderTest, ReenableAfterDisableOwnsReplicaAgain) {
     fakeConnection *conn = connCreateFake(1024);
     client *c = makeOnlineReplica(conn);
+    listAddNodeTail(server.replicas, c);
 
     server.repl_stream_sender = REPL_STREAM_SENDER_APPEND;
     replStreamSenderInit();
     replStreamSenderAdd(c);
+    ASSERT_EQ(replStreamSenderOwnedReplicas(), 1u);
     server.repl_stream_sender = REPL_STREAM_SENDER_NO;
     replStreamSenderTick();
+    ASSERT_EQ(c->repl_data->stream_via_sender, 0);
+    /* Main queued a write for the handed-back replica; the adopt must take it out. */
+    EXPECT_TRUE(c->flag.pending_write);
 
-    /* Re-enable: a replica that is ONLINE and eligible can be handed over again
-     * (replicaPutOnline is not re-run, so Add must not be refused by stale state). */
+    /* Re-enable through the config path only: no manual Add. */
     server.repl_stream_sender = REPL_STREAM_SENDER_APPEND;
-    replStreamSenderInit();
-    replStreamSenderAdd(c);
+    replStreamSenderTick();
     EXPECT_EQ(replStreamSenderOwnedReplicas(), 1u);
+    EXPECT_EQ(c->repl_data->stream_via_sender, 1);
+    EXPECT_FALSE(c->flag.pending_write);
+    EXPECT_EQ(listLength(server.clients_pending_write), 0u);
 
     server.repl_stream_sender = REPL_STREAM_SENDER_NO;
     replStreamSenderStop();
+    if (c->flag.pending_write) {
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        c->flag.pending_write = 0;
+    }
+    listDelNode(server.replicas, listSearchKey(server.replicas, c));
+    connFreeFake(conn);
+    freeReplica(c);
+}
+
+/* A replica whose main-path write is still offloaded to an IO thread when the sender
+ * starts must not be taken while the IO thread owns the cursor: it is marked and
+ * adopted by replStreamSenderAdoptSettled once the write has completed. */
+TEST_F(ReplSenderTest, ReenableDefersAReplicaWithAWriteInFlight) {
+    fakeConnection *conn = connCreateFake(1024);
+    client *c = makeOnlineReplica(conn);
+    listAddNodeTail(server.replicas, c);
+    c->io_write_state = CLIENT_PENDING_IO;
+
+    server.repl_stream_sender = REPL_STREAM_SENDER_APPEND;
+    replStreamSenderInit();
+    EXPECT_EQ(replStreamSenderOwnedReplicas(), 0u);
+    EXPECT_EQ(c->repl_data->stream_via_sender, 0);
+    EXPECT_EQ(c->repl_data->sender_adopt_pending, 1);
+
+    /* Still in flight: the settle hook must not take it. */
+    replStreamSenderAdoptSettled(c);
+    EXPECT_EQ(replStreamSenderOwnedReplicas(), 0u);
+    EXPECT_EQ(c->repl_data->sender_adopt_pending, 0);
+
+    /* The write completed: processClientIOWriteDone sets IDLE, then calls the hook. */
+    c->repl_data->sender_adopt_pending = 1;
+    c->io_write_state = CLIENT_IDLE;
+    replStreamSenderAdoptSettled(c);
+    EXPECT_EQ(replStreamSenderOwnedReplicas(), 1u);
+    EXPECT_EQ(c->repl_data->stream_via_sender, 1);
+    EXPECT_EQ(c->repl_data->sender_adopt_pending, 0);
+
+    server.repl_stream_sender = REPL_STREAM_SENDER_NO;
+    replStreamSenderStop();
+    if (c->flag.pending_write) {
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        c->flag.pending_write = 0;
+    }
+    listDelNode(server.replicas, listSearchKey(server.replicas, c));
     connFreeFake(conn);
     freeReplica(c);
 }
