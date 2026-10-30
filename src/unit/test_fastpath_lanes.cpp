@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 extern "C" {
+#include "cluster.h"
 #include "connection.h"
 #include "fastpath.h"
 #include "io_threads.h"
@@ -684,4 +685,57 @@ TEST_F(FastpathLanesTest, WatchInTheWindowAbortsTheExecAfterTheLaneWrite) {
 
     freeClient(w);
     freeStaged(f, pf);
+}
+
+/* Cluster mode: the shard a lane entry carries is the parser's slot (clusterSlotByCommand, keyHashSlot
+ * over the declared keys), and the record of observed keys must place a key in that same slot, or an
+ * entry of the watched key's slot would keep its lane without a lookup. A hash-tagged key shares the
+ * slot of its tag; a key of another slot is not a candidate. A key that is not an sds string cannot be
+ * placed and must make every entry a candidate. */
+TEST_F(FastpathLanesTest, KeyObserverShardRecordUsesTheParserSlotInClusterMode) {
+    int saved = server.cluster_enabled;
+    server.cluster_enabled = 1;
+    fastpathKeyObserversRechecked();
+    struct serverCommand *set = lookupCommandByCString("set");
+    ASSERT_NE(set, nullptr);
+    robj *watched = createStringObject("{tag}watched", 12);
+    robj *argv[3] = {createStringObject("SET", 3), createStringObject("{tag}other", 10), createStringObject("v", 1)};
+    int read_flags = 0;
+    int slot = clusterSlotByCommand(set, argv, 3, &read_flags);
+    ASSERT_GE(slot, 0);
+    int shard = fastpathKeysShard(server.db[0], set, argv, 3, slot);
+    EXPECT_EQ(shard, slot) << "a lane entry in cluster mode carries the parser's slot";
+    EXPECT_EQ(slot, (int)keyHashSlot("tag", 3));
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(shard)) << "nothing added since the sample";
+
+    fastpathKeyObserverAdded(watched);
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(shard)) << "the watched key's slot is the entry's slot";
+    /* A key of another slot: find one by trying names. */
+    robj *other = nullptr;
+    for (int i = 0; i < 64 && other == nullptr; i++) {
+        std::string name = "o" + std::to_string(i);
+        robj *cand = createStringObject(name.c_str(), name.size());
+        if ((int)keyHashSlot(name.c_str(), (int)name.size()) != slot)
+            other = cand;
+        else
+            decrRefCount(cand);
+    }
+    ASSERT_NE(other, nullptr);
+    int oslot = (int)keyHashSlot((char *)objectGetVal(other), (int)sdslen((sds)objectGetVal(other)));
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(oslot)) << "an entry of another slot is not looked up";
+    fastpathKeyObserversRechecked();
+
+    /* An int-encoded key cannot be placed: the record must fall back to every entry. */
+    robj *num = createStringObjectFromLongLong(12345);
+    ASSERT_FALSE(sdsEncodedObject(num));
+    fastpathKeyObserverAdded(num);
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(oslot));
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(shard));
+    fastpathKeyObserversRechecked();
+
+    decrRefCount(num);
+    decrRefCount(other);
+    decrRefCount(watched);
+    for (robj *o : argv) decrRefCount(o);
+    server.cluster_enabled = saved;
 }
