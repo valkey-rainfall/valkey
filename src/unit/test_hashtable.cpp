@@ -1706,8 +1706,13 @@ TEST_F(HashtableTest, scan_no_shrink_during_callback) {
 
     hashtablePauseAutoShrink(ht);
     size_t size_before = hashtableSize(ht);
-    size_t cursor = hashtableScan(ht, 0, scanDeleteManyCb, ht);
-    (void)cursor;
+    /* One scan step visits one bucket, and with a random hash seed that bucket
+     * can be empty, so the callback would never run. Step until it has run
+     * (the size changed) so the test does not depend on the seed. */
+    size_t cursor = 0;
+    do {
+        cursor = hashtableScan(ht, cursor, scanDeleteManyCb, ht);
+    } while (cursor != 0 && hashtableSize(ht) == size_before);
 
     /* Shrink is still blocked by PauseAutoShrink. */
     ASSERT_LT(hashtableSize(ht), size_before / 2);
