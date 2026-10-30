@@ -91,6 +91,9 @@ class NetworkingTest : public ::testing::Test {
   protected:
     void SetUp() override {
         /* Initialize server fields that are accessed by networking functions */
+        /* A failed serverAssert() logs before it aborts; with logfile NULL that log call
+         * itself crashes with SIGSEGV and hides the assertion message. */
+        if (server.logfile == NULL) server.logfile = const_cast<char *>("/dev/null");
         server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold = -1; /* Disable tracking */
         server.debug_client_enforce_reply_list = 0;
     }
@@ -335,6 +338,7 @@ TEST_F(NetworkingTest, TestPostWriteToReplica) {
     freeClientReplicationData(c);
     raxFree(server.repl_backlog->blocks_index);
     zfree(server.repl_backlog);
+    server.repl_backlog = NULL; /* createReplicationBacklog() asserts it is NULL */
     listRelease(server.repl_buffer_blocks);
     listRelease(c->reply);
     zfree(c);
