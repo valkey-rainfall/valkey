@@ -80,6 +80,10 @@ class FastGetGatesTest : public ::testing::Test {
         decrRefCount(key);
     }
 
+    static void TearDownTestSuite() {
+        unitTestDeleteEventLoop();
+    }
+
     /* A fake client (no connection) with "GET k" parsed, as the IO thread leaves it. */
     static client *makeGetClient(void) {
         client *c = createClient(NULL);

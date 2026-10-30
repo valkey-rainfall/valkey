@@ -95,6 +95,7 @@ class FastpathStagedTest : public ::testing::Test {
         fastpathFreeThread(1);
         testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
+        unitTestDeleteEventLoop();
     }
 
     void SetUp() override {

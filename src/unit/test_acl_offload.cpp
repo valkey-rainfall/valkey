@@ -53,6 +53,10 @@ class AclOffloadTest : public ::testing::Test {
         server.io_threads_num = 2;
     }
 
+    static void TearDownTestSuite() {
+        unitTestDeleteEventLoop();
+    }
+
     /* A restricted user: read + SET on key pattern foo:* only. */
     static user *makeRestricted() {
         user *u = ACLCreateUnlinkedUser();

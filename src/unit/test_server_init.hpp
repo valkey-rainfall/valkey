@@ -22,15 +22,39 @@ extern "C" {
 #include "server.h"
 }
 
+#include <unistd.h>
+
 /* moduleInitModulesSystem() ends by locking the module GIL. The GIL is a plain
  * (non-recursive) mutex that the server releases only when it enters the event
  * loop. A second call in the same process blocks forever on that lock. Release
  * the lock taken by the previous call before initialising again. */
 inline void unitTestInitModulesSystem(void) {
     static bool gil_locked = false;
+    static int module_pipe[2] = {-1, -1};
     if (gil_locked) moduleReleaseGIL();
+    /* Each call opens a new server.module_pipe. The next suite's memset(&server)
+     * forgets the two fds, so without this they stay open for the rest of the
+     * process, one pair per suite per --gtest_repeat iteration. */
+    if (module_pipe[0] >= 0) {
+        close(module_pipe[0]);
+        close(module_pipe[1]);
+    }
     moduleInitModulesSystem();
+    module_pipe[0] = server.module_pipe[0];
+    module_pipe[1] = server.module_pipe[1];
     gil_locked = true;
+}
+
+/* aeCreateEventLoop() opens one epoll fd. A suite that creates server.el in
+ * SetUpTestSuite and never deletes it leaks that fd on every iteration, and
+ * the next suite's memset(&server) drops the pointer. Tests that build a small
+ * event loop (aeCreateEventLoop(64)) then fail once the lowest free fd is 64
+ * or more, because aeCreateFileEvent rejects fd >= setsize. Delete the loop
+ * at the end of the suite and leave server.el NULL. */
+inline void unitTestDeleteEventLoop(void) {
+    if (server.el == NULL) return;
+    aeDeleteEventLoop(server.el);
+    server.el = NULL;
 }
 
 extern "C" {
