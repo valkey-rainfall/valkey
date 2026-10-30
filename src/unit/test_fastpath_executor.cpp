@@ -93,6 +93,7 @@ class FastpathExecutorTest : public ::testing::Test {
 
     static void TearDownTestSuite() {
         fastpathFreeThread(1);
+        testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
     }
 

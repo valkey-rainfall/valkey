@@ -93,6 +93,7 @@ class FastpathStagedTest : public ::testing::Test {
 
     static void TearDownTestSuite() {
         fastpathFreeThread(1);
+        testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
     }
 
@@ -599,6 +600,7 @@ TEST_F(FastpathStagedTest, LeavingClientsHandedBackInArrivalOrderAcrossThreads) 
     iteration();
     freeClientsInAsyncFreeQueue();
     fastpathFreeThread(2);
+    testOnlyClearIOThreadReady(2);
 }
 
 /* STR-12: a reply larger than 4 GiB (MGET of a 512 MiB value 9 times) is sent by the fast path

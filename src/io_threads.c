@@ -1870,6 +1870,17 @@ void testOnlySetIOThreadReady(int tid, int epfd) {
     if (io_ready_num <= tid) io_ready_num = tid + 1;
 }
 
+/* Undo testOnlySetIOThreadReady() for one slot so the next suite starts from a clean
+ * registry: a slot left RUNNING by an earlier suite would otherwise still be chosen by
+ * the partition round robin, with an epoll fd that suite closed and no client list. */
+void testOnlyClearIOThreadReady(int tid) {
+    if (io_epfd[tid] > 0) close(io_epfd[tid]);
+    io_epfd[tid] = 0;
+    atomic_store_explicit(&io_worker_state[tid], IO_WORKER_ABSENT, memory_order_release);
+    while (io_worker_hwm > 1 && ioWorkerState(io_worker_hwm - 1) == IO_WORKER_ABSENT) io_worker_hwm--;
+    if (io_ready_num > tid) io_ready_num = tid;
+}
+
 void testOnlySetPartitionPublishHook(void (*hook)(client *c)) {
     partition_publish_hook = hook;
 }
