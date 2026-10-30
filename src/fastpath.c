@@ -630,6 +630,26 @@ static int fpAclEpochMoved(void) {
     return aclOffloadEpoch() != fp_acl_epoch_sampled;
 }
 
+/* Audit finding B-1, cluster mode: the read phase accepts a lane entry only while this node serves
+ * its slot stably (clusterServesSlotStably: cluster OK, slot owned by myself, no slot migrating or
+ * importing). Main changes these only between phases or in a main-path command (CLUSTER SETSLOT,
+ * ADDSLOTS, DELSLOTS, FLUSHSLOTS, a cluster bus packet, a state evaluation), and every such change
+ * bumps this generation at the lowest common functions in cluster_legacy.c. Main samples it with
+ * the lane flags and, when it moved, runs the iteration's remaining lane entries serially: that path
+ * goes through processCommand, where getNodeByQuery answers MOVED, ASK or CLUSTERDOWN as stock does.
+ * Main-only, plain loads: one 64-bit load and compare per plan and per barrier. */
+static uint64_t fp_slot_owner_gen = 0;
+static uint64_t fp_slot_owner_gen_sampled = 0;
+
+void fastpathSlotOwnershipChanged(void) {
+    debugServerAssert(inMainThread());
+    fp_slot_owner_gen++;
+}
+
+static int fpSlotOwnershipMoved(void) {
+    return fp_slot_owner_gen != fp_slot_owner_gen_sampled;
+}
+
 /* Main, no other thread running commands: a client blocks on or watches one of the command's keys,
  * looked up in the dicts as they are now, whatever the sampled flags said. */
 int fastpathKeysObservedNow(serverDb *db, struct serverCommand *cmd, robj **argv, int argc) {
@@ -1818,7 +1838,8 @@ void fastpathStagedPrepareLanes(void) {
     fp_check_watched = server.watching_clients > 0;
     fp_observers_gen_sampled = fp_observers_gen; /* the observer set the flags above describe */
     fpObserverShardsClear();
-    fp_acl_epoch_sampled = aclOffloadEpoch();    /* the rule sets the read phase's ACL verdicts describe */
+    fp_acl_epoch_sampled = aclOffloadEpoch();      /* the rule sets the read phase's ACL verdicts describe */
+    fp_slot_owner_gen_sampled = fp_slot_owner_gen; /* the slot ownership the read phase's lane verdicts describe */
     /* The previous iteration's replies were delivered in its reply phase. */
     for (int l = 0; l < FP_MAX_LANES; l++) {
         fp_lanes[l].chunk = 0;
@@ -2526,8 +2547,11 @@ static int fpExecuteWithLanes(void) {
      * the existing serial path. The per-entry demotion the replica plan does (rpDemoteObserved) is not
      * done here yet: the per-thread lane vectors and segment counts would have to be rebuilt.
      * The ACL epoch gets the same treatment: an ACL change among the ring commands or in a barrier
-     * makes every ALLOW verdict the read phase tagged stale, and the serial path re-checks them. */
-    int serial = !fpLanesAllowed() || fastpathKeyObserversChanged() || fpAclEpochMoved();
+     * makes every ALLOW verdict the read phase tagged stale, and the serial path re-checks them.
+     * So does slot ownership in cluster mode (audit finding B-1): a SETSLOT or a state change among
+     * the ring commands makes the "serves the slot stably" verdict stale, and the serial path runs
+     * the stock redirect check (getNodeByQuery) before each entry. */
+    int serial = !fpLanesAllowed() || fastpathKeyObserversChanged() || fpAclEpochMoved() || fpSlotOwnershipMoved();
     for (int l = 0; l < fp_nlanes; l++) memset(fp_lanes[l].cursor, 0, sizeof(int) * fp_slots);
     fp_nparts = 0;
     int pending = 0;
@@ -2548,7 +2572,9 @@ static int fpExecuteWithLanes(void) {
             clientSetUser(ec, DefaultUser, 0);
             total++;
             fp_stat_barriers++;
-            if (!serial && (!fpLanesAllowed() || fastpathKeyObserversChanged() || fpAclEpochMoved())) serial = 1;
+            if (!serial && (!fpLanesAllowed() || fastpathKeyObserversChanged() || fpAclEpochMoved() ||
+                            fpSlotOwnershipMoved()))
+                serial = 1;
         }
     }
     total += fpRunSegment(pending, serial, use_prefetch);

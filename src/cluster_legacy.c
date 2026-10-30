@@ -360,6 +360,7 @@ clusterNode *getMigratingSlotDest(int slot) {
 
 void setMigratingSlotDest(int slot, clusterNode *node) {
     dictEntry *de = dictFind(server.cluster->migrating_slots_to, (void *)(intptr_t)slot);
+    fastpathSlotOwnershipChanged(); /* clusterServesSlotStably reads this table (B-1) */
     if (node == NULL) {
         if (de) dictDelete(server.cluster->migrating_slots_to, (void *)(intptr_t)slot);
         return;
@@ -378,6 +379,7 @@ clusterNode *getImportingSlotSource(int slot) {
 
 void setImportingSlotSource(int slot, clusterNode *node) {
     dictEntry *de = dictFind(server.cluster->importing_slots_from, (void *)(intptr_t)slot);
+    fastpathSlotOwnershipChanged(); /* clusterServesSlotStably reads this table (B-1) */
     if (node == NULL) {
         if (de) dictDelete(server.cluster->importing_slots_from, (void *)(intptr_t)slot);
         return;
@@ -7151,6 +7153,7 @@ int clusterAddSlot(clusterNode *n, int slot) {
     if (server.cluster->slots[slot]) return C_ERR;
     clusterNodeSetSlotBit(n, slot);
     server.cluster->slots[slot] = n;
+    fastpathSlotOwnershipChanged(); /* a lane entry classified for the old owner must not run (B-1) */
     bitmapClearBit(server.cluster->owner_not_claiming_slot, slot);
     clusterSlotStatReset(slot);
     return C_OK;
@@ -7169,6 +7172,7 @@ int clusterDelSlot(int slot) {
     /* Clear the slot bit. */
     serverAssert(clusterNodeClearSlotBit(n, slot) == 1);
     server.cluster->slots[slot] = NULL;
+    fastpathSlotOwnershipChanged(); /* a lane entry classified for the old owner must not run (B-1) */
     /* Make owner_not_claiming_slot flag consistent with slot ownership information. */
     bitmapClearBit(server.cluster->owner_not_claiming_slot, slot);
     clusterSlotStatReset(slot);
@@ -7244,6 +7248,7 @@ void clusterMoveNodeSlots(clusterNode *from_node, clusterNode *to_node, int *slo
 void clusterCloseAllSlots(void) {
     dictEmpty(server.cluster->migrating_slots_to, NULL);
     dictEmpty(server.cluster->importing_slots_from, NULL);
+    fastpathSlotOwnershipChanged(); /* clusterServesSlotStably reads these tables (B-1) */
 }
 
 /* -----------------------------------------------------------------------------
@@ -7369,6 +7374,7 @@ void clusterUpdateState(void) {
         serverLog(new_state == CLUSTER_OK ? LL_NOTICE : LL_WARNING, "Cluster state changed: %s",
                   new_state == CLUSTER_OK ? "ok" : "fail");
         server.cluster->state = new_state;
+        fastpathSlotOwnershipChanged(); /* clusterServesSlotStably requires CLUSTER_OK (B-1) */
 
         /* Cluster state changes from ok to fail, print a log. */
         if (new_state == CLUSTER_FAIL) {

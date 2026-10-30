@@ -3998,6 +3998,9 @@ void fastpathResetLaneStats(void);
 /* Main: a key was added to a db's watched_keys or blocking_keys (audit issue 29, see fastpath.c). */
 void fastpathKeyObserverAdded(robj *key);
 int fastpathKeyObserverShardAffected(int shard);
+/* Main, cluster mode: slot ownership, the migrating / importing tables or the cluster state changed
+ * (audit finding B-1, see fastpath.c). Lane entries classified under the old state run on main. */
+void fastpathSlotOwnershipChanged(void);
 void postExecutionUnitOperations(void);
 void serverOpArrayFree(serverOpArray *oa);
 void forceCommandPropagation(client *c, int flags);
