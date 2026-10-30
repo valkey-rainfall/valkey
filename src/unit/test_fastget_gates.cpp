@@ -11,6 +11,7 @@
  * spec_acl_ok gate. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <cstring>
 
@@ -40,7 +41,7 @@ class FastGetGatesTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(64);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
         populateCommandTable();

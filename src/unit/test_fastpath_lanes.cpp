@@ -11,6 +11,7 @@
  * order, and the serial fallback of a small segment gives the same answers as the lanes. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <cstdarg>
 #include <cstring>
@@ -56,7 +57,7 @@ class FastpathLanesTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
         populateCommandTable();
