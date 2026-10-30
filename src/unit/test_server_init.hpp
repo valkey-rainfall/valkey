@@ -17,6 +17,7 @@
 #define VALKEY_UNIT_TEST_SERVER_INIT_HPP
 
 extern "C" {
+#include "allocator_defrag.h"
 #include "module.h"
 #include "server.h"
 }
@@ -85,6 +86,17 @@ inline void unitTestACLInit(void) {
     static bool initialized = false;
     if (initialized) return;
     ACLInit();
+    initialized = true;
+}
+
+/* allocatorDefragInit() asserts that it has not run before (the jemalloc
+ * query keys it resolves are process state). A second call in the same
+ * process aborts, and the abort then crashes in serverLogRaw because the
+ * suite has no server.logfile. Initialise once per process. */
+inline void unitTestAllocatorDefragInit(void) {
+    static bool initialized = false;
+    if (initialized) return;
+    allocatorDefragInit();
     initialized = true;
 }
 
