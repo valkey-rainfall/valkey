@@ -107,7 +107,15 @@ size_t nextCursor(size_t v, size_t mask);
 
 class HashtableTest : public ::testing::Test {
   protected:
+    /* randomSeed() changes the process-wide hash function seed. Every
+     * hashtable that other suites filled before this suite ran (for example
+     * the static command table's subcommand tables, which are filled once per
+     * process) was hashed with the old seed and can no longer be searched
+     * with the new one. Save the seed and put it back when the suite ends. */
+    static inline uint8_t saved_hash_seed[16];
+
     static void SetUpTestSuite() {
+        memcpy(saved_hash_seed, hashtableGetHashFunctionSeed(), sizeof(saved_hash_seed));
         /* Initialize monotonic clock once for all tests */
         monotonicInit();
 
@@ -117,6 +125,10 @@ class HashtableTest : public ::testing::Test {
         keyval_type.keyCompare = keycmp;
         keyval_type.entryDestructor = freekeyval;
         keyval_type.trackMemUsage = trackmemusage;
+    }
+
+    static void TearDownTestSuite() {
+        hashtableSetHashFunctionSeed(saved_hash_seed);
     }
 
     void SetUp() override {
