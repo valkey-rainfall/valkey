@@ -3219,3 +3219,55 @@ TEST_F(BgIterationTest, checkNoKeysWriteIsReplicated) {
     expectReadKeySequence(it, 3, LAST_ITEM);
     expectReadComplete(it);
 }
+
+
+// REVIEW PROBE (not part of PR): after a replicated write creates a new key, curCmdMissingKeys
+//  still holds that key.  Active expiry then calls bgIteration_handleCommandReplication(DEL)
+//  without a preceding bgIteration_blockClientIfRequired.
+TEST_F(BgIterationTest, probe_staleMissingKeyThenExpire_eventual) {
+    simpleDelItem(14); // W0 (DB1) doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c); // SET W0 xxx -> replicated, W0 in early set
+
+    simulateExpiration(10); // same DB as W0, no client command
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    expectReadKeySequence(it, 3, 9);
+    expectReadKeySequence(it, 11, 13);
+    expectReadKey(it, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+// REVIEW PROBE (not part of PR): same stale list, but the unpaired record is the HDEL that
+//  propagateFieldsDeletion() emits from the active-expire cron for expired hash fields.
+//  HDEL is not DEL/UNLINK, so an isDeleteCmd() guard would not cover it.
+TEST_F(BgIterationTest, probe_staleMissingKeyThenFieldExpireHdel_eventual) {
+    simpleDelItem(14); // W0 (DB1) doesn't exist before iteration
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_EVENTUAL, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+
+    c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c); // SET W0 xxx -> replicated, W0 in early set
+
+    // propagateFieldsDeletion(): alsoPropagate(HDEL somehash f1) with no blockClientIfRequired
+    int db = getDbFromItemNum(10);
+    robj *argv[3];
+    argv[0] = createStringObjectFromCString("HDEL");
+    argv[1] = createStringObjectFromCString(keyStr(10));
+    argv[2] = createStringObjectFromCString("f1");
+    serverCommand *cmd = lookupCommandByCString("HDEL");
+    ASSERT_EQ(server.in_call, 0);
+    bgIteration_handleCommandReplication(db, cmd, 3, argv);
+    for (int i = 0; i < 3; i++) decrRefCount(argv[i]);
+
+    expectReadKeySequence(it, 1, 2);
+    expectReadReplication(it, c);
+    // whatever the HDEL record does afterwards is not the point; reaching here means no abort
+    bgIteratorTerminate(it);
+}
