@@ -2026,6 +2026,8 @@ struct valkeyServer {
     mstime_t shutdown_mstime;                         /* Timestamp to limit graceful shutdown. */
     int last_sig_received;                            /* Indicates the last SIGNAL received, if any (e.g., SIGINT or SIGTERM). */
     int shutdown_flags;                               /* Flags passed to prepareForShutdown(). */
+    int shutdown_no_write_offload;                    /* finishShutdown accounts the in-flight replica write but must
+                                                       * not re-offload; the final flush writes the rest once. */
     int activerehashing;                              /* Incremental rehash in serverCron() */
     int active_defrag_cpu_percent;                    /* Current desired CPU percentage for active defrag */
     char *pidfile;                                    /* PID file path */

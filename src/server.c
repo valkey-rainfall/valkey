@@ -5645,7 +5645,20 @@ int finishShutdown(void) {
      * write), an earlier write to a replica. Such a replica is neither in the pending write
      * queue nor has a write handler, so flushReplicasOutputBuffers would skip the data fed
      * after that write, which the fast path may already have acknowledged to clients. Wait
-     * for those writes and account them first. */
+     * for the write that is in flight now and account it, so the final flush includes its
+     * bytes (audit finding N3).
+     *
+     * Forbid a re-offload while we do this. Without the flag, accounting a completed write
+     * hands the rest of the replica's backlog to an IO thread again, and the loop repeats
+     * until the whole backlog is on the wire; SHUTDOWN then blocks for as long as a slow live
+     * replica takes to drain, which shutdown-timeout does not bound here. With the flag set,
+     * trySendWriteToIOThreads refuses, processClientIOWriteDone falls through to
+     * putClientInPendingWriteQueue, and the single best-effort flush below sends the pending
+     * data in one writev as stock does. The wait is then bounded by one in-flight write per
+     * replica. */
+    server.shutdown_no_write_offload = 1;
+    int drained_writes = 0;
+    mstime_t drain_start = mstime();
     listIter wli;
     listNode *wln;
     listRewind(server.replicas, &wli);
@@ -5656,13 +5669,18 @@ int finishShutdown(void) {
             if (replica->io_write_state == CLIENT_COMPLETED_IO) {
                 atomic_thread_fence(memory_order_acquire);
                 processClientIOWriteDone(replica);
+                drained_writes++;
             }
         }
     }
+    if (drained_writes)
+        serverLog(LL_NOTICE, "Accounted %d in-flight replica write(s) at shutdown in %lld ms.", drained_writes,
+                  (long long)(mstime() - drain_start));
 
     /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushReplicasOutputBuffers();
+    server.shutdown_no_write_offload = 0;
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
