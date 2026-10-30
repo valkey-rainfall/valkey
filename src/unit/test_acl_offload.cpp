@@ -41,7 +41,7 @@ class AclOffloadTest : public ::testing::Test {
         unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
+        unitTestPopulateCommandTable();
         ACLInit();
         server.dbnum = 1;
         server.db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *)));
