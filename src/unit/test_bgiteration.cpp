@@ -316,6 +316,11 @@ class BgIterationTest : public ::testing::Test {
             zfree(server.db[i]);
         }
         zfree(server.db);
+        /* Later suites test server.db != NULL before they walk it (for example
+         * objectSetMetadataSize checks that every db is empty): do not leave a
+         * pointer to freed memory behind. */
+        server.db = NULL;
+        server.dbnum = 0;
 
         if (c != NULL) freeTestClient(c);
         EXPECT_EQ(ectx->in_call, 0); // make sure tests are handling this properly
