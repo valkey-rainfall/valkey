@@ -5,6 +5,7 @@
  */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 extern "C" {
 #include "server.h"
@@ -18,7 +19,7 @@ class CmdFlagsTest : public ::testing::Test {
     void SetUp() override {
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&originalCommandSetType);
-        populateCommandTable();
+        unitTestPopulateCommandTable();
     }
 };
 

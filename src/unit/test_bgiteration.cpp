@@ -224,7 +224,7 @@ class BgIterationTest : public ::testing::Test {
 
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
+        unitTestPopulateCommandTable();
     }
 
 

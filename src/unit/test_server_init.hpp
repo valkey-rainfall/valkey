@@ -32,4 +32,35 @@ inline void unitTestInitModulesSystem(void) {
     gil_locked = true;
 }
 
+extern "C" {
+extern struct serverCommand serverCommandTable[];
+}
+
+/* populateCommandTable() fills the static serverCommandTable entries in place
+ * (fullname, key specs, ACL id, subcommand hashtable) and adds them to
+ * server.commands and server.orig_commands. The filling step cannot run twice:
+ * commandAddSubcommand() asserts that a subcommand is not already present in
+ * the parent's subcommands_ht, so the second call aborts the process. The two
+ * hashtables, however, are cleared by every suite's memset(&server), and some
+ * suites release them in TearDownTestSuite, so they must be rebuilt.
+ *
+ * The caller creates server.commands and server.orig_commands first, as it
+ * does for populateCommandTable(). The first call runs the real function;
+ * later calls only re-add the already filled entries to the new tables. */
+inline void unitTestPopulateCommandTable(void) {
+    static bool populated = false;
+    if (!populated) {
+        populateCommandTable();
+        populated = true;
+        return;
+    }
+    for (int j = 0; serverCommandTable[j].declared_name != NULL; j++) {
+        struct serverCommand *c = serverCommandTable + j;
+        /* Same skip rule as populateCommandStructure() with sentinel_mode == 0. */
+        if (c->flags & CMD_ONLY_SENTINEL) continue;
+        serverAssert(hashtableAdd(server.commands, c));
+        serverAssert(hashtableAdd(server.orig_commands, c));
+    }
+}
+
 #endif
