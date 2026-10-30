@@ -1391,14 +1391,16 @@ proc system_backtrace_supported {} {
     }
 
     # libmusl does not support backtrace natively. Also return 0 on
-    # static binaries (ldd exit code 1) where we can't detect libmusl
-    catch {
-        set ldd [exec ldd $::VALKEY_SERVER_BIN]
-        if {![string match {*libc.*musl*} $ldd]} {
-            return 1
-        }
+    # static binaries (ldd exit code 1) where we can't detect libmusl.
+    # The return must stay outside the catch: catch swallows a return
+    # issued inside its body and the proc would fall through.
+    if {[catch {exec ldd $::VALKEY_SERVER_BIN} ldd]} {
+        return 0
     }
-    return 0
+    if {[string match {*libc.*musl*} $ldd]} {
+        return 0
+    }
+    return 1
 }
 
 proc generate_largevalue_test_array {} {
