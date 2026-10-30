@@ -1400,6 +1400,9 @@ typedef struct ClientReplicationData {
      * dedicated sender thread. The sender owns send_node/send_pos; main owns the cursor
      * (ref_repl_buf_node/ref_block_pos) and advances it from sent_offset for accounting. */
     int stream_via_sender;          /* 1 while the sender streams this replica. */
+    int sender_adopt_pending;       /* Main-only: the sender started while a main-path write
+                                     * for this replica was in flight; adopt it when that
+                                     * write completes (processClientIOWriteDone). */
     int stream_ineligible;          /* 1 to keep this replica on the main path (diskless/socket
                                      * RDB transfer): the sender streams only disk/inline-sync
                                      * replicas. */
@@ -3707,6 +3710,7 @@ int replStreamSenderEligible(client *replica);
 void replStreamSenderPublishStable(long long offset);
 void replStreamSenderPublishAppend(long long offset);
 void replStreamSenderAdd(client *replica);
+void replStreamSenderAdoptSettled(client *replica);
 void replStreamSenderRemove(client *replica);
 void replStreamSenderAccount(void);
 int replStreamSenderActive(void);
