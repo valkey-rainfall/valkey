@@ -117,6 +117,10 @@ int clusterNodeNumReplicas(clusterNode *node);
 clusterNode *clusterNodeGetReplica(clusterNode *node, int replica_idx);
 clusterNode *getMigratingSlotDest(int slot);
 clusterNode *getImportingSlotSource(int slot);
+/* Set (node) or clear (NULL) the migrating / importing entry of a slot, as CLUSTER SETSLOT
+ * MIGRATING / IMPORTING / STABLE and the cluster bus do. */
+void setMigratingSlotDest(int slot, clusterNode *node);
+void setImportingSlotSource(int slot, clusterNode *node);
 clusterNode *getNodeBySlot(int slot);
 int clusterNodeClientPort(clusterNode *n, int use_tls, client *c);
 char *clusterNodeHostname(clusterNode *node);

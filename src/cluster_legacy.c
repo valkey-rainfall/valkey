@@ -358,7 +358,7 @@ clusterNode *getMigratingSlotDest(int slot) {
     return de ? dictGetVal(de) : NULL;
 }
 
-static void setMigratingSlotDest(int slot, clusterNode *node) {
+void setMigratingSlotDest(int slot, clusterNode *node) {
     dictEntry *de = dictFind(server.cluster->migrating_slots_to, (void *)(intptr_t)slot);
     if (node == NULL) {
         if (de) dictDelete(server.cluster->migrating_slots_to, (void *)(intptr_t)slot);
@@ -376,7 +376,7 @@ clusterNode *getImportingSlotSource(int slot) {
     return de ? dictGetVal(de) : NULL;
 }
 
-static void setImportingSlotSource(int slot, clusterNode *node) {
+void setImportingSlotSource(int slot, clusterNode *node) {
     dictEntry *de = dictFind(server.cluster->importing_slots_from, (void *)(intptr_t)slot);
     if (node == NULL) {
         if (de) dictDelete(server.cluster->importing_slots_from, (void *)(intptr_t)slot);
