@@ -30,6 +30,7 @@
  * RADIFF_FIRST shifts the seed range. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -117,11 +118,11 @@ class ReplApplyTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
-        ACLInit();
+        unitTestPopulateCommandTable();
+        unitTestACLInit();
 
         server.keyspace_shard_bits = LANE_BITS;
         server.dbnum = 2;
@@ -161,7 +162,7 @@ class ReplApplyTest : public ::testing::Test {
         server.repl_serve_stale_data = 1;
         server.repl_replica_ro = 1;
 
-        connTypeInitialize();
+        unitTestConnTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
         fastpathInitThread(1);
@@ -171,6 +172,7 @@ class ReplApplyTest : public ::testing::Test {
 
     static void TearDownTestSuite() {
         fastpathFreeThread(1);
+        testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
     }
 
