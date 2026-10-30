@@ -93,6 +93,7 @@ class FastpathStagedTest : public ::testing::Test {
 
     static void TearDownTestSuite() {
         fastpathFreeThread(1);
+        testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
     }
 
@@ -544,6 +545,7 @@ TEST_F(FastpathStagedTest, LeavingClientsHandedBackInArrivalOrderAcrossThreads) 
     iteration();
     freeClientsInAsyncFreeQueue();
     fastpathFreeThread(2);
+    testOnlyClearIOThreadReady(2);
 }
 
 /* F14 (review1 gap 1): a client that leaves in the STREAM or REPLY phase (main handed its entries
@@ -604,6 +606,7 @@ TEST_F(FastpathStagedTest, LeaversInStreamAndReplyPhasesKeepArrivalOrder) {
     iteration();
     freeClientsInAsyncFreeQueue();
     fastpathFreeThread(2);
+    testOnlyClearIOThreadReady(2);
 }
 
 /* F14 (review1 gap 2): handing back N leavers must cost one pass over the leaving lists plus one
