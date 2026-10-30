@@ -60,6 +60,11 @@ if {$backtrace_supported} {
             check_log_backtrace_for_debug "*WATCHDOG TIMER EXPIRED*"
             # make sure the server is still alive
             assert_equal "PONG" [r ping]
+
+            # Disarm the watchdog before shutdown. A slow exit (for example
+            # LeakSanitizer's exit-time scan) would otherwise trip it, and the
+            # watchdog handler is not safe to run during exit.
+            r config set watchdog-period 0
         }
     }
 }

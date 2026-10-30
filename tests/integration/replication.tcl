@@ -1721,6 +1721,10 @@ test {replica can handle EINTR if use diskless load} {
             assert ![log_file_matches [srv -1 stdout] "*Reconnecting to MASTER*"]
             assert_equal 1 [s 0 sync_full]
             assert_equal 1 [s -1 loading]
+
+            # Disarm the watchdog now that the EINTR has been observed, so it
+            # cannot fire while the replica is shut down.
+            $replica config set watchdog-period 0
         }
     }
 } {} {external:skip}
