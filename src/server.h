@@ -3651,6 +3651,7 @@ unsigned int objectGetLRU(const robj *o);
 void objectSetLRU(robj *o, unsigned int lru);
 /* Object metadata management */
 void objectSetMetadataSize(size_t size);
+void testOnlyResetObjectMetadataSize(void);
 size_t objectGetMetadataSize(const robj *o);
 void *objectGetMetadata(const robj *o);
 void objectCopyMetadata(robj *dst, const robj *src);
