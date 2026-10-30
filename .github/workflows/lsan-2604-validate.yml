@@ -1,6 +1,7 @@
 name: lsan-2604-validate
 
-# 100x validation of the harness fix on the PR branch
+# 100x validation of the three harness fixes (SIGCONT, watchdog reset,
+# backtrace gate) on the PR branches
 # (fix/test-sigcont-lsan-exit-hang, on top of current unstable). CI-faithful
 # ASan build and runtest invocation from test-sanitizer-address, 100 shards on
 # ubuntu-26.04. Per shard: LSan warnings in server stderr (control: the exit
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - rain/lsan-2604-validate
+      - rain/lsan-2604-validate2
 
 permissions:
   contents: read
