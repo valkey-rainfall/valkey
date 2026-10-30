@@ -74,4 +74,18 @@ inline void unitTestConnTypeInitialize(void) {
     initialized = true;
 }
 
+/* ACLInit() calls ACLInitCommandCategories(), which allocates a fresh
+ * ACLCommandCategories array but keeps the static write index
+ * nextCommandCategory. The second call therefore writes the default
+ * categories after a block of zeroed slots, so a lookup such as "+@read"
+ * stops at the first empty slot and fails, and the fourth call runs past
+ * ACL_MAX_CATEGORIES (64) and asserts. All ACL state ACLInit() creates is
+ * static (not in the server struct), so one call per process is enough. */
+inline void unitTestACLInit(void) {
+    static bool initialized = false;
+    if (initialized) return;
+    ACLInit();
+    initialized = true;
+}
+
 #endif

@@ -61,7 +61,7 @@ class FastpathLanesTest : public ::testing::Test {
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
         unitTestPopulateCommandTable();
-        ACLInit();
+        unitTestACLInit();
 
         server.keyspace_shard_bits = LANE_BITS;
         server.dbnum = 1;
