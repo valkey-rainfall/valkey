@@ -499,7 +499,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
              * A key already in the dict (another client blocks on it, or this client re-blocks) changes
              * nothing a classification could see. blocking_keys_unblock_on_nokey needs no bump of its
              * own: a key there is always also in blocking_keys. */
-            fastpathKeyObserverAdded();
+            fastpathKeyObserverAdded(keys[j]);
             l = listCreate();
             dictSetVal(c->db->blocking_keys, db_blocked_entry, l);
             incrRefCount(keys[j]);

@@ -563,9 +563,45 @@ static int fp_check_watched = 0; /* clients watch keys */
 static uint64_t fp_observers_gen = 0;
 static uint64_t fp_observers_gen_sampled = 0;
 
-void fastpathKeyObserverAdded(void) {
+/* The keyspace shards (cluster: slots) of the keys that became observed since the sample, so a
+ * re-check looks up only the lane entries that can be affected. A lane entry has all its keys in one
+ * shard (e->shard), and at classification none of them was observed, so it needs demotion only if one
+ * of its keys was added since the sample, and that key's shard is recorded here. More additions than
+ * the array holds set the overflow flag, and the re-check falls back to looking every entry up. */
+#define FP_OBSERVER_SHARDS_MAX 16
+static int fp_observer_shards[FP_OBSERVER_SHARDS_MAX];
+static int fp_observer_shards_n = 0;
+static int fp_observer_shards_overflow = 0;
+
+static void fpObserverShardsClear(void) {
+    fp_observer_shards_n = 0;
+    fp_observer_shards_overflow = 0;
+}
+
+/* Main: key became present in a watched_keys or blocking_keys dict. */
+void fastpathKeyObserverAdded(robj *key) {
     debugServerAssert(inMainThread());
     fp_observers_gen++;
+    if (fp_observer_shards_overflow) return;
+    if (!key || !sdsEncodedObject(key) || fp_observer_shards_n == FP_OBSERVER_SHARDS_MAX) {
+        fp_observer_shards_overflow = 1;
+        return;
+    }
+    sds k = objectGetVal(key);
+    /* The same function rpClassify's fastpathKeysShard uses for a lane entry's shard. */
+    int shard = server.cluster_enabled ? (int)keyHashSlot(k, (int)sdslen(k)) : getKVStoreIndexForKey(k);
+    for (int i = 0; i < fp_observer_shards_n; i++)
+        if (fp_observer_shards[i] == shard) return;
+    fp_observer_shards[fp_observer_shards_n++] = shard;
+}
+
+/* Main: can a lane entry whose keys are in this shard need demotion? True when a key of that shard
+ * became observed since the sample, when the record overflowed, or when the shard is unknown. */
+int fastpathKeyObserverShardAffected(int shard) {
+    if (fp_observer_shards_overflow || shard < 0) return 1;
+    for (int i = 0; i < fp_observer_shards_n; i++)
+        if (fp_observer_shards[i] == shard) return 1;
+    return 0;
 }
 
 /* Main: a key became watched or blocked on since the lane flags were sampled for this iteration, or
@@ -574,9 +610,11 @@ int fastpathKeyObserversChanged(void) {
     return fp_observers_gen != fp_observers_gen_sampled;
 }
 
-/* Main: the plan owner looked every planned key up against the dicts as they are now. */
+/* Main: the plan owner looked every planned key that could be affected up against the dicts as they
+ * are now; the record of added shards starts again from here. */
 void fastpathKeyObserversRechecked(void) {
     fp_observers_gen_sampled = fp_observers_gen;
+    fpObserverShardsClear();
 }
 
 /* The ACL epoch the read phase tagged its ALLOW verdicts under. A lane entry runs cmd->proc directly,
@@ -1779,6 +1817,7 @@ void fastpathStagedPrepareLanes(void) {
                        server.blocked_clients_by_type[BLOCKED_STREAM];
     fp_check_watched = server.watching_clients > 0;
     fp_observers_gen_sampled = fp_observers_gen; /* the observer set the flags above describe */
+    fpObserverShardsClear();
     fp_acl_epoch_sampled = aclOffloadEpoch();    /* the rule sets the read phase's ACL verdicts describe */
     /* The previous iteration's replies were delivered in its reply phase. */
     for (int l = 0; l < FP_MAX_LANES; l++) {

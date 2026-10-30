@@ -837,6 +837,7 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             set before [pwl_repl_applied $replica]
             set rechecks0 [pwl_stat $replica repl_lane_rechecks]
             set demoted0 [pwl_stat $replica repl_lane_demoted]
+            set lookups0 [pwl_stat $replica repl_lane_recheck_lookups]
             set fired0 [$replica debug staged-window-fired]
             set rd [valkey_deferring_client]
             $rd select 0
@@ -868,9 +869,12 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             $rd close
             assert_equal changed [$replica get pwl:ww]
             assert {[pwl_repl_applied $replica] - $before >= 290}
-            # The plan was re-checked once and exactly the write to the watched key left its lane.
+            # The plan was re-checked once and exactly the write to the watched key left its lane. Only the
+            # entries in the watched key's keyspace shard were looked up (1 of 1024 shards), not all 301.
             assert_equal 1 [expr {[pwl_stat $replica repl_lane_rechecks] - $rechecks0}]
             assert_equal 1 [expr {[pwl_stat $replica repl_lane_demoted] - $demoted0}]
+            set lookups [expr {[pwl_stat $replica repl_lane_recheck_lookups] - $lookups0}]
+            assert {$lookups >= 1 && $lookups <= 30}
             assert_equal {} $res
         }
 
@@ -879,6 +883,7 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             set rechecks0 [pwl_stat $replica repl_lane_rechecks]
             set demoted0 [pwl_stat $replica repl_lane_demoted]
             set barriers0 [pwl_stat $replica repl_lane_barriers]
+            set lookups0 [pwl_stat $replica repl_lane_recheck_lookups]
             set fired0 [$replica debug staged-window-fired]
             set rd [valkey_deferring_client]
             $rd select 0
@@ -911,6 +916,9 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
             assert_equal 1 [expr {[pwl_stat $replica repl_lane_rechecks] - $rechecks0}]
             assert_equal 0 [expr {[pwl_stat $replica repl_lane_demoted] - $demoted0}]
             assert_equal 0 [expr {[pwl_stat $replica repl_lane_barriers] - $barriers0}]
+            # The re-check is not linear in the plan: only the entries in the watched key's shard were
+            # looked up (expected about 300/1024 of them), not all 300.
+            assert {[pwl_stat $replica repl_lane_recheck_lookups] - $lookups0 <= 30}
             assert {[pwl_repl_applied $replica] - $before >= 300}
             assert_equal {7} $res
         }

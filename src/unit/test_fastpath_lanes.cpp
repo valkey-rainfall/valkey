@@ -532,3 +532,52 @@ TEST_F(FastpathLanesTest, LaneEntryTaggedBeforeMainRevokesIsRefused) {
     freeClientsInAsyncFreeQueue();
     server.acl_offload = 0;
 }
+
+/* The record of shards whose keys became observed since the sample: a re-check looks up only the lane
+ * entries in those shards. Removals and keys of other shards leave an entry alone; an unknown shard,
+ * a key the record cannot place, or more additions than it holds make every entry a candidate. */
+TEST_F(FastpathLanesTest, KeyObserverShardRecordLimitsTheRecheckToAffectedShards) {
+    fastpathKeyObserversRechecked();
+    robj *a = createStringObject("k0", 2); /* shard 12 with LANE_BITS 4, asserted by the fixture via laneOf */
+    int sa = getKVStoreIndexForKey((sds)objectGetVal(a));
+    /* A key in another shard. */
+    robj *b = nullptr;
+    int sb = -1;
+    for (int i = 0; i < 64 && (b == nullptr); i++) {
+        std::string name = "other" + std::to_string(i);
+        robj *cand = createStringObject(name.c_str(), name.size());
+        int s = getKVStoreIndexForKey((sds)objectGetVal(cand));
+        if (s != sa) {
+            b = cand;
+            sb = s;
+        } else {
+            decrRefCount(cand);
+        }
+    }
+    ASSERT_NE(b, nullptr);
+
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(sa)) << "nothing added since the sample";
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(-1)) << "an entry with no shard is always looked up";
+    fastpathKeyObserverAdded(a);
+    EXPECT_TRUE(fastpathKeyObserversChanged());
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(sa));
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(sb)) << "a shard with no new observed key is not looked up";
+    fastpathKeyObserverAdded(a); /* the same shard again: still only that shard */
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(sb));
+    fastpathKeyObserverAdded(b);
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(sb));
+
+    fastpathKeyObserversRechecked();
+    EXPECT_FALSE(fastpathKeyObserversChanged());
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(sa)) << "the re-check consumed the record";
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(sb));
+
+    fastpathKeyObserverAdded(NULL); /* a key the record cannot place: fall back to the full walk */
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(sa));
+    EXPECT_TRUE(fastpathKeyObserverShardAffected(sb));
+    fastpathKeyObserversRechecked();
+    EXPECT_FALSE(fastpathKeyObserverShardAffected(sa));
+
+    decrRefCount(a);
+    decrRefCount(b);
+}

@@ -512,7 +512,7 @@ void watchForKey(client *c, robj *key) {
     if (de == NULL) {
         /* The key becomes observed now: a lane plan classified before this call must look it up again. A
          * second watcher of a key already in the dict changes nothing a classification could see. */
-        fastpathKeyObserverAdded();
+        fastpathKeyObserverAdded(key);
         clients = listCreate();
         dictAdd(c->db->watched_keys, key, clients);
         incrRefCount(key);

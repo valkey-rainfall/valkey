@@ -350,17 +350,20 @@ void replApplyPlanRead(client *c) {
  * Entries whose keys are not observed keep their lanes. Nothing runs here. */
 static void rpDemoteObserved(client *c) {
     server.stat_repl_lane_rechecks++;
-    fastpathKeyObserversRechecked();
     for (int t = 0; t < rp.nchunks; t++) {
         rpChunk *k = &rp.ch[t];
         rpResetChunk(k);
         /* Chunk 0 also holds position 0, the client's current command, before its first scanned one. */
         for (int idx = t == 0 ? 0 : k->first; idx < k->first + k->n; idx++) {
             rpEntry *e = &rp.e[idx];
-            if (e->lane >= 0) {
+            /* Only an entry whose shard holds a key that became observed since the sample can need
+             * demotion: at classification none of its keys was observed. The other entries keep their
+             * lane with no lookup. */
+            if (e->lane >= 0 && fastpathKeyObserverShardAffected(e->shard)) {
                 struct serverCommand *cmd = idx == 0 ? c->parsed_cmd : c->cmd_queue.cmds[idx - 1].cmd;
                 robj **argv = idx == 0 ? c->argv : c->cmd_queue.cmds[idx - 1].argv;
                 int argc = idx == 0 ? c->argc : c->cmd_queue.cmds[idx - 1].argc;
+                server.stat_repl_lane_recheck_lookups++;
                 if (fastpathKeysObservedNow(e->db, cmd, argv, argc)) {
                     e->lane = -1;
                     e->shard = -1;
@@ -377,6 +380,7 @@ static void rpDemoteObserved(client *c) {
             }
         }
     }
+    fastpathKeyObserversRechecked(); /* after the walk: it clears the record of added shards */
 }
 
 /* Main, after the chunks are parsed: the barriers of all chunks in T order. */

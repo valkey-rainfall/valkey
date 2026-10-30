@@ -734,9 +734,9 @@ static int obsCheck(struct serverCommand *cmd, const char *a0, const char *a1 = 
 TEST_F(FastpathStagedTest, KeyObserverGenerationMovesOnEveryAddition) {
     fastpathKeyObserversRechecked();
     EXPECT_FALSE(fastpathKeyObserversChanged());
-    fastpathKeyObserverAdded();
+    fastpathKeyObserverAdded(NULL);
     EXPECT_TRUE(fastpathKeyObserversChanged());
-    fastpathKeyObserverAdded();
+    fastpathKeyObserverAdded(NULL);
     EXPECT_TRUE(fastpathKeyObserversChanged());
     fastpathKeyObserversRechecked();
     EXPECT_FALSE(fastpathKeyObserversChanged());
