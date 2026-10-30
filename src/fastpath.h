@@ -85,6 +85,7 @@ void fastpathAdmitReadBegin(void);
 void fastpathAdmitReadEnd(void);
 void fastpathAdmissionQuiesce(void);
 uint32_t testOnlyFastpathAdmitSeq(int tid);
+uint64_t testOnlyFastpathLeaveVisits(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);

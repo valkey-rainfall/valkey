@@ -17,6 +17,8 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 extern "C" {
 #include "connection.h"
@@ -602,6 +604,103 @@ TEST_F(FastpathStagedTest, LeavingClientsHandedBackInArrivalOrderAcrossThreads) 
     freeClientsInAsyncFreeQueue();
     fastpathFreeThread(2);
     testOnlyClearIOThreadReady(2);
+}
+
+/* F14 (review1 gap 1): a client that leaves in the STREAM or REPLY phase (main handed its entries
+ * back unexecuted) must be ordered by the read that produced them, not by whatever its IO thread
+ * claimed last. Arrival order here: A (thread 2), B (thread 1), R (thread 1, leaves in the READ
+ * phase: MULTI), X (thread 2). A failover in progress makes main requeue A, B and X; thread 2
+ * delivers in a STREAM phase, thread 1 in the REPLY phase. Main must run the four LPUSHes as
+ * A, B, R, X. With the stamp taken from the thread's last claim, A is stamped like X (thread 2's
+ * last claim) and runs after B and R. */
+TEST_F(FastpathStagedTest, LeaversInStreamAndReplyPhasesKeepArrivalOrder) {
+    fastpathInitThread(2);
+    testOnlySetIOThreadReady(2, epoll_create1(EPOLL_CLOEXEC));
+    int pa, pb, pr, px, po;
+    client *a = newStagedClient(&pa);
+    client *b = newStagedClient(&pb);
+    client *r = newStagedClient(&pr);
+    client *x = newStagedClient(&px);
+    client *o = newStagedClient(&po);
+    auto lpush = [](const char *v) { return std::string("*3\r\n$5\r\nLPUSH\r\n$4\r\nst:q\r\n$1\r\n") + v + "\r\n"; };
+    send(pa, lpush("A"));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(2);
+    send(pb, lpush("B"));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    send(pr, "*1\r\n$5\r\nMULTI\r\n" + lpush("R") + "*1\r\n$4\r\nEXEC\r\n");
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    send(px, lpush("X"));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(2);
+    EXPECT_EQ(a->fp_inflight, 1u);
+    EXPECT_EQ(b->fp_inflight, 1u);
+    EXPECT_EQ(r->control->lifecycle, FP_LEAVING) << "MULTI leaves in the read phase";
+    EXPECT_EQ(x->fp_inflight, 1u);
+
+    server.failover_state = FAILOVER_WAIT_FOR_SYNC; /* fpMustRunOnMain: every entry is requeued */
+    fastpathStagedStreamBegin();
+    fastpathStagedExecuteStreaming();
+    fastpathStagedStreamPhase(2); /* A and X leave in the STREAM phase */
+    EXPECT_EQ(a->control->lifecycle, FP_LEAVING);
+    EXPECT_EQ(x->control->lifecycle, FP_LEAVING);
+    fastpathStagedReplyPhase(1); /* B leaves in the REPLY phase */
+    EXPECT_EQ(b->control->lifecycle, FP_LEAVING);
+    fastpathStagedReplyPhase(2);
+    fastpathStagedFinish(); /* hands back and runs the LPUSHes on main */
+    server.failover_state = NO_FAILOVER;
+
+    send(po, "*4\r\n$6\r\nLRANGE\r\n$4\r\nst:q\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+    iteration();
+    EXPECT_EQ(recv(po), "*4\r\n$1\r\nX\r\n$1\r\nR\r\n$1\r\nB\r\n$1\r\nA\r\n")
+        << "STREAM/REPLY-phase leavers must be handed back in arrival order (A, B, R, X)";
+    freeStaged(o, po);
+    for (auto p : {std::make_pair(a, pa), std::make_pair(b, pb), std::make_pair(r, pr), std::make_pair(x, px)}) {
+        close(p.second);
+        freeClient(p.first);
+    }
+    iteration();
+    freeClientsInAsyncFreeQueue();
+    fastpathFreeThread(2);
+    testOnlyClearIOThreadReady(2);
+}
+
+/* F14 (review1 gap 2): handing back N leavers must cost one pass over the leaving lists plus one
+ * sort, not a rescan after every handoff (N^2/2 node visits: a CLIENT PAUSE or a forkless save
+ * requeues every client with a batched command in one iteration). The work is counted in list nodes
+ * visited by fastpathStagedFinish, not in time. 160 clients, each with one PING batched for main and
+ * requeued by a failover in progress: the merge may visit each node a small constant number of
+ * times; the rescanning merge visits 160 * 161 / 2 = 12880. */
+TEST_F(FastpathStagedTest, ManyLeaversAreMergedInOneSortedPass) {
+    const int n = 160;
+    std::vector<client *> cs(n);
+    std::vector<int> peers(n);
+    for (int i = 0; i < n; i++) {
+        cs[i] = newStagedClient(&peers[i]);
+        send(peers[i], "*2\r\n$4\r\nPING\r\n$1\r\np\r\n");
+    }
+    readPhase();
+    for (int i = 0; i < n; i++) ASSERT_EQ(cs[i]->fp_inflight, 1u) << "client " << i;
+    server.failover_state = FAILOVER_WAIT_FOR_SYNC;
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1); /* every client is requeued and leaves */
+    for (int i = 0; i < n; i++) ASSERT_EQ(cs[i]->control->lifecycle, FP_LEAVING) << "client " << i;
+    uint64_t visits_before = testOnlyFastpathLeaveVisits();
+    fastpathStagedFinish();
+    server.failover_state = NO_FAILOVER;
+    uint64_t visits = testOnlyFastpathLeaveVisits() - visits_before;
+    EXPECT_LE(visits, (uint64_t)4 * n) << "the leaving lists were rescanned after handoffs (quadratic merge)";
+    EXPECT_GE(visits, (uint64_t)n) << "every leaver is visited at least once";
+    for (int i = 0; i < n; i++)
+        EXPECT_EQ(recv(peers[i]) + mainBuf(cs[i]), "$1\r\np\r\n") << "client " << i << " was not handed back";
+    for (int i = 0; i < n; i++) {
+        close(peers[i]);
+        freeClient(cs[i]);
+    }
+    iteration();
+    freeClientsInAsyncFreeQueue();
 }
 
 /* STR-12: a reply larger than 4 GiB (MGET of a 512 MiB value 9 times) is sent by the fast path
