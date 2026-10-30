@@ -51,14 +51,44 @@ class ThrottleReplTest : public ::testing::Test {
         server.replicas = NULL;
     }
 
+    /* The repl throttle event counters are cumulative for the process; each
+     * test here expects the events it causes itself. Values at test start. */
+    long activation_at_start = 0, more_at_start = 0, less_at_start = 0;
+
     void SetUp() override {
+        /* Settings that tests change for their own scenario and that must not
+         * carry over to the next test: the COB limits (noCobLimitConfigured
+         * NoThrottle sets them to 0), the enable flag (disabledConfigNoNew
+         * Throttle clears it) and the replica role (throttlerRemovedAfter
+         * Failover sets a primary host). */
+        server.client_obuf_limits[CLIENT_TYPE_REPLICA].soft_limit_bytes = COB_LIMIT;
+        server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes = COB_LIMIT;
+        throttleRepl_config.repl_throttling_enabled = 1;
+        server.primary_host = NULL;
+
         replica_steady = createFakeReplicaClient(1);
         replica_steady->repl_data->repl_state = REPLICA_STATE_ONLINE;
         EXPECT_CALL(mock, throttle_getMetrics(_, _)).WillRepeatedly(SetArgPointee<1>(throttleMetrics{}));
         EXPECT_CALL(mock, throttle_getGuardrailSecs(_)).WillRepeatedly(Return(0L));
+        /* readMetric goes through the mocked throttle_getMetrics: read after the
+         * expectations above are in place. */
+        activation_at_start = (long)readMetric("repl_throttle_activation_events");
+        more_at_start = (long)readMetric("repl_throttle_more_events");
+        less_at_start = (long)readMetric("repl_throttle_less_events");
     }
 
     void TearDown() override {
+        /* A test may end with the repl throttler installed (clientCobLimitsExempt
+         * does). The throttler handle is a dummy the mock returned, so the next
+         * test must not reach it through the real throttle_adjustRate: take the
+         * throttler down the way a failover does (not primary -> uninstall). */
+        if (isReplThrottlerActive()) {
+            EXPECT_CALL(mock, throttle_deregister(_)).Times(1);
+            server.primary_host = (char *)"127.0.0.1";
+            throttleRepl_adjustThrottling();
+            server.primary_host = NULL;
+            EXPECT_FALSE(isReplThrottlerActive());
+        }
         freeFakeReplicaClient(replica_steady);
         replica_steady = NULL;
     }
@@ -92,9 +122,9 @@ class ThrottleReplTest : public ::testing::Test {
     }
 
     bool verifyThrottleEvent(long activation_events, long more, long less) {
-        return (long)readMetric("repl_throttle_activation_events") == activation_events &&
-               (long)readMetric("repl_throttle_more_events") == more &&
-               (long)readMetric("repl_throttle_less_events") == less;
+        return (long)readMetric("repl_throttle_activation_events") - activation_at_start == activation_events &&
+               (long)readMetric("repl_throttle_more_events") - more_at_start == more &&
+               (long)readMetric("repl_throttle_less_events") - less_at_start == less;
     }
 
   private:
