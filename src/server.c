@@ -5352,6 +5352,13 @@ int finishShutdown(void) {
     /* Module unloading may drain IO queues, so stop workers afterward. */
     killIOThreads();
 
+    /* Disarm the software watchdog. It is armed from serverCron to catch a
+     * main thread that does not return to the event loop in time. From here
+     * on the main thread leaves the loop on purpose and exit() runs code that
+     * the watchdog's stack trace handler cannot safely interrupt, such as
+     * atexit handlers and sanitizer leak checks. */
+    watchdogScheduleSignal(0);
+
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;
 
