@@ -84,7 +84,7 @@ class FastpathExecutorTest : public ::testing::Test {
         server.io_threads_fast_path = 1;
         server.io_threads_strict_offload = 1;
         server.io_batch_commands = 16;
-        connTypeInitialize();
+        unitTestConnTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
         fastpathInitThread(1);
