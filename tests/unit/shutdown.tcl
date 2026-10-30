@@ -137,3 +137,36 @@ start_server {tags {"shutdown external:skip"} overrides {appendonly no}} {
         r config set shutdown-on-sigterm force
     }
 }
+
+start_server {tags {"shutdown external:skip"}} {
+    test {SHUTDOWN with the software watchdog armed exits without firing it} {
+        # Arm the watchdog with the shortest period, so its one-shot timer is
+        # always pending when the server leaves the event loop. If shutdown
+        # does not disarm it, the timer fires while exit() is running and the
+        # watchdog signal handler runs its stack-trace machinery at a point
+        # where that is not safe. Under AddressSanitizer the exit-time leak
+        # check keeps the handler busy for seconds, and with libbacktrace the
+        # handler's fork() deadlocks against the leak checker, so the process
+        # never terminates. On a plain build exit() is short and the timer
+        # rarely fires, so this test is mainly effective on sanitizer builds.
+        r config set hz 500
+        r config set watchdog-period 4
+        set pid [s process_id]
+        # Signal rather than SHUTDOWN: a deadlocked exit() never closes the
+        # client socket, so a command reply would block instead of failing.
+        exec kill -SIGTERM $pid
+        wait_for_condition 100 100 {
+            ![process_is_alive $pid]
+        } else {
+            fail "server did not exit within 10s of SIGTERM"
+        }
+
+        # The watchdog must not have fired once the server committed to exit.
+        set fd [open [srv 0 stdout]]
+        set log [read $fd]
+        close $fd
+        set exit_idx [string first "ready to exit" $log]
+        assert {$exit_idx >= 0}
+        assert_equal -1 [string first "WATCHDOG TIMER EXPIRED" $log $exit_idx]
+    }
+}
