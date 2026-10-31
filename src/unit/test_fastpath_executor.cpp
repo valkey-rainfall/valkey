@@ -67,6 +67,7 @@ class FastpathExecutorTest : public ::testing::Test {
         server.clients = listCreate();
         server.clients_to_close = listCreate();
         server.clients_pending_write = listCreate();
+        server.clients_pending_read = listCreate();
         server.unblocked_clients = listCreate();
         server.ready_keys = listCreate();
         server.tracking_pending_keys = listCreate();
@@ -105,6 +106,15 @@ class FastpathExecutorTest : public ::testing::Test {
 
     void TearDown() override {
         testOnlyStagedStop();
+        /* Clients the tests freed while the staged loop ran were only recorded; free them now. */
+        freeClientsInAsyncFreeQueue();
+    }
+
+    /* Free a client that is back on main (not on the fast path any more): freeClient closes and
+     * frees its connection and every buffer the test's traffic allocated. */
+    static void freeMainClient(client *c) {
+        ASSERT_EQ(c->flag.fastpath, 0u);
+        freeClient(c);
     }
 
     /* Read whatever the executor produced for the client from the other end of the pair. */
@@ -166,17 +176,21 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     EXPECT_NE(lookupKeyRead(server.db[0], key), nullptr);
     decrRefCount(key);
 
-    /* Hand the client back (no freeClient on mmap'd pages), then reclaim its separately allocated control. */
+    /* Hand the client back, then reclaim its separately allocated control. */
     testOnlyStagedStop();
     EXPECT_EQ(c->flag.fastpath, 0u);
     connSetReadHandler(conn, NULL);
     fastpathControlReclaim(c);
     ASSERT_EQ(testOnlyStagedStart(), 0);
 
-    close(sv[1]);
-    close(sv[0]);
-    conn->fd = -1;
+    /* freeClient cannot release mmap'd pages: move the client back to the heap first. The copy
+     * owns the buffers and the connection; freeClient closes the socket and frees them all. */
+    client *heap = static_cast<client *>(zmalloc(sizeof(client)));
+    memcpy(heap, c, sizeof(client));
     munmap(c, maplen);
+    connSetPrivateData(conn, heap);
+    close(sv[1]);
+    freeMainClient(heap);
 }
 
 /* A retired user struct is kept until the last fast-path client naming it hands off,
@@ -259,8 +273,7 @@ TEST_F(FastpathExecutorTest, ClientInfoOfFastpathClientComesFromAdmissionPeer) {
     EXPECT_STRNE(ci.addr, "192.0.2.77");
 
     close(sv[1]);
-    close(sv[0]);
-    conn->fd = -1;
+    freeMainClient(c);
 }
 
 /* ---- Regression tests added by the superset audit (repro-group-c) ---- */
@@ -294,16 +307,16 @@ static client *fpTestAdmitClient(int *peer_fd, connection **conn_out) {
     return c;
 }
 
-/* Hand the client back to main and release the socket. The client struct is leaked on purpose:
- * freeClient needs the full server state that this fixture does not build. */
+/* Hand the client back to main, then free it: freeClient closes the socket and frees the
+ * connection and the client's buffers. */
 static void fpTestReleaseClient(client *c, connection *conn, int peer_fd) {
     testOnlyStagedStop();
     connSetReadHandler(conn, NULL);
     fastpathControlReclaim(c);
     testOnlyStagedStart();
     close(peer_fd);
-    close(conn->fd);
-    conn->fd = -1;
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    freeClient(c);
 }
 
 /* Bytes the peer can read right now, without blocking. */
@@ -591,8 +604,7 @@ TEST_F(FastpathExecutorTest, PartitionedClientStateIsStoredBeforeEpollAdd) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, sv[0], NULL);
     close(epfd);
     testOnlySetIOThreadReady(1, epoll_create1(EPOLL_CLOEXEC));
-    c->conn = NULL;
     close(sv[1]);
-    close(sv[0]);
+    freeMainClient(c);
     testOnlyStagedStart();
 }
