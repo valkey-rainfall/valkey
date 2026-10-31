@@ -81,6 +81,7 @@ void fastGetOnMonitorsChanged(void);
  * the threads recorded for the values fast GET answered. */
 void fastGetApplyTouches(void);
 void fastGetDiscardTouches(void);
+size_t testOnlyFastGetPendingTouches(void);
 
 /* IO thread: reply to a GET prefix of the parsed commands; returns how many.
  * tid = IO thread index (1..N-1). */

@@ -269,6 +269,7 @@ extern "C" {
 long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
 void updateClientMemoryUsage(client *c);
 void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage);
+size_t testOnlyFastGetPendingTouches(void); /* fastget.h uses <stdatomic.h>, which C++ cannot include */
 }
 
 /* An admitted fast-path client on one end of a socketpair; the test writes requests to *peer_fd. */
@@ -455,6 +456,101 @@ TEST_F(FastpathExecutorTest, FastGetTouchIsAppliedByMainAfterTheReadPhase) {
     fastpathStagedFinish();
     lfu_getFrequency(stored->lru, &freq);
     EXPECT_EQ(freq, 5) << "a touch recorded while a child runs must not be applied";
+
+    fpTestReleaseClient(c, conn, peer);
+    dbDelete(server.db[0], key);
+    decrRefCount(key);
+    server.maxmemory_policy = 0;
+    lrulfu_updateClockAndPolicy(mstime(), false);
+}
+
+/* Phase 14: in LRU mode a fast GET of a value that already holds the current LRU clock records no
+ * touch, because the touch main would apply stores the same value. The record vector and main's
+ * apply loop then only carry the values whose idle time changes (at 10M GET/s over 3M keys with a
+ * 1 s clock about 7 in 10 fast GETs re-read a value touched in the same second). A value with any
+ * idle time is still recorded and applied, and in LFU mode every GET is recorded, because the
+ * counter increment is random. The result for OBJECT IDLETIME is the same with and without the skip. */
+TEST_F(FastpathExecutorTest, FastGetSkipsTheTouchOfAValueAlreadyAtTheLruClock) {
+    server.child_pid = -1;
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+    lrulfu_updateClockAndPolicy(mstime(), false);
+    robj *key = createStringObject("hot3", 4);
+    robj *val = createStringObject("z", 1);
+    dbAdd(server.db[0], key, &val);
+    robj *stored = lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NOTOUCH | LOOKUP_NOSTATS | LOOKUP_NONOTIFY);
+    ASSERT_NE(stored, nullptr);
+    uint32_t idle = 0;
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+    const char *req = "*2\r\n$3\r\nGET\r\n$4\r\nhot3\r\n";
+    char buf[128];
+    char many[8 * 25 + 1];
+    many[0] = '\0';
+    for (int i = 0; i < 8; i++) strcat(many, req);
+
+    /* Idle value: 8 GETs in one read record 8 touches; applied, the value is at the clock. */
+    stored->lru = lru_import(100);
+    ASSERT_EQ(testOnlyFastGetPendingTouches(), 0u);
+    ASSERT_EQ(write(peer, many, strlen(many)), (ssize_t)strlen(many));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 8 * 7) << "the GET batch was not answered by fast GET (engagement check)";
+    EXPECT_EQ(testOnlyFastGetPendingTouches(), 8u) << "an idle value must be recorded by every fast GET";
+    fastpathStagedExecute();
+    EXPECT_EQ(testOnlyFastGetPendingTouches(), 0u);
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_EQ(idle, 0u) << "main did not apply the recorded touches";
+
+    /* Value already at the clock: the same 8 GETs record nothing; the value stays at the clock. The
+     * clock is refreshed and the value set right before the read, so a one-second tick in between
+     * (the staged execute above may have moved the cached time) cannot make the value look idle. */
+    lrulfu_updateClockAndPolicy(mstime(), false);
+    stored->lru = lru_import(0);
+    ASSERT_EQ(write(peer, many, strlen(many)), (ssize_t)strlen(many));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 8 * 7) << "the GET batch was not answered by fast GET (engagement check)";
+    EXPECT_EQ(testOnlyFastGetPendingTouches(), 0u) << "a value at the LRU clock must not be recorded again";
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_EQ(idle, 0u);
+
+    /* A clock one period ahead makes the value idle again: recorded and applied. */
+    stored->lru = lru_import(1);
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 7);
+    EXPECT_EQ(testOnlyFastGetPendingTouches(), 1u) << "a value one clock period behind must be recorded";
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_EQ(idle, 0u);
+
+    /* LFU: a value at the current minute is still recorded by every GET (the increment is random). */
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LFU;
+    lfu_config_log_factor = 0;
+    lrulfu_updateClockAndPolicy(mstime(), true);
+    stored->lru = lfu_import(5);
+    ASSERT_EQ(write(peer, many, strlen(many)), (ssize_t)strlen(many));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 8 * 7);
+    EXPECT_EQ(testOnlyFastGetPendingTouches(), 8u) << "LFU touches must all be recorded";
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    uint8_t freq = 0;
+    lfu_getFrequency(stored->lru, &freq);
+    EXPECT_EQ(freq, 13) << "8 fast GETs must count as 8 LFU touches";
 
     fpTestReleaseClient(c, conn, peer);
     dbDelete(server.db[0], key);

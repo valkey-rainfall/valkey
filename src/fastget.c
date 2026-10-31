@@ -190,6 +190,15 @@ typedef struct fastGetTouchVec {
 static fastGetTouchVec fastget_touch[FASTGET_MAX_IO_THREADS]; /* slot tid: written by that thread in the read phase */
 
 static void fastGetTouch(int tid, robj *o) {
+    /* LRU: the value main applies is lru_import(0), the LRU clock of this iteration. Main moves the
+     * clock (updateCachedTime) only outside the read phase and after the apply, so an IO thread reads
+     * the clock main's apply will use, ordered by the phase barrier like the other gates. A value read
+     * earlier in the same clock period (one second) already holds that value: recording it would store
+     * what is already there. Skipping it keeps the record, main's apply loop and the dirtied object
+     * header to the values whose idle time changes, with the same result for OBJECT IDLETIME and for
+     * eviction. LFU touches are always recorded: the counter increment is random and the decay field
+     * (minutes) is read by main at apply time. */
+    if (!lrulfu_isUsingLFU() && o->lru == lru_import(0)) return;
     fastGetTouchVec *v = &fastget_touch[tid];
     if (v->n == v->cap) {
         v->cap = v->cap ? v->cap * 2 : 1024;
@@ -213,6 +222,13 @@ void fastGetApplyTouches(void) {
 /* Main, when staged mode turns off: drop recorded touches instead of applying them. */
 void fastGetDiscardTouches(void) {
     for (int tid = 0; tid < FASTGET_MAX_IO_THREADS; tid++) fastget_touch[tid].n = 0;
+}
+
+/* Unit tests: touches recorded by the read phase and not yet applied, over all thread slots. */
+size_t testOnlyFastGetPendingTouches(void) {
+    size_t n = 0;
+    for (int tid = 0; tid < FASTGET_MAX_IO_THREADS; tid++) n += (size_t)fastget_touch[tid].n;
+    return n;
 }
 
 /* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
