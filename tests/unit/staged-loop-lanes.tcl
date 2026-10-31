@@ -1045,6 +1045,18 @@ start_cluster 1 1 {tags {"staged-loop cluster external:skip tls:skip"} overrides
 
     test {Write lanes (cluster): CLUSTER SLOT-STATS counts a lane command against its slot} {
         set slot [R 0 cluster keyslot pwl:c7]
+        # cpu-usec adds whole microseconds per command, and one SET or GET takes less than a
+        # microsecond on a fast host, so a slot that saw two commands often reads 0. Run many
+        # lane commands in the slot first; their total is clearly above 0 on any host.
+        set fd [pwl_fast_socket [srv 0 client] $host $port]
+        set before [expr {[pwl_lane_entries [srv 0 client]] + [pwl_speculated [srv 0 client]]}]
+        set buf ""
+        for {set i 0} {$i < 1000} {incr i} { append buf [pwl_resp set pwl:c7 v7] }
+        puts -nonewline $fd $buf
+        flush $fd
+        assert_equal [lrepeat 1000 +OK] [pwl_read_replies $fd 1000]
+        assert {[pwl_lane_entries [srv 0 client]] + [pwl_speculated [srv 0 client]] - $before >= 1000}
+        close $fd
         set stats [R 0 cluster slot-stats slotsrange $slot $slot]
         set entry [dict get [lindex [lindex $stats 0] 1]]
         assert_equal 1 [dict get $entry key-count]
