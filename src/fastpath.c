@@ -477,6 +477,15 @@ static void fpSubmit(fpThread *t) {
 /* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
  * the reply phase. */
 
+/* IO thread: the client's last interaction time, as readQueryFromClient and the write path set it on
+ * main. A relaxed atomic store: main reads the field during the STREAM phase (CLIENT LIST idle=,
+ * CLIENT KILL IDLE, through clientLastInteraction) while this thread delivers replies; the other main
+ * readers (clientsCron, the query buffer resize) run between phases. The value is a whole time_t, so
+ * only the C11 race is at stake, not the value. */
+static inline void fpTouchInteraction(client *c) {
+    __atomic_store_n(&c->last_interaction, (time_t)server.unixtime, __ATOMIC_RELAXED);
+}
+
 /* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
  * the reply phase. The client keeps the arrival stamp of its last claimed read (fp_leave_seq, set in
  * fastpathStagedEvent), whichever phase it leaves in: a client requeued or failed in the STREAM or
@@ -1067,7 +1076,7 @@ static void fpRead(fpThread *t, int tid, client *c, int mask) {
     }
     t->net_input_bytes += c->nread;
     c->net_input_bytes += c->nread;
-    c->last_interaction = server.unixtime;
+    fpTouchInteraction(c);
     if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
         trimClientQueryBuffer(c);
         fpBeginLeave(t, c, FP_LEAVING);
@@ -1118,7 +1127,7 @@ static int fpFlushOut(fpThread *t, client *c) {
         }
         t->net_output_bytes += n;
         c->net_output_bytes += n;
-        c->last_interaction = server.unixtime; /* a write is interaction, as on main */
+        fpTouchInteraction(c); /* a write is interaction, as on main */
         t->writes++;
         sdsrange(c->fp_out, n, -1);
     }
@@ -1159,7 +1168,7 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     }
     t->net_output_bytes += n;
     c->net_output_bytes += n;
-    if (n > 0) c->last_interaction = server.unixtime; /* a write is interaction, as on main */
+    if (n > 0) fpTouchInteraction(c); /* a write is interaction, as on main */
     t->writes++;
     for (int i = 0; i < iovcnt; i++) {
         if ((size_t)n >= iov[i].iov_len) {
@@ -1745,6 +1754,7 @@ void fastpathStagedSet(int on) {
     } else {
         serverAssert(listLength(&fp_staged_clients) == 0 && fastpath_clients == 0);
         fp_staged_admit = 0;
+        fastGetDiscardTouches(); /* a read phase with no write phase after it (tests): drop, never apply late */
         atomic_store_explicit(&fp_staged, 0, memory_order_relaxed);
     }
 }
@@ -2591,8 +2601,16 @@ static int fpExecuteWithLanes(void) {
     return total;
 }
 
+/* Main, right after the read barrier: the keyspace writes the read phase deferred (fast GET's LRU/LFU
+ * touches) land now, before any command, lane or replica stream runs. The staged loop calls this when
+ * the READ phase closes; the executors call it too for callers that drive the phases inline. */
+void fastpathStagedReadClosed(void) {
+    fastGetApplyTouches();
+}
+
 /* Main, write phase: execute every batch the read phase published, filling each entry's reply. */
 int fastpathStagedExecute(void) {
+    fastpathStagedReadClosed();
     int d = fpDepth();
     if (d == 0 && fp_lanes_iter) return fpExecuteWithLanes();
     int total = 0;
@@ -2741,6 +2759,7 @@ static void fpStreamArenaGuard(cmdBatch *b) {
 /* Main, write phase (exec/loop overlap): execute runs round-robin across threads, publishing each
  * batch's executed count as runs finish, so STREAM workers can deliver them while main runs on. */
 int fastpathStagedExecuteStreaming(void) {
+    fastpathStagedReadClosed();
     int d = fpDepth();
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);

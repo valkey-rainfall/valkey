@@ -382,6 +382,87 @@ TEST_F(FastpathExecutorTest, FastGetTouchesLruAndLfu) {
     lrulfu_updateClockAndPolicy(mstime(), false);
 }
 
+/* The LRU/LFU touch of a value answered by fast GET is recorded by the IO thread and applied by main
+ * once the read phase has closed (fastGetApplyTouches, called from fastpathStagedExecute and by the
+ * staged loop when the READ barrier closes): the IO thread never writes the object's first word,
+ * which it shares with type, encoding, the flags and the refcount that other fast GETs read at the
+ * same time. So right after the read phase the value is still idle; after main's write phase entry
+ * it is touched, and with lfu-log-factor 0 every one of the 8 GETs counts (5 + 8 = 13), as 8
+ * lookupKey calls on main would count. A touch applied on the IO thread fails the first check. */
+TEST_F(FastpathExecutorTest, FastGetTouchIsAppliedByMainAfterTheReadPhase) {
+    server.child_pid = -1;
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+    lrulfu_updateClockAndPolicy(mstime(), false);
+    robj *key = createStringObject("hot2", 4);
+    robj *val = createStringObject("y", 1);
+    dbAdd(server.db[0], key, &val);
+    robj *stored = lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NOTOUCH | LOOKUP_NOSTATS | LOOKUP_NONOTIFY);
+    ASSERT_NE(stored, nullptr);
+    stored->lru = lru_import(100);
+    uint32_t idle = 0;
+    lrulfu_getIdleness(stored->lru, &idle);
+    ASSERT_GE(idle, 99u);
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+    const char *req = "*2\r\n$3\r\nGET\r\n$4\r\nhot2\r\n";
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    char buf[128];
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 7) << "the GET was not answered by fast GET (engagement check)";
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_GE(idle, 99u) << "the IO thread wrote the object's lru during the read phase";
+    fastpathStagedExecute(); /* main: the deferred touch lands here */
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_EQ(idle, 0u) << "main did not apply the deferred touch";
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+
+    /* LFU: every one of 8 GETs counts once. */
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LFU;
+    lfu_config_log_factor = 0;
+    lrulfu_updateClockAndPolicy(mstime(), true);
+    stored->lru = lfu_import(5);
+    uint8_t freq = 0;
+    char many[8 * 25 + 1];
+    many[0] = '\0';
+    for (int i = 0; i < 8; i++) strcat(many, req);
+    ASSERT_EQ(write(peer, many, strlen(many)), (ssize_t)strlen(many));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 8 * 7) << "the GET batch was not answered by fast GET (engagement check)";
+    lfu_getFrequency(stored->lru, &freq);
+    EXPECT_EQ(freq, 5) << "the IO thread changed the LFU counter during the read phase";
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    lfu_getFrequency(stored->lru, &freq);
+    EXPECT_EQ(freq, 13) << "8 fast GETs must count as 8 touches";
+
+    /* A child process in progress skips the touch, as lookupKey does, and drops the records. */
+    stored->lru = lfu_import(5);
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 7);
+    server.child_pid = 1; /* hasActiveChildProcess() */
+    fastpathStagedExecute();
+    server.child_pid = -1;
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    lfu_getFrequency(stored->lru, &freq);
+    EXPECT_EQ(freq, 5) << "a touch recorded while a child runs must not be applied";
+
+    fpTestReleaseClient(c, conn, peer);
+    dbDelete(server.db[0], key);
+    decrRefCount(key);
+    server.maxmemory_policy = 0;
+    lrulfu_updateClockAndPolicy(mstime(), false);
+}
+
 /* OBS-08: bytes read and written by fast-path IO threads must be counted in the stock INFO stats
  * (total_net_input_bytes, total_net_output_bytes, total_reads_processed, total_writes_processed),
  * as the stock IO threads count them. */

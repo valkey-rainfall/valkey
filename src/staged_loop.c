@@ -197,6 +197,7 @@ static void stagedRunPhase(int phase) {
     else if (sl_main_lane && phase == STAGED_PHASE_REPLY)
         fastpathStagedReplyPhase(0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    if (phase == STAGED_PHASE_READ) fastpathStagedReadClosed(); /* deferred keyspace writes of the read phase */
     stagedAccountPhase(phase, sl_workers);
 }
 

@@ -5260,6 +5260,13 @@ int isClientConnIpV6(client *c) {
 
 /* Concatenate a string representing the state of a client in a human
  * readable format, into the sds string 's'. */
+/* The client's last interaction time for CLIENT LIST and CLIENT KILL IDLE, which main may run while a
+ * fast-path IO thread delivers the client's replies (STREAM phase) and stores the field with a
+ * relaxed atomic. A relaxed atomic load pairs with it; every other reader runs between phases. */
+static time_t clientLastInteraction(client *client) {
+    return __atomic_load_n(&client->last_interaction, __ATOMIC_RELAXED);
+}
+
 sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
     int held_reads = !server.crashed && partitionedClientHoldReads(client);
@@ -5325,7 +5332,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
             " name=%s", hide_user_data ? "*redacted*" : (client->name ? (char *)objectGetVal(client->name) : ""),
             " age=%I", (long long)(commandTimeSnapshot() / 1000 - client->ctime),
-            " idle=%I", (long long)(server.unixtime - client->last_interaction),
+            " idle=%I", (long long)(server.unixtime - clientLastInteraction(client)),
             " flags=%s", flags,
             " capa=%s", capa,
             " db=%i", client->db->id,
@@ -5841,7 +5848,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->user && ACLResolveUser(client->user) != client_filter->user) return 0;
     if (client_filter->skipme && client == ectx->current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
-    if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
+    if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - clientLastInteraction(client)) < client_filter->idle) return 0;
     if (client_filter->flags && clientMatchesFlagFilter(client, client_filter->flags) == 0) return 0;
     if (client_filter->name) {
         if (!client->name || !objectGetVal(client->name) || strcmp(objectGetVal(client->name), client_filter->name) != 0) {

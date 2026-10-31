@@ -77,6 +77,10 @@ void fastGetOnAclRulesChanged(void);
 /* Main: the number of modules subscribed to successful command results changed. */
 void fastGetOnCommandResultListenersChanged(int success_listeners);
 void fastGetOnMonitorsChanged(void);
+/* Main: apply (right after the read barrier) or drop (staged mode turning off) the LRU/LFU touches
+ * the threads recorded for the values fast GET answered. */
+void fastGetApplyTouches(void);
+void fastGetDiscardTouches(void);
 
 /* IO thread: reply to a GET prefix of the parsed commands; returns how many.
  * tid = IO thread index (1..N-1). */
