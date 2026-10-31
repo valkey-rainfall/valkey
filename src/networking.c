@@ -5089,7 +5089,16 @@ void readQueryFromClient(connection *conn) {
         return;
     }
 
-    if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return;
+    if (c->io_read_state != CLIENT_IDLE) return;
+    /* An in-flight offloaded WRITE does not block reading a replica's input. A replica
+     * link only sends REPLCONF ACK, which produces no reply, so reading and processing it
+     * touches none of the client state (reply buffers) the IO thread's write job walks, and
+     * connSocketRead only forbids a main-thread read while an IO READ is in flight, not a
+     * write. Blocking the read while a write was pending starved the ACK under a continuous
+     * outbound stream, so the primary never refreshed repl_ack_time and dropped a live
+     * replica as timed out. For any other client, processing input can generate a reply, so
+     * keep deferring until the write completes. */
+    if (c->io_write_state != CLIENT_IDLE && getClientType(c) != CLIENT_TYPE_REPLICA) return;
 
     bool repeat = false;
     int iter = 0;

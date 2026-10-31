@@ -777,3 +777,41 @@ TEST_F(ReplApplyTest, MultiWrappedSplitMsetIsNeverSeparated) {
     EXPECT_EQ(w.dirty, 1);
     EXPECT_EQ(w.dump, n.dump);
 }
+
+/* Phase 13 regression. A primary must read a replica's REPLCONF ACK even while a write to
+ * that replica is offloaded to an IO thread (io_write_state == CLIENT_PENDING_IO). A replica
+ * link only sends ACKs, which produce no reply, so reading one cannot race the IO thread's
+ * write of the replica's output buffer. Before the fix readQueryFromClient returned early
+ * whenever a write was in flight, so under a continuous outbound stream (the write is almost
+ * always in flight) the ACK was never read, repl_ack_time was never refreshed, and the
+ * primary dropped a live, ACKing replica as timed out. */
+TEST_F(ReplApplyTest, PrimaryReadsReplicaAckWhileStreamWriteOffloaded) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(conn);
+    c->flag.replica = 1;
+    initClientReplicationData(c);
+    c->repl_data->repl_state = REPLICA_STATE_ONLINE;
+    c->repl_data->repl_ack_off = 0;
+    listAddNodeTail(server.replicas, c);
+    selectDb(c, 0);
+
+    /* The replica sends REPLCONF ACK 12345 (the multibulk form a replica propagates). */
+    const std::string ack = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$5\r\n12345\r\n";
+    ASSERT_EQ(write(sv[1], ack.data(), ack.size()), (ssize_t)ack.size());
+
+    /* An IO thread is writing the replication stream to this replica right now. */
+    c->io_write_state = CLIENT_PENDING_IO;
+    readQueryFromClient(c->conn);
+    c->io_write_state = CLIENT_IDLE; /* clear before teardown */
+
+    EXPECT_EQ(c->repl_data->repl_ack_off, 12345) << "primary must read the replica ACK despite the in-flight write";
+
+    listNode *ln = listSearchKey(server.replicas, c);
+    if (ln) listDelNode(server.replicas, ln);
+    c->flag.replica = 0; /* avoid replica-specific teardown in freeClient */
+    freeClient(c);
+    close(sv[1]);
+}
