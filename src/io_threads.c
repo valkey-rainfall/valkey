@@ -2337,18 +2337,71 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
     return C_OK;
 }
 
+/* Module values a lane unlinked, waiting for main (F18-M). A module's free callback belongs to the
+ * module, which may not be thread safe: stock runs it on main, or on bio only when the module's own
+ * free_effort asks for it. A write lane or a replica apply lane runs on an IO thread, so it records
+ * the value here, in the slot of its thread, and main frees it in the merge that follows the lane
+ * phase (laneApplyDeferredModuleFrees) exactly as the main path does: freeObjAsync with the key when
+ * there is one, a plain decrRefCount otherwise. The key object is the command's argument, alive at
+ * least until the entry is freed in the reply phase; a reference is held anyway so the merge never
+ * depends on that. */
+typedef struct laneModuleFree {
+    robj *key;
+    robj *val;
+    int dbid;
+} laneModuleFree;
+typedef struct laneModuleFreeVec {
+    laneModuleFree *v;
+    int n, cap;
+} laneModuleFreeVec;
+static laneModuleFreeVec lane_module_frees[IO_THREADS_MAX_NUM]; /* slot thread_id: written by that lane thread */
+
+static void laneDeferModuleFree(robj *key, robj *val, int dbid) {
+    laneModuleFreeVec *d = &lane_module_frees[thread_id];
+    if (d->n == d->cap) {
+        d->cap = d->cap ? d->cap * 2 : 8;
+        d->v = zrealloc(d->v, sizeof(laneModuleFree) * d->cap);
+    }
+    if (key) incrRefCount(key);
+    d->v[d->n++] = (laneModuleFree){.key = key, .val = val, .dbid = dbid};
+}
+
+/* Main, in the merge after a lane phase: free the module values the lanes unlinked, on main. */
+void laneApplyDeferredModuleFrees(void) {
+    for (int tid = 0; tid < IO_THREADS_MAX_NUM; tid++) {
+        laneModuleFreeVec *d = &lane_module_frees[tid];
+        for (int i = 0; i < d->n; i++) {
+            laneModuleFree *f = &d->v[i];
+            if (f->key) {
+                freeObjAsync(f->key, f->val, f->dbid);
+                decrRefCount(f->key);
+            } else {
+                decrRefCount(f->val);
+            }
+        }
+        d->n = 0;
+    }
+}
+
 /* Terminal frees use IO threads when active; otherwise preserve freeObjAsync behavior. */
 void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
+    if (repl_apply_in_lane && !inMainThread() && val && val->refcount == 1 && val->type == OBJ_MODULE) {
+        laneDeferModuleFree(key, val, dbid); /* a replica apply lane: the module's callback waits for main */
+        return;
+    }
     if (inline_reclaim_depth || repl_apply_in_lane || maint_lane_free) { /* emergency reclaim frees inline */
         if (val) decrRefCount(val);
         return;
     }
     if (exec_lane && !inMainThread()) {
-        /* A write lane is already off main and the free slab is main's. As main does, streams and module
-         * values go to bio; the rest is freed here, unless large enough to hold the lane up. */
+        /* A write lane is already off main and the free slab is main's. As main does, streams go to bio;
+         * a module value waits for main (laneDeferModuleFree); the rest is freed here, unless large enough
+         * to hold the lane up. */
         if (!val) return;
-        if (val->refcount == 1 && (val->type == OBJ_STREAM || val->type == OBJ_MODULE ||
-                                   (val->type != OBJ_STRING && lazyfreeGetFreeEffort(key, val, dbid) > 64)))
+        if (val->refcount == 1 && val->type == OBJ_MODULE)
+            laneDeferModuleFree(key, val, dbid);
+        else if (val->refcount == 1 && (val->type == OBJ_STREAM ||
+                                        (val->type != OBJ_STRING && lazyfreeGetFreeEffort(key, val, dbid) > 64)))
             freeObjAsyncForce(val);
         else
             decrRefCount(val);

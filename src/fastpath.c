@@ -2332,6 +2332,7 @@ static int fpFeedSplitPropagation(cmdEntry *e) {
 
 /* Main, after a write phase: fold what the lanes accumulated and replay their propagation in T order. */
 static void fpMergeLanes(void) {
+    laneApplyDeferredModuleFrees(); /* module values the lanes unlinked: their free callbacks run here, on main */
     fpFoldLaneStats(fp_nlanes, 0);
     /* Propagation in T order: each part's entries in its IO thread's harvest order. A client's writes
      * of one iteration are contiguous there, so its replication offset is stored once per run. With no
@@ -2471,6 +2472,7 @@ void fastpathStreamLaneLeave(void) {
 }
 
 void fastpathStreamLanesMerge(int nlanes) {
+    laneApplyDeferredModuleFrees(); /* module values the apply lanes unlinked: freed here, on main */
     fpFoldLaneStats(nlanes, 1);
 }
 

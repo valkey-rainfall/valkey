@@ -767,6 +767,59 @@ TEST_F(FastpathStagedTest, ModuleValueFreeCallbackRunsOnMainWithIoThreads) {
     EXPECT_EXIT(mod01FreeSoleModuleValue(), ::testing::ExitedWithCode(0), "mod01: calls=1 on_main=1");
 }
 
+/* F18-M: a write lane (exec_lane on an IO thread) or a replica apply lane (repl_apply_in_lane) that
+ * unlinks a sole module value must not run the module's free callback on its own thread, nor send it
+ * to bio regardless of the module's free_effort; it waits for main, which frees it in the merge after
+ * the lane phase (laneApplyDeferredModuleFrees) as the main path does. Runs in a child like mod01:
+ * bio is not initialised here, so the S1 lane path dies in bioCreateLazyFreeJob. Exit 0: the callback
+ * did not run on the lane, nothing went to bio, and the merge ran it exactly once on the calling
+ * (main) thread. Exit 3: it ran on the lane or not at all. Exit 4: the merge ran it twice. */
+extern "C" {
+extern thread_local int exec_lane;
+extern thread_local int repl_apply_in_lane;
+}
+static void mod01LaneFreeWaitsForMain(int apply_lane) {
+    moduleType mt;
+    memset(&mt, 0, sizeof(mt));
+    mt.free = mod01FreeCallback;
+    memcpy(mt.name, "p12mod01t", 9);
+    int marker = 0;
+    robj *key = createStringObject("st:mod2", 7);
+    robj *val = createModuleObject(&mt, &marker);
+    server.active_io_threads_num = 4;
+    mod01_free_calls = 0;
+    size_t lazy_before = lazyfreeGetPendingObjectsCount();
+
+    testOnlySetCurTid(1); /* the lane runs on IO thread 1 */
+    if (apply_lane)
+        repl_apply_in_lane = 1;
+    else
+        exec_lane = 1;
+    freeValueNeverOnMain(key, val, 0);
+    exec_lane = 0;
+    repl_apply_in_lane = 0;
+    testOnlySetCurTid(0);
+    int on_lane = mod01_free_calls;
+    size_t lazy_delta = lazyfreeGetPendingObjectsCount() - lazy_before;
+
+    laneApplyDeferredModuleFrees(); /* main's merge */
+    int after_merge = mod01_free_calls;
+    int on_main = after_merge == 1 && pthread_equal(mod01_free_thread, pthread_self());
+    fprintf(stderr, "mod01lane: apply_lane=%d on_lane=%d lazyfree_pending_delta=%zu after_merge=%d on_main=%d key_refcount=%d\n",
+            apply_lane, on_lane, lazy_delta, after_merge, on_main, key->refcount);
+    int ok = on_lane == 0 && lazy_delta == 0 && on_main && key->refcount == 1;
+    decrRefCount(key);
+    exit(after_merge > 1 ? 4 : (ok ? 0 : 3));
+}
+
+TEST_F(FastpathStagedTest, LaneFreedModuleValueCallbackRunsOnMainAtMerge) {
+    EXPECT_EXIT(mod01LaneFreeWaitsForMain(0), ::testing::ExitedWithCode(0), "mod01lane: apply_lane=0 on_lane=0 lazyfree_pending_delta=0 after_merge=1 on_main=1");
+}
+
+TEST_F(FastpathStagedTest, ApplyLaneFreedModuleValueCallbackRunsOnMainAtMerge) {
+    EXPECT_EXIT(mod01LaneFreeWaitsForMain(1), ::testing::ExitedWithCode(0), "mod01lane: apply_lane=1 on_lane=0 lazyfree_pending_delta=0 after_merge=1 on_main=1");
+}
+
 /* N1: main hands batched entries back (fpMustRunOnMain: a forkless save, a pause, a failover, a
  * throttler ...) while the client has a trailing partial command whose "*N" header is parsed but no
  * argument yet (argc 0, multibulklen > 0). The partial's argv must survive the requeue: the parser

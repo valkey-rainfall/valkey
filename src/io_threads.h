@@ -75,6 +75,7 @@ void endInlineReclaim(void);
 void beginMaintLaneFree(void);
 void endMaintLaneFree(void);
 void freeValueNeverOnMain(robj *key, robj *val, int dbid);
+void laneApplyDeferredModuleFrees(void);
 void drainPendingMainFrees(void);
 size_t pendingMainFreesLen(void);
 /* Bytes committed to off-main frees but not yet physically reclaimed. */
