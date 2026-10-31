@@ -1880,6 +1880,7 @@ void replconfCommand(client *c) {
                 if (offset > c->repl_data->repl_aof_off) c->repl_data->repl_aof_off = offset;
             }
             c->repl_data->repl_ack_time = server.unixtime;
+            server.stat_probe_replica_ack_reads++; /* PROBE (phase13 diag): primary read+processed this replica's ACK */
             /* If this was a diskless replication, we need to really put
              * the replica online when the first ACK is received (which
              * confirms replica is online and ready to get more data). This
@@ -5886,6 +5887,22 @@ void handleBioThreadFinishedRDBDownload(void) {
 /* Replication cron function, called 1 time per second. */
 void replicationCron(void) {
     static long long replication_cron_loops = 0;
+
+    /* PROBE (phase13 ACK-loss diagnostic; remove with the rest of this patch). Every ~5 s
+     * emit the three counters so one run can tell H1 from H2:
+     *   H1 (poller/ae starvation): during an ACK gap, probe_ae_fired stays flat -- the staged
+     *      loop almost never enters aeProcessEvents, the only path that reads a replica link.
+     *   H2 (read masked while output pending): probe_ae_fired keeps climbing but
+     *      probe_replica_ack_reads (and the replica's CLIENT LIST tot-net-in) stays flat --
+     *      aeProcessEvents runs yet the replica fd is never dispatched as readable.
+     * Read probe_ae_checked as the denominator (every write-phase iteration). */
+    static mstime_t probe_last_log = 0;
+    if (server.mstime - probe_last_log >= 5000) {
+        probe_last_log = server.mstime;
+        serverLog(LL_NOTICE, "PROBE phase13 ae_checked=%lld ae_fired=%lld replica_ack_reads=%lld",
+                  server.stat_probe_ae_checked, server.stat_probe_ae_fired,
+                  server.stat_probe_replica_ack_reads);
+    }
 
     /* Converge replication transports to the current repl-compression
      * setting (see the reconcile functions for the model). Paused during

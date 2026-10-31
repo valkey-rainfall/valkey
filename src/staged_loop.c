@@ -458,6 +458,8 @@ static int stagedStreamEligible(void) {
  * In exec/loop overlap, a STREAM phase delivers completed runs while main executes. */
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
+    server.stat_probe_ae_checked++;                /* PROBE (phase13 diag): this write phase evaluated ae_ready */
+    if (ae_ready) server.stat_probe_ae_fired++;    /* PROBE: ... and aeProcessEvents (the only replica-read path) runs */
     uint64_t t0 = stagedNowNs();
     if (sl_read_queued) {
         sl_read_queued = 0;

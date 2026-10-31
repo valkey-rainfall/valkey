@@ -2159,6 +2159,10 @@ struct valkeyServer {
     long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
     long long stat_repl_apply_phases;              /* APPLY phases run */
     long long stat_repl_lane_reads;                /* Primary reads whose plan main ran on the write lanes */
+    /* PROBE (phase13 ACK-loss diagnostic; remove with the rest of this patch). */
+    long long stat_probe_ae_checked;               /* staged write-phase iterations (ae_ready evaluated) */
+    long long stat_probe_ae_fired;                 /* ... of which ae_ready was true, so aeProcessEvents ran */
+    long long stat_probe_replica_ack_reads;        /* REPLCONF ACKs this instance read+processed from a replica */
     long long stat_repl_lane_read_usec;            /* IO-thread time of those reads: read, parse and plan */
     long long stat_repl_lane_classify_usec;        /* Of which the scan, and the parse of one-chunk reads */
     long long stat_repl_lane_parse_usec;           /* Main's time in PARSE phases */

@@ -3107,6 +3107,9 @@ void resetServerStats(void) {
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
     server.stat_repl_lane_reads = 0;
+    server.stat_probe_ae_checked = 0;         /* PROBE (phase13 diag) */
+    server.stat_probe_ae_fired = 0;
+    server.stat_probe_replica_ack_reads = 0;
     server.stat_repl_lane_read_usec = 0;
     server.stat_repl_lane_classify_usec = 0;
     server.stat_repl_lane_parse_usec = 0;
@@ -7215,6 +7218,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
                 "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
                 "repl_lane_reads:%lld\r\n", server.stat_repl_lane_reads,
+                "probe_ae_checked:%lld\r\n", server.stat_probe_ae_checked,
+                "probe_ae_fired:%lld\r\n", server.stat_probe_ae_fired,
+                "probe_replica_ack_reads:%lld\r\n", server.stat_probe_replica_ack_reads,
                 "repl_lane_read_usec:%lld\r\n", server.stat_repl_lane_read_usec,
                 "repl_lane_classify_usec:%lld\r\n", server.stat_repl_lane_classify_usec,
                 "repl_lane_parse_usec:%lld\r\n", server.stat_repl_lane_parse_usec,
