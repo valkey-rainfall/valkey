@@ -128,6 +128,10 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
 #define FASTGET_VALUE_PREFETCH_DISTANCE FASTGET_BATCH_DEPTH
 #endif
 
+/* Variant 3: also prefetch the line where the value bytes continue past the header's line (see
+ * fastGetBatchPrefetchValue). */
+#define FASTGET_VALUE_PREFETCH_FIRST_LINE 1
+
 /* Per-key state for the batched prefetch + reply pipeline. */
 typedef struct fastGetBatchEntry {
     hashtableIncrementalFindState find_state; /* Incremental find state */
