@@ -119,12 +119,61 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
 /* Maximum batch depth for prefetch overlap. Matches server.prefetch_batch_max_size default. */
 #define FASTGET_BATCH_DEPTH 16
 
+/* How many slots ahead of the one being replied to may have their value line in flight: the value
+ * prefetch window (see fastGetBatchPrefetchValue). A slot's value is prefetched when its find
+ * completes if it is within this many slots of the head, otherwise when it moves into the window as
+ * the head advances. FASTGET_BATCH_DEPTH means the whole ring: every value is prefetched as soon as
+ * its find completes, before any slot of that sweep is replied to. */
+#ifndef FASTGET_VALUE_PREFETCH_DISTANCE
+#define FASTGET_VALUE_PREFETCH_DISTANCE FASTGET_BATCH_DEPTH
+#endif
+
 /* Per-key state for the batched prefetch + reply pipeline. */
 typedef struct fastGetBatchEntry {
     hashtableIncrementalFindState find_state; /* Incremental find state */
     int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
+    robj *obj;                                /* The found value, NULL on a miss (set when the find completes) */
+    char *val;                                /* Its value pointer (the sds of a RAW or EMBSTR string), NULL for INT */
 } fastGetBatchEntry;
+
+/* The find of slot e has completed: record its result. The value pointer (the sds of a RAW or
+ * EMBSTR string) is read now, while the robj line the key compare just loaded is in L1, so that
+ * the reply need not call objectGetVal again and the value can be prefetched. The encoding does
+ * not change in the read phase, so reading the header word here and again in fastGetReplyFromEntry
+ * (which also reads type and lru from it, for the touch) gives the same values; the word is read
+ * through the atomic load as everywhere on this path. */
+static inline void fastGetBatchResolve(fastGetBatchEntry *e) {
+    void *entry = NULL;
+    e->val = NULL;
+    e->obj = hashtableIncrementalFindGetResult(&e->find_state, &entry) ? (robj *)entry : NULL;
+    if (e->obj == NULL) return;
+    robj h;
+    h.hdr[0] = objectHeaderWord0(e->obj);
+    /* Not INT: the value has a pointer. A value of another type (which the reply punts) gets its
+     * pointer read and prefetched too; that is harmless and saves the type test here. */
+    if (h.encoding != OBJ_ENCODING_INT) e->val = objectGetVal(e->obj);
+}
+
+/* Prefetch the line that holds the value's sds header. The lookup prefetches the bucket and the
+ * robj (with its embedded key), never the value: for a RAW string the sds is its own allocation,
+ * so the first read of its header in the reply (sdsType, then sdslen) is a dependent miss that
+ * nothing hides, about 600 cycles on a large keyspace. The reply reads the header at val - 1
+ * (the flags byte) and the length just before it; the allocator aligns the sds to 16 bytes, and the
+ * header of a value fast GET answers (at most FASTGET_MAX_SPECULATIVE_VALUE_LEN bytes) is 3, 5 or
+ * 9 bytes, so val - 1 and the length are in one cache line. A prefetch
+ * has no effect on behavior: it neither faults nor changes memory. An EMBSTR value sits in the
+ * robj allocation, where the prefetch costs one instruction and may fetch the next line. */
+static inline void fastGetBatchPrefetchValue(fastGetBatchEntry *e) {
+    if (e->val == NULL) return;
+    valkey_prefetch(e->val - 1);
+#ifdef FASTGET_VALUE_PREFETCH_FIRST_LINE
+    /* Also the line where the value bytes continue past the header's line, which the reply's memcpy
+     * reads next: with a 16-byte aligned header this is the line of val + 63 whatever the offset of
+     * the header within its line. */
+    valkey_prefetch(e->val + 63);
+#endif
+}
 
 /* IO thread, read phase: this node serves a GET on the slot for client c with no redirect or cluster
  * error. The common states are decided from the slot owner directly: this node owns the slot, or it is a
@@ -227,8 +276,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
         size_t in = e->is_first_cmd ? c->net_input_bytes_curr_cmd : c->cmd_queue.cmds[e->queue_idx].input_bytes;
         if ((long long)in >= request_threshold) return 0;
     }
-    void *entry = NULL;
-    if (!hashtableIncrementalFindGetResult(&e->find_state, &entry)) {
+    if (e->obj == NULL) {
         /* A miss goes to main, which fires the keymiss notification and counts the miss. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         FASTGET_STAT_ADD(miss_punts, 1);
@@ -236,7 +284,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
         return 0;
     }
 
-    robj *o = (robj *)entry;
+    robj *o = e->obj;
     robj h; /* the first header word, read once (see fastGetTouch) */
     h.hdr[0] = objectHeaderWord0(o);
     if (h.type != OBJ_STRING) return 0;
@@ -260,7 +308,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
         vallen = ll2string(intbuf, sizeof(intbuf), (long long)(long)objectGetVal(o));
         val = intbuf;
     } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
-        val = objectGetVal(o);
+        val = e->val; /* objectGetVal(o), read by fastGetBatchResolve; its line was prefetched */
         vallen = sdslen((sds)val);
         if (vallen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -403,7 +451,15 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * tops the window back up from the queue, so prefetch depth stays constant
      * across the eligible prefix. The first ineligible command or punt ends
      * speculation for the whole read. head..tail are monotonic; slot index =
-     * seq % FASTGET_BATCH_DEPTH; done[] marks completed finds. */
+     * seq % FASTGET_BATCH_DEPTH; done[] marks completed finds: 0 in flight,
+     * 1 complete, 2 complete with the value line prefetched.
+     *
+     * The find pipeline hides the bucket and robj misses; the value's sds (a
+     * separate allocation for a RAW string) is the one miss left, and it was
+     * taken in the drain, one slot at a time, serialized by the reply code
+     * that depends on it. The value prefetch stage issues that line for a slot
+     * as soon as its find completes (within the window, see
+     * FASTGET_VALUE_PREFETCH_DISTANCE), so the drain finds it in cache. */
     fastGetBatchEntry batch[FASTGET_BATCH_DEPTH];
     uint8_t done[FASTGET_BATCH_DEPTH];
     cmdQueue *queue = &c->cmd_queue;
@@ -441,10 +497,22 @@ int fastGetSpeculateBatch(client *c, int tid) {
         if (queue_pos >= queue->len) prefix_open = 0; /* queue exhausted -- drain */
         if (head == tail) break;                      /* nothing in flight and nothing to fill */
 
-        /* Sweep: one find step per pending slot (one prefetch each). */
+        /* Sweep: one find step per pending slot (one prefetch each). A find
+         * that completes resolves its entry and, inside the window, prefetches
+         * its value line. */
         for (unsigned s = head; s < tail; s++) {
             unsigned i = s % FASTGET_BATCH_DEPTH;
-            if (!done[i]) done[i] = !hashtableIncrementalFindStep(&batch[i].find_state);
+            if (done[i]) continue;
+            if (hashtableIncrementalFindStep(&batch[i].find_state)) continue;
+            fastGetBatchResolve(&batch[i]);
+            /* With the window as large as the ring every slot is inside it (tail - head is at most
+             * FASTGET_BATCH_DEPTH), so the test folds away. */
+            if (FASTGET_VALUE_PREFETCH_DISTANCE >= FASTGET_BATCH_DEPTH || s - head < FASTGET_VALUE_PREFETCH_DISTANCE) {
+                fastGetBatchPrefetchValue(&batch[i]);
+                done[i] = 2;
+            } else {
+                done[i] = 1;
+            }
         }
 
         /* Drain: reply completed HEADS in command order. */
@@ -466,6 +534,15 @@ int fastGetSpeculateBatch(client *c, int tid) {
                 queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_FASTGET_SPECULATED;
             speculated++;
             head++;
+            if (FASTGET_VALUE_PREFETCH_DISTANCE < FASTGET_BATCH_DEPTH) {
+                /* The slot that just moved into the window: prefetch its value if its find is
+                 * already complete (otherwise the sweep does it when the find completes). */
+                unsigned n = head + FASTGET_VALUE_PREFETCH_DISTANCE - 1;
+                if (n < tail && done[n % FASTGET_BATCH_DEPTH] == 1) {
+                    fastGetBatchPrefetchValue(&batch[n % FASTGET_BATCH_DEPTH]);
+                    done[n % FASTGET_BATCH_DEPTH] = 2;
+                }
+            }
         }
     }
 
