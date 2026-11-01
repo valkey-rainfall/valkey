@@ -125,7 +125,9 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
  * the head advances. FASTGET_BATCH_DEPTH means the whole ring: every value is prefetched as soon as
  * its find completes, before any slot of that sweep is replied to. */
 #ifndef FASTGET_VALUE_PREFETCH_DISTANCE
-#define FASTGET_VALUE_PREFETCH_DISTANCE FASTGET_BATCH_DEPTH
+/* Variant 2: a window of 4 slots. At most 4 value lines are in flight, and a slot that enters the
+ * window as the head advances gets 3 replies of lead time, about the latency of the miss. */
+#define FASTGET_VALUE_PREFETCH_DISTANCE 4
 #endif
 
 /* Per-key state for the batched prefetch + reply pipeline. */
