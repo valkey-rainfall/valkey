@@ -280,6 +280,98 @@ static int fastGetReplyFromEntry(client *c, int tid, fastGetBatchEntry *e) {
     return 1;
 }
 
+/* The command GET, looked up once. */
+static struct serverCommand *fastget_get_cmd = NULL;
+
+/* IO thread, read phase: is this read kept from fast GET? Returns 1 when the GETs at its head must go
+ * to main, 0 when they may be answered here. Every check runs once per read. Main changes the state
+ * the checks read only outside the read phase (CLIENT PAUSE, FAILOVER, the replication state machine,
+ * module and monitor registration, and the client's own flags and buffer all move on main), so the
+ * plain reads are ordered by the phase barrier like every other gate (P6).
+ *
+ * The checks are compiled apart from the lookup loop of fastGetSpeculateBatch on purpose (noinline).
+ * The two client fields the F11 gate reads, c->flag.pending_write and c->bufpos, are on the 64-byte
+ * line of the client (bytes 320-383) that the MULTI check loads a few instructions earlier and that
+ * fastGetWriteBulkReply writes for every reply, so they add no cache line and no coherence transfer.
+ * What a check can still cost is its effect on the code the compiler generates for the loop when both
+ * share one function: adding the F11 gate moved the loop's register allocation and its hot/cold
+ * split (gcc 11, x86: prefix_open spilled to the stack, the split point moved). With the checks in
+ * their own function the loop's code is the same whatever the checks do, now and after the next
+ * gate is added. */
+static __attribute__((noinline)) int fastGetReadGated(client *c) {
+    if (server.io_threads_num <= 1) return 1;
+
+    /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
+    if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 1;
+
+    /* Gates processCommand applies to every command, which a GET answered here skips.
+     * CLIENT PAUSE ALL holds reads too: the client is postponed on main until unpause. */
+    if (server.paused_actions & PAUSE_ACTION_CLIENT_ALL) return 1;
+    /* A replica with a broken primary link and replica-serve-stale-data no answers -MASTERDOWN. */
+    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 1;
+
+    /* Inside MULTI a GET must be queued, not run. A blocked or just-unblocked client's replies must
+     * follow its unblock reply. The reply is written as plain RESP into c->buf, which would corrupt a
+     * buffer in copy-avoidance encoded mode, and would reorder replies if the reply list is not
+     * empty.
+     *
+     * pending_write (F11): main queued a write of this client's buffers (a tracking push to a REDIRECT
+     * target) and owns that write; sending c->buf from here too would send those bytes twice. The bit
+     * is in the flag word the four tests above load, so it costs one more bit in the same mask. */
+    if (c->flag.multi || c->flag.blocked || c->flag.unblocked || c->flag.buf_encoded || c->flag.pending_write ||
+        listLength(c->reply) != 0)
+        return 1;
+
+    /* F11, second half: main's bytes are in c->buf although no write is queued any more (main wrote
+     * part of them and installed a write handler for the rest). Same cache line as the flag word. */
+    if (c->bufpos != 0) return 1;
+
+    /* A tracking client must have its keys remembered, which this path skips, or a later write would
+     * not invalidate its cache. BCAST tracking invalidates by prefix and is unaffected. Main does not
+     * run this client's commands while its read is parsed, so the plain flags are stable here. */
+    if (c->flag.tracking && !c->flag.tracking_bcast) return 1;
+
+    /* A module subscribed to command results (see fastGetOnCommandResultListenersChanged). */
+    if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 1;
+
+    /* A module command filter may rewrite or redirect the GET. Filters change only on main, which
+     * waits at the barrier while IO threads run this. */
+    if (moduleHasCommandFilters()) return 1;
+
+    /* An attached monitor (see fastGetOnMonitorsChanged). */
+    if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 1;
+
+    /* Only a read that starts with a GET is answered here. */
+    if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
+    if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 1;
+
+    /* Answer the read here only when every complete command in it is a GET. A prefix of GETs answered
+     * here while the rest waits for main splits one pipeline's replies into two writes; the client
+     * then refills its pipeline in pieces, the next reads are smaller, and under load the server
+     * settles into serving fragments of a couple of commands per read. */
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        parsedCommand *p = &c->cmd_queue.cmds[i];
+        if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break; /* the trailing partial */
+        if (p->cmd != fastget_get_cmd || p->argc != 2) return 1;
+    }
+
+    /* In cluster mode only a GET this node answers without a redirect: the same check main runs, on
+     * cluster state main changes only outside the read phase. A slot being migrated or imported needs
+     * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. With per-slot stats on,
+     * main runs every GET so the stats count it. */
+    if (server.cluster_enabled && server.cluster_slot_stats_enabled) return 1;
+    if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 1;
+
+    /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
+    if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 1;
+
+    /* With a slow threshold of 0 the commandlog records every command, so every GET goes to main, which
+     * records it. Large requests and replies are checked per GET. */
+    if (fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 1;
+
+    return 0;
+}
+
 /* Called from the IO thread after parsing is complete. Executes a contiguous
  * prefix of GET commands, using batched incremental finds to overlap memory
  * prefetches across keys before replying in command order.
@@ -291,74 +383,7 @@ static int fastGetReplyFromEntry(client *c, int tid, fastGetBatchEntry *e) {
 int fastGetSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
-    if (server.io_threads_num <= 1) return 0;
-
-    /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
-    if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
-
-    /* Gates processCommand applies to every command, which a GET answered here skips. Main changes
-     * them only outside the read phase (CLIENT PAUSE, FAILOVER and the replication state machine run
-     * on main), so the plain reads are ordered by the phase barrier like the other gates below.
-     * CLIENT PAUSE ALL holds reads too: the client is postponed on main until unpause. */
-    if (server.paused_actions & PAUSE_ACTION_CLIENT_ALL) return 0;
-    /* A replica with a broken primary link and replica-serve-stale-data no answers -MASTERDOWN. */
-    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 0;
-
-    /* Inside MULTI a GET must be queued, not run. A blocked or just-unblocked client's replies must
-     * follow its unblock reply. The reply is written as plain RESP into c->buf, which would corrupt a
-     * buffer in copy-avoidance encoded mode, and would reorder replies if the reply list is not
-     * empty. */
-    if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
-        c->flag.buf_encoded || listLength(c->reply) != 0)
-        return 0;
-
-    /* Main wrote into this client's buffer (a tracking push to a REDIRECT target) and owns
-     * that write: sending c->buf from here too would send those bytes twice. */
-    if (c->bufpos != 0 || c->flag.pending_write) return 0;
-
-    /* A tracking client must have its keys remembered, which this path skips, or a later write would
-     * not invalidate its cache. BCAST tracking invalidates by prefix and is unaffected. Main does not
-     * run this client's commands while its read is parsed, so the plain flags are stable here. */
-    if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
-
-    /* A module subscribed to command results (see fastGetOnCommandResultListenersChanged). */
-    if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 0;
-
-    /* A module command filter may rewrite or redirect the GET. Filters change only on main, which
-     * waits at the barrier while IO threads run this. */
-    if (moduleHasCommandFilters()) return 0;
-
-    /* An attached monitor (see fastGetOnMonitorsChanged). */
-    if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 0;
-
-    /* Only a read that starts with a GET is answered here. */
-    static struct serverCommand *fastget_get_cmd = NULL;
-    if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
-    if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 0;
-
-    /* Answer the read here only when every complete command in it is a GET. A prefix of GETs answered
-     * here while the rest waits for main splits one pipeline's replies into two writes; the client
-     * then refills its pipeline in pieces, the next reads are smaller, and under load the server
-     * settles into serving fragments of a couple of commands per read. */
-    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-        parsedCommand *p = &c->cmd_queue.cmds[i];
-        if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break; /* the trailing partial */
-        if (p->cmd != fastget_get_cmd || p->argc != 2) return 0;
-    }
-
-    /* In cluster mode only a GET this node answers without a redirect: the same check main runs, on
-     * cluster state main changes only outside the read phase. A slot being migrated or imported needs
-     * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. With per-slot stats on,
-     * main runs every GET so the stats count it. */
-    if (server.cluster_enabled && server.cluster_slot_stats_enabled) return 0;
-    if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 0;
-
-    /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
-    if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
-
-    /* With a slow threshold of 0 the commandlog records every command, so every GET goes to main, which
-     * records it. Large requests and replies are checked per GET. */
-    if (fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
+    if (fastGetReadGated(c)) return 0;
 
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
      * so their duration must be accumulated per-thread and folded into the

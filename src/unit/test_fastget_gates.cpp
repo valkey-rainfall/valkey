@@ -162,6 +162,39 @@ TEST_F(FastGetGatesTest, StaleReplicaWithServeStaleDataNoPuntsGet) {
     freeFakeClient(c);
 }
 
+/* F11, first half: main queued a write of this client's buffers (pending_write) and owns it. The
+ * buffer is empty here (main's bytes may sit in the reply list, or its write already drained them
+ * but the queue entry remains until beforeSleep). A GET answered on the IO thread would send c->buf
+ * from both threads. The bit is tested with the MULTI / blocked / buf_encoded flags in one mask;
+ * this test fails when the bit is dropped from that mask. */
+TEST_F(FastGetGatesTest, PendingWriteWithEmptyBufferPuntsGet) {
+    client *c = makeGetClient();
+    c->flag.pending_write = 1;
+    EXPECT_EQ(fastGetSpeculateBatch(c, 1), 0);
+    EXPECT_EQ(c->bufpos, 0) << "the IO thread wrote a reply into a buffer main is about to send";
+    c->flag.pending_write = 0;
+    EXPECT_EQ(fastGetSpeculateBatch(c, 1), 1) << "with the write queue entry gone the GET is answered here again";
+    freeFakeClient(c);
+}
+
+/* F11, second half: main's bytes are in c->buf but no write is queued (main wrote part of them and
+ * installed a write handler for the rest, which clears pending_write). The GET must still go to
+ * main, which appends its reply after those bytes. This test fails when the bufpos check is
+ * dropped: the IO thread would append the reply to main's bytes and send both. */
+TEST_F(FastGetGatesTest, MainBytesInBufferWithoutPendingWritePuntsGet) {
+    client *c = makeGetClient();
+    const char push[] = ">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n";
+    memcpy(c->buf, push, sizeof(push) - 1);
+    c->bufpos = sizeof(push) - 1;
+    c->flag.pending_write = 0;
+    EXPECT_EQ(fastGetSpeculateBatch(c, 1), 0);
+    EXPECT_EQ(c->bufpos, (size_t)(sizeof(push) - 1)) << "the IO thread appended a reply behind main's bytes";
+    EXPECT_EQ(memcmp(c->buf, push, sizeof(push) - 1), 0) << "main's bytes were changed";
+    c->bufpos = 0;
+    EXPECT_EQ(fastGetSpeculateBatch(c, 1), 1) << "with the buffer drained the GET is answered here again";
+    freeFakeClient(c);
+}
+
 /* Run "ACL <args...>" on a fake admin client. */
 static void runAcl(const char **args, int argc) {
     client *a = createClient(NULL);
