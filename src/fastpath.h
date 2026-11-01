@@ -107,7 +107,6 @@ int fastpathStagedOn(void);
 void fastpathStagedSet(int on);
 void fastpathStagedSetDepth(int depth);
 void fastpathStagedReadPhase(int tid);
-void fastpathStagedReadClosed(void);
 int fastpathStagedExecute(void);
 int fastpathStagedExecuteStreaming(void);
 int fastpathStagedRepliesPending(void);

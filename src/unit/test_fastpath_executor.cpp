@@ -395,14 +395,15 @@ TEST_F(FastpathExecutorTest, FastGetTouchesLruAndLfu) {
     lrulfu_updateClockAndPolicy(mstime(), false);
 }
 
-/* The LRU/LFU touch of a value answered by fast GET is recorded by the IO thread and applied by main
- * once the read phase has closed (fastGetApplyTouches, called from fastpathStagedExecute and by the
- * staged loop when the READ barrier closes): the IO thread never writes the object's first word,
- * which it shares with type, encoding, the flags and the refcount that other fast GETs read at the
- * same time. So right after the read phase the value is still idle; after main's write phase entry
- * it is touched, and with lfu-log-factor 0 every one of the 8 GETs counts (5 + 8 = 13), as 8
- * lookupKey calls on main would count. A touch applied on the IO thread fails the first check. */
-TEST_F(FastpathExecutorTest, FastGetTouchIsAppliedByMainAfterTheReadPhase) {
+/* The LRU/LFU touch of a value answered by fast GET lands on the IO thread, in the read phase, as an
+ * atomic store of the value's first header word with only the lru bits changed (fastGetTouch). So
+ * right after the read phase, before main runs anything, the value is no longer idle; with
+ * lfu-log-factor 0 every one of 8 GETs counts (5 + 8 = 13), as 8 lookupKey calls on main would count,
+ * and the counter is already 13 when the read phase closes; a child process in progress at the time
+ * of the read skips the touch, as lookupKey does. The store must leave type, encoding, the
+ * embedded-data flags and the refcount as they were. A design that defers the touch to main fails
+ * the first check (the value is still idle when the read phase closes). */
+TEST_F(FastpathExecutorTest, FastGetTouchLandsOnTheIoThreadInTheReadPhase) {
     server.child_pid = -1;
     server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
     lrulfu_updateClockAndPolicy(mstime(), false);
@@ -412,6 +413,7 @@ TEST_F(FastpathExecutorTest, FastGetTouchIsAppliedByMainAfterTheReadPhase) {
     robj *stored = lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NOTOUCH | LOOKUP_NOSTATS | LOOKUP_NONOTIFY);
     ASSERT_NE(stored, nullptr);
     stored->lru = lru_import(100);
+    const robj before = *stored; /* header words as they are before any touch */
     uint32_t idle = 0;
     lrulfu_getIdleness(stored->lru, &idle);
     ASSERT_GE(idle, 99u);
@@ -427,14 +429,30 @@ TEST_F(FastpathExecutorTest, FastGetTouchIsAppliedByMainAfterTheReadPhase) {
     char buf[128];
     ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 7) << "the GET was not answered by fast GET (engagement check)";
     lrulfu_getIdleness(stored->lru, &idle);
-    EXPECT_GE(idle, 99u) << "the IO thread wrote the object's lru during the read phase";
-    fastpathStagedExecute(); /* main: the deferred touch lands here */
+    EXPECT_EQ(idle, 0u) << "the touch must land on the IO thread, before main runs anything";
+    EXPECT_EQ(stored->type, before.type) << "the touch changed the type bits";
+    EXPECT_EQ(stored->encoding, before.encoding) << "the touch changed the encoding bits";
+    EXPECT_EQ(stored->hdr[1], before.hdr[1]) << "the touch changed the flags or the refcount word";
+    EXPECT_EQ(stored->val_ptr, before.val_ptr);
+    fastpathStagedExecute();
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
     lrulfu_getIdleness(stored->lru, &idle);
-    EXPECT_EQ(idle, 0u) << "main did not apply the deferred touch";
+    EXPECT_EQ(idle, 0u);
+
+    /* A value already at the clock: the GET is answered and the value stays at the clock (the store
+     * is skipped because it would write what is there; the result is the same). */
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 7);
+    lrulfu_getIdleness(stored->lru, &idle);
+    EXPECT_EQ(idle, 0u);
+    fastpathStagedExecute();
     fastpathStagedReplyPhase(1);
     fastpathStagedFinish();
 
-    /* LFU: every one of 8 GETs counts once. */
+    /* LFU: every one of 8 GETs counts once, and the count is there when the read phase closes. */
     server.maxmemory_policy = MAXMEMORY_ALLKEYS_LFU;
     lfu_config_log_factor = 0;
     lrulfu_updateClockAndPolicy(mstime(), true);
@@ -448,26 +466,29 @@ TEST_F(FastpathExecutorTest, FastGetTouchIsAppliedByMainAfterTheReadPhase) {
     fastpathStagedReadPhase(1);
     ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 8 * 7) << "the GET batch was not answered by fast GET (engagement check)";
     lfu_getFrequency(stored->lru, &freq);
-    EXPECT_EQ(freq, 5) << "the IO thread changed the LFU counter during the read phase";
+    EXPECT_EQ(freq, 13) << "8 fast GETs must count as 8 touches by the time the read phase closes";
+    EXPECT_EQ(stored->type, before.type);
+    EXPECT_EQ(stored->encoding, before.encoding);
+    EXPECT_EQ(stored->hdr[1], before.hdr[1]) << "the touch changed the flags or the refcount word";
     fastpathStagedExecute();
     fastpathStagedReplyPhase(1);
     fastpathStagedFinish();
     lfu_getFrequency(stored->lru, &freq);
-    EXPECT_EQ(freq, 13) << "8 fast GETs must count as 8 touches";
+    EXPECT_EQ(freq, 13);
 
-    /* A child process in progress skips the touch, as lookupKey does, and drops the records. */
+    /* A child process in progress skips the touch, as lookupKey does. */
     stored->lru = lfu_import(5);
+    server.child_pid = 1; /* hasActiveChildProcess() */
     ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
     pollerGetNextBatch(stagedPoller(), 0);
     fastpathStagedReadPhase(1);
     ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 7);
-    server.child_pid = 1; /* hasActiveChildProcess() */
-    fastpathStagedExecute();
     server.child_pid = -1;
+    fastpathStagedExecute();
     fastpathStagedReplyPhase(1);
     fastpathStagedFinish();
     lfu_getFrequency(stored->lru, &freq);
-    EXPECT_EQ(freq, 5) << "a touch recorded while a child runs must not be applied";
+    EXPECT_EQ(freq, 5) << "a GET answered while a child runs must not touch the value";
 
     fpTestReleaseClient(c, conn, peer);
     dbDelete(server.db[0], key);

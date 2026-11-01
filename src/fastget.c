@@ -168,57 +168,59 @@ static long long fastGetCommandlogThreshold(int type) {
 }
 
 /* A value read by fast GET counts as an access for LRU and LFU, as lookupKey does on main (EV-02 /
- * STR-05). The touch is not applied on the IO thread. lru is a bitfield in the first word of robj,
- * which also holds type, encoding, the expire and embedded-key flags and the refcount; the compiler
- * updates it with a read-modify-write of the containing word (8 bytes in this tree with gcc 11). In
- * the read phase the only other writers of that word would be other fast GETs of the same value (IO
- * threads and main's read share): main executes nothing, lanes and bio frees only touch unlinked or
- * write-phase objects, and module threads wait for the GIL, which main holds from afterSleep until
- * beforeSleep. So a store from an IO thread could lose only another touch. But every fast GET and
- * every hashtable lookup that passes the object reads the word's other bits with plain loads, so a
- * store from an IO thread is a C11 data race with those reads whatever its width, and TSan reports
- * it (fastGetTouch write of 8 bytes against objectEmbeddedData's read of the flag byte). Instead each
- * thread records the values it answered, and main applies the touches with lrulfu_touch, the call
- * lookupKey makes, as soon as the read phase has closed (fastGetApplyTouches): IO threads never write
- * a keyspace object, and main writes it while no IO thread reads the keyspace. The pointers are valid
- * because nothing changes the keyspace between the read barrier and the apply. Every touch counts, as
- * on main; a touch lands a few microseconds later than the read, within the same loop iteration. */
-typedef struct fastGetTouchVec {
-    robj **o;
-    int n, cap;
-} fastGetTouchVec;
-static fastGetTouchVec fastget_touch[FASTGET_MAX_IO_THREADS]; /* slot tid: written by that thread in the read phase */
-
-static void fastGetTouch(int tid, robj *o) {
-    fastGetTouchVec *v = &fastget_touch[tid];
-    if (v->n == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 1024;
-        v->o = zrealloc(v->o, sizeof(robj *) * v->cap);
-    }
-    v->o[v->n++] = o;
+ * STR-05). The touch is applied here, on the IO thread, into the first header word of the value.
+ *
+ * Who else accesses that word in the read phase: other fast GETs of the same value (IO threads and
+ * main's read share), which read type, encoding and lru and may store lru. Nothing else: main runs
+ * no command in the read phase, lanes and the stream run in the write phase, bio frees only unlinked
+ * values, IO threads free only sole-reference argv objects, and module threads wait for the GIL,
+ * which main holds from afterSleep to beforeSleep. The second header word (the embedded-data flags
+ * and the refcount) is a separate memory location (the zero-width bit-field in struct serverObject),
+ * which nobody stores in the read phase, so its plain reads race with nothing.
+ *
+ * So the store is a C11 data race only with the reads of the first word, and every one of those goes
+ * through an atomic load: objectGetType, objectGetEncoding and objectGetLRU read the word with
+ * objectHeaderWord0, and fastGetReplyFromEntry loads it once for type, encoding and this touch. The
+ * store is a relaxed atomic store of the whole word with only the lru bits changed. Two threads
+ * touching the same value at once both store the same type and encoding bits (nothing changes them
+ * in the read phase); for LRU both store the same clock, for LFU one random increment of the
+ * approximate counter can be lost, which eviction tolerates. Outside the read phase main and the
+ * lanes read and write the word with plain accesses, ordered before and after these atomics by the
+ * phase barrier (principles P6).
+ *
+ * The store is skipped when the touch would not change the word: in LRU mode a value read earlier in
+ * the same clock second already holds the clock (at 10M GET/s over 3M keys that is about 71 percent of
+ * the touches), in LFU mode an increment that the random draw did not grant. OBJECT IDLETIME, OBJECT
+ * FREQ and eviction order see the same values either way; what the skip saves is a dirtied cache line
+ * per skipped touch. The touch is skipped while a child process runs (no copy-on-write storms), as
+ * lookupKey does; server.child_pid changes only on main, outside the read phase. LFU needs a random
+ * number and rand() is not thread safe, so each thread keeps its own xorshift generator. */
+static __attribute__((noinline)) uint32_t fastGetLfuTouch(uint32_t lfu) {
+    static __thread uint64_t rng;
+    if (rng == 0) rng = ((uint64_t)(uintptr_t)&rng) ^ (uint64_t)ustime() ^ 0x9E3779B97F4A7C15ULL;
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    double r = (double)(rng >> 11) / (double)(1ULL << 53);
+    return lrulfu_touchWithRandom(lfu, r);
 }
 
-/* Main, right after the read phase closed: apply the touches the threads recorded. Skipped while a
- * child process runs (no copy-on-write storms), as lookupKey does. */
-void fastGetApplyTouches(void) {
-    int touch = !hasActiveChildProcess();
-    for (int tid = 0; tid < FASTGET_MAX_IO_THREADS; tid++) {
-        fastGetTouchVec *v = &fastget_touch[tid];
-        if (touch)
-            for (int i = 0; i < v->n; i++) v->o[i]->lru = lrulfu_touch(v->o[i]->lru);
-        v->n = 0;
-    }
-}
-
-/* Main, when staged mode turns off: drop recorded touches instead of applying them. */
-void fastGetDiscardTouches(void) {
-    for (int tid = 0; tid < FASTGET_MAX_IO_THREADS; tid++) fastget_touch[tid].n = 0;
+static inline void fastGetTouch(robj *o, uint32_t hdr0) {
+    if (hasActiveChildProcess()) return;
+    robj h;
+    h.hdr[0] = hdr0; /* the word fastGetReplyFromEntry loaded for type and encoding */
+    /* LRU: the clock of this iteration; main moves it outside the read phase. The LFU path is kept out
+     * of the lookup loop's code (noinline): the random draw and the decay are floating point. */
+    uint32_t touched = lrulfu_isUsingLFU() ? fastGetLfuTouch(h.lru) : lru_import(0);
+    if (touched == h.lru) return;
+    h.lru = touched;
+    __atomic_store_n(&o->hdr[0], h.hdr[0], __ATOMIC_RELAXED);
 }
 
 /* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
  * written), 0 on punt. The keyspace is quiescent while IO threads read: main
  * mutates it only outside the read phase. */
-static int fastGetReplyFromEntry(client *c, int tid, fastGetBatchEntry *e) {
+static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
     /* A GET the large-request commandlog would record goes to main, which records it. */
     long long request_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
     if (request_threshold >= 0) {
@@ -235,7 +237,9 @@ static int fastGetReplyFromEntry(client *c, int tid, fastGetBatchEntry *e) {
     }
 
     robj *o = (robj *)entry;
-    if (objectGetType(o) != OBJ_STRING) return 0;
+    robj h; /* the first header word, read once (see fastGetTouch) */
+    h.hdr[0] = objectHeaderWord0(o);
+    if (h.type != OBJ_STRING) return 0;
 
     /* Expired keys punt: only main may lazily delete them. */
     if (o->hasexpire) {
@@ -251,7 +255,7 @@ static int fastGetReplyFromEntry(client *c, int tid, fastGetBatchEntry *e) {
     char intbuf[LONG_STR_SIZE];
     const char *val;
     size_t vallen;
-    int encoding = objectGetEncoding(o);
+    int encoding = h.encoding;
     if (encoding == OBJ_ENCODING_INT) {
         vallen = ll2string(intbuf, sizeof(intbuf), (long long)(long)objectGetVal(o));
         val = intbuf;
@@ -273,7 +277,7 @@ static int fastGetReplyFromEntry(client *c, int tid, fastGetBatchEntry *e) {
     if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
     if (fastGetWriteBulkReply(c, val, vallen) <= 0) return 0;
-    fastGetTouch(tid, o); /* applied by main after the read phase */
+    fastGetTouch(o, h.hdr[0]);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     FASTGET_STAT_ADD(speculative_hits, 1);
 #endif
@@ -449,7 +453,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             FASTGET_STAT_ADD(speculative_attempts, 1);
 #endif
-            if (!fastGetReplyFromEntry(c, tid, e)) {
+            if (!fastGetReplyFromEntry(c, e)) {
                 /* Contiguous-prefix rule: in-flight slots behind a punt are
                  * abandoned and their commands fall through to main. */
                 prefix_open = 0;

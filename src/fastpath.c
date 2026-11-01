@@ -1754,7 +1754,6 @@ void fastpathStagedSet(int on) {
     } else {
         serverAssert(listLength(&fp_staged_clients) == 0 && fastpath_clients == 0);
         fp_staged_admit = 0;
-        fastGetDiscardTouches(); /* a read phase with no write phase after it (tests): drop, never apply late */
         atomic_store_explicit(&fp_staged, 0, memory_order_relaxed);
     }
 }
@@ -2603,16 +2602,8 @@ static int fpExecuteWithLanes(void) {
     return total;
 }
 
-/* Main, right after the read barrier: the keyspace writes the read phase deferred (fast GET's LRU/LFU
- * touches) land now, before any command, lane or replica stream runs. The staged loop calls this when
- * the READ phase closes; the executors call it too for callers that drive the phases inline. */
-void fastpathStagedReadClosed(void) {
-    fastGetApplyTouches();
-}
-
 /* Main, write phase: execute every batch the read phase published, filling each entry's reply. */
 int fastpathStagedExecute(void) {
-    fastpathStagedReadClosed();
     int d = fpDepth();
     if (d == 0 && fp_lanes_iter) return fpExecuteWithLanes();
     int total = 0;
@@ -2761,7 +2752,6 @@ static void fpStreamArenaGuard(cmdBatch *b) {
 /* Main, write phase (exec/loop overlap): execute runs round-robin across threads, publishing each
  * batch's executed count as runs finish, so STREAM workers can deliver them while main runs on. */
 int fastpathStagedExecuteStreaming(void) {
-    fastpathStagedReadClosed();
     int d = fpDepth();
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
