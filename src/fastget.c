@@ -390,6 +390,14 @@ static struct serverCommand *fastget_get_cmd = NULL;
  * their own function the loop's code is the same whatever the checks do, now and after the next
  * gate is added. */
 static __attribute__((noinline)) int fastGetReadGated(client *c) {
+    /* Only a read that starts with a GET is answered here. This is the first test so that a read of
+     * any other command (every read of a SET pipeline) leaves after two loads of client fields the
+     * parser just wrote, instead of after the server-state and client-flag checks below, which only
+     * matter for a GET. The checks are all plain reads with no side effect, so their order does not
+     * change the result. */
+    if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
+    if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 1;
+
     if (server.io_threads_num <= 1) return 1;
 
     /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
@@ -431,10 +439,6 @@ static __attribute__((noinline)) int fastGetReadGated(client *c) {
 
     /* An attached monitor (see fastGetOnMonitorsChanged). */
     if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 1;
-
-    /* Only a read that starts with a GET is answered here. */
-    if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
-    if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 1;
 
     /* Answer the read here only when every complete command in it is a GET. A prefix of GETs answered
      * here while the rest waits for main splits one pipeline's replies into two writes; the client
