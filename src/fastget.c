@@ -128,55 +128,88 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
 #define FASTGET_VALUE_PREFETCH_DISTANCE FASTGET_BATCH_DEPTH
 #endif
 
-/* Variant 3: also prefetch the line where the value bytes continue past the header's line (see
- * fastGetBatchPrefetchValue). */
-#define FASTGET_VALUE_PREFETCH_FIRST_LINE 1
-
 /* Per-key state for the batched prefetch + reply pipeline. */
 typedef struct fastGetBatchEntry {
     hashtableIncrementalFindState find_state; /* Incremental find state */
     int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
     robj *obj;                                /* The found value, NULL on a miss (set when the find completes) */
-    char *val;                                /* Its value pointer (the sds of a RAW or EMBSTR string), NULL for INT */
+    char *val;                                /* Its sds when that is a separate allocation (a RAW string), else NULL */
 } fastGetBatchEntry;
 
-/* The find of slot e has completed: record its result. The value pointer (the sds of a RAW or
- * EMBSTR string) is read now, while the robj line the key compare just loaded is in L1, so that
- * the reply need not call objectGetVal again and the value can be prefetched. The encoding does
- * not change in the read phase, so reading the header word here and again in fastGetReplyFromEntry
- * (which also reads type and lru from it, for the touch) gives the same values; the word is read
- * through the atomic load as everywhere on this path. */
-static inline void fastGetBatchResolve(fastGetBatchEntry *e) {
+/* The value's sds pointer when the value lives outside the object's allocation, NULL when it lives
+ * inside it or has no pointer. This is the prefetch decision of the value stage (variant 4).
+ *
+ * Where a string value is stored, from object.c:
+ * - EMBSTR: createEmbeddedStringObjectWithKeyAndExpire places the value sds right after the embedded
+ *   key (NUL, then the 3-byte SDS_TYPE_8 header, then the bytes), in the object's own allocation of at
+ *   most 128 bytes (shouldEmbedStringObject), and sets hasembval. The header's 3 bytes follow the key's
+ *   NUL, so the flags byte the reply reads first is 4 bytes after the last key byte the find's compare
+ *   just read: its line is in L1 already except when a 64-byte boundary falls in those 4 bytes. A
+ *   prefetch of it costs an instruction and a prefetch slot for nothing, and a prefetch of the next
+ *   line pulls another object's line for a value of 16 bytes.
+ * - RAW: createUnembeddedObjectWithKeyAndExpire and objectUnembedVal clear hasembval and point
+ *   val_ptr at an sds that sdsnewlen allocated on its own (jemalloc keeps size classes in separate
+ *   runs, so it is never in the object's line). Nothing in the find touched it: its header is the
+ *   dependent miss the stage hides.
+ * - INT: val_ptr holds the integer; nothing to prefetch.
+ * The encoding is set together with hasembval everywhere (objectGetVal asserts EMBSTR when hasembval
+ * is set; the two unembedded constructors set RAW), so RAW alone tells that val_ptr is the sds, and
+ * the test costs one mask of the header word already in a register: type OBJ_STRING (0) and encoding
+ * OBJ_ENCODING_RAW (0) are the low byte. A module value is RAW too but not OBJ_STRING, so it is left
+ * alone (the reply punts it). It is the rule main's own batch prefetch applies to the same objects
+ * (hashtableObjectPrefetchValue: no prefetch for EMBSTR and INT). The unit test
+ * FastGetValuePrefetchTest checks it against objects built on both sides of the embedding limit. */
+static inline char *fastGetValueOutsideObject(const robj *o, uint32_t hdr0) {
+    robj h;
+    h.hdr[0] = hdr0;
+    if (h.type != OBJ_STRING || h.encoding != OBJ_ENCODING_RAW) return NULL;
+    return o->val_ptr; /* RAW: hasembval is clear, so this is what objectGetVal returns */
+}
+
+/* The find of slot e has completed: record its result and the value pointer (the sds of a RAW or
+ * EMBSTR string, NULL for INT), read now while the robj line the key compare just loaded is in L1,
+ * so that the reply need not call objectGetVal again. Returns 1 when the value is stored outside
+ * the object (fastGetValueOutsideObject), that is when its lines are worth a prefetch; its pointer
+ * is then val_ptr itself and objectGetVal is not called. The encoding does not change in the read
+ * phase, so reading the header word here and again in fastGetReplyFromEntry (which also reads type
+ * and lru from it, for the touch) gives the same values; the word is read through the atomic load
+ * as everywhere on this path. */
+static inline int fastGetBatchResolve(fastGetBatchEntry *e) {
     void *entry = NULL;
     e->val = NULL;
     e->obj = hashtableIncrementalFindGetResult(&e->find_state, &entry) ? (robj *)entry : NULL;
-    if (e->obj == NULL) return;
+    if (e->obj == NULL) return 0;
     robj h;
     h.hdr[0] = objectHeaderWord0(e->obj);
-    /* Not INT: the value has a pointer. A value of another type (which the reply punts) gets its
-     * pointer read and prefetched too; that is harmless and saves the type test here. */
+    e->val = fastGetValueOutsideObject(e->obj, h.hdr[0]);
+    if (e->val != NULL) return 1;
+    /* Inside the object (EMBSTR) or a value of another type, which the reply punts: its pointer is
+     * read for the reply, nothing is prefetched. INT has no pointer. */
     if (h.encoding != OBJ_ENCODING_INT) e->val = objectGetVal(e->obj);
+    return 0;
 }
 
-/* Prefetch the line that holds the value's sds header. The lookup prefetches the bucket and the
- * robj (with its embedded key), never the value: for a RAW string the sds is its own allocation,
- * so the first read of its header in the reply (sdsType, then sdslen) is a dependent miss that
- * nothing hides, about 600 cycles on a large keyspace. The reply reads the header at val - 1
- * (the flags byte) and the length just before it; the allocator aligns the sds to 16 bytes, and the
- * header of a value fast GET answers (at most FASTGET_MAX_SPECULATIVE_VALUE_LEN bytes) is 3, 5 or
- * 9 bytes, so val - 1 and the length are in one cache line. A prefetch
- * has no effect on behavior: it neither faults nor changes memory. An EMBSTR value sits in the
- * robj allocation, where the prefetch costs one instruction and may fetch the next line. */
+/* Prefetch the two lines the reply reads first of a value stored outside the object: the line that
+ * holds the sds header and the line where the bytes continue. The lookup prefetches the bucket and
+ * the robj (with its embedded key), never the value: for a RAW string the sds is its own
+ * allocation, so the first read of its header in the reply (sdsType, then sdslen) is a dependent
+ * miss that nothing hides, about 600 cycles on a large keyspace. The reply reads the header at
+ * val - 1 (the flags byte) and the length just before it; the allocator aligns the sds to 16 bytes,
+ * and the header of a value fast GET answers (at most FASTGET_MAX_SPECULATIVE_VALUE_LEN bytes) is
+ * 3, 5 or 9 bytes, so val - 1 and the length are in one cache line. The second line is where the
+ * value bytes continue past the header's line, which the reply's memcpy reads next: with a 16-byte
+ * aligned header this is the line of val + 63 whatever the offset of the header within its line.
+ * A prefetch has no effect on behavior: it neither faults nor changes memory. Called only for a
+ * slot whose resolve returned 1. */
 static inline void fastGetBatchPrefetchValue(fastGetBatchEntry *e) {
-    if (e->val == NULL) return;
     valkey_prefetch(e->val - 1);
-#ifdef FASTGET_VALUE_PREFETCH_FIRST_LINE
-    /* Also the line where the value bytes continue past the header's line, which the reply's memcpy
-     * reads next: with a 16-byte aligned header this is the line of val + 63 whatever the offset of
-     * the header within its line. */
     valkey_prefetch(e->val + 63);
-#endif
+}
+
+/* Test seam: the pointer the value stage would prefetch for o, NULL when it issues no prefetch. */
+char *fastGetValueToPrefetch(const robj *o) {
+    return fastGetValueOutsideObject(o, objectHeaderWord0(o));
 }
 
 /* IO thread, read phase: this node serves a GET on the slot for client c with no redirect or cluster
@@ -312,7 +345,9 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
         vallen = ll2string(intbuf, sizeof(intbuf), (long long)(long)objectGetVal(o));
         val = intbuf;
     } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
-        val = e->val; /* objectGetVal(o), read by fastGetBatchResolve; its line was prefetched */
+        /* The sds pointer fastGetBatchResolve read: for RAW its first two lines were prefetched, for
+         * EMBSTR it is inside the object, in the lines the key compare loaded. */
+        val = e->val;
         vallen = sdslen((sds)val);
         if (vallen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -456,14 +491,17 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * across the eligible prefix. The first ineligible command or punt ends
      * speculation for the whole read. head..tail are monotonic; slot index =
      * seq % FASTGET_BATCH_DEPTH; done[] marks completed finds: 0 in flight,
-     * 1 complete, 2 complete with the value line prefetched.
+     * 1 complete with a value prefetch still to issue, 2 complete with
+     * nothing left to prefetch.
      *
      * The find pipeline hides the bucket and robj misses; the value's sds (a
      * separate allocation for a RAW string) is the one miss left, and it was
      * taken in the drain, one slot at a time, serialized by the reply code
      * that depends on it. The value prefetch stage issues that line for a slot
      * as soon as its find completes (within the window, see
-     * FASTGET_VALUE_PREFETCH_DISTANCE), so the drain finds it in cache. */
+     * FASTGET_VALUE_PREFETCH_DISTANCE), so the drain finds it in cache. It
+     * issues nothing for a value stored inside the object (EMBSTR, INT): the
+     * key compare already loaded that line (fastGetValueOutsideObject). */
     fastGetBatchEntry batch[FASTGET_BATCH_DEPTH];
     uint8_t done[FASTGET_BATCH_DEPTH];
     cmdQueue *queue = &c->cmd_queue;
@@ -502,13 +540,17 @@ int fastGetSpeculateBatch(client *c, int tid) {
         if (head == tail) break;                      /* nothing in flight and nothing to fill */
 
         /* Sweep: one find step per pending slot (one prefetch each). A find
-         * that completes resolves its entry and, inside the window, prefetches
-         * its value line. */
+         * that completes resolves its entry and, when its value is stored
+         * outside the object and the slot is inside the window, prefetches
+         * the value's lines. */
         for (unsigned s = head; s < tail; s++) {
             unsigned i = s % FASTGET_BATCH_DEPTH;
             if (done[i]) continue;
             if (hashtableIncrementalFindStep(&batch[i].find_state)) continue;
-            fastGetBatchResolve(&batch[i]);
+            if (!fastGetBatchResolve(&batch[i])) {
+                done[i] = 2; /* nothing to prefetch for this slot (a miss, INT, EMBSTR, another type) */
+                continue;
+            }
             /* With the window as large as the ring every slot is inside it (tail - head is at most
              * FASTGET_BATCH_DEPTH), so the test folds away. */
             if (FASTGET_VALUE_PREFETCH_DISTANCE >= FASTGET_BATCH_DEPTH || s - head < FASTGET_VALUE_PREFETCH_DISTANCE) {

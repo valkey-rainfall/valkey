@@ -90,6 +90,11 @@ void fastGetConsumeSpeculated(struct client *c, int count, int tid);
  * Called once per event-loop iteration from beforeSleep. O(num_io_threads). */
 void fastGetAggregateStats(void);
 
+/* Test seam: the value pointer the batch's value stage prefetches for the
+ * keyspace object o (a RAW string, its sds outside the object), or NULL when
+ * the stage issues no prefetch for it (EMBSTR and INT values, other types). */
+char *fastGetValueToPrefetch(const robj *o);
+
 /* Maximum embedded value size for speculative copy. Larger values punt.
  * The value-size sweep showed a smooth gradient with no cliff up to 1KB. */
 #define FASTGET_MAX_SPECULATIVE_VALUE_LEN 1024
