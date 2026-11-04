@@ -89,13 +89,6 @@ static _Atomic int mt_cursor = 0;
 static _Atomic int mt_first_cut = INT_MAX;
 static long mt_resume_key = 0;
 static mstime_t mt_now = 0;
-/* Monotonic time by which this phase's timed jobs end; 0 when only untimed jobs run. */
-static _Atomic uint64_t mt_phase_deadline = 0;
-
-uint64_t maintPhaseDeadline(void) {
-    return atomic_load_explicit(&mt_phase_deadline, memory_order_relaxed);
-}
-
 /* EXPIRE cost model: main's serial replay time per expired key, a moving average over phases that
  * expired keys. The shared budget bound charges it per key so lanes plus replay fit the cycle's budget. */
 static double mt_expire_replay_us = 0.5;
@@ -515,10 +508,6 @@ void maintRun(void) {
     }
 
     monotime phase_t0 = getMonotonicUs();
-    uint64_t longest = 0;
-    for (int j = 0; j < MAINT_JOB_COUNT; j++)
-        if (mt_requested[j] && mt_budget_us[j] > longest) longest = mt_budget_us[j];
-    atomic_store_explicit(&mt_phase_deadline, longest ? phase_t0 + longest : 0, memory_order_relaxed);
     dbLanePhaseBegin();
     if (parallel) {
         stagedRunLanePhase(STAGED_PHASE_MAINT, 1);
