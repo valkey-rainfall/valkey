@@ -9,6 +9,7 @@
 #include "server.h"
 #include "maint.h"
 #include "staged_loop.h"
+#include "fastpath.h"
 #include "cronstats.h"
 #include "kvstore.h"
 #include "io_threads.h"
@@ -87,7 +88,6 @@ static _Atomic int mt_cursor = 0;
  * so units cut off by a budget come first. Kept as a unit key (dbid * tables + didx) across phases. */
 static _Atomic int mt_first_cut = INT_MAX;
 static long mt_resume_key = 0;
-static int mt_nlanes = 0;
 static mstime_t mt_now = 0;
 /* Monotonic time by which this phase's timed jobs end; 0 when only untimed jobs run. */
 static _Atomic uint64_t mt_phase_deadline = 0;
@@ -326,7 +326,7 @@ int maintKeyspaceSplit(void) {
 }
 
 int maintParallelReady(void) {
-    return server.cron_lanes && maintKeyspaceSplit() && stagedApplyReady() && stagedWorkerCount() > 0;
+    return fastpathParallelVeto(FP_PAR_MAINT) == FP_VETO_NONE;
 }
 
 /* Main, after the phase: the effects of every delete the lanes made, thread by thread in log order. A
@@ -494,7 +494,6 @@ void maintRun(void) {
     mt_now = server.mstime;
 
     int parallel = maintParallelReady();
-    mt_nlanes = parallel ? stagedWorkerCount() + stagedMainTakesLane() : 1;
     if (mt_requested[MAINT_JOB_EXPIRE]) {
         /* Decide once, before the exclusive phase, whether expired keys need main's per-key replay or a
          * lane can free the value itself. The state it reads is global or db-wide and cannot change in
@@ -522,7 +521,7 @@ void maintRun(void) {
     atomic_store_explicit(&mt_phase_deadline, longest ? phase_t0 + longest : 0, memory_order_relaxed);
     dbLanePhaseBegin();
     if (parallel) {
-        stagedRunLanePhase(STAGED_PHASE_MAINT, mt_nlanes > 1 || !stagedMainTakesLane());
+        stagedRunLanePhase(STAGED_PHASE_MAINT, 1);
     } else {
         maintLane(0);
     }

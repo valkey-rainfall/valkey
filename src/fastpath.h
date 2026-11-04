@@ -121,6 +121,41 @@ void fastpathStagedAdoptClients(void);
 
 /* Parallel write phase. */
 #define FP_MAX_LANES 64 /* write lanes; more IO threads than this leave the rest idle in the write phase */
+
+/* Who asks whether a primary's work may run on lanes now. A replica's stream: fastpathStreamParallelAllowed. */
+enum {
+    FP_PAR_CLIENTS,
+    FP_PAR_MAINT,
+    FP_PAR_COUNT
+};
+/* Why it may not: the first condition that failed. */
+enum {
+    FP_VETO_NONE,
+    FP_VETO_OFF,
+    FP_VETO_NOT_STAGED,
+    FP_VETO_UNSPLIT,
+    FP_VETO_SLOT_MIGRATING,
+    FP_VETO_ROLE,
+    FP_VETO_LOADING,
+    FP_VETO_PAUSED,
+    FP_VETO_MONITOR,
+    FP_VETO_TRACKING,
+    FP_VETO_KEYSPACE_EVENTS,
+    FP_VETO_MODULE,
+    FP_VETO_FORKLESS_SAVE,
+    FP_VETO_THROTTLE,
+    FP_VETO_MAXMEMORY,
+    FP_VETO_HOTKEYS,
+    FP_VETO_KEY_DICTS,
+    FP_VETO_DISK_ERROR,
+    FP_VETO_MIN_REPLICAS,
+    FP_VETO_COUNT
+};
+/* Main: FP_VETO_NONE when role's work may run on lanes now, else the reason it may not. */
+int fastpathParallelVeto(int role);
+/* The reason the last ask for role returned, and its INFO name. */
+int fastpathLastParallelVeto(int role);
+const char *fastpathParallelVetoName(int veto);
 /* Main, before the read phase: decide whether this iteration's entries are sorted into write lanes. */
 void fastpathStagedPrepareLanes(void);
 /* Main, after the read phase: the write phase will run lane phases on the IO threads. */
