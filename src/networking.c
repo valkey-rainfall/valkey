@@ -2091,6 +2091,11 @@ static void reclassifyClientsPriority(void) {
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
         if (!c->conn) continue;
+        /* Replication and slot migration links are prioritized for their role, not their address. */
+        if (c->flag.primary || c->flag.replica || c->slot_migration_job) {
+            if (connIsPriority(c->conn)) count++;
+            continue;
+        }
 
         char ip[CONN_ADDR_STR_LEN];
         int port = 0;
