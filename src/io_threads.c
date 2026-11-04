@@ -113,6 +113,20 @@ void ioThreadWake(int tid) {
     if (s->fd >= 0 && atomic_load_explicit(&s->sleeping, memory_order_relaxed)) ioSleepSignal(s);
 }
 
+/* After publishing one job any thread may take: wakes one sleeper, if any thread sleeps. */
+static void ioThreadsWakeOne(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++) {
+        ioSleepSlot *s = &io_sleep[tid];
+        if (s->fd < 0 || !atomic_load_explicit(&s->sleeping, memory_order_relaxed)) continue;
+        if (!atomic_exchange_explicit(&s->sleeping, 0, memory_order_relaxed)) continue; /* another publisher woke it */
+        uint64_t one = 1;
+        ssize_t n = write(s->fd, &one, sizeof(one));
+        UNUSED(n); /* EAGAIN means a wake is already pending */
+        return;
+    }
+}
+
 /* After publishing work any thread may take, or before main waits for one: wakes every sleeper. */
 void ioThreadsWakeAll(void) {
     atomic_thread_fence(memory_order_seq_cst);
@@ -220,6 +234,12 @@ _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 static inline jobPriority getJobPriority(const client *c) {
     return (c && connIsPriority(c->conn)) ? JOB_PRIORITY_HIGH : JOB_PRIORITY_NORMAL;
+}
+
+/* Main, after publishing a job on the shared inbox. A high-priority job wakes a sleeping thread now,
+ * as a slab job wakes its own, instead of waiting for the next IOThreadsBeforeSleep. */
+static void sharedInboxPublished(jobPriority qidx) {
+    if (qidx == JOB_PRIORITY_HIGH) ioThreadsWakeOne();
 }
 
 static inline void *tagJob(void *ptr, int type) {
@@ -1870,6 +1890,16 @@ size_t testOnlyGetClusterIOPendingResponses(void) {
     return cluster_io_pending_responses;
 }
 
+/* Unit tests: give IO thread tid a wake channel and mark it asleep (fd -1 removes the channel). */
+void testOnlySetIOThreadSleeping(int tid, int fd) {
+    io_sleep[tid].fd = fd;
+    atomic_store_explicit(&io_sleep[tid].sleeping, fd >= 0, memory_order_relaxed);
+}
+
+int testOnlyIOThreadSleeping(int tid) {
+    return atomic_load_explicit(&io_sleep[tid].sleeping, memory_order_relaxed);
+}
+
 /* Unit tests drive one fast-path thread inline; admission needs it ready and pollable. */
 void testOnlySetIOThreadReady(int tid, int epfd) {
     io_epfd[tid] = epfd;
@@ -1943,6 +1973,7 @@ static int sendReadToIOThreads(client *c, int read_flags) {
     io_jobs_submitted++;
     server.stat_io_reads_pending++;
     c->flag.pending_read = 1;
+    sharedInboxPublished(qidx);
     return C_OK;
 }
 
@@ -2029,6 +2060,7 @@ int trySendWriteToIOThreads(client *c) {
     if (qidx == JOB_PRIORITY_HIGH) {
         io_jobs_submitted++;
         server.stat_io_writes_pending++;
+        sharedInboxPublished(qidx);
         return C_OK;
     }
 
@@ -2099,6 +2131,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
 
     io_jobs_submitted++;
     cluster_io_pending_responses++;
+    sharedInboxPublished(JOB_PRIORITY_HIGH);
     return C_OK;
 }
 
@@ -2178,6 +2211,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
 
     io_jobs_submitted++;
     cluster_io_pending_responses++;
+    sharedInboxPublished(JOB_PRIORITY_HIGH);
     return C_OK;
 }
 
@@ -2207,6 +2241,7 @@ int trySendClusterAcceptToIOThreads(connection *conn) {
 
     io_jobs_submitted++;
     cluster_io_pending_responses++;
+    sharedInboxPublished(JOB_PRIORITY_HIGH);
     return C_OK;
 }
 
