@@ -217,3 +217,46 @@ foreach policy {everysec no} {
         }
     }
 }
+
+foreach mode {append iteration} {
+    start_server {tags {"repl aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync everysec enable-debug-command yes save "" repl-diskless-sync no}} {
+        set primary [srv 0 client]
+        $primary config set repl-stream-sender $mode
+        waitForBgrewriteaof $primary
+        start_server {overrides {io-threads 2 save ""}} {
+            set replica [srv 0 client]
+            $replica replicaof [srv -1 host] [srv -1 port]
+            wait_for_sync $replica
+            wait_replica_online $primary
+            wait_for_condition 50 100 {
+                [getInfoProperty [$primary info replication] repl_sender_replicas] == 1
+            } else {
+                fail "the sender did not take the replica"
+            }
+
+            test "AOF order: everysec, repl-stream-sender $mode sends a replica a write only after the AOF write (#42)" {
+                set rd [valkey_deferring_client -1]
+                for {set i 0} {$i < 3} {incr i} {
+                    wait_for_condition 500 10 {
+                        [getInfoProperty [$primary info persistence] aof_pending_bio_fsync] == 0
+                    } else {
+                        fail "background AOF fsync did not finish"
+                    }
+                    $primary debug aof-flush-sleep [expr {$fao_sleep * 1000}]
+                    $rd set fao:snd $i
+                    after [expr {$fao_sleep / 2}]
+                    set seen [$replica get fao:snd]
+                    assert_equal OK [$rd read]
+                    $primary debug aof-flush-sleep 0
+                    if {$i == 0} { assert_equal $seen {} } else { assert_equal $seen [expr {$i - 1}] }
+                    wait_for_condition 50 20 {
+                        [$replica get fao:snd] eq $i
+                    } else {
+                        fail "replica did not get the write"
+                    }
+                }
+                $rd close
+            }
+        }
+    }
+}

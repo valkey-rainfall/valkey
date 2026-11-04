@@ -249,12 +249,12 @@ void replStreamSenderPublishStable(long long offset) {
  * when the sender is parked (repl_sender_idle) AND at least repl-stream-sender-wake-bytes
  * have been published since the sender's last wake, so a stream of small appends coalesces
  * into one wake. The per-iteration tick (replStreamSenderPublishStable) always signals, so
- * a sub-threshold tail is never stranded. No-op unless the sender runs in append mode. Under
- * appendfsync always this does nothing (the tick publishes the fsync-bounded offset), so
- * no byte is streamed before it is on disk. */
+ * a sub-threshold tail is never stranded. No-op unless the sender runs in append mode. With
+ * AOF on this does nothing (the tick publishes the offset the AOF already holds), so no byte
+ * is streamed before the AOF has it. */
 void replStreamSenderPublishAppend(long long offset) {
     if (!repl_sender_running || server.repl_stream_sender != REPL_STREAM_SENDER_APPEND) return;
-    if (server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS) return;
+    if (server.aof_state != AOF_OFF) return;
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
     if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
