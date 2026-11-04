@@ -2226,10 +2226,10 @@ static void fpMergeLanes(void) {
 
 static _Thread_local execContext *fp_stream_saved_ectx = NULL;
 
-/* As fpLanesAllowed, for the stream a replica applies. Main proxies the stream to the backlog and the
- * sub-replicas itself, so of the sinks only the AOF, which execution feeds, needs stream order. */
-int fastpathStreamLanesAllowed(void) {
-    if (!server.io_threads_parallel_writes || fpDepth() != 0) return 0;
+/* As fpLanesAllowed, for the stream a replica applies, whether planned onto lanes or held. Main proxies
+ * the stream to the backlog and the sub-replicas itself, so of the sinks only the AOF, which execution
+ * feeds, needs stream order. */
+int fastpathStreamParallelAllowed(void) {
     if (server.cluster_enabled ? (clusterIsAnySlotExporting() || clusterIsAnySlotImporting())
                                : !server.keyspace_shard_bits)
         return 0;
@@ -2244,8 +2244,14 @@ int fastpathStreamLanesAllowed(void) {
     int blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
                   server.blocked_clients_by_type[BLOCKED_STREAM];
     if ((blocked || server.watching_clients) && !fpKeyDictsSettled()) return 0;
-    if (hotkeysEnabled() || server.busy_module_yield_flags) return 0;
+    if (server.busy_module_yield_flags) return 0;
     return 1;
+}
+
+/* Planned lanes also stay off while hotkeys are tracked: unlike held SETs they do not record them. */
+int fastpathStreamLanesAllowed(void) {
+    if (!server.io_threads_parallel_writes || fpDepth() != 0 || hotkeysEnabled()) return 0;
+    return fastpathStreamParallelAllowed();
 }
 
 int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int slot) {

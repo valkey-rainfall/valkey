@@ -132,6 +132,19 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
             $replica config set replica-parallel-apply yes
         }
 
+        test {Parallel apply: held SETs stop under every state that stops planned lanes} {
+            # maxmemory-clients keeps planned lanes off; held SETs must stay off too.
+            $replica config set maxmemory-clients 100mb
+            set before [parallel_applied $replica]
+            set rd [valkey_deferring_client -1]
+            for {set i 0} {$i < 2000} {incr i} { $rd set mmc:$i v }
+            for {set i 0} {$i < 2000} {incr i} { $rd read }
+            $rd close
+            assert_in_sync $primary $replica
+            assert_equal [parallel_applied $replica] $before
+            $replica config set maxmemory-clients 0
+        }
+
         test {Parallel apply: sharded replica survives a full resync and SCAN sees every key} {
             $replica replicaof no one
             $primary set post-resync 1
