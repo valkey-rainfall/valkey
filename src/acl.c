@@ -4653,6 +4653,8 @@ void aclCommand(client *c) {
         sds error = ACLStringSetRole(r, rolename, temp_argv, c->argc - 3);
         zfree(temp_argv);
         if (error == NULL) {
+            /* The role's holders get its new rules: recompute their fast GET ACL gates. */
+            fastGetOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {
             addReplyErrorSdsSafe(c, error);
