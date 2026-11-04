@@ -2005,6 +2005,11 @@ typedef enum childInfoType {
 /* Adaptive mode: lowest size floor used when the main thread is the constraint. */
 #define COPY_AVOID_ADAPTIVE_FLOOR_MIN 1024
 
+/* Staged loop: whether main works a share of each phase (staged-main-lane). */
+#define STAGED_MAIN_LANE_AUTO 0 /* unless main shares a CPU with an IO thread */
+#define STAGED_MAIN_LANE_YES 1
+#define STAGED_MAIN_LANE_NO 2
+
 /* Staged loop reply overlap mode (staged-reply-overlap). */
 #define STAGED_REPLY_OVERLAP_NONE 0 /* Base behavior: exec then a separate reply phase. */
 #define STAGED_REPLY_OVERLAP_EXEC 1 /* Workers stream replies while main executes, closed before crons. */
@@ -2127,6 +2132,7 @@ struct valkeyServer {
     int io_threads_idle_us;                   /* An idle IO thread, and main with only offloaded clients, block after this long without work */
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
+    int staged_main_lane;                     /* Staged loop: main works a share of each phase, see STAGED_MAIN_LANE_* */
     int staged_reply_overlap;                 /* Staged loop: overlap reply delivery with exec, see STAGED_REPLY_OVERLAP_* */
     int repl_stream_sender;                   /* Hidden: stream the backlog to ONLINE plaintext replicas from a
                                                * dedicated sender thread, off the staged loop. One of

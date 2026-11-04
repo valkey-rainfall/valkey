@@ -70,6 +70,7 @@ static void stagedAccountPhase(int phase, int nworkers) {
 #define STAGED_EPOLL_THREAD_MIN_IO_THREADS 3
 
 static int stagedEpollThreadRunning(void);
+static int stagedMainSharesCpu(void);
 
 int stagedEpollThreadConfigValid(int on, int io_threads, const char **err) {
     if (on && io_threads < STAGED_EPOLL_THREAD_MIN_IO_THREADS) {
@@ -107,6 +108,8 @@ void stagedInfo(char **info) {
     sds s = *info;
     s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
     s = sdscatprintf(s, "staged_epoll_thread:%d\r\n", stagedEpollThreadRunning());
+    s = sdscatprintf(s, "staged_main_lane:%d\r\nstaged_main_shares_cpu:%d\r\n", stagedMainTakesLane(),
+                     stagedMainSharesCpu());
     s = sdscatprintf(s, "staged_lanes_veto_clients:%s\r\nstaged_lanes_veto_maint:%s\r\n",
                      fastpathParallelVetoName(fastpathLastParallelVeto(FP_PAR_CLIENTS)),
                      fastpathParallelVetoName(fastpathLastParallelVeto(FP_PAR_MAINT)));
@@ -155,19 +158,21 @@ static int sl_depth = 0;      /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
 static int sl_ae_fd = -1;     /* ae's own epoll fd, the single main-affinity entry */
 static int sl_warned = 0;
-static int sl_main_lane = 1;        /* main has a CPU no worker is pinned to, so it works a share of each phase */
+static int sl_main_lane = 1;        /* main works a share of each phase */
 static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
 static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
 static int sl_stream_open = 0;      /* a STREAM phase is open: workers deliver while main executes */
 
-/* Main and the workers pinned to main's one CPU sleep at the barrier instead of spinning. Pinning
- * can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
+/* Pinning can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
 #define STAGED_PINNING_READ_US 1000000
 
-static int sl_main_spins = 1;     /* no enrolled worker is pinned to main's CPU */
-static int sl_pinned_workers = 0; /* enrolled workers pinned to main's one CPU, as last read */
-static int sl_pinned_cpu = -1;    /* main's one CPU, as last read; -1 when main may run on several */
+static int sl_main_shares = 0; /* main shares a CPU with an enrolled worker, as last read */
+static int sl_main_spins = 1;  /* main spins at the barrier: it shares no CPU */
 static monotime sl_pinning_read = 0;
+
+static int stagedMainSharesCpu(void) {
+    return sl_main_shares;
+}
 static cpu_set_t sl_proc_cpus; /* main's CPUs when staged mode first started: the server's CPUs */
 static int sl_proc_cpus_read = 0;
 static cpu_set_t sl_epoll_placed; /* the epoll thread's CPUs as main last placed it */
@@ -178,7 +183,7 @@ static int sl_epoll_placed_set = 0;
 static _Atomic int sl_enrolled[IO_THREADS_MAX_NUM];
 static _Atomic uint32_t sl_gen[IO_THREADS_MAX_NUM];
 static uint64_t sl_enroll_seq[IO_THREADS_MAX_NUM];
-static _Atomic int sl_on_main_cpu[IO_THREADS_MAX_NUM]; /* worker is pinned to main's one CPU */
+static _Atomic int sl_on_main_cpu[IO_THREADS_MAX_NUM]; /* worker shares a CPU with main */
 
 /* Also read by IO threads deciding whether they may sleep; main writes both at iteration boundaries. */
 int stagedLoopActive(void) {
@@ -464,63 +469,47 @@ static void stagedFollowEpollThread(void) {
     }
 }
 
-/* Main is pinned to CPUs a worker also runs on, so a lane on main would only take turns with it.
- * A cpuset or taskset that confines the whole process confines every thread alike and counts as
- * unpinned, as on a host of that many CPUs, unless it leaves them all one CPU. */
-static int stagedMainSharesWorkerCpu(void) {
+/* Main: does main share a CPU with an enrolled worker? Then they only take turns on it: neither
+ * spins at the barrier, where a spinning waiter holds the CPU the other needs, and by default main
+ * leaves the phases' work to the workers. A cpuset or taskset that confines the whole process
+ * confines every thread alike and counts as unpinned, as on a host of that many CPUs, unless it
+ * leaves them all one CPU. */
+static void stagedReadCpuPinning(void) {
     cpu_set_t mine, all;
+    int overlap[IO_THREADS_MAX_NUM] = {0};
+    int any = 0;
     CPU_ZERO(&mine);
-    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) != 0) return 0;
+    int known = pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0;
     all = mine;
-    int overlap = 0;
-    for (int tid = 1; tid <= sl_workers; tid++) {
+    for (int tid = 1; known && tid <= sl_workers && tid < IO_THREADS_MAX_NUM; tid++) {
         cpu_set_t one, both;
         CPU_ZERO(&one);
         if (ioThreadGetAffinity(tid, &one, sizeof(one)) != 0) continue;
         CPU_OR(&all, &all, &one);
         CPU_AND(&both, &one, &mine);
-        if (CPU_COUNT(&both) > 0) overlap = 1;
+        overlap[tid] = CPU_COUNT(&both) > 0;
+        any |= overlap[tid];
     }
-    return overlap && (CPU_COUNT(&mine) < CPU_COUNT(&all) || CPU_COUNT(&all) == 1);
+    int shares = any && (CPU_COUNT(&mine) < CPU_COUNT(&all) || CPU_COUNT(&all) == 1);
+    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++)
+        atomic_store_explicit(&sl_on_main_cpu[tid], shares && overlap[tid], memory_order_relaxed);
+    if (sl_workers > 0 && shares != sl_main_shares)
+        serverLog(LL_NOTICE, shares ? "Staged event loop: main shares a CPU with an IO thread; they sleep at the barrier instead of spinning"
+                                    : "Staged event loop: main shares no CPU with an IO thread; the barrier spins again");
+    sl_main_shares = shares;
+    sl_main_spins = !shares;
+    sl_pinning_read = getMonotonicUs();
 }
 
-/* Main: a worker pinned to the one CPU main is pinned to only takes turns with main, so neither
- * of them spins at the barrier, where a spinning waiter holds the CPU the other needs. */
-static void stagedReadCpuPinning(void) {
-    cpu_set_t mine;
-    CPU_ZERO(&mine);
-    int cpu = -1;
-    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) == 1) {
-        for (int i = 0; i < CPU_SETSIZE && cpu < 0; i++)
-            if (CPU_ISSET(i, &mine)) cpu = i;
-    }
-    int pinned = 0;
-    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++) {
-        int on = 0;
-        if (cpu >= 0 && tid <= sl_workers) {
-            cpu_set_t one;
-            CPU_ZERO(&one);
-            on = ioThreadGetAffinity(tid, &one, sizeof(one)) == 0 && CPU_EQUAL(&one, &mine);
-        }
-        atomic_store_explicit(&sl_on_main_cpu[tid], on, memory_order_relaxed);
-        pinned += on;
-    }
-    if (sl_workers > 0 && (pinned != sl_pinned_workers || (pinned && cpu != sl_pinned_cpu))) {
-        if (pinned)
-            serverLog(LL_NOTICE, "Staged event loop: %d IO thread%s pinned to main's CPU %d; they and main sleep at the barrier instead of spinning",
-                      pinned, pinned == 1 ? " is" : "s are", cpu);
-        else
-            serverLog(LL_NOTICE, "Staged event loop: no IO thread is pinned to main's CPU; the barrier spins again");
-    }
-    sl_pinned_workers = pinned;
-    sl_pinned_cpu = cpu;
-    sl_main_spins = pinned == 0;
-    int lane = !stagedMainSharesWorkerCpu();
+/* Main, at the iteration boundary: whether main works a share of each phase this iteration. */
+static void stagedFollowMainLane(void) {
+    int lane = server.staged_main_lane == STAGED_MAIN_LANE_YES  ? 1
+               : server.staged_main_lane == STAGED_MAIN_LANE_NO ? 0
+                                                                : !sl_main_shares;
     if (sl_workers > 0 && lane != sl_main_lane)
         serverLog(LL_NOTICE, lane ? "Staged event loop: main works a share of each phase"
-                                  : "Staged event loop: main shares a CPU with an IO thread and leaves the phases to the IO threads");
+                                  : "Staged event loop: main leaves the phases to the IO threads");
     sl_main_lane = lane;
-    sl_pinning_read = getMonotonicUs();
 }
 
 /* Main, between phases: enroll IO threads 1..want. Leavers pass one SYNC phase so none is left
@@ -544,6 +533,7 @@ static void stagedSetWorkers(int want) {
         stagedPlaceEpollThread();
     }
     stagedReadCpuPinning();
+    stagedFollowMainLane();
 }
 
 /* Main, at the iteration boundary: follow the configuration and the live IO thread count. */
@@ -596,6 +586,7 @@ static void stagedReconcile(aeEventLoop *el) {
         stagedReadCpuPinning();
         if (pollerThreadRunning(sl_poller)) stagedPlaceEpollThread();
     }
+    stagedFollowMainLane();
 }
 
 /* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
@@ -654,7 +645,7 @@ static int stagedStreamEligible(void) {
     if (sl_depth != 0 || sl_workers <= 0) return 0;
     if (fastpathStagedStreamBatchCount() == 0) return 0;
     if (server.aof_state != AOF_OFF) return 0; /* replies follow the AOF write of their commands */
-    if (!sl_main_spins || !sl_main_lane) return 0; /* a worker shares main's CPU */
+    if (!sl_main_spins || !sl_main_lane) return 0; /* main would only take turns with a worker */
     if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
     if (fastpathStagedLanesWillRun()) return 0; /* the IO threads execute write lanes instead */
     return 1;
@@ -868,6 +859,10 @@ void testOnlyStagedStop(void) {
 #else /* !HAVE_FASTPATH_EPOLL */
 
 static int stagedEpollThreadRunning(void) {
+    return 0;
+}
+
+static int stagedMainSharesCpu(void) {
     return 0;
 }
 

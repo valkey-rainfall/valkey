@@ -235,6 +235,16 @@ proc sl_affinity {tid} {
 
 if {$::tcl_platform(os) eq "Linux" && ![catch {exec taskset -pc [pid]}]} {
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 io-threads-epoll-thread no}} {
+    proc sl_main_state {} {
+        set info [r info fastpath]
+        list [getInfoProperty $info staged_main_shares_cpu] [getInfoProperty $info staged_main_lane]
+    }
+    proc sl_wait_main_state {want} {
+        wait_for_condition 100 50 {[sl_main_state] eq $want} else {
+            fail "main's staged state is [sl_main_state], expected $want (shares a CPU, works a lane)"
+        }
+    }
+
     test {Staged loop: main and an IO thread pinned to its CPU sleep at the barrier instead of spinning} {
         set pid [srv 0 pid]
         set io1 [sl_thread_tid $pid io_thd_1]
@@ -245,7 +255,8 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
         set loglines [count_log_lines 0]
         exec taskset -pc $cpu $pid
         exec taskset -pc $cpu $io1
-        wait_for_log_messages 0 {"*1 IO thread is pinned to main's CPU*sleep at the barrier*"} $loglines 100 50
+        wait_for_log_messages 0 {"*main shares a CPU with an IO thread*sleep at the barrier*"} $loglines 100 50
+        sl_wait_main_state {1 0}
         # Fast-path reads and writes still complete, in order, while neither spins.
         set fd [sl_socket]
         set payload ""
@@ -261,7 +272,8 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
         set loglines [count_log_lines 0]
         exec taskset -pc $io1_cpus $io1
         exec taskset -pc $main_cpus $pid
-        wait_for_log_messages 0 {"*no IO thread is pinned to main's CPU*"} $loglines 100 50
+        wait_for_log_messages 0 {"*main shares no CPU with an IO thread*"} $loglines 100 50
+        sl_wait_main_state {0 1}
     }
 
     test {Staged loop: main takes its share of each phase again once its CPU is its own} {
@@ -286,11 +298,13 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
             exec taskset -pc $a $pid
             exec taskset -pc $a $io1
             exec taskset -pc $a $io2
-            wait_for_log_messages 0 {"*main shares a CPU with an IO thread and leaves the phases*"} $loglines 100 50
+            wait_for_log_messages 0 {"*main leaves the phases to the IO threads*"} $loglines 100 50
+            sl_wait_main_state {1 0}
             set loglines [count_log_lines 0]
             exec taskset -pc $b $io1
             exec taskset -pc $b $io2
             wait_for_log_messages 0 {"*main works a share of each phase*"} $loglines 100 50
+            sl_wait_main_state {0 1}
             set fd [sl_socket]
             set payload ""
             set expect {}
@@ -307,6 +321,27 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
             exec taskset -pc $main_cpus $pid
         }
     } undefined {valgrind:skip}
+
+    test {Staged loop: staged-main-lane decides main's share of each phase} {
+        set shares [lindex [sl_main_state] 0]
+        r config set staged-main-lane no
+        sl_wait_main_state [list $shares 0]
+        set fd [sl_socket]
+        set payload ""
+        set expect {}
+        for {set i 0} {$i < 200} {incr i} {
+            append payload [sl_resp set sl:cfglane:$i v$i] [sl_resp get sl:cfglane:$i]
+            lappend expect {+OK} v$i
+        }
+        puts -nonewline $fd $payload
+        flush $fd
+        assert_equal $expect [sl_read_replies $fd 400]
+        close $fd
+        r config set staged-main-lane yes
+        sl_wait_main_state [list $shares 1]
+        r config set staged-main-lane auto
+        sl_wait_main_state [list $shares [expr {!$shares}]]
+    }
 }
 }
 
