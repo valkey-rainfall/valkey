@@ -322,3 +322,41 @@ foreach call_type {nested normal} {
         assert_equal {OK} [r module unload blockedclient]
     }
 }
+
+start_server {tags {"modules external:skip"} overrides {appendonly yes}} {
+    r module load $testmodule
+
+    test {RM_Yield from a thread with a pending effect propagates it before main runs} {
+        set old_time_limit [lindex [r config get busy-reply-threshold] 1]
+        r config set busy-reply-threshold 5
+        r set_write_before_slow_bg_operation 1
+        r set_slow_bg_operation 1
+        r hset hash foo bar
+        set rd [valkey_deferring_client]
+        $rd do_bg_rm_call_format ! incr bg_write_before_yield
+        $rd flush
+
+        wait_for_condition 50 100 {
+            [r is_in_slow_bg_operation] eq 1
+        } else {
+            fail "Failed waiting for slow operation to start"
+        }
+        # Let main run several iterations while the thread is parked in RM_Yield.
+        after 200
+        assert_error {*BUSY Slow module operation*} {r ping}
+        r set_slow_bg_operation 0
+        wait_for_condition 50 100 {
+            [r is_in_slow_bg_operation] eq 0
+        } else {
+            fail "Failed waiting for slow operation to stop"
+        }
+        assert_equal 2 [$rd read]
+        $rd close
+        r set_write_before_slow_bg_operation 0
+        r config set busy-reply-threshold $old_time_limit
+
+        # Both increments reached the AOF.
+        r debug loadaof
+        assert_equal 2 [r get bg_write_before_yield]
+    } {} {needs:debug}
+}
