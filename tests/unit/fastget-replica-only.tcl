@@ -67,3 +67,31 @@ start_server {tags {"fastget-replica-only tls:skip"} overrides {io-threads 4 io-
         }
     }
 }
+
+start_server {tags {"fastget-replica-only tls:skip"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
+    r select 0
+    r set st:s v
+    r hset st:h f hv
+    r sadd st:set m
+
+    test {A replica with replica-serve-stale-data no rejects reads the reading thread would answer} {
+        # A primary that never answers: the link stays down.
+        r replicaof 127.0.0.1 1
+        set rd [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
+        foreach cmd {{get st:s} {mget st:s st:s} {hget st:h f} {sismember st:set m}} {
+            # Stale reads allowed: the reading thread answers this client's GETs.
+            r config set replica-serve-stale-data yes
+            set before [speculated r]
+            for {set round 0} {$round < 20 && [speculated r] == $before} {incr round} {
+                for {set i 0} {$i < 10} {incr i} { $rd get st:s }
+                for {set i 0} {$i < 10} {incr i} { assert_equal v [$rd read] }
+            }
+            assert_morethan [speculated r] $before
+            r config set replica-serve-stale-data no
+            $rd {*}$cmd
+            assert_error {*MASTERDOWN*} {$rd read}
+        }
+        $rd close
+        r replicaof no one
+    }
+}
