@@ -98,6 +98,12 @@ bool __wrap_tokenBucket_tryConsume(tokenBucket *bucket, double tokens, bool forc
 double __wrap_tpsCalculator_averageTps(tpsCalculator *calc);
 double __wrap_trendCalculator_changePerSecShortTerm(trendCalculator *calc);
 
+/* MAINT phase mocks: the per-table expire jobs maint.c runs */
+int __wrap_activeExpireInLanes(void);
+int __wrap_maintExpireReplayNeeded(void);
+uint64_t __wrap_activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit);
+uint64_t __wrap_activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit);
+
 #undef protected
 #undef _Bool
 #undef typename
