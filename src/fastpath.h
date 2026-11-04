@@ -124,6 +124,9 @@ void fastpathStagedAdoptClients(void);
 void fastpathStagedPrepareLanes(void);
 /* Main, after the read phase: the write phase will run lane phases on the IO threads. */
 int fastpathStagedLanesWillRun(void);
+/* Test only: sort the next read phase's entries into nlanes lanes, as fastpathStagedPrepareLanes does
+ * with that many lane threads (0 turns the lanes off). */
+void testOnlyFastpathSetLanes(int nlanes);
 /* Thread tid (0 = main): run its lane of the current write segment. */
 void fastpathStagedWriteLane(int tid);
 
