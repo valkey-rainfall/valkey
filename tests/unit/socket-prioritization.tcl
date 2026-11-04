@@ -58,6 +58,14 @@ start_server {tags {"socket-prioritization"}} {
             assert_match "*flags=*H*" $rep_list
             assert_match "*connected_priority_clients:0*" [$primary info clients]
 
+            # Changing priority-subnets on either side does not demote the replication links.
+            foreach subnets {10.255.255.0/24 ""} {
+                $primary config set priority-subnets $subnets
+                $replica config set priority-subnets $subnets
+                assert_match "*flags=*S*H*" [$primary client list flags S]
+                assert_match "*flags=*M*H*" [$replica client list flags M]
+            }
+
             set val [string repeat "a" 1024]
             for {set i 0} {$i < 50} {incr i} {
                 $primary set "key:$i" $val
