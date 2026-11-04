@@ -3159,3 +3159,47 @@ start_cluster 2 1 {tags {logreqres:skip external:skip cluster} overrides {cluste
         R 0 flushall
     }
 }
+
+# A post-notification job of a module on the import target can write keys the
+# target owns while a slot import client is current. Those writes are not part
+# of the import stream that is proxied to its replicas, so they must be
+# replicated like any other write.
+start_cluster 3 3 {tags {logreqres:skip external:skip cluster modules} overrides {cluster-allow-replica-migration no cluster-node-timeout 15000 cluster-databases 1}} {
+    set node0_id [R 0 CLUSTER MYID]
+    set node2_id [R 2 CLUSTER MYID]
+
+    set 0_slot_tag "{06S}"
+    set 16383_slot_tag "{6ZJ}"
+    set counter "$0_slot_tag:counter"
+    set testmodule [file normalize tests/modules/postnotifications_import.so]
+
+    # Node 0 is the import target, node 3 its replica and node 2 the source.
+    foreach aof {no yes} {
+        test "Module writes on an import target are replicated (appendonly $aof)" {
+            assert_does_not_resync {
+                R 0 CONFIG SET appendonly $aof
+                if {$aof eq "yes"} {waitForBgrewriteaof [Rn 0]}
+                assert_match "OK" [R 0 MODULE LOAD $testmodule $counter]
+
+                populate 10 "$16383_slot_tag:imported:" 100 -2
+                assert_match "OK" [R 2 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node0_id]
+                set jobname [get_job_name 2 16383]
+                wait_for_migration 0 16383
+                wait_for_migration_field 0 $jobname state success
+                wait_for_migration_field 2 $jobname state success
+
+                # The module counted the imported keys, and the replica has the same count
+                assert_morethan_equal [R 0 GET $counter] 10
+                assert_in_sync 0 3 {0}
+            }
+
+            # Cleanup for the next test
+            assert_match "OK" [R 0 MODULE UNLOAD postnotifications_import]
+            assert_match "OK" [R 0 FLUSHALL SYNC]
+            assert_match "OK" [R 0 CONFIG SET appendonly no]
+            assert_match "OK" [R 0 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node2_id]
+            wait_for_migration 2 16383
+            assert_match "OK" [R 2 FLUSHALL SYNC]
+        }
+    }
+}

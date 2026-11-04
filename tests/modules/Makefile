@@ -86,6 +86,7 @@ TEST_MODULES = \
     publish.so \
     usercall.so \
     postnotifications.so \
+    postnotifications_import.so \
     moduleauthtwo.so \
     rdbloadsave.so \
     crash.so \
