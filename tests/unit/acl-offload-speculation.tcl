@@ -57,4 +57,20 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         assert_error {*NOPERM*} {$c read}
         $c close
     }
+
+    test {acl-offload: ACL SETROLE revoking GET stops IO-thread reads of the role's holders} {
+        als_write_aclfile $aclfile {
+            {user default on nopass ~* &* +@all}
+            {user alice on >pw ~* +get +@connection}
+        }
+        r acl load
+        r acl setrole reader ~* +get
+        r acl setuser alice -get role=reader
+        r set k v
+        set c [als_engaged_client]
+        r acl setrole reader -get
+        $c get k
+        assert_error {*NOPERM*} {$c read}
+        $c close
+    }
 }
