@@ -2957,7 +2957,9 @@ start_cluster 3 3 {tags {logreqres:skip external:skip cluster} overrides {cluste
     # Node 0 is the import target, node 3 its replica and node 2 the source.
     test "Evictions on a full import target are replicated" {
         assert_does_not_resync {
-            set saved [setup_import_eviction 0 [expr {300*1024}]]
+            # 1 MB of own keys to evict: with io-threads the import can briefly hold
+            # a few hundred KB more than without, which a smaller margin turns into OOM.
+            set saved [setup_import_eviction 0 [expr {1024*1024}]]
             fill_until_evicting 0 "$0_slot_tag:own"
             assert_in_sync 0 3 {0}
 
@@ -3084,7 +3086,9 @@ start_cluster 3 3 {tags {logreqres:skip external:skip cluster} overrides {cluste
             # Dbs are created on first use, create them before sizing maxmemory
             R 0 SELECT 2
             R 0 SELECT 1
-            set saved [setup_import_eviction 0 [expr {300*1024}]]
+            # 1 MB of own keys to evict: with io-threads the import can briefly hold
+            # a few hundred KB more than without, which a smaller margin turns into OOM.
+            set saved [setup_import_eviction 0 [expr {1024*1024}]]
             fill_until_evicting 0 "$0_slot_tag:own"
             R 0 SELECT 0
             assert_in_sync 0 3 {0 1 2}
