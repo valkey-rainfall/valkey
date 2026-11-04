@@ -138,7 +138,7 @@ typedef struct __attribute__((__packed__)) payloadHeader {
     /* tracked_for_cob is placed after the bitfield byte so it is byte aligned.
      * _Atomic(uint8_t) has alignment 1, this is safe inside __packed__
      * because the compiler will not insert padding before it */
-    _Atomic(uint8_t) tracked_for_cob; /* 1 if this header's reply_len has been tracked in io_tracked_reply_len */
+    _Atomic(uint8_t) tracked_for_cob; /* 1 once a writer computed this header's reply_len; main then starts a new header */
 } payloadHeader;
 
 /* To avoid copy of whole string in reply buffer
@@ -147,6 +147,20 @@ typedef struct __attribute__((__packed__)) bulkStrRef {
     robj *obj; /* pointer to object used for reference count management */
     sds str;   /* pointer to string to optimize memory access by I/O thread */
 } bulkStrRef;
+
+/* Bytes a string reference puts on the wire. */
+static size_t strRefReplyLen(uint8_t payload_type, const bulkStrRef *str_ref) {
+    size_t str_len = sdslen(str_ref->str);
+    if (payload_type == BULK_STR_REF) return (digits10(str_len) + 3) + str_len + 2;
+    return str_len;
+}
+
+/* Main, as a string reference is added: its reply bytes count toward the output buffer limit at
+ * once, as copied bytes would, not only once an IO thread scans the buffer. */
+static void countStrRefReply(client *c, uint8_t payload_type, const void *payload) {
+    if (!isStrRefPayload(payload_type)) return;
+    atomic_fetch_add_explicit(&c->io_tracked_reply_len, strRefReplyLen(payload_type, payload), memory_order_relaxed);
+}
 
 static void setProtocolError(const char *errstr, client *c);
 static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
@@ -723,6 +737,7 @@ static size_t _addReplyPayloadToBuffer(client *c, const void *payload, size_t le
 
     memcpy(c->buf + c->bufpos, payload, reply_len);
     c->bufpos += reply_len;
+    countStrRefReply(c, payload_type, payload);
     /* We update the buffer peak after appending the reply to the buffer */
     if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
     return reply_len;
@@ -774,6 +789,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         if (copy) {
             memcpy(tail->buf + tail->used, payload, copy);
             tail->used += copy;
+            countStrRefReply(c, payload_type, payload);
             payload += copy;
             len -= copy;
         }
@@ -797,6 +813,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         }
         memcpy(tail->buf + tail->used, payload, len);
         tail->used += len;
+        countStrRefReply(c, payload_type, payload);
         listAddNodeTail(reply_list, tail);
         unsigned long long *reply_bytes = clientGetReplyBytesPtr(c);
         *reply_bytes += tail->size;
@@ -874,6 +891,7 @@ static void _addStrRefToBufferOrList(client *c, robj *obj, uint8_t payload_type)
         c->last_header = NULL;
         _addStrRefToList(c, (void *)&str_ref, sizeof(str_ref), payload_type);
     }
+    closeClientOnOutputBufferLimitReached(c, 1);
 }
 
 /* -----------------------------------------------------------------------------
@@ -1883,6 +1901,10 @@ void AddReplyFromClient(client *dst, client *src) {
     if (listLength(src->reply)) listJoin(dst->reply, src->reply);
     dst->reply_bytes += src->reply_bytes;
     src->reply_bytes = 0;
+    /* String references counted for src move with its reply blocks. */
+    atomic_fetch_add_explicit(&dst->io_tracked_reply_len,
+                              atomic_exchange_explicit(&src->io_tracked_reply_len, 0, memory_order_relaxed),
+                              memory_order_relaxed);
     src->bufpos = 0;
 
     if (src->deferred_reply_errors) {
@@ -3501,8 +3523,8 @@ void resetLastWrittenBuf(client *c) {
 }
 
 /* Track BULK_STR_REF sizes.
- * Calculates reply_len for BULK_STR_REFs if not already set, and adds to client's tracking counter.
- * This is called from I/O thread before writing to account for actual reply sizes. */
+ * Calculates reply_len for BULK_STR_REFs if not already set. The bytes were counted in the client's
+ * tracking counter as main added them. Called before writing. */
 static void trackBufReferences(char *buf, size_t bufpos, client *c) {
     serverAssert(c);
 
@@ -3520,13 +3542,7 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
                 size_t len = header->payload_len;
                 size_t total_reply_len = 0;
                 while (len > 0) {
-                    size_t str_len = sdslen(str_ref->str);
-                    if (header->payload_type == BULK_STR_REF) {
-                        uint32_t num_len = digits10(str_len);
-                        total_reply_len += (num_len + 3) + str_len + 2;
-                    } else {
-                        total_reply_len += str_len;
-                    }
+                    total_reply_len += strRefReplyLen(header->payload_type, str_ref);
                     str_ref++;
                     len -= sizeof(bulkStrRef);
                 }
@@ -3534,7 +3550,6 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
                  * stops early on partial writes (limit_reached) and may not check
                  * headers after write boundary */
                 header->reply_len = total_reply_len;
-                atomic_fetch_add_explicit(&c->io_tracked_reply_len, total_reply_len, memory_order_relaxed);
             }
         }
 
@@ -3552,11 +3567,7 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
         ptr += sizeof(payloadHeader);
 
         if (isStrRefPayload(header->payload_type)) {
-            /* Decrement tracked reply size only if it was previously tracked.
-             * Use atomic exchange to ensure we only decrement once. */
-            if (c && atomic_exchange_explicit(&header->tracked_for_cob, 0, memory_order_acq_rel)) {
-                atomic_fetch_sub_explicit(&c->io_tracked_reply_len, header->reply_len, memory_order_relaxed);
-            }
+            atomic_store_explicit(&header->tracked_for_cob, 0, memory_order_release);
 
             /* When net byte tracking was disabled in the main thread (commandlog-reply-larger-than -1)
              * at the time this reply was added, we account for cluster slot stats here in the IO thread
@@ -3569,6 +3580,8 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
             bulkStrRef *str_ref = (bulkStrRef *)ptr;
             size_t len = header->payload_len;
             while (len > 0) {
+                /* Uncount the reply bytes main counted when it added the reference. */
+                if (c) atomic_fetch_sub_explicit(&c->io_tracked_reply_len, strRefReplyLen(header->payload_type, str_ref), memory_order_relaxed);
                 /* Last reply references free off main; shared references only decrement here. */
                 freeValueNeverOnMain(NULL, str_ref->obj, -1);
                 str_ref++;
