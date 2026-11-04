@@ -365,3 +365,61 @@ TEST_F(FastpathStagedTest, ReclaimWithoutControlIsSafe) {
     EXPECT_EQ(fake->control, nullptr);
     freeClient(fake);
 }
+
+/* The write phase opens a lane phase only for a run of lane entries between barriers that reaches
+ * io-threads-parallel-writes-min, so the promise that IO threads will run lanes (which keeps replies
+ * from streaming) holds only when such a run exists, however many lane entries the iteration has. */
+TEST_F(FastpathStagedTest, LanesWillRunCountsEachSegment) {
+    int saved_bits = server.keyspace_shard_bits;
+    int saved_min = server.io_threads_parallel_writes_min;
+    int saved_batch = server.io_batch_commands;
+    server.keyspace_shard_bits = 1; /* lanes need keyspace shards outside cluster mode */
+    server.io_threads_parallel_writes_min = 32;
+    server.io_batch_commands = 1024;
+    int peer;
+    client *c = newStagedClient(&peer);
+    const std::string ping = "*1\r\n$4\r\nPING\r\n";
+    const std::string barrier = "*2\r\n$4\r\nINCR\r\n$4\r\nst:w\r\n"; /* not a lane command here */
+
+    /* 50 lane entries, every run between barriers 5 long. */
+    std::string req, expect;
+    for (int i = 1; i <= 10; i++) {
+        req += barrier;
+        expect += ":" + std::to_string(i) + "\r\n";
+        for (int j = 0; j < 5; j++) {
+            req += ping;
+            expect += "+PONG\r\n";
+        }
+    }
+    send(peer, req);
+    testOnlyFastpathSetLanes(2);
+    readPhase();
+    EXPECT_EQ(fastpathStagedLanesWillRun(), 0);
+    testOnlyFastpathSetLanes(0);
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), expect);
+
+    /* One run as long as the minimum. */
+    req.clear();
+    expect.clear();
+    req += barrier;
+    expect += ":11\r\n";
+    for (int j = 0; j < 32; j++) {
+        req += ping;
+        expect += "+PONG\r\n";
+    }
+    req += barrier;
+    expect += ":12\r\n";
+    send(peer, req);
+    testOnlyFastpathSetLanes(2);
+    readPhase();
+    EXPECT_EQ(fastpathStagedLanesWillRun(), 1);
+    testOnlyFastpathSetLanes(0);
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), expect);
+
+    freeStaged(c, peer);
+    server.keyspace_shard_bits = saved_bits;
+    server.io_threads_parallel_writes_min = saved_min;
+    server.io_batch_commands = saved_batch;
+}
