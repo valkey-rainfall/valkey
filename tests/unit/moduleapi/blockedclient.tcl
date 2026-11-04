@@ -318,6 +318,24 @@ foreach call_type {nested normal} {
         assert_equal PONG [r ping]
     }
 
+    test {RM_Call commands carry a module address in MONITOR and the commandlog} {
+        set mon [valkey_deferring_client]
+        $mon monitor
+        assert_equal OK [$mon read]
+        r config set slowlog-log-slower-than 0
+        r slowlog reset
+        r do_rm_call set mod_addr 1
+        r config set slowlog-log-slower-than 10000
+        set lines [list [$mon read] [$mon read]]
+        assert_match {*\[9 module\] "set" "mod_addr" "1"*} $lines
+        $mon close
+        set peer {}
+        foreach e [r slowlog get -1] {
+            if {[lindex $e 3] eq {set mod_addr 1}} { set peer [lindex $e 4] }
+        }
+        assert_equal module $peer
+    }
+
     test "Unload the module - blockedclient" {
         assert_equal {OK} [r module unload blockedclient]
     }
