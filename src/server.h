@@ -1373,6 +1373,7 @@ typedef struct ClientReplicationData {
     long long read_reploff;              /* Read replication offset if this is a primary. */
     long long reploff;                   /* Applied replication offset if this is a primary. */
     long long repl_applied;              /* Applied replication data count in querybuf, if this is a replica. */
+    int repl_applied_dbid;               /* DB selected at repl_applied in the stream, if this is a slot import. */
     long long repl_ack_off;              /* Replication ack offset, if this is a replica. */
     long long repl_aof_off;              /* Replication AOF fsync ack offset, if this is a replica. */
     long long repl_ack_time;             /* Replication ack time, if this is a replica. */
@@ -3670,6 +3671,7 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc);
 sds replicationCatCommand(sds buf, robj **argv, int argc);
 void replicationFeedFrames(int dictid, const char *buf, size_t len, int wrap);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
+void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
 void freeReplicaReferencedReplBuffer(client *replica);
