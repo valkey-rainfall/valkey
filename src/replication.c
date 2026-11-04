@@ -903,13 +903,7 @@ void replicationFeedFrames(int dictid, const char *buf, size_t len, int wrap) {
     serverAssert(server.primary_host == NULL && server.repl_backlog != NULL);
     if (wrap) replicationFeedReplicas(-1, &shared.multi, 1);
     prepareReplicasToWrite();
-    if (server.replicas_eldb != dictid) {
-        robj *selectcmd = generateSelectCommand(dictid);
-        feedReplicationBufferWithObject(selectcmd);
-        clusterSlotStatsDecrNetworkBytesOutForReplication(sdslen(objectGetVal(selectcmd)));
-        decrRefCount(selectcmd);
-        server.replicas_eldb = dictid;
-    }
+    replicationFeedSelectDb(dictid);
     feedReplicationBuffer((char *)buf, len);
     if (wrap) replicationFeedReplicas(-1, &shared.exec, 1);
 }
