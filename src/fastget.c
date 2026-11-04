@@ -539,6 +539,9 @@ int fastGetSpeculateBatch(client *c, int tid) {
     if (server.failover_state == FAILOVER_IN_PROGRESS && clientSupportStandAloneRedirect(c) && !c->flag.readonly)
         return 0;
 
+    /* A replica whose link is down and that may not serve stale data replies MASTERDOWN from main. */
+    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 0;
+
     fastGetTouchBegin(c);
 
     /* Only a read that starts with a GET, or a SISMEMBER or HGET with io-threads-speculate-reads, is
