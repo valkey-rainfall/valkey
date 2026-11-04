@@ -1659,3 +1659,59 @@ start_server {tags {"dual-channel-replication external:skip"}} {
         }
     }
 }
+
+# A REPLCONF GETACK in the stream a dual-channel replica buffered during the RDB load is
+# answered while the buffer is replayed, not only after the whole buffer has been applied. The IO
+# threads write it; staged workers run jobs only in phases, so the staged loop is not covered.
+start_server {tags {"dual-channel-replication external:skip"} overrides {io-threads 4 io-threads-fast-path no}} {
+    set replica [srv 0 client]
+    set replica_log [srv 0 stdout]
+    start_server {} {
+        set primary [srv 0 client]
+        set primary_host [srv 0 host]
+        set primary_port [srv 0 port]
+        $primary config set repl-diskless-sync yes
+        $primary config set dual-channel-replication-enabled yes
+        $primary config set client-output-buffer-limit "replica 0 0 0"
+        populate 1000 load: 10
+        # A slow snapshot, so the replica buffers the stream for a while.
+        $primary config set rdb-key-save-delay 3000
+        $replica config set dual-channel-replication-enabled yes
+        $replica config set client-output-buffer-limit "replica 0 0 0"
+        $replica config set loading-process-events-interval-bytes [expr {1 << 30}]
+
+        test "Dual-channel replay answers GETACK before the whole buffer is applied" {
+            set loglines [count_log_lines -1]
+            $replica replicaof $primary_host $primary_port
+            wait_for_log_messages -1 {"*receiving streamed RDB from primary*"} $loglines 100 50
+            set rw [valkey_deferring_client]
+            $rw set waited 1
+            $rw read
+            $rw wait 1 0
+            $rw flush
+            # The writes behind the GETACK come from another process, so this one is free to time
+            # the WAIT reply.
+            set pipe [tmpfile dual-channel-tail]
+            set fd [open $pipe w]
+            fconfigure $fd -translation binary
+            set v [string repeat x 40]
+            for {set i 0} {$i < 300000} {incr i} {
+                puts -nonewline $fd "*3\r\n\$3\r\nSET\r\n\$[string length tail:$i]\r\ntail:$i\r\n\$40\r\n$v\r\n"
+            }
+            close $fd
+            set cli [open "|src/valkey-cli -p $primary_port --pipe < $pipe" r]
+            assert_equal 1 [$rw read]
+            set waited_ms [clock milliseconds]
+            $rw close
+            while {[gets $cli line] >= 0} {}
+            catch {close $cli}
+            wait_for_log_messages -1 {"*Successfully streamed replication data into memory*"} $loglines 200 50
+            set line [lindex [lsearch -inline -all [split [exec cat $replica_log] "\n"] "*Successfully streamed replication data into memory*"] end]
+            regexp {(\d+ \w+ \d+ \d+:\d+:\d+)\.(\d+)} $line -> stamp ms
+            set streamed_ms [expr {[clock scan $stamp -format {%d %b %Y %H:%M:%S}] * 1000 + [scan $ms %d]}]
+            # The replay of the buffered writes takes long enough to tell the two apart.
+            assert {$streamed_ms - $waited_ms > 50}
+            wait_for_ofs_sync $primary $replica
+        }
+    }
+}
