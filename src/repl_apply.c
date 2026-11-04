@@ -12,6 +12,7 @@
 #include "fastpath.h"
 #include "hotkeys.h"
 #include "cluster_slot_stats.h"
+#include "hdr_histogram.h"
 
 
 _Thread_local int repl_apply_in_lane = 0;
@@ -25,6 +26,8 @@ typedef struct {
     int argc;
     int shard;
     long long pxat; /* -1: no expire */
+    unsigned long long in_bytes;
+    long long duration; /* usec, set only for an op kept for the commandlog */
 } replApplyOp;
 
 typedef struct {
@@ -32,6 +35,11 @@ typedef struct {
     int len;
     int cap;
     monotime usec;
+    struct hdr_histogram *hist; /* this lane's SET latencies, merged into the command's by main */
+    long long max_us;
+    int *logs; /* ops the commandlog may take; they keep their arguments until main logs them */
+    int nlogs;
+    int logcap;
 } replApplyLane;
 
 static replApplyLane ra_lanes[IO_THREADS_MAX_NUM];
@@ -622,7 +630,12 @@ int replApplyDefer(client *c) {
         l->cap = l->cap ? l->cap * 2 : 256;
         l->ops = zrealloc(l->ops, sizeof(replApplyOp) * l->cap);
     }
-    l->ops[l->len++] = (replApplyOp){.db = c->db, .argv = c->argv, .argc = c->argc, .shard = shard, .pxat = pxat};
+    l->ops[l->len++] = (replApplyOp){.db = c->db,
+                                     .argv = c->argv,
+                                     .argc = c->argc,
+                                     .shard = shard,
+                                     .pxat = pxat,
+                                     .in_bytes = c->net_input_bytes_curr_cmd};
     ra_pending++;
     hotkeysRecordLookup(c->argv[1], c->db->id, LOOKUP_WRITE);
 
@@ -651,9 +664,38 @@ static void replApplyOne(replApplyOp *op) {
     setKey(NULL, op->db, key, &val, flags);
     if (op->pxat >= 0) setExpire(NULL, op->db, key, op->pxat);
     repl_apply_key = NULL;
+}
+
+/* The value went to the keyspace; the other arguments are the op's. */
+static void replApplyFreeArgs(replApplyOp *op) {
     for (int j = 0; j < op->argc; j++)
-        if (j != 2) decrRefCount(argv[j]);
-    zfree(argv);
+        if (j != 2) decrRefCount(op->argv[j]);
+    zfree(op->argv);
+}
+
+static int commandlogTakes(int type, long long value) {
+    return server.commandlog[type].threshold >= 0 && server.commandlog[type].max_len != 0 &&
+           value >= server.commandlog[type].threshold;
+}
+
+/* After the op ran: whether the commandlog takes it, as call() would decide on main. */
+static int replApplyLogged(replApplyOp *op, long long duration) {
+    return commandlogTakes(COMMANDLOG_TYPE_SLOW, duration) ||
+           commandlogTakes(COMMANDLOG_TYPE_LARGE_REQUEST, (long long)op->in_bytes) ||
+           commandlogTakes(COMMANDLOG_TYPE_LARGE_REPLY, 0);
+}
+
+/* Keep the op's arguments for main's commandlog entry, with a copy of the value the keyspace now owns. */
+static void replApplyKeepForLog(replApplyLane *l, int i, long long duration) {
+    replApplyOp *op = &l->ops[i];
+    robj *v = lookupKeyWriteWithFlags(op->db, op->argv[1], LOOKUP_NOEFFECTS);
+    op->argv[2] = v && v->type == OBJ_STRING ? dupStringObject(v) : createStringObject("", 0);
+    op->duration = duration;
+    if (l->nlogs == l->logcap) {
+        l->logcap = l->logcap ? l->logcap * 2 : 16;
+        l->logs = zrealloc(l->logs, sizeof(int) * l->logcap);
+    }
+    l->logs[l->nlogs++] = i;
 }
 
 void replApplyRunLane(int tid) {
@@ -667,29 +709,81 @@ void replApplyRunLane(int tid) {
     if (!l->len) return;
     repl_apply_in_lane = 1;
     monotime start = getMonotonicUs();
-    if (server.cluster_enabled && server.cluster_slot_stats_enabled) {
-        /* Per-slot CPU, as call() accounts it on the main path. In cluster mode op->shard is the slot and
-         * one slot maps to one lane, so no two threads touch the same counter. A lane op is sub-microsecond,
-         * so count nanoseconds and credit whole microseconds as they accrue (a sub-microsecond residue
-         * may land on the next op's slot); the final residual rounds up once so a lone op is not free. */
+    int slot_stats = server.cluster_enabled && server.cluster_slot_stats_enabled;
+    int histogram = server.latency_tracking_enabled;
+    int slowlog = server.commandlog[COMMANDLOG_TYPE_SLOW].threshold >= 0 &&
+                  server.commandlog[COMMANDLOG_TYPE_SLOW].max_len != 0;
+    if (slot_stats || histogram || slowlog || server.latency_monitor_threshold) {
+        /* Per-op time, as call() measures it on the main path, for the per-slot CPU, the latency
+         * histogram, the latency monitor and the commandlog. In cluster mode op->shard is the slot and
+         * one slot maps to one lane, so no two threads touch the same slot counter. A lane op is
+         * sub-microsecond, so per-slot CPU counts nanoseconds and credits whole microseconds as they
+         * accrue (a sub-microsecond residue may land on the next op's slot); the final residual rounds
+         * up once so a lone op is not free. */
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t prev = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec, carry = 0;
         for (int i = 0; i < l->len; i++) {
-            replApplyOne(&l->ops[i]);
+            replApplyOp *op = &l->ops[i];
+            replApplyOne(op);
             clock_gettime(CLOCK_MONOTONIC, &ts);
             uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-            carry += now - prev;
+            uint64_t ns = now - prev;
             prev = now;
-            clusterSlotStatsAddCpuDurationForSlot(l->ops[i].shard, carry / 1000);
-            carry %= 1000;
+            if (slot_stats) {
+                carry += ns;
+                clusterSlotStatsAddCpuDurationForSlot(op->shard, carry / 1000);
+                carry %= 1000;
+            }
+            if (histogram) updateCommandLatencyHistogram(&l->hist, (int64_t)ns);
+            long long us = (long long)(ns / 1000);
+            if (us > l->max_us) l->max_us = us;
+            if (replApplyLogged(op, us))
+                replApplyKeepForLog(l, i, us);
+            else
+                replApplyFreeArgs(op);
         }
-        if (carry && l->len) clusterSlotStatsAddCpuDurationForSlot(l->ops[l->len - 1].shard, 1);
+        if (slot_stats && carry && l->len) clusterSlotStatsAddCpuDurationForSlot(l->ops[l->len - 1].shard, 1);
     } else {
-        for (int i = 0; i < l->len; i++) replApplyOne(&l->ops[i]);
+        for (int i = 0; i < l->len; i++) {
+            replApplyOp *op = &l->ops[i];
+            replApplyOne(op);
+            if (replApplyLogged(op, 0))
+                replApplyKeepForLog(l, i, 0);
+            else
+                replApplyFreeArgs(op);
+        }
     }
     l->usec = getMonotonicUs() - start;
     repl_apply_in_lane = 0;
+}
+
+/* Main: the commandlog entry call() would add for the op, attributed to the primary client c. */
+static void replApplyLogOp(client *c, replApplyOp *op) {
+    robj **argv = c->argv, **original_argv = c->original_argv;
+    int argc = c->argc, original_argc = c->original_argc;
+    long long duration = c->duration;
+    unsigned long long in = c->net_input_bytes_curr_cmd, out = c->net_output_bytes_curr_cmd;
+    uint32_t redact = c->redact_arg_bitmap;
+    c->argv = op->argv;
+    c->argc = op->argc;
+    c->original_argv = NULL;
+    c->original_argc = 0;
+    c->duration = op->duration;
+    c->net_input_bytes_curr_cmd = op->in_bytes;
+    c->net_output_bytes_curr_cmd = 0;
+    c->redact_arg_bitmap = 0;
+    commandlogPushCurrentCommand(c, ra_set_cmd);
+    c->argv = argv;
+    c->argc = argc;
+    c->original_argv = original_argv;
+    c->original_argc = original_argc;
+    c->duration = duration;
+    c->net_input_bytes_curr_cmd = in;
+    c->net_output_bytes_curr_cmd = out;
+    c->redact_arg_bitmap = redact;
+    for (int j = 0; j < op->argc; j++) decrRefCount(op->argv[j]);
+    zfree(op->argv);
 }
 
 void replApplyFlush(client *c) {
@@ -703,11 +797,27 @@ void replApplyFlush(client *c) {
     ectx->current_client = old;
 
     monotime usec = 0;
+    long long max_us = 0;
     for (int i = 0; i < ra_nlanes; i++) {
-        usec += ra_lanes[i].usec;
-        ra_lanes[i].usec = 0;
-        ra_lanes[i].len = 0;
+        replApplyLane *l = &ra_lanes[i];
+        usec += l->usec;
+        if (l->max_us > max_us) max_us = l->max_us;
+        if (l->hist) {
+            if (server.latency_tracking_enabled && l->hist->total_count) {
+                if (!ra_set_cmd->latency_histogram)
+                    hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
+                             &ra_set_cmd->latency_histogram);
+                hdr_add(ra_set_cmd->latency_histogram, l->hist);
+            }
+            hdr_reset(l->hist);
+        }
+        for (int j = 0; j < l->nlogs; j++) replApplyLogOp(c, &l->ops[l->logs[j]]);
+        l->usec = 0;
+        l->max_us = 0;
+        l->len = 0;
+        l->nlogs = 0;
     }
+    latencyAddSampleIfNeeded((ra_set_cmd->flags & CMD_FAST) ? "fast-command" : "command", max_us);
     ectx->dirty += ra_pending;
     ectx->stat_numcommands += ra_pending;
     server.stat_repl_parallel_applied += ra_pending;
