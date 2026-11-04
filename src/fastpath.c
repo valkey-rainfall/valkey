@@ -193,6 +193,18 @@ typedef struct fpSegPart {
 static fpSegPart *fp_parts = NULL;
 static int fp_nparts = 0, fp_parts_cap = 0;
 static mstime_t fp_phase_time = 0;
+/* Wall and monotonic clocks at the phase start: a lane command's time is the wall time at the phase
+ * start plus the monotonic time since, so each command gets a fresh time without a clock call of
+ * its own. */
+static ustime_t fp_phase_us = 0;
+static monotime fp_phase_mono = 0;
+
+static void fpPhaseClockStart(void) {
+    updateCachedTime(0);
+    fp_phase_time = server.mstime;
+    fp_phase_us = server.ustime;
+    fp_phase_mono = getMonotonicUs();
+}
 /* How a lane hands an entry's propagation to main. Main sets it before each lane phase; it stays fixed
  * through the phase and its merge, since only main-path commands and crons change the sinks. */
 #define FP_PROP_NONE 0   /* no sink is fed: the ops are dropped */
@@ -1817,11 +1829,13 @@ static void fpLaneCall(fpLane *L, client *c) {
     c->redact_arg_bitmap = 0;
     long long dirty = ectx->dirty;
     long long errors = ectx->stat_total_error_replies;
+    monotime start = getMonotonicUs();
+    /* As call() does for a top-level command: relative TTLs and expiry checks use this command's time. */
+    if (ectx->execution_nesting == 0) ectx->cmd_time_snapshot = (fp_phase_us + (ustime_t)(start - fp_phase_mono)) / 1000;
     enterExecutionUnit(0, 0);
     c->flag.executing_command = 1;
     c->flag.buffered_reply = 0;
     c->flag.keyspace_notified = 0;
-    monotime start = getMonotonicUs();
 
     c->cmd->proc(c);
 
@@ -2306,8 +2320,7 @@ void fastpathStreamLanesPrepare(int nlanes, int main_lane) {
         }
         L->sec->cur_tid = main_lane ? l : l + 1;
     }
-    updateCachedTime(0);
-    fp_phase_time = server.mstime;
+    fpPhaseClockStart();
     fp_prop_mode = FP_PROP_NONE;
 }
 
@@ -2396,8 +2409,7 @@ static int fpRunSegment(int pending, int serial, int use_prefetch) {
                 L->ec->cur_tid = fp_lane_main ? l : l + 1;
             }
         }
-        updateCachedTime(0);
-        fp_phase_time = server.mstime;
+        fpPhaseClockStart();
         fp_prop_mode = fpPropMode();
         dbLanePhaseBegin();
         stagedRunWritePhase();
