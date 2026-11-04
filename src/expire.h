@@ -96,6 +96,8 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
 uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit);
 /* Main, after the phase and its replay: merge the per-thread results into the server's stats. */
 void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us);
+/* Main, from maintRun: run on main an expire cycle posted for a MAINT phase whose lanes went off. */
+void activeExpireRunPostedOnMain(uint64_t timelimit_us);
 void expireReplicaKeys(void);
 void rememberReplicaKeyWithExpire(serverDb *db, robj *key);
 void flushReplicaKeysWithExpireList(int async);
