@@ -3683,7 +3683,7 @@ void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
     if (trySendWriteToIOThreads(c) == C_OK) return;
 
-    if (strictOffloadActive() && clientStrictDeferEligible(c) && clientHasPendingReplies(c)) {
+    if ((aofHoldsReplies() || (strictOffloadActive() && clientStrictDeferEligible(c))) && clientHasPendingReplies(c)) {
         connSetWriteHandler(c->conn, NULL);
         putClientInPendingWriteQueue(c);
         return;
@@ -3912,6 +3912,7 @@ int handleClientsWithPendingWrites(void) {
     int processed = 0;
     int pending_writes = listLength(server.clients_pending_write);
     if (pending_writes == 0) return processed; /* Return ASAP if there are no clients. */
+    if (aofHoldsReplies()) return processed;   /* sent after the AOF flush */
 
     listIter li;
     listNode *ln;
