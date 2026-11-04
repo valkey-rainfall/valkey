@@ -335,3 +335,43 @@ TEST_F(ObjectTest, rdb_save_lfu_does_not_write_object_header) {
     server.maxmemory_policy = saved_policy;
     lfu_config_decay_time = saved_decay;
 }
+
+/* Reading the LFU counter (OBJECT FREQ, an eviction sample, a save) stores the
+ * decayed value back. Reads more frequent than lfu-decay-time must not hold
+ * back the decay. */
+TEST_F(ObjectTest, lfu_reads_do_not_reset_decay_clock) {
+    int saved_policy = server.maxmemory_policy;
+    int saved_decay = lfu_config_decay_time;
+    long long t0 = 1000LL * 60 * 60 * 24 * 365;
+    const long long minute = 60 * 1000;
+
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LFU;
+    lfu_config_decay_time = 2;
+    lrulfu_updateClockAndPolicy(t0, true);
+
+    robj *a = createKeyValueObject("lfu-a", "value");
+    robj *b = createKeyValueObject("lfu-b", "value");
+    objectSetLRU(a, lfu_import(100));
+    objectSetLRU(b, lfu_import(100));
+
+    /* A read every minute, for four minutes: two decay periods. */
+    for (int m = 1; m <= 4; m++) {
+        lrulfu_updateClockAndPolicy(t0 + m * minute, true);
+        objectGetLFUFrequency(a);
+        objectGetIdleness(b);
+    }
+    EXPECT_EQ(objectGetLFUFrequency(a), 98);
+    EXPECT_EQ(objectGetIdleness(b), (uint32_t)(UINT8_MAX - 98));
+
+    /* An access still restarts the period. */
+    objectSetLRU(a, lrulfu_touchWithRandom(objectGetLRU(a), 1.0));
+    lrulfu_updateClockAndPolicy(t0 + 5 * minute, true);
+    EXPECT_EQ(objectGetLFUFrequency(a), 98);
+    lrulfu_updateClockAndPolicy(t0 + 6 * minute, true);
+    EXPECT_EQ(objectGetLFUFrequency(a), 97);
+
+    decrRefCount(a);
+    decrRefCount(b);
+    server.maxmemory_policy = saved_policy;
+    lfu_config_decay_time = saved_decay;
+}
