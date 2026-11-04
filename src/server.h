@@ -4000,6 +4000,7 @@ void fastpathLaneLatencySample(const char *event, long long latency_us);
 void fastpathFoldLaneHistograms(void);
 void fastpathResetLaneStats(void);
 void postExecutionUnitOperations(void);
+void propagatePendingEffects(void);
 void serverOpArrayFree(serverOpArray *oa);
 void forceCommandPropagation(client *c, int flags);
 void preventCommandPropagation(client *c);

@@ -4346,6 +4346,14 @@ void postExecutionUnitOperations(void) {
     }
 }
 
+/* Propagates what the current execution unit has done so far, for a module thread that releases
+ * the GIL in the middle of its unit: main runs and propagates its own units meanwhile, so what the
+ * thread did must reach the AOF and replicas first. */
+void propagatePendingEffects(void) {
+    firePostExecutionUnitJobs();
+    propagatePendingCommands();
+}
+
 /* Increment the command failure counters (either rejected_calls or failed_calls).
  * The decision which counter to increment is done using the flags argument, options are:
  * * ERROR_COMMAND_REJECTED - update rejected_calls
