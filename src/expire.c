@@ -837,7 +837,8 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
     int probe = !*stale;
     laneFieldScanData d = {.db = db, .now = now, .tid = tid};
     monotime start = getMonotonicUs();
-    if (lane_expire_free_inline || lane_expire_propagate_only) beginMaintLaneFree();
+    /* Every mode can free an emptied hash in the lane, and the offload free slab is main's alone. */
+    beginMaintLaneFree();
     int repeat = 0;
     do {
         unsigned long num = kvstoreHashtableSize(kvs, didx);
@@ -874,7 +875,7 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
         }
     } while (repeat);
     *stale = repeat;
-    if (lane_expire_free_inline || lane_expire_propagate_only) endMaintLaneFree();
+    endMaintLaneFree();
     lane_expire_stats[tid].fsampled += d.sampled;
     lane_expire_stats[tid].fexpired += d.hashes;
     return elapsedUs(start);
