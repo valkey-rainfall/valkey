@@ -74,3 +74,21 @@ start_server {tags {"keyspace-shard-bits" "external:skip"} overrides {io-threads
         assert_equal {6} [effective_shard_bits]
     }
 }
+
+# The commented example in the shipped valkey.conf must be a value the server accepts.
+set shipped {}
+set fh [open valkey.conf r]
+foreach line [split [read $fh] "\n"] {
+    if {[regexp {^# keyspace-shard-bits (\S+)$} $line -> v]} { set shipped $v }
+}
+close $fh
+test {the shipped valkey.conf shows a keyspace-shard-bits value that parses} {
+    assert_not_equal {} $shipped
+    assert {[string is integer -strict $shipped]}
+}
+start_server [list tags {"keyspace-shard-bits" "external:skip"} overrides [list keyspace-shard-bits $shipped]] {
+    test {the shipped valkey.conf keyspace-shard-bits example is the default} {
+        assert_equal {-1} [configured_shard_bits]
+        assert_equal {8} [effective_shard_bits]
+    }
+}
