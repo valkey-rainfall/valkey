@@ -379,6 +379,20 @@ void fastpathFreeThread(int tid) {
     while (fp_slots > 0 && !fp_threads[fp_slots - 1].ready) fp_slots--;
 }
 
+/* A connection that can never join: its transport, or a role that lasts for the life of the connection. */
+static int fpNeverEligible(client *c) {
+    if (!c->conn || c->flag.fake) return 1;
+    if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 1;
+    if (c->flag.replica || c->flag.primary || c->slot_migration_job || c->flag.import_source) return 1;
+    if (c->flag.repl_rdb_channel || c->repl_data) return 1;
+    if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 1;
+    return 0;
+}
+
+int fastpathMayJoinLater(client *c) {
+    return !fpNeverEligible(c);
+}
+
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
 static int fpSessionEligible(client *c) {
     if (!server.io_threads_fast_path || !fpStaged()) return 0; /* the staged loop is the only fast-path mode */
@@ -394,7 +408,8 @@ static int fpSessionEligible(client *c) {
     if (c->flag.repl_rdb_channel || c->repl_data) return 0; /* a connection on its way to becoming a replica */
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
-    if (c->mstate || c->flag.pubsub || c->flag.tracking || c->name) return 0;
+    if (c->flag.multi || (c->mstate && listLength(&c->mstate->watched_keys))) return 0; /* mstate outlives EXEC */
+    if (c->flag.pubsub || c->flag.tracking || c->name) return 0;
     if (c->capa) return 0; /* CLIENT CAPA changes replies main builds for this client, e.g. REDIRECT */
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;
@@ -1462,20 +1477,25 @@ static int fpReadmit(client *c) {
     return 0;
 }
 
-/* Called by main for a client it owns (partitioned or event-loop) after AUTH ran on it. Returns 1 once the
- * client is on the fast path; a client that is not yet quiescent keeps the flag and is retried next time. */
+/* Called by main for a client it owns (partitioned or event-loop) after a command ran on it. Returns 1
+ * once the client is on the fast path. A client that cannot join yet, because main is not done with it,
+ * a server-wide gate is up, its socket cannot take its pending replies or it holds session state
+ * (MULTI, WATCH, a name, a subscription, ...), keeps the flag and is retried after its next command;
+ * only a client that can never join drops it. */
 int fastpathReadmitAuthenticated(client *c) {
-    if (c->flag.fastpath || c->flag.executor) {
+    if (c->flag.fastpath || c->flag.executor || fpNeverEligible(c)) {
         c->flag.fp_readmit = 0;
         return 0;
     }
     if (!fp_staged_admit) return 0; /* admission needs staged mode; the flag is kept until it starts */
     if (!fpQuiescent(c) || (c->flag.partitioned && c->flag.pending_read)) return 0;
-    c->flag.fp_readmit = 0;
     if (!fpSessionEligible(c)) return 0;
     int was_partitioned = c->flag.partitioned;
     if (was_partitioned) unpartitionClient(c);
-    if (fpReadmit(c)) return 1;
+    if (fpReadmit(c)) {
+        c->flag.fp_readmit = 0;
+        return 1;
+    }
     if (was_partitioned && tryPartitionClient(c) == C_OK) connSetReadHandler(c->conn, NULL);
     return 0;
 }
