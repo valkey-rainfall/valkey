@@ -84,6 +84,8 @@ void fastGetOnAclRulesChanged(void);
 /* Main: the number of modules subscribed to successful command results changed. */
 void fastGetOnCommandResultListenersChanged(int success_listeners);
 void fastGetOnMonitorsChanged(void);
+/* Main, after sleep with the GIL held: recompute the pause/yield/failover gate the read phase tests. */
+void fastGetRefreshMainGate(void);
 
 /* IO thread: reply to a GET prefix of the parsed commands; returns how many.
  * tid = IO thread index (1..N-1). */
