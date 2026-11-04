@@ -110,6 +110,9 @@ static uint32_t maskToEpoll(int mask, int affinity) {
     /* IO fds: one report per edge, never re-reported while unread. MAIN fds: level-triggered but
      * disarmed after each report, re-armed once main consumed the batch that carried it. */
     ev |= affinity == POLLER_AFF_MAIN ? EPOLLONESHOT : EPOLLET;
+    /* An edge that carries the last bytes and the peer's close is reported once: say so, or a
+     * short read leaves the close unseen. */
+    if (affinity != POLLER_AFF_MAIN) ev |= EPOLLRDHUP;
     return ev;
 }
 
@@ -123,6 +126,7 @@ static int epollToMask(uint32_t events) {
     int mask = 0;
     if (events & EPOLLIN) mask |= POLLER_READABLE;
     if (events & EPOLLOUT) mask |= POLLER_WRITABLE;
+    if (events & EPOLLRDHUP) mask |= POLLER_READABLE | POLLER_HUP;
     if (events & (EPOLLERR | EPOLLHUP)) mask |= POLLER_READABLE | POLLER_WRITABLE | POLLER_ERROR;
     return mask;
 }
