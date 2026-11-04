@@ -282,6 +282,26 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         assert_match "*keys_with_volatile_items=0*" [r info keyspace]
     }
 
+    test "Active expire with cron-lanes $lanes frees hashes emptied by field expiry in replay mode" {
+        r flushdb
+        r config resetstat
+        # A blocked client puts the lanes in replay mode; every lane then empties small hashes at once.
+        set rd [valkey_deferring_client]
+        $rd select 0
+        $rd read
+        $rd blpop never-pushed 0
+        wait_for_blocked_clients_count 1
+        r eval {for i=1,20000 do redis.call('hset', 'rh:'..i, 'f', 'v') redis.call('hpexpire', 'rh:'..i, 300, 'FIELDS', 1, 'f') end return 1} 0
+        wait_for_condition 400 50 {[r dbsize] == 0} else { fail "hashes did not empty: [r dbsize]" }
+        assert_equal 20000 [s expired_fields]
+        if {$lanes eq "yes"} { assert_morethan [me_cron_calls r maint_fields] 0 }
+        assert_equal 1 [s blocked_clients]
+        r rpush never-pushed x
+        assert_equal {never-pushed x} [$rd read]
+        $rd close
+        r flushdb
+    }
+
     test "Active expire with cron-lanes $lanes sends hexpired per hash and del when it empties" {
         r flushdb
         r config set notify-keyspace-events Exg
