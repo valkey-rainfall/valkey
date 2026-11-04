@@ -61,6 +61,8 @@ int stagedEpollThreadCpuValid(int cpu, const char **err);
 void stagedEpollThreadReplace(void);
 /* The configuration asks for the epoll thread: io-threads N then runs N-2 IO threads besides main. */
 int stagedEpollThreadWanted(void);
+/* DEBUG: make a running epoll thread exit as on an epoll_wait error. 0 when none runs. */
+int stagedDebugFailEpollThread(void);
 /* Main, from processEventsWhileBlocked: one nested read/write/reply pass so fast-path clients get
  * their BUSY/LOADING replies while main is blocked. A no-op outside staged mode or when nested. */
 void stagedNestedIteration(void);
