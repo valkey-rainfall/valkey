@@ -4,6 +4,7 @@
 #include "functions.h"
 #include "cluster.h"
 #include "module.h"
+#include "bgiteration.h"
 
 #include <stdatomic.h>
 
@@ -387,6 +388,7 @@ void emptyDbAsync(serverDb *db) {
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
+    bgIteration_unlinkInUseEntries(oldkeys, oldexpires, oldkeyswithexpires);
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
 
     uint64_t id = ++next_pending_db_free_id;

@@ -27,6 +27,7 @@
 typedef struct serverObject dbEntry; // An object with key/value inserted into main dictionary
 typedef struct serverObject robj;    // An object with a value used for command parameters
 typedef struct client client;
+typedef struct _kvstore kvstore;
 
 /* The bgIterator is an opaque structure.  */
 typedef struct bgIterator bgIterator;
@@ -308,6 +309,10 @@ void bgIteration_flushall(void);
 /* Iteration needs to know about every SWAPDB, including ones that are not replicated (e.g. a script
  * that disabled replication), so this is called from the swap itself rather than from replication. */
 void bgIteration_swapdb(int db1, int db2);
+
+/* A keyspace about to be freed off the main thread must first drop the entries an iterator still
+ * holds, so their last references are released on main, not raced by the free. */
+void bgIteration_unlinkInUseEntries(kvstore *keys, kvstore *expires, kvstore *keys_with_volatile_items);
 
 
 /* Updating value or expiration of an existing key may lead to reallocation of the dbEntry (robj).

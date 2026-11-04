@@ -2339,6 +2339,23 @@ void bgIteration_swapdb(int db1, int db2) {
     if (bgIteration_iterationActive()) handleSwapdb(db1, db2);
 }
 
+void bgIteration_unlinkInUseEntries(kvstore *keys, kvstore *expires, kvstore *keys_with_volatile_items) {
+    if (inUseEntries == NULL || dictSize(inUseEntries) == 0) return;
+    dictIterator *di = dictGetIterator(inUseEntries);
+    dictEntry *e;
+    while ((e = dictNext(di)) != NULL) {
+        dbEntry *de = dictGetKey(e);
+        sds key = objectGetKey(de);
+        int didx = getKVStoreIndexForKey(key);
+        void *found;
+        if (!kvstoreHashtableFind(keys, didx, key, &found) || found != de) continue;
+        kvstoreHashtableDelete(expires, didx, key);
+        kvstoreHashtableDelete(keys_with_volatile_items, didx, key);
+        kvstoreHashtableDelete(keys, didx, key);
+    }
+    dictReleaseIterator(di);
+}
+
 
 // PUBLIC API
 bool bgIteration_blockClientIfRequired(client *c) {
