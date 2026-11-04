@@ -2066,6 +2066,18 @@ static void updateCopyAvoidPressure(monotime current_time) {
     }
 }
 
+/* Microseconds main may sleep while a WAIT or WAITAOF client waits on the everysec fsync, which a
+ * background thread completes without waking main and which starts only when main runs a second after
+ * the last one; -1 when no client waits on it. */
+long long aofFsyncWaitSleepCapUs(void) {
+    if (listLength(server.clients_waiting_acks) == 0) return -1;
+    if (server.aof_state != AOF_ON || server.aof_fsync != AOF_FSYNC_EVERYSEC) return -1;
+    if (server.fsynced_reploff == -1 || server.fsynced_reploff >= server.primary_repl_offset) return -1;
+    if (bioPendingJobsOfType(BIO_AOF_FSYNC)) return 1000;
+    long long due_ms = server.aof_last_fsync + 1000 - server.mstime;
+    return due_ms > 1 ? due_ms * 1000 : 1000;
+}
+
 /* Keep the main execution loop together in the compiler hot section as adjacent subsystems grow. */
 void beforeSleep(struct aeEventLoop *eventLoop) __attribute__((hot, aligned(64)));
 void call(client *c, int flags) __attribute__((hot, aligned(64)));
