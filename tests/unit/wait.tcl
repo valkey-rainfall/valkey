@@ -215,6 +215,29 @@ tags {"wait aof network external:skip"} {
             assert_equal [$master waitaof 1 0 0] {1 0}
         }
 
+        test {WAITAOF always is not undone by a late fsync of an old INCR file} {
+            # The first rewrite's fsync-and-close job sleeps 2 seconds. A later
+            # write is fsynced inline, then a second rewrite queues another
+            # close job, which sleeps after the first one lands.
+            $master debug aof-bio-fsync-sleep 2000000
+            set start [clock milliseconds]
+            $master bgrewriteaof
+            waitForBgrewriteaof $master
+            $master incr foo
+            assert_equal [$master waitaof 1 0 0] {1 0}
+            $master bgrewriteaof
+            waitForBgrewriteaof $master
+            $master debug aof-bio-fsync-sleep 0
+            set now [clock milliseconds]
+            if {$now - $start < 2300} {after [expr {2300 - ($now - $start)}]}
+            set reply [$master waitaof 1 0 100]
+            if {[clock milliseconds] - $start < 3700} {
+                assert_equal $reply {1 0}
+            }
+            after 2500
+            assert_equal [$master waitaof 1 0 0] {1 0}
+        }
+
         test {WAITAOF local wait and then stop aof} {
             r config set appendfsync no
             set rd [valkey_deferring_client]
@@ -640,4 +663,56 @@ start_server {} {
     }
 }
 }
+}
+
+tags {"wait aof network external:skip"} {
+    start_server {overrides {appendonly {yes} appendfsync {no} auto-aof-rewrite-percentage {0}}} {
+        set replica [srv 0 client]
+
+        start_server {} {
+            set primary [srv 0 client]
+            set primary_host [srv 0 host]
+            set primary_port [srv 0 port]
+
+            test {A late fsync of the old AOF does not raise the fsynced offset after a full sync} {
+                # Give the replica-to-be a replication offset well above the new primary's.
+                set rd [valkey_deferring_client -1]
+                for {set i 0} {$i < 3000} {incr i} {
+                    $rd incr k
+                }
+                for {set i 0} {$i < 3000} {incr i} {
+                    $rd read
+                }
+                $rd close
+                set old_offset [status $replica master_repl_offset]
+                assert_morethan_equal $old_offset 3000
+
+                # The close job of the old INCR file stores that large offset
+                # 3 seconds from now, after the full sync has restarted the AOF.
+                $replica debug aof-bio-fsync-sleep 3000000
+                set start [clock milliseconds]
+                $replica bgrewriteaof
+                waitForBgrewriteaof $replica
+                $replica debug aof-bio-fsync-sleep 0
+                $replica replicaof $primary_host $primary_port
+                wait_for_condition 100 100 {
+                    [status $replica master_link_status] eq {up} &&
+                    [status $replica aof_rewrite_in_progress] == 0 &&
+                    [status $replica aof_rewrite_scheduled] == 0
+                } else {
+                    fail "replica did not sync"
+                }
+                wait_replica_online $primary
+
+                # Let the close job land and the replica send its next FACK.
+                set elapsed [expr {[clock milliseconds] - $start}]
+                if {$elapsed < 4500} {after [expr {4500 - $elapsed}]}
+
+                # Under appendfsync no the replica has not fsynced this write.
+                $primary set x 1
+                assert_lessthan [status $primary master_repl_offset] $old_offset
+                assert_equal [$primary waitaof 0 1 200] {0 0}
+            }
+        }
+    }
 }
