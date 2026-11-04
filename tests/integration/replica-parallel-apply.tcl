@@ -151,3 +151,62 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
         }
     }
 }
+
+# With every local client in a priority subnet, replies to many subscribers queue ahead of the
+# primary's planned read, which then completes after main-path commands of the same iteration ran.
+# A WATCH among them was not seen when the read was classified.
+start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fast-path yes}} {
+    start_server {overrides {io-threads 4 io-threads-fast-path yes keyspace-shard-bits 8 priority-subnets 127.0.0.0/8 enable-debug-assert yes}} {
+        set primary [srv -1 client]
+        set replica [srv 0 client]
+        $replica config set notify-keyspace-events ""
+        $replica replicaof [srv -1 host] [srv -1 port]
+        wait_for_sync $replica
+        wait_for_ofs_sync $primary $replica
+
+        test {Parallel apply: WATCHes racing planned lane reads leave the watch state intact} {
+            set lane_reads [getInfoProperty [$replica info stats] repl_lane_reads]
+            set subs {}
+            for {set j 0} {$j < 200} {incr j} {
+                set s [valkey_deferring_client]
+                $s subscribe ch
+                $s read
+                lappend subs $s
+            }
+            set watched {}
+            for {set k 0} {$k < 16} {incr k} { lappend watched w:$k }
+            set w [valkey_client]
+            set rd [valkey_deferring_client -1]
+            set pending 0
+            for {set round 0} {$round < 2000} {incr round} {
+                $rd publish ch x
+                for {set k 0} {$k < 40} {incr k} { $rd set w:[expr {$k % 16}] $round }
+                $rd flush
+                incr pending 41
+                $w watch {*}$watched
+                $w unwatch
+                if {$pending >= 4100} {
+                    for {set i 0} {$i < $pending} {incr i} { $rd read }
+                    set pending 0
+                }
+            }
+            for {set i 0} {$i < $pending} {incr i} { $rd read }
+            $rd close
+            $w close
+            foreach s $subs { $s close }
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            assert_morethan [getInfoProperty [$replica info stats] repl_lane_reads] $lane_reads
+            assert_equal 0 [getInfoProperty [$replica info clients] watching_clients]
+            set rr [valkey_client]
+            $rr watch w:0
+            $primary set w:0 changed
+            wait_for_ofs_sync $primary $replica
+            $rr multi
+            $rr get w:0
+            assert_equal [$rr exec] {}
+            $rr close
+            assert_equal 0 [getInfoProperty [$replica info clients] watching_clients]
+        }
+    }
+}
