@@ -107,6 +107,9 @@ void stagedInfo(char **info) {
     sds s = *info;
     s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
     s = sdscatprintf(s, "staged_epoll_thread:%d\r\n", stagedEpollThreadRunning());
+    s = sdscatprintf(s, "staged_lanes_veto_clients:%s\r\nstaged_lanes_veto_maint:%s\r\n",
+                     fastpathParallelVetoName(fastpathLastParallelVeto(FP_PAR_CLIENTS)),
+                     fastpathParallelVetoName(fastpathLastParallelVeto(FP_PAR_MAINT)));
     s = sdscatprintf(s, "staged_stream_arena_guard_bytes:%lld\r\n",
                      (long long)server.stat_staged_stream_arena_guard_bytes);
     for (int i = 0; i < SL_T_COUNT; i++)
@@ -787,6 +790,11 @@ int stagedMainTakesLane(void) {
     return sl_main_lane;
 }
 
+int stagedLaneCount(void) {
+    int n = sl_workers + sl_main_lane;
+    return n > FP_MAX_LANES ? FP_MAX_LANES : n;
+}
+
 int stagedWorkerSpins(int tid) {
     return !atomic_load_explicit(&sl_on_main_cpu[tid], memory_order_relaxed);
 }
@@ -908,6 +916,9 @@ int stagedDeferRead(client *c) {
     return 0;
 }
 int stagedMainTakesLane(void) {
+    return 1;
+}
+int stagedLaneCount(void) {
     return 1;
 }
 int stagedWorkerSpins(int tid) {
