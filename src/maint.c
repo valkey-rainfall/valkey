@@ -212,6 +212,13 @@ static void maintNoteCut(int claim_index) {
 static void maintRunUnit(int tid, int claim_index, const maintUnit *u, uint64_t remain_us[MAINT_JOB_COUNT]) {
     serverDb *db = server.db[u->dbid];
 
+    /* A unit claimed after this thread's EXPIRE budget ran out gets no expiry: the next phase starts here. */
+    if (mt_requested[MAINT_JOB_EXPIRE] && remain_us[MAINT_JOB_EXPIRE] == 0 &&
+        (kvstoreHashtableSize(db->expires, u->didx) > 0 ||
+         (u->didx < kvstoreNumHashtables(db->keys_with_volatile_items) &&
+          kvstoreHashtableSize(db->keys_with_volatile_items, u->didx) > 0)))
+        maintNoteCut(claim_index);
+
     if (mt_requested[MAINT_JOB_EXPIRE] && remain_us[MAINT_JOB_EXPIRE] > 0) {
         int hit_limit = 0;
         uint64_t spent =
@@ -230,6 +237,9 @@ static void maintRunUnit(int tid, int claim_index, const maintUnit *u, uint64_t 
             remain_us[MAINT_JOB_EXPIRE] =
                 fspent >= remain_us[MAINT_JOB_EXPIRE] ? 0 : remain_us[MAINT_JOB_EXPIRE] - fspent;
             if (fhit) maintNoteCut(claim_index);
+        } else if (u->didx < kvstoreNumHashtables(db->keys_with_volatile_items) &&
+                   kvstoreHashtableSize(db->keys_with_volatile_items, u->didx) > 0) {
+            maintNoteCut(claim_index); /* the keys used the budget; this table's hash fields come first next */
         }
     }
 
@@ -541,8 +551,11 @@ void maintRun(void) {
         activeExpireLaneEnd(lanes_us, getMonotonicUs() - phase_t0, usec[MAINT_JOB_EXPIRE]);
     }
 
-    /* Start the next phase at the first unit a budget cut off. */
+    /* Start the next phase at the first unit a budget cut off, or else at the first one no thread claimed
+     * because every budget ran out. */
     int cut = atomic_load_explicit(&mt_first_cut, memory_order_relaxed);
+    int unclaimed = atomic_load_explicit(&mt_cursor, memory_order_relaxed);
+    if (unclaimed < cut) cut = unclaimed;
     if (cut < mt_units_len) mt_resume_key = maintUnitKey(&mt_units[(mt_start + cut) % mt_units_len]);
 
     maintReset();
