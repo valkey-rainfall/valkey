@@ -159,6 +159,42 @@ start_server {tags {"reply-offload external:skip needs:debug logreqres:skip"} ov
         assert_equal PONG [r ping]
     }
 
+    test {Reply offload: a reply past the hard limit closes the client before any of it is written} {
+        reply_offload_on
+        set orig [lindex [r config get client-output-buffer-limit] 1]
+        r config set client-output-buffer-limit {normal 1048576 0 0}
+        r set k [mkbig 8388608]
+        # A raw socket that never reads: as with a copied reply, the limit applies when the reply is
+        # added, so the client is closed with nothing sent.
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation binary -blocking 1
+        puts -nonewline $fd "*3\r\n\$6\r\nclient\r\n\$7\r\nsetname\r\n\$3\r\nrol\r\n"
+        flush $fd
+        assert_equal "+OK" [string trim [gets $fd]]
+        puts -nonewline $fd "*2\r\n\$6\r\nselect\r\n\$1\r\n9\r\n"
+        flush $fd
+        assert_equal "+OK" [string trim [gets $fd]]
+        set closed [s client_output_buffer_limit_disconnections]
+        set out [s total_net_output_bytes]
+        puts -nonewline $fd "*2\r\n\$3\r\nget\r\n\$1\r\nk\r\n"
+        flush $fd
+        wait_for_condition 100 50 {
+            ![string match "*name=rol *" [r client list]]
+        } else {
+            fail "client with oversized offloaded reply was not closed"
+        }
+        assert_equal [expr {$closed + 1}] [s client_output_buffer_limit_disconnections]
+        # Only this connection's INFO replies were written since.
+        assert_lessthan [expr {[s total_net_output_bytes] - $out}] 100000
+        fconfigure $fd -blocking 0
+        set got ""
+        catch {set got [read $fd]}
+        catch {close $fd}
+        assert_equal 0 [string length $got]
+        r config set client-output-buffer-limit $orig
+        assert_equal PONG [r ping]
+    }
+
     test {Reply offload: DEBUG REPLY-RAW value is byte-exact via raw ref arm} {
         reply_offload_on
         r set k [mkbig 100]
