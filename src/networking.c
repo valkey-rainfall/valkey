@@ -2724,9 +2724,11 @@ void beforeNextClient(client *c) {
     if (!c->flag.ring_epilogue) updateClientMemUsageAndBucket(c);
     if (c->flag.fp_readmit && fastpathReadmitAuthenticated(c)) return;
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
-     * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
+     * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer.
+     * A reply held for the AOF write waits in the pending-write queue, which a ring epilogue skipped. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
-        trySendWriteToIOThreads(c);
+        if (trySendWriteToIOThreads(c) != C_OK && aofHoldsReplies() && clientHasPendingReplies(c))
+            putClientInPendingWriteQueue(c);
     }
 
     armPartitionedClientRead(c);

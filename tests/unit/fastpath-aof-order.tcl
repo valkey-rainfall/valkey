@@ -41,8 +41,18 @@ proc fao_fp_client {{host {}} {port {}}} {
     return $fd
 }
 
+# An everysec write postponed behind a background fsync sends its replies first, as upstream does.
+proc fao_wait_no_bio_fsync {} {
+    wait_for_condition 500 10 {
+        [getInfoProperty [r info persistence] aof_pending_bio_fsync] == 0
+    } else {
+        fail "background AOF fsync did not finish"
+    }
+}
+
 # Milliseconds from sending cmd on fd until its reply, with every AOF flush delayed by sleep_ms.
 proc fao_reply_ms {fd sleep_ms args} {
+    fao_wait_no_bio_fsync
     r debug aof-flush-sleep [expr {$sleep_ms * 1000}]
     set t0 [clock milliseconds]
     puts -nonewline $fd [fao_resp {*}$args]
@@ -156,5 +166,54 @@ start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overri
         r config set rdb-key-save-delay 0
         waitForBgrewriteaof r
         close $fd
+    }
+}
+
+foreach policy {everysec no} {
+    start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes enable-debug-command yes save ""}} {
+        r config set appendfsync $policy
+        r select 0
+        waitForBgrewriteaof r
+
+        test "AOF order: $policy, a fast-path write's reply follows its AOF write (#41)" {
+            set fd [fao_fp_client]
+            for {set i 0} {$i < 3} {incr i} {
+                lassign [fao_reply_ms $fd $fao_sleep set fao:es $i] ms reply
+                assert_equal {+OK} $reply
+                assert_morethan_equal $ms [expr {$fao_sleep - 50}]
+            }
+            # Pipelined writes, which the staged loop may stream while it executes.
+            fao_wait_no_bio_fsync
+            r debug aof-flush-sleep [expr {$fao_sleep * 1000}]
+            set t0 [clock milliseconds]
+            set p {}
+            for {set i 0} {$i < 200} {incr i} { append p [fao_resp incr fao:es:n] }
+            puts -nonewline $fd $p
+            flush $fd
+            assert_equal {:1} [fao_read_line $fd]
+            assert_morethan_equal [expr {[clock milliseconds] - $t0}] [expr {$fao_sleep - 50}]
+            for {set i 2} {$i <= 200} {incr i} { assert_equal ":$i" [fao_read_line $fd] }
+            r debug aof-flush-sleep 0
+            close $fd
+        }
+    }
+
+    start_server {tags {"aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-fast-path no appendonly yes enable-debug-command yes save ""}} {
+        r config set appendfsync $policy
+        waitForBgrewriteaof r
+
+        test "AOF order: $policy, IO threads without the staged loop: a write's reply follows its AOF write (#45)" {
+            set rd [valkey_deferring_client]
+            for {set i 0} {$i < 5} {incr i} {
+                fao_wait_no_bio_fsync
+                r debug aof-flush-sleep [expr {$fao_sleep * 1000}]
+                set t0 [clock milliseconds]
+                $rd set fao:io $i
+                assert_equal OK [$rd read]
+                assert_morethan_equal [expr {[clock milliseconds] - $t0}] [expr {$fao_sleep - 50}]
+                r debug aof-flush-sleep 0
+            }
+            $rd close
+        }
     }
 }

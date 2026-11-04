@@ -3775,10 +3775,13 @@ int bg_unlink(const char *filename);
 
 /* AOF persistence */
 void flushAppendOnlyFile(int force);
-/* The AOF buffer holds writes that, under appendfsync always, must be fsynced before a reply or a
- * replica byte that may depend on them leaves the process. */
+/* The AOF buffer holds writes that must reach the AOF before a reply or a replica byte that may depend
+ * on them leaves the process: fsynced under appendfsync always; under everysec and no, written, unless
+ * the write was postponed behind a background fsync or failed, where replies go as on the stock loop. */
 static inline int aofHoldsReplies(void) {
-    return server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS && sdslen(server.aof_buf) > 0;
+    if (server.aof_state == AOF_OFF || sdslen(server.aof_buf) == 0) return 0;
+    if (server.aof_fsync == AOF_FSYNC_ALWAYS) return 1;
+    return !server.aof_flush_postponed_start && server.aof_last_write_status == C_OK;
 }
 void feedAppendOnlyFile(int dictid, robj **argv, int argc);
 void aofRemoveTempFile(pid_t childpid, int from_signal);
