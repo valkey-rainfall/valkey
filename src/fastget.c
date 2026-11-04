@@ -110,6 +110,21 @@ void fastGetOnMonitorsChanged(void) {
     atomic_store_explicit(&fastget_monitor_gate, listLength(server.monitors) > 0, memory_order_release);
 }
 
+/* Set while main may postpone or reject a read: CLIENT PAUSE ALL, a yielding script or module, or
+ * FAILOVER_IN_PROGRESS. Kept alone on its line and stored only when it changes, so the read phase
+ * tests one shared word and checks the states themselves only while it is set. */
+static struct {
+    _Atomic int on;
+    char pad[CACHE_LINE_SIZE - sizeof(int)];
+} fastget_main_gate __attribute__((aligned(CACHE_LINE_SIZE)));
+
+void fastGetRefreshMainGate(void) {
+    int gate = isPausedActions(PAUSE_ACTION_CLIENT_ALL) || isInsideYieldingLongCommand() ||
+               server.failover_state == FAILOVER_IN_PROGRESS;
+    if (atomic_load_explicit(&fastget_main_gate.on, memory_order_relaxed) != gate)
+        atomic_store_explicit(&fastget_main_gate.on, gate, memory_order_relaxed);
+}
+
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
  * Returns bytes written, or 0 if insufficient space (punt to main). */
 static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
@@ -533,11 +548,14 @@ int fastGetSpeculateBatch(client *c, int tid) {
     /* Main postpones or rejects the read: CLIENT PAUSE ALL postpones it, a yielding script or module
      * (including a module thread yielding from a thread-safe context) postpones it or replies BUSY,
      * and during FAILOVER_IN_PROGRESS a client that may be redirected waits for the new primary. All
-     * of this state changes only on main, outside the read phase. */
-    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL)) return 0;
-    if (isInsideYieldingLongCommand()) return 0;
-    if (server.failover_state == FAILOVER_IN_PROGRESS && clientSupportStandAloneRedirect(c) && !c->flag.readonly)
-        return 0;
+     * of this state changes only on main, outside the read phase, and main refreshes the gate after
+     * the GIL is back and before the read phase opens. */
+    if (atomic_load_explicit(&fastget_main_gate.on, memory_order_relaxed)) {
+        if (isPausedActions(PAUSE_ACTION_CLIENT_ALL)) return 0;
+        if (isInsideYieldingLongCommand()) return 0;
+        if (server.failover_state == FAILOVER_IN_PROGRESS && clientSupportStandAloneRedirect(c) && !c->flag.readonly)
+            return 0;
+    }
 
     /* A replica whose link is down and that may not serve stale data replies MASTERDOWN from main. */
     if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 0;
