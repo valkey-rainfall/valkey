@@ -251,3 +251,41 @@ start_server {tags {"repl external:skip"} overrides {io-threads 2 enable-debug-c
         }
     }
 }
+
+# A replica holding replicated SETs for parallel apply publishes their bytes to its own
+# sender only once they are applied; its sub-replica still gets every byte.
+start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fast-path yes}} {
+    set primary [srv 0 client]
+    start_server {overrides {io-threads 4 io-threads-fast-path yes keyspace-shard-bits 8 io-threads-parallel-writes no repl-diskless-sync no}} {
+        set replica [srv 0 client]
+        $replica config set notify-keyspace-events ""
+        $replica config set repl-stream-sender append
+        $replica config set repl-stream-sender-wake-bytes 0
+        $replica replicaof [srv -1 host] [srv -1 port]
+        wait_for_sync $replica
+        start_server {overrides {io-threads 2}} {
+            set sub [srv 0 client]
+            $sub replicaof [srv -1 host] [srv -1 port]
+            wait_for_sync $sub
+            test "repl-stream-sender append: a sub-replica gets every held parallel-apply SET" {
+                wait_for_condition 50 100 {
+                    [rss_sender_replicas $replica] == 1
+                } else {
+                    fail "sender did not take ownership of the sub-replica"
+                }
+                set held [getInfoProperty [$replica info stats] repl_parallel_applied]
+                set rd [valkey_deferring_client -2]
+                for {set batch 0} {$batch < 100} {incr batch} {
+                    for {set i 0} {$i < 200} {incr i} { $rd set h${batch}_$i v }
+                    $rd flush
+                    for {set i 0} {$i < 200} {incr i} { $rd read }
+                }
+                $rd close
+                wait_for_ofs_sync $primary $replica
+                wait_for_ofs_sync $replica $sub
+                assert_equal [$primary debug digest] [$sub debug digest]
+                assert_morethan [getInfoProperty [$replica info stats] repl_parallel_applied] $held
+            }
+        }
+    }
+}
