@@ -3810,6 +3810,7 @@ int bg_unlink(const char *filename);
 
 /* AOF persistence */
 void flushAppendOnlyFile(int force);
+long long aofFsyncWaitSleepCapUs(void);
 /* The AOF buffer holds writes that must reach the AOF before a reply or a replica byte that may depend
  * on them leaves the process: fsynced under appendfsync always; under everysec and no, written, unless
  * the write was postponed behind a background fsync or failed, where replies go as on the stock loop. */
