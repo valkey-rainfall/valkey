@@ -218,6 +218,9 @@ static void stagedStreamClose(int abort) {
 /* Open one phase for the enrolled workers and wait until all of them are done. */
 static void stagedRunPhase(int phase) {
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
+    /* READ answers GETs and REPLY sends replies: a write made since the last flush, such as a module
+     * thread's while main slept, reaches the AOF first. */
+    if ((phase == STAGED_PHASE_READ || phase == STAGED_PHASE_REPLY) && aofHoldsReplies()) flushAppendOnlyFile(0);
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
