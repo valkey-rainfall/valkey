@@ -2220,6 +2220,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         if (listLength(server.clients_waiting_acks) && prev_fsynced_reploff != server.fsynced_reploff) dont_sleep = 1;
     }
 
+    /* Clients whose readmission waited for this flush write their replies and rejoin the fast path. */
+    fastpathRetryAofReadmits();
+
     /* Handle writes with pending output buffers. */
     int client_writes = handleClientsWithPendingWrites();
     if (client_writes > 0) server.el_iteration_active = true;

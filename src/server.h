@@ -3775,6 +3775,11 @@ int bg_unlink(const char *filename);
 
 /* AOF persistence */
 void flushAppendOnlyFile(int force);
+/* The AOF buffer holds writes that, under appendfsync always, must be fsynced before a reply or a
+ * replica byte that may depend on them leaves the process. */
+static inline int aofHoldsReplies(void) {
+    return server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS && sdslen(server.aof_buf) > 0;
+}
 void feedAppendOnlyFile(int dictid, robj **argv, int argc);
 void aofRemoveTempFile(pid_t childpid, int from_signal);
 int rewriteAppendOnlyFileBackground(void);

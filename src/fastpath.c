@@ -1398,8 +1398,37 @@ static int fpQuiescent(client *c) {
     return 1;
 }
 
+/* Clients whose readmission waits for the AOF flush; main retries them right after it. */
+static uint64_t *fp_aof_readmit = NULL;
+static size_t fp_aof_readmit_len = 0, fp_aof_readmit_cap = 0;
+
+static void fpReadmitAfterAof(client *c) {
+    c->flag.fp_readmit = 1;
+    if (fp_aof_readmit_len && fp_aof_readmit[fp_aof_readmit_len - 1] == c->id) return;
+    if (fp_aof_readmit_len == fp_aof_readmit_cap) {
+        fp_aof_readmit_cap = fp_aof_readmit_cap ? fp_aof_readmit_cap * 2 : 16;
+        fp_aof_readmit = zrealloc(fp_aof_readmit, fp_aof_readmit_cap * sizeof(uint64_t));
+    }
+    fp_aof_readmit[fp_aof_readmit_len++] = c->id;
+}
+
+/* Main, right after an AOF flush: readmit the clients whose replies waited for it. */
+void fastpathRetryAofReadmits(void) {
+    if (fp_aof_readmit_len == 0 || aofHoldsReplies()) return;
+    size_t n = fp_aof_readmit_len;
+    fp_aof_readmit_len = 0;
+    for (size_t i = 0; i < n; i++) {
+        client *c = lookupClientByID(fp_aof_readmit[i]);
+        if (c && c->flag.fp_readmit && !c->flag.fastpath && !c->flag.blocked) fastpathReadmitAuthenticated(c);
+    }
+}
+
 static int fpReadmit(client *c) {
     if (!fpQuiescent(c)) return 0;
+    if (clientHasPendingReplies(c) && aofHoldsReplies()) {
+        fpReadmitAfterAof(c);
+        return 0;
+    }
     if (clientHasPendingReplies(c) && (writeToClient(c) != C_OK || clientHasPendingReplies(c))) return 0;
     if (!fastpathEligible(c)) return 0;
     if (c->flag.pending_write) {
