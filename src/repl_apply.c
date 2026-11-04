@@ -18,6 +18,7 @@
 
 
 _Thread_local int repl_apply_in_lane = 0;
+_Thread_local int repl_apply_plan_lane = 0;
 _Thread_local const char *repl_apply_key = NULL;
 _Thread_local int repl_apply_shard = 0;
 
@@ -375,6 +376,7 @@ static void rpRunLane(int lane) {
             if (seg < rp.seg) continue; /* its segment ran on main */
             if (!entered) {
                 fastpathStreamLaneEnter(lane);
+                repl_apply_plan_lane = 1;
                 entered = 1;
             }
             if (idx == 0) {
@@ -390,7 +392,10 @@ static void rpRunLane(int lane) {
         cur->pos = 0;
     }
 done:
-    if (entered) fastpathStreamLaneLeave();
+    if (entered) {
+        repl_apply_plan_lane = 0;
+        fastpathStreamLaneLeave();
+    }
 }
 
 /* Staged thread tid (0 = main) in a phase of the plan. */
@@ -461,6 +466,39 @@ static void rpRunPhase(int mode) {
     rp.mode = RP_IDLE;
 }
 
+/* Main: a lane command of [from, to) has a key a client watches or is blocked on. The read was classified
+ * against the observers that existed when it was read; commands that ran on main since (a WATCH, a
+ * blocking command) can have added more. */
+static int rpObservedInRange(client *c, int from, int to) {
+    int blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
+                  server.blocked_clients_by_type[BLOCKED_STREAM];
+    if (!blocked && !server.watching_clients) return 0;
+    for (int idx = from; idx < to; idx++) {
+        rpEntry *e = &rp.e[idx];
+        struct serverCommand *cmd;
+        robj **argv;
+        int argc;
+        if (idx == 0) {
+            cmd = c->parsed_cmd, argv = c->argv, argc = c->argc;
+        } else {
+            parsedCommand *p = &c->cmd_queue.cmds[idx - 1];
+            cmd = p->cmd, argv = p->argv, argc = p->argc;
+        }
+        getKeysResult result;
+        initGetKeysResult(&result);
+        int n = getKeysFromCommand(cmd, argv, argc, &result);
+        int observed = 0;
+        for (int i = 0; i < n && !observed; i++) {
+            robj *k = argv[result.keys[i].pos];
+            observed = (server.watching_clients && dictFind(e->db->watched_keys, k)) ||
+                       (blocked && dictFind(e->db->blocking_keys, k));
+        }
+        getKeysFreeResult(&result);
+        if (observed) return 1;
+    }
+    return 0;
+}
+
 static void rpApplySegment(uint32_t s, int count) {
     monotime start = getMonotonicUs();
     fastpathStreamLanesPrepare(rp.nlanes, rp.main_lane);
@@ -479,13 +517,13 @@ static int rpRunSegments(client *c) {
     int pos = 0;
     for (int s = 0;; s++) {
         int end = s < rp.nb ? rp.bpos[s] : rp.n;
-        if (end - pos >= server.io_threads_parallel_writes_min) {
+        if (end - pos >= server.io_threads_parallel_writes_min && !rpObservedInRange(c, pos, end)) {
             if (!rpQueueAt(c, pos, qlen)) return C_OK;
             replApplyFlush(c); /* writes held from earlier segments land first */
             rpApplySegment((uint32_t)s, end - pos);
             rpConsume(c, pos, end);
         } else {
-            /* Too few to pay for a lane phase: on main, in order; the lanes skip them. */
+            /* Too few to pay for a lane phase, or one is observed: on main, in order; the lanes skip them. */
             for (int i = pos; i < end; i++) {
                 int r = rpRunOnMain(c, i, qlen);
                 if (r != C_OK) return r == C_ERR ? C_ERR : C_OK;

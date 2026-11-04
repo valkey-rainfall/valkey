@@ -876,7 +876,10 @@ long long dbTotalServerKeyCount(void) {
 /* Note that the 'c' argument may be NULL if the key was modified out of
  * a context of a client. */
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
-    touchWatchedKey(db, key);
+    if (repl_apply_plan_lane)
+        debugServerAssert(!dictSize(db->watched_keys) || !dictFind(db->watched_keys, key));
+    else
+        touchWatchedKey(db, key);
     trackingInvalidateKey(c, key, 1);
     bgIteration_keyModified(db->id, objectGetVal(key));
 }
