@@ -10,6 +10,8 @@
 
 #include <cstddef>
 #include <cstring>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 extern "C" {
 #include "cluster.h"
@@ -415,6 +417,50 @@ TEST_F(ClusterIOOffloadTest, WriteDispatchSnapshotsBoundary) {
     runInlineWorkerAndDrain(clusterWriteJob, link);
     EXPECT_EQ(link->io_write_state, CLUSTER_LINK_IO_IDLE);
     EXPECT_EQ(link->io_refs, 0);
+}
+
+/* A high-priority job on the shared inbox wakes a sleeping IO thread when it is published, rather than
+ * waiting for the next IOThreadsBeforeSleep (an idle thread sleeps up to 100 ms meanwhile). */
+TEST_F(ClusterIOOffloadTest, HighPriorityJobWakesSleepingThread) {
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT_GE(efd, 0);
+    testOnlySetIOThreadSleeping(1, efd);
+    clusterLink *link = makeLink();
+    enqueueFakeMsg(link);
+    ASSERT_EQ(trySendClusterWriteToIOThreads(link), C_OK);
+    EXPECT_EQ(testOnlyIOThreadSleeping(1), 0);
+    uint64_t v = 0;
+    EXPECT_EQ(read(efd, &v, sizeof(v)), (ssize_t)sizeof(v));
+    testOnlySetIOThreadSleeping(1, -1);
+    close(efd);
+    runInlineWorkerAndDrain(clusterWriteJob, link);
+}
+
+/* The same for a priority client's write job (a replica, or a client in priority-subnets). */
+TEST_F(ClusterIOOffloadTest, PriorityClientWriteWakesSleepingThread) {
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT_GE(efd, 0);
+    testOnlySetIOThreadSleeping(1, efd);
+    fakeConnection *fc = makeConn(CONN_OWNER_CLIENT);
+    fc->conn.is_priority = true;
+    client *c = (client *)zcalloc(sizeof(client));
+    c->conn = &fc->conn;
+    c->reply = listCreate();
+    c->buf = (char *)zmalloc(64);
+    c->buf_usable_size = 64;
+    memcpy(c->buf, "+OK\r\n", 5);
+    c->bufpos = 5;
+    ASSERT_EQ(trySendWriteToIOThreads(c), C_OK);
+    EXPECT_EQ(c->io_write_state, CLIENT_PENDING_IO);
+    EXPECT_EQ(testOnlyIOThreadSleeping(1), 0);
+    uint64_t v = 0;
+    EXPECT_EQ(read(efd, &v, sizeof(v)), (ssize_t)sizeof(v));
+    testOnlySetIOThreadSleeping(1, -1);
+    close(efd);
+    connSetPostponeUpdateState(c->conn, 0);
+    listRelease(c->reply);
+    zfree(c->buf);
+    zfree(c);
 }
 
 TEST_F(ClusterIOOffloadTest, WriteOffloadRoundTripDrainsQueue) {
