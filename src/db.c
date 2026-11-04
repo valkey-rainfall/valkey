@@ -260,8 +260,13 @@ static int keyspaceShard(sds key) {
     }
     uint64_t w = 0;
     for (size_t i = 0; i < len; i++) w |= (uint64_t)s[i] << (8 * i);
-    h = (h ^ w) * 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 29;
+    /* Full 64-bit finalizer: the low bits taken below must depend on every bit of the tail word. */
+    h ^= w;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
     return (int)(h & ((1u << server.keyspace_shard_bits) - 1));
 }
 
