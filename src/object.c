@@ -1853,6 +1853,15 @@ uint8_t objectGetLFUFrequency(robj *o) {
     return freq;
 }
 
+/* Return the decayed LFU frequency without storing it back. Safe for a thread
+ * other than main (forkless save): it never writes the header word that also
+ * holds the refcount. */
+uint8_t objectPeekLFUFrequency(const robj *o) {
+    uint8_t freq;
+    lfu_getFrequency(objectGetLRU(o), &freq);
+    return freq;
+}
+
 /* Return the LRU idle time for an object. */
 uint32_t objectGetLRUIdleSecs(robj *o) {
     return lru_getIdleSecs(objectGetLRU(o));
