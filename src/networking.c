@@ -421,6 +421,9 @@ client *createClient(connection *conn) {
     c->deferred_reply = NULL;
     c->deferred_reply_errors = NULL;
     c->reply_bytes = 0;
+    c->bulk_str_refs_added = 0;
+    c->bulk_str_refs_released = 0;
+    c->pending_db_free_waits = NULL;
     c->deferred_reply_bytes = ULLONG_MAX;
     c->obuf_soft_limit_reached_time = 0;
     listSetFreeMethod(c->reply, freeClientReplyValue);
@@ -854,6 +857,7 @@ static void _addStrRefToBufferOrList(client *c, robj *obj, uint8_t payload_type)
     /* Refcount will be decremented in write completion handler by the main thread */
     incrRefCount(obj);
     server.stat_reply_copy_avoided++;
+    c->bulk_str_refs_added++;
 
     bulkStrRef str_ref = {.obj = obj, .str = objectGetVal(obj)};
     if (!_addBulkStrRefToBuffer(c, (void *)&str_ref, sizeof(str_ref), payload_type)) {
@@ -2530,6 +2534,7 @@ int freeClient(client *c) {
 
     /* Free data structures. */
     releaseReplyReferences(c);
+    if (c->pending_db_free_waits) lazyfreeReleaseClientWaits(c, 1);
     listRelease(c->reply);
     c->reply = NULL;
     zfree_with_size(c->buf, c->buf_usable_size);
@@ -2538,6 +2543,7 @@ int freeClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    if (c->pending_db_free_waits) lazyfreeReleaseClientArgv(c);
     discardCommandQueue(c);
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
@@ -3483,6 +3489,7 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
 /* Release references to string objects inside an encoded buffer */
 static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
     char *ptr = buf;
+    uint64_t released = 0;
     while (ptr < buf + bufpos) {
         payloadHeader *header = (payloadHeader *)ptr;
         ptr += sizeof(payloadHeader);
@@ -3509,6 +3516,7 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
                 freeValueNeverOnMain(NULL, str_ref->obj, -1);
                 str_ref++;
                 len -= sizeof(bulkStrRef);
+                released++;
             }
         } else {
             serverAssert(header->payload_type == PLAIN_REPLY);
@@ -3517,6 +3525,10 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
         ptr += header->payload_len;
     }
     serverAssert(ptr == buf + bufpos);
+    if (c) {
+        c->bulk_str_refs_released += released;
+        if (c->pending_db_free_waits) lazyfreeReleaseClientWaits(c, 0);
+    }
 }
 
 void releaseReplyReferences(client *c) {
@@ -3956,6 +3968,7 @@ void resetClient(client *c) {
 
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    if (c->pending_db_free_waits) lazyfreeReleaseClientArgv(c);
     c->redact_arg_bitmap = 0;
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
