@@ -183,11 +183,12 @@ int scriptingEngineManagerUnregister(const char *engine_name) {
 
     /* We need to ensure that any pending async flush of eval scripts or
      * functions have completed before freeing the engine resources, which
-     * may be used by the async jobs. Release the GIL first since the lazy
-     * free jobs need to acquire it to call scriptingEngineCallFreeFunction. */
-    moduleReleaseGIL();
+     * may be used by the async jobs. Lend the GIL since the lazy free jobs
+     * need to acquire it to call scriptingEngineCallFreeFunction, while
+     * module threads stay off it until the command ends. */
+    moduleLendGIL();
     bioDrainWorker(BIO_LAZY_FREE);
-    moduleAcquireGIL();
+    moduleReclaimGIL();
 
     sdsfree(e->name);
 

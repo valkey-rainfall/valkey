@@ -499,4 +499,30 @@ start_server {tags {"modules"}} {
         set result [r module unload helloengine]
         assert_equal $result "OK"
     }
+
+    test {Unregistering an engine keeps module threads off the GIL while it waits for async frees} {
+        if {![string match "*helloengine*" [r module list]]} {r module load $testmodule}
+        r module load [file normalize tests/modules/blockedclient.so]
+        r function load replace $HELLO_PROGRAM
+        r debug populate 1000000
+        r lock_loop.start
+        # The pending async free keeps the unregister waiting for the lazy-free thread,
+        # while the module thread waits for the GIL.
+        set rd [valkey_deferring_client]
+        $rd flushall async
+        $rd function flush async
+        $rd module unload helloengine
+        assert_equal OK [$rd read]
+        assert_equal OK [$rd read]
+        assert_equal OK [$rd read]
+        $rd close
+        assert_morethan [r lock_loop.stop] 0
+        wait_for_condition 100 10 {
+            [r lock_loop.running] == 0
+        } else {
+            fail "lock loop thread did not stop"
+        }
+        assert_equal PONG [r ping]
+        assert_equal OK [r module unload blockedclient]
+    } {} {needs:debug}
 }

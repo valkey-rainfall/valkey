@@ -214,6 +214,8 @@ int moduleObservesWrites(void);
 void moduleAcquireGIL(void);
 int moduleTryAcquireGIL(void);
 void moduleReleaseGIL(void);
+void moduleLendGIL(void);
+void moduleReclaimGIL(void);
 void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid);
 unsigned long moduleNotifyKeyspaceSubscribersCnt(void);
 void firePostExecutionUnitJobs(void);
