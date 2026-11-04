@@ -175,6 +175,40 @@ tags {"wait aof network external:skip"} {
             assert_equal [$master waitaof 1 0 0] {1 0}
         }
 
+        test {WAITAOF everysec does not count a write whose fsync was not yet requested} {
+            # The first write after more than a second without a fsync request
+            # requests the once-a-second fsync; the next one, within that second,
+            # is written but not fsynced.
+            after 2200
+            $master incr warm
+            set start [clock milliseconds]
+            $master incr foo
+            set reply [$master waitaof 1 0 100]
+            if {[clock milliseconds] - $start < 900} {
+                assert_equal $reply {0 0}
+            }
+            assert_equal [$master waitaof 1 0 0] {1 0}
+        }
+
+        test {WAITAOF everysec does not count a write whose fsync is still running} {
+            $master debug aof-bio-fsync-sleep 1000000
+            after 2200
+            $master incr foo
+            assert_equal [$master waitaof 1 0 300] {0 0}
+            assert_equal [$master waitaof 1 0 0] {1 0}
+            $master debug aof-bio-fsync-sleep 0
+        }
+
+        test {WAITAOF everysec does not count a write whose old INCR file is still being fsynced} {
+            $master debug aof-bio-fsync-sleep 1000000
+            $master incr foo
+            $master bgrewriteaof
+            assert_equal [$master waitaof 1 0 300] {0 0}
+            assert_equal [$master waitaof 1 0 0] {1 0}
+            $master debug aof-bio-fsync-sleep 0
+            waitForBgrewriteaof $master
+        }
+
         test {WAITAOF local copy with appendfsync always} {
             r config set appendfsync always
             $master incr foo
