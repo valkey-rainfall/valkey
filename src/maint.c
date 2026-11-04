@@ -454,6 +454,13 @@ static void maintExpireUpdateCosts(void) {
 
 void maintRun(void) {
     if (!maintPending()) return;
+    /* serverCron can fork after databasesCron posted table work; resizing or rehashing then would copy
+     * the child's pages, so it waits until no child exists, as on the inline cron path. */
+    if (hasActiveChildProcess()) {
+        mt_requested[MAINT_JOB_RESIZE] = mt_requested[MAINT_JOB_REHASH] = 0;
+        mt_budget_us[MAINT_JOB_RESIZE] = mt_budget_us[MAINT_JOB_REHASH] = 0;
+        if (!maintPending()) return;
+    }
     /* The EXPIRE gate is rechecked: serverCron can start a forkless save after databasesCron posted. */
     if (mt_requested[MAINT_JOB_EXPIRE] && !activeExpireInLanes()) {
         mt_requested[MAINT_JOB_EXPIRE] = 0;
