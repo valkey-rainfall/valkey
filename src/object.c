@@ -1648,18 +1648,19 @@ struct serverMemOverhead *getMemoryOverheadData(void) {
         mh->db[mh->num_dbs].overhead_ht_main = mem;
         mem_total += mem;
 
-        mem = kvstoreMemUsage(db->expires);
+        /* The index of keys with volatile items (hash field TTLs) is expiry bookkeeping as well. */
+        mem = kvstoreMemUsage(db->expires) + kvstoreMemUsage(db->keys_with_volatile_items);
         mh->db[mh->num_dbs].overhead_ht_expires = mem;
         mem_total += mem;
 
         mh->num_dbs++;
 
-        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->keys);
-        mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(db->expires);
-        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->keys);
-        mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(db->expires);
-        mh->db_dict_rehashing_count += kvstoreHashtableRehashingCount(db->keys);
-        mh->db_dict_rehashing_count += kvstoreHashtableRehashingCount(db->expires);
+        kvstore *kvs[] = {db->keys, db->expires, db->keys_with_volatile_items};
+        for (size_t k = 0; k < sizeof(kvs) / sizeof(kvs[0]); k++) {
+            mh->overhead_db_hashtable_lut += kvstoreOverheadHashtableLut(kvs[k]);
+            mh->overhead_db_hashtable_rehashing += kvstoreOverheadHashtableRehashing(kvs[k]);
+            mh->db_dict_rehashing_count += kvstoreHashtableRehashingCount(kvs[k]);
+        }
     }
 
     mh->overhead_total = mem_total;
