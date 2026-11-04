@@ -108,3 +108,86 @@ TEST_F(MaintTest, NoTableWorkWhileForkChildExists) {
     }
     delKeys(0, 0, 300);
 }
+
+/* Tables the mocked lane expiry visited, in order, and what each visit costs. */
+static int expire_visits[64];
+static int expire_nvisits = 0;
+static uint64_t expire_table_cost_us = 0;
+
+static uint64_t fakeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit) {
+    UNUSED(tid);
+    UNUSED(db);
+    UNUSED(now);
+    UNUSED(budget_us);
+    UNUSED(hit_limit); /* each table finishes: nothing left expired in it */
+    if (expire_nvisits < 64) expire_visits[expire_nvisits++] = didx;
+    return expire_table_cost_us;
+}
+
+class MaintExpireTest : public MaintTest {
+  protected:
+    MockValkey mock;
+
+    void SetUp() override {
+        MaintTest::SetUp();
+        using ::testing::_;
+        using ::testing::Invoke;
+        using ::testing::Return;
+        EXPECT_CALL(mock, activeExpireInLanes()).WillRepeatedly(Return(1));
+        EXPECT_CALL(mock, maintExpireReplayNeeded()).WillRepeatedly(Return(0));
+        EXPECT_CALL(mock, activeExpireTableInLane(_, _, _, _, _, _)).WillRepeatedly(Invoke(fakeExpireTableInLane));
+        EXPECT_CALL(mock, activeExpireFieldsTableInLane(_, _, _, _, _, _)).WillRepeatedly(Return(0));
+        /* One key with a TTL in every table, so every table has expire work. */
+        for (int didx = 0; didx < 4; didx++) {
+            sds key = sdscatprintf(sdsempty(), "ttl:%d", didx);
+            robj *o = objectSetKeyAndExpire(createStringObject("v", 1), key, 1);
+            kvstoreHashtableAdd(server.db[0]->keys, didx, o);
+            kvstoreHashtableAdd(server.db[0]->expires, didx, o);
+            sdsfree(key);
+        }
+        expire_nvisits = 0;
+        expire_table_cost_us = 0;
+    }
+
+    void TearDown() override {
+        for (int didx = 0; didx < 4; didx++) {
+            sds key = sdscatprintf(sdsempty(), "ttl:%d", didx);
+            kvstoreHashtableDelete(server.db[0]->expires, didx, key);
+            kvstoreHashtableDelete(server.db[0]->keys, didx, key);
+            sdsfree(key);
+        }
+        MaintTest::TearDown();
+    }
+
+    /* Run one phase with the given jobs; returns how many tables it expired. */
+    static int runPhase(int with_resize, uint64_t expire_budget_us) {
+        int before = expire_nvisits;
+        if (with_resize) maintRequest(MAINT_JOB_RESIZE, 0);
+        maintRequest(MAINT_JOB_EXPIRE, expire_budget_us);
+        maintRun();
+        return expire_nvisits - before;
+    }
+};
+
+/* The lane's budget runs out on a table that finished, so no table was cut off; the next phase must
+ * start at the first table this one did not expire rather than at the same place again. */
+TEST_F(MaintExpireTest, NextPhaseStartsAtFirstTableNotExpired) {
+    expire_table_cost_us = 60;
+    ASSERT_EQ(runPhase(0, 100), 2);
+    int first = expire_visits[0];
+    ASSERT_EQ(expire_visits[1], (first + 1) % 4);
+    ASSERT_EQ(runPhase(0, 100), 2);
+    ASSERT_EQ(expire_visits[2], (first + 2) % 4);
+    ASSERT_EQ(expire_visits[3], (first + 3) % 4);
+}
+
+/* RESIZE keeps the lane claiming tables after its expire budget is spent; those tables are claimed
+ * without expiry and the next phase must start expiring there. */
+TEST_F(MaintExpireTest, TablesClaimedWithoutExpiryComeFirstNextPhase) {
+    expire_table_cost_us = 60;
+    ASSERT_EQ(runPhase(1, 100), 2);
+    int first = expire_visits[0];
+    ASSERT_EQ(runPhase(1, 100), 2);
+    ASSERT_EQ(expire_visits[2], (first + 2) % 4);
+    ASSERT_EQ(expire_visits[3], (first + 3) % 4);
+}
