@@ -102,3 +102,38 @@ start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overri
         close $fd
     }
 }
+
+start_server {tags {"fastpath aof modules external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync always enable-debug-command yes save ""}} {
+    r select 0
+    waitForBgrewriteaof r
+    r module load [file normalize tests/modules/blockedclient.so]
+
+    test {AOF order: always, a fast-path GET does not return a module thread's write before its fsync (#40)} {
+        set fd [fao_fp_client]
+        r set fao:bg 0
+        set rd [valkey_deferring_client]
+        $rd select 0
+        $rd read
+        set violations 0
+        for {set round 1} {$round <= 5} {incr round} {
+            r debug aof-flush-sleep [expr {$fao_sleep * 1000}]
+            set t0 [clock milliseconds]
+            # The module thread takes the GIL while main sleeps in its poll, after beforeSleep's flush.
+            $rd do_bg_rm_call_format ! incr fao:bg
+            while 1 {
+                puts -nonewline $fd [fao_resp get fao:bg]
+                flush $fd
+                set v [fao_read_line $fd]
+                if {$v == $round} break
+                if {[clock milliseconds] - $t0 > 5000} { fail "module write never became visible" }
+            }
+            set ms [expr {[clock milliseconds] - $t0}]
+            if {$ms < $fao_sleep - 50} { incr violations }
+            assert_equal $round [$rd read]
+            r debug aof-flush-sleep 0
+        }
+        assert_equal 0 $violations
+        $rd close
+        close $fd
+    }
+}
