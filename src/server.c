@@ -2383,6 +2383,10 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     }
 
     IOThreadsAfterSleep(numevents);
+
+    /* Pause, yield and failover state changes on main, or on a module thread under the GIL, before
+     * this point; the staged loop's read phase follows. */
+    fastGetRefreshMainGate();
 }
 
 /* Callback invoked by the event loop after draining priority events.
