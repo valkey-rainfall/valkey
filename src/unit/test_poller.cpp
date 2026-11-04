@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -189,6 +190,20 @@ TEST_F(PollerTest, HangupReportsErrorAndBothDirections) {
     pollerEvent e;
     ASSERT_EQ(pollerClaimIO(p, &e), 1);
     EXPECT_EQ(e.mask, POLLER_READABLE | POLLER_WRITABLE | POLLER_ERROR);
+}
+
+TEST_F(PollerTest, PeerCloseBehindDataIsReportedOnTheSameEdge) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv), 0);
+    fds.push_back(sv[0]);
+    fds.push_back(sv[1]);
+    poke(sv[1]);
+    ASSERT_EQ(shutdown(sv[1], SHUT_WR), 0);
+    ASSERT_EQ(pollerRegister(p, sv[0], POLLER_READABLE, noopHandler, nullptr, POLLER_AFF_IO), 0);
+    ASSERT_EQ(pollerGetNextBatch(p, 0), 1);
+    pollerEvent e;
+    ASSERT_EQ(pollerClaimIO(p, &e), 1);
+    EXPECT_EQ(e.mask, POLLER_READABLE | POLLER_HUP);
 }
 
 static void timeoutSemantics(poller *p, int w) {

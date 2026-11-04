@@ -905,10 +905,11 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
     fpSend(t, c, &iov, 1);
 }
 
-static void fpRead(fpThread *t, int tid, client *c) {
+static void fpRead(fpThread *t, int tid, client *c, int closed) {
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     /* The fd is edge-triggered: a read that filled its buffer may have left bytes in the socket that
-     * no new edge will report, so the next batch reads the client again. */
+     * no new edge will report, and so may a read of the bytes in front of the peer's close or error,
+     * so the next batch reads the client again. */
     int more = readToQueryBuf(c);
     t->reads++;
     if (c->nread <= 0) {
@@ -948,7 +949,7 @@ static void fpRead(fpThread *t, int tid, client *c) {
         c->read_flags = 0;
     }
     trimClientQueryBuffer(c);
-    if (more && c->control->lifecycle == FP_ACTIVE) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_READABLE);
+    if ((more || closed) && c->control->lifecycle == FP_ACTIVE) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_READABLE);
 }
 
 static void fpEnableWriteInterest(client *c, int on) {
@@ -1631,7 +1632,7 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
         if (fpFlushOut(t, c)) fpEnableWriteInterest(c, 0);
         if (c->control->lifecycle != FP_ACTIVE) return;
     }
-    if (mask & POLLER_READABLE) fpRead(t, tid, c);
+    if (mask & POLLER_READABLE) fpRead(t, tid, c, mask & (POLLER_HUP | POLLER_ERROR));
 }
 
 /* Read phase, on each IO thread and on main (tid 0): claim ready client fds until none are left, then

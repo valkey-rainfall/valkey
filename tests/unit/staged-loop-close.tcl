@@ -187,6 +187,35 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         r config set min-string-size-avoid-copy-reply-threaded $avoid min-io-threads-avoid-copy-reply $avoid_threads
     }
 
+    test {Staged loop close: a client whose last bytes and close arrive together is freed} {
+        # Main sleeps, so a partial command and the FIN behind it are both in the socket when the
+        # client is next read. Nothing is ever sent back to draw a reset, and the timeout is 0.
+        set fds {}
+        for {set i 0} {$i < 4} {incr i} { lappend fds [slc_fastpath_socket] }
+        set sleeper [slc_fastpath_socket]
+        set before [slc_fastpath_clients]
+        puts -nonewline $sleeper [slc_resp debug sleep 1]
+        flush $sleeper
+        after 200
+        foreach fd $fds {
+            puts -nonewline $fd "*1\r\n\$4\r\nPI"
+            flush $fd
+            close $fd
+        }
+        assert_equal "+OK" [string trim [gets $sleeper]]
+        wait_for_condition 100 50 {
+            [slc_fastpath_clients] == $before - 4
+        } else {
+            fail "closed clients not freed: [r info fastpath] [r client list]"
+        }
+        close $sleeper
+        wait_for_condition 200 20 {
+            [slc_fastpath_clients] == 0
+        } else {
+            fail "fast-path client not released"
+        }
+    }
+
     test {Staged loop close: a fast-path client keeps working after other clients are closed} {
         set fd [slc_fastpath_socket]
         puts -nonewline $fd [slc_resp incr slc:n]
