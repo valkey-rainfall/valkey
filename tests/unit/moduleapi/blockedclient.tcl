@@ -339,3 +339,46 @@ start_server {tags {"modules external:skip"} overrides {appendonly yes}} {
         assert_equal 2 [r get bg_write_before_yield]
     } {} {needs:debug}
 }
+
+start_server {tags {"modules external:skip"} overrides {io-threads 4 save {}}} {
+    r module load $testmodule
+    r select 0
+
+    test {A read the reading thread would answer gets BUSY while a module thread yields} {
+        r set yk v
+        # A deferring client that sends nothing first stays on the fast path, where the reading
+        # thread answers its GETs.
+        set fp [valkey_deferring_client_by_addr [srv 0 host] [srv 0 port]]
+        set engaged 0
+        for {set round 0} {$round < 20 && !$engaged} {incr round} {
+            set before [getInfoProperty [r info fastget] fastget_speculated_commands]
+            for {set i 0} {$i < 10} {incr i} { $fp get yk }
+            for {set i 0} {$i < 10} {incr i} { assert_equal v [$fp read] }
+            set engaged [expr {[getInfoProperty [r info fastget] fastget_speculated_commands] > $before}]
+        }
+        assert_equal 1 $engaged
+        set old_time_limit [lindex [r config get busy-reply-threshold] 1]
+        r config set busy-reply-threshold 5
+        r set_slow_bg_operation 1
+        set rd [valkey_deferring_client]
+        $rd do_bg_rm_call hgetall hash
+        wait_for_condition 50 100 {
+            [r is_in_slow_bg_operation] eq 1
+        } else {
+            fail "Failed waiting for slow operation to start"
+        }
+        after 50
+        $fp get yk
+        assert_error {*BUSY Slow module operation*} {$fp read}
+        r set_slow_bg_operation 0
+        wait_for_condition 50 100 {
+            [r is_in_slow_bg_operation] eq 0
+        } else {
+            fail "Failed waiting for slow operation to stop"
+        }
+        $rd read
+        $rd close
+        $fp close
+        r config set busy-reply-threshold $old_time_limit
+    }
+}
