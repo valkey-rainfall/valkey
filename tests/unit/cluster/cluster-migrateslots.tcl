@@ -674,6 +674,33 @@ start_cluster 3 3 {tags {logreqres:skip external:skip cluster network} overrides
         }
     }
 
+    test "Slot migration links stay prioritized when priority-subnets changes" {
+        assert_does_not_resync {
+            set_debug_prevent_pause 1
+
+            assert_match "OK" [R 2 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node0_id]
+            set jobname [get_job_name 2 16383]
+            wait_for_migration_field 2 $jobname state waiting-to-pause
+
+            assert_match "*flags=*H*" [R 0 CLIENT LIST FLAGS i]
+            assert_match "*flags=*H*" [R 2 CLIENT LIST FLAGS E]
+            # A subnet no client of this test matches, then none at all.
+            foreach subnets {10.255.255.0/24 ""} {
+                R 0 CONFIG SET priority-subnets $subnets
+                R 2 CONFIG SET priority-subnets $subnets
+                assert_match "*flags=*H*" [R 0 CLIENT LIST FLAGS i]
+                assert_match "*flags=*H*" [R 2 CLIENT LIST FLAGS E]
+            }
+
+            set_debug_prevent_pause 0
+            wait_for_migration 0 16383
+
+            # Cleanup for the next test
+            assert_match "OK" [R 0 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node2_id]
+            wait_for_migration 2 16383
+        }
+    }
+
     test "Slot migration seen in client flags" {
         assert_does_not_resync {
             set_debug_prevent_pause 1
