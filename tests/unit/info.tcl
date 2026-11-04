@@ -580,6 +580,20 @@ start_server {tags {"info" "external:skip"} overrides {keyspace-shard-bits 0}} {
         assert_range [dict get $mem_stats overhead.db.hashtable.rehashing] 1 64
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {1}
     }
+
+    test {memory: keys with volatile hash fields count as db overhead} {
+        r flushall
+        r select 9
+        set expires_before [dict get [r memory stats] db.9 overhead.hashtable.expires]
+        for {set i 0} {$i < 1000} {incr i} {
+            r hset vh:$i f v
+            r hexpire vh:$i 100000 FIELDS 1 f
+        }
+        # No key has a TTL: only the volatile-items index grew.
+        assert_match {*db9:keys=1000,expires=0,*} [r info keyspace]
+        assert_morethan [dict get [r memory stats] db.9 overhead.hashtable.expires] [expr {$expires_before + 1000}]
+        r flushall
+    }
 }
 
 start_server {tags {"info" "external:skip"} overrides {save "" forkless-infrastructure-enabled yes}} {
