@@ -2020,6 +2020,8 @@ int trySendWriteToIOThreads(client *c) {
     if (c->flag.close_asap) return C_ERR;
     /* The I/O thread is already writing for this client. */
     if (c->io_write_state != CLIENT_IDLE) return C_OK;
+    /* A job's snapshot would cover writes not yet in the AOF; the pending-write queue sends it after the flush. */
+    if (aofHoldsReplies()) return C_ERR;
     if (c->io_read_state == CLIENT_PENDING_IO) return C_ERR;
     /* Nothing to write */
     if (!clientHasPendingReplies(c)) return C_ERR;
