@@ -1068,6 +1068,53 @@ int unblock_by_timer(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
     return VALKEYMODULE_OK;
 }
 
+/* A thread that takes and drops the GIL until stopped, to test who may take it while main waits. */
+static volatile int g_lock_loop_stop = 0;
+static volatile int g_lock_loop_running = 0;
+static volatile long long g_lock_loop_count = 0;
+
+static void *lock_loop_worker(void *arg) {
+    ValkeyModuleCtx *ctx = arg;
+    while (!g_lock_loop_stop) {
+        ValkeyModule_ThreadSafeContextLock(ctx);
+        g_lock_loop_count++;
+        ValkeyModule_ThreadSafeContextUnlock(ctx);
+        usleep(1);
+    }
+    ValkeyModule_FreeThreadSafeContext(ctx);
+    g_lock_loop_running = 0;
+    return NULL;
+}
+
+int lock_loop_start(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    UNUSED(argv);
+    if (argc != 1) return ValkeyModule_WrongArity(ctx);
+    if (g_lock_loop_running) return ValkeyModule_ReplyWithError(ctx, "ERR already running");
+    g_lock_loop_stop = 0;
+    g_lock_loop_count = 0;
+    g_lock_loop_running = 1;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, lock_loop_worker, ValkeyModule_GetDetachedThreadSafeContext(ctx)) != 0) {
+        g_lock_loop_running = 0;
+        return ValkeyModule_ReplyWithError(ctx, "-ERR Can't start thread");
+    }
+    pthread_detach(tid);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+int lock_loop_stop(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    UNUSED(argv);
+    if (argc != 1) return ValkeyModule_WrongArity(ctx);
+    g_lock_loop_stop = 1;
+    return ValkeyModule_ReplyWithLongLong(ctx, g_lock_loop_count);
+}
+
+int lock_loop_running(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    UNUSED(argv);
+    if (argc != 1) return ValkeyModule_WrongArity(ctx);
+    return ValkeyModule_ReplyWithLongLong(ctx, g_lock_loop_running);
+}
+
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -1076,6 +1123,15 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "acquire_gil", acquire_gil, "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "lock_loop.start", lock_loop_start, "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "lock_loop.stop", lock_loop_stop, "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "lock_loop.running", lock_loop_running, "", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "do_rm_call", do_rm_call,

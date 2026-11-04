@@ -2574,6 +2574,8 @@ int VM_BlockedClientMeasureTimeEnd(ValkeyModuleBlockedClient *bc) {
     return VALKEYMODULE_OK;
 }
 
+static void moduleAcquireGILForThread(void);
+
 /* This API allows modules to let the server process background tasks, and some
  * commands during long blocking execution of a module command.
  * The module can call this API periodically.
@@ -2641,7 +2643,7 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
                      * event processing, and then acquire the GIL again until the main thread releases it. */
                     moduleReleaseGIL();
                     sched_yield();
-                    moduleAcquireGIL();
+                    moduleAcquireGILForThread();
                 }
             } else {
                 /* If we are in the main thread, we can safely process events. */
@@ -9544,6 +9546,33 @@ void VM_FreeThreadSafeContext(ValkeyModuleCtx *ctx) {
     zfree(ctx);
 }
 
+/* Set while main, in the middle of a command, has released the GIL only so that a background job
+ * it waits for can take it. Module threads must not take it then. Written with the GIL held or just
+ * before releasing it, and read with the GIL held. */
+static _Atomic int module_gil_lent = 0;
+
+/* Takes the GIL for a module thread, waiting while main has lent it to a background job. */
+static void moduleAcquireGILForThread(void) {
+    moduleAcquireGIL();
+    while (atomic_load_explicit(&module_gil_lent, memory_order_relaxed)) {
+        moduleReleaseGIL();
+        sched_yield();
+        moduleAcquireGIL();
+    }
+}
+
+/* Main releases the GIL for a background job it is about to wait for. */
+void moduleLendGIL(void) {
+    atomic_store_explicit(&module_gil_lent, 1, memory_order_relaxed);
+    moduleReleaseGIL();
+}
+
+/* Main takes back the GIL it lent. */
+void moduleReclaimGIL(void) {
+    moduleAcquireGIL();
+    atomic_store_explicit(&module_gil_lent, 0, memory_order_relaxed);
+}
+
 void moduleGILAfterLock(void) {
     /* We should never get here if we already inside a module
      * code block which already opened a context. */
@@ -9558,7 +9587,7 @@ void moduleGILAfterLock(void) {
  * a blocked client connected to the thread safe context. */
 void VM_ThreadSafeContextLock(ValkeyModuleCtx *ctx) {
     UNUSED(ctx);
-    moduleAcquireGIL();
+    moduleAcquireGILForThread();
     moduleGILAfterLock();
 }
 
@@ -9572,6 +9601,10 @@ int VM_ThreadSafeContextTryLock(ValkeyModuleCtx *ctx) {
     UNUSED(ctx);
 
     int res = moduleTryAcquireGIL();
+    if (res == 0 && atomic_load_explicit(&module_gil_lent, memory_order_relaxed)) {
+        moduleReleaseGIL();
+        res = EBUSY;
+    }
     if (res != 0) {
         errno = res;
         return VALKEYMODULE_ERR;
