@@ -143,6 +143,8 @@ void stagedResetStats(void) {
 #include "phase_barrier.h"
 #include <sched.h>
 
+static void stagedFlushDeferredReplies(void);
+
 
 static poller *sl_poller = NULL;
 
@@ -215,6 +217,7 @@ int stagedWorkerEnrolled(int tid, uint64_t *seen, uint32_t *gen) {
 /* Main: open a STREAM phase. Unlike stagedRunPhase it does not wait: the workers deliver completed
  * runs while main executes. Closed by stagedStreamClose. */
 static void stagedStreamOpen(void) {
+    stagedFlushDeferredReplies();
     fastpathStagedStreamBegin();
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_STREAM);
     serverAssert(rc == 0);
@@ -236,11 +239,29 @@ static void stagedStreamClose(int abort) {
     sl_stream_open = 0;
 }
 
-/* Open one phase for the enrolled workers and wait until all of them are done. */
+static void stagedOpenAndWait(int phase);
+
+/* Main, between phases: the replies the last iteration left for the next read phase go out now,
+ * because something other than that read phase comes first. */
+static void stagedFlushDeferredReplies(void) {
+    if (!fastpathStagedRepliesDeferred()) return;
+    serverAssert(sl_depth == 0 && sl_workers > 0);
+    stagedOpenAndWait(STAGED_PHASE_REPLY);
+    fastpathStagedDeferredDelivered();
+    fastpathStagedFinish();
+}
+
+/* Open one phase for the enrolled workers and wait until all of them are done. Only a read phase
+ * delivers deferred replies itself. */
 static void stagedRunPhase(int phase) {
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
-    /* READ answers GETs and REPLY sends replies: a write made since the last flush, such as a module
-     * thread's while main slept, reaches the AOF first. */
+    if (phase != STAGED_PHASE_READ) stagedFlushDeferredReplies();
+    stagedOpenAndWait(phase);
+}
+
+static void stagedOpenAndWait(int phase) {
+    /* READ answers GETs and delivers deferred replies, REPLY sends replies: a write made since the last
+     * flush, such as a module thread's while main slept, reaches the AOF first. */
     if ((phase == STAGED_PHASE_READ || phase == STAGED_PHASE_REPLY) && aofHoldsReplies()) flushAppendOnlyFile(0);
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
@@ -506,6 +527,7 @@ static void stagedFollowMainLane(void) {
     int lane = server.staged_main_lane == STAGED_MAIN_LANE_YES  ? 1
                : server.staged_main_lane == STAGED_MAIN_LANE_NO ? 0
                                                                 : !sl_main_shares;
+    if (lane != sl_main_lane) stagedFlushDeferredReplies(); /* main's share of them goes with its lane */
     if (sl_workers > 0 && lane != sl_main_lane)
         serverLog(LL_NOTICE, lane ? "Staged event loop: main works a share of each phase"
                                   : "Staged event loop: main leaves the phases to the IO threads");
@@ -516,6 +538,7 @@ static void stagedFollowMainLane(void) {
  * waiting on the barrier; newcomers wait from the current sequence. */
 static void stagedSetWorkers(int want) {
     if (want == sl_workers) return;
+    stagedFlushDeferredReplies(); /* the leavers own some of them */
     if (want < sl_workers) {
         for (int tid = want + 1; tid <= sl_workers; tid++) atomic_store_explicit(&sl_enrolled[tid], 0, memory_order_release);
         stagedRunPhase(STAGED_PHASE_SYNC);
@@ -541,6 +564,7 @@ static void stagedReconcile(aeEventLoop *el) {
     int want = stagedWanted();
     if (want && !sl_on && !stagedInit()) want = 0;
     if (sl_on && !want) {
+        stagedFlushDeferredReplies();
         fastpathStagedReleaseAll();
         fastpathStagedSet(0);
         pollerUnregister(sl_poller, sl_ae_fd);
@@ -600,7 +624,11 @@ static void collectFDs(aeEventLoop *el) {
     }
     uint64_t t1 = stagedNowNs();
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
-    long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client) ? 0 : aeUsUntilEarliestTimer(el);
+    /* Deferred replies go out in the next read phase: do not sleep on them either. */
+    long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client ||
+                         fastpathStagedRepliesDeferred())
+                            ? 0
+                            : aeUsUntilEarliestTimer(el);
     long long fsync_cap = timeout != 0 ? aofFsyncWaitSleepCapUs() : -1;
     if (fsync_cap >= 0 && (timeout < 0 || fsync_cap < timeout)) timeout = fsync_cap;
     monotime pl = getMonotonicUs();
@@ -630,8 +658,10 @@ static void stagedQueueDeferredRead(void) {
 static void readPhase(void) {
     fastpathStagedPrepareLanes();
     stagedQueueDeferredRead();
-    if (pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) return;
+    int deferred = fastpathStagedRepliesDeferred();
+    if (!deferred && pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) return;
     stagedRunPhase(STAGED_PHASE_READ);
+    if (deferred) fastpathStagedDeferredDelivered();
 }
 
 /* Main: a STREAM phase may overlap exec this iteration. Only when batches exist, workers are
@@ -682,9 +712,26 @@ static void writePhase(aeEventLoop *el) {
 
 /* Reply: IO threads write the replies of their own batches and any main-path write jobs; the barrier
  * closes the phase, then main takes back the clients that left and unmaps the ones it closed. */
-static void replyPhase(void) {
+/* Main, after the write phase: this iteration's replies may go out in the next read phase instead of
+ * a reply phase of their own, saving a barrier. Only on the plain path: nothing is handed back to
+ * the main path, no cron is due, and no BCAST tracking prefix is set (beforeSleep's invalidations go
+ * out before the deferred replies). Anything else that opens a phase first delivers them. */
+static int stagedMayDeferReplies(aeEventLoop *el) {
+    if (!server.staged_reply_merge) return 0;
+    if (sl_depth != 0 || sl_workers <= 0 || !sl_main_lane) return 0;
+    if (!fastpathStagedRepliesPending()) return 0;
+    if (fastpathStagedHandoffsPending()) return 0;
+    if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
+    if (aeUsUntilEarliestTimer(el) == 0) return 0;
+    return 1;
+}
+
+static void replyPhase(aeEventLoop *el) {
     uint64_t t0 = stagedNowNs();
-    if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
+    if (stagedMayDeferReplies(el))
+        fastpathStagedDeferReplies();
+    else if (fastpathStagedRepliesPending() || ioThreadsInboxPending())
+        stagedRunPhase(STAGED_PHASE_REPLY);
     uint64_t t1 = stagedNowNs();
     fastpathStagedFinish();
     sl_main_ns[SL_T_REPLY] += t1 - t0;
@@ -723,7 +770,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     }
     cronStatsRecord(CRON_JOB_SL_AOF_ALWAYS, getMonotonicUs() - t);
     t = getMonotonicUs();
-    replyPhase();
+    replyPhase(el);
     cronStatsRecord(CRON_JOB_SL_REPLY, getMonotonicUs() - t);
     /* Publish the next stable offset now, so this iteration's writes need not wait for the next collect. */
     replStreamSenderTick();
@@ -746,6 +793,7 @@ void stagedMain(aeEventLoop *el) {
 
 void stagedNestedIteration(void) {
     if (!sl_on || sl_depth) return;
+    stagedFlushDeferredReplies(); /* they belong to the outer iteration's batches */
     sl_depth = 1;
     fastpathStagedSetDepth(1);
     if ((pollerGetNextBatch(sl_poller, 0) > 0 && pollerIOCount(sl_poller) > 0) || ioThreadsInboxPending())
@@ -807,6 +855,7 @@ void stagedRunLane(int phase, int tid) {
  * or no enrolled worker, runs lane 0 on main alone with no barrier. */
 void stagedRunLanePhase(int phase, int with_workers) {
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
+    stagedFlushDeferredReplies();
     if (!with_workers) {
         stagedRunLane(phase, 0);
         return;
@@ -825,6 +874,7 @@ void stagedRunApplyPhase(int with_workers) {
 
 void stagedRunWritePhase(void) {
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
+    stagedFlushDeferredReplies();
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
     serverAssert(rc == 0);
     sl_opens++;

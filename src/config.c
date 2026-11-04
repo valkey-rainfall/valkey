@@ -3654,6 +3654,7 @@ standardConfig static_configs[] = {
     createEnumConfig("avoid-copy-reply-mode", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, copy_avoid_mode_enum, server.copy_avoid_mode, COPY_AVOID_MODE_STATIC, NULL, NULL),
     createEnumConfig("staged-main-lane", NULL, MODIFIABLE_CONFIG, staged_main_lane_enum, server.staged_main_lane, STAGED_MAIN_LANE_AUTO, NULL, NULL),
     createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
+    createBoolConfig("staged-reply-merge", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.staged_reply_merge, 0, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-epoll-thread-cpu", NULL, MODIFIABLE_CONFIG, -1, 1023, server.io_threads_epoll_thread_cpu, -1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThreadCpu),
