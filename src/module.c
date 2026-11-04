@@ -761,6 +761,8 @@ client *moduleAllocTempClient(void) {
         c->flag.module = 1;
         c->flag.fake = 1;
         c->user = NULL; /* Root user */
+        /* No connection to take an address from: MONITOR and the commandlog show this instead. */
+        c->peerid = sdsnew("module");
     }
     return c;
 }
