@@ -191,3 +191,34 @@ TEST_F(MaintExpireTest, TablesClaimedWithoutExpiryComeFirstNextPhase) {
     ASSERT_EQ(expire_visits[2], (first + 2) % 4);
     ASSERT_EQ(expire_visits[3], (first + 3) % 4);
 }
+
+/* An expire cycle posted while lanes were on must still run when they are off by the time MAINT runs
+ * (cron-lanes turned off, a forkless save started): it runs on main instead of being dropped. */
+TEST_F(MaintTest, PostedExpireRunsOnMainWhenLanesAreOff) {
+    server.active_expire_enabled = 1;
+    server.active_expire_effort = 1;
+    server.mstime = mstime();
+    serverDb *db = server.db[0];
+    for (int i = 0; i < 16; i++) {
+        sds key = sdscatprintf(sdsempty(), "ttl:%d", i);
+        robj *o = objectSetKeyAndExpire(createStringObject("v", 1), key, server.mstime + 1000000);
+        int didx = i % 4;
+        kvstoreHashtableAdd(db->keys, didx, o);
+        kvstoreHashtableAdd(db->expires, didx, o);
+        sdsfree(key);
+    }
+    db->expiry[KEYS].avg_ttl = 0;
+
+    /* Lanes are off here (no staged workers): the posted cycle samples the keys on main, which sets the
+     * db's average TTL. */
+    maintRequest(MAINT_JOB_EXPIRE, 25000);
+    maintRun();
+    ASSERT_GT(db->expiry[KEYS].avg_ttl, 0);
+
+    for (int i = 0; i < 16; i++) {
+        sds key = sdscatprintf(sdsempty(), "ttl:%d", i);
+        kvstoreHashtableDelete(db->expires, i % 4, key);
+        kvstoreHashtableDelete(db->keys, i % 4, key);
+        sdsfree(key);
+    }
+}
