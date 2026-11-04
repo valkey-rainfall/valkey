@@ -352,6 +352,41 @@ TEST_F(KvstoreTest, kvstoreConcurrentDeferredEmptyFree) {
     kvstoreRelease(kvs);
 }
 
+static unsigned long liveBuckets(kvstore *kvs, int ntables) {
+    unsigned long sum = 0;
+    for (int didx = 0; didx < ntables; didx++)
+        if (kvstoreGetHashtable(kvs, didx)) sum += kvstoreHashtableBuckets(kvs, didx);
+    return sum;
+}
+
+/* Freeing an emptied table drops its buckets from the kvstore's bucket count, serially and when
+ * reconcile frees a table a concurrent phase emptied. */
+TEST_F(KvstoreTest, kvstoreFreedTablesLeaveNoBuckets) {
+    const int bits = 2;
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, bits,
+                                 KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND | KVSTORE_FREE_EMPTY_HASHTABLES);
+    for (int n = 0; n < 20; n++) ASSERT_TRUE(kvstoreHashtableAdd(kvs, 1, tableKey(1, n)));
+    for (int cycle = 0; cycle < 6; cycle++) {
+        int concurrent = cycle & 1;
+        int nkeys = 1 + cycle * 7;
+        for (int n = 0; n < nkeys; n++) ASSERT_TRUE(kvstoreHashtableAdd(kvs, 0, tableKey(0, n)));
+        if (concurrent) kvstoreSetConcurrent(kvs, 1);
+        for (int n = 0; n < nkeys; n++) {
+            void *popped = nullptr;
+            char *k = tableKey(0, n);
+            if (kvstoreHashtablePop(kvs, 0, k, &popped)) zfree(popped);
+            zfree(k);
+        }
+        if (concurrent) {
+            kvstoreSetConcurrent(kvs, 0);
+            kvstoreReconcile(kvs);
+        }
+        ASSERT_EQ(kvstoreGetHashtable(kvs, 0), nullptr);
+        ASSERT_EQ(kvstoreBuckets(kvs), liveBuckets(kvs, 1 << bits)) << "cycle " << cycle;
+    }
+    kvstoreRelease(kvs);
+}
+
 /* A table that finishes one rehash and starts the next inside one concurrent phase stays on the
  * rehashing list, so the serial cron driver still finds it. */
 TEST_F(KvstoreTest, kvstoreConcurrentRehashRestartKeepsListNode) {
