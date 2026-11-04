@@ -329,3 +329,29 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
         $rd close
     }
 }
+
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    test {CLIENT PAUSE ALL postpones reads the reading thread would answer} {
+        r set pa:s v
+        r hset pa:h f hv
+        r sadd pa:set m
+        set rd [fastget_client]
+        foreach {cmd expect} {
+            {get pa:s} v
+            {mget pa:s pa:s} {v v}
+            {hget pa:h f} hv
+            {sismember pa:set m} 1
+        } {
+            ensure_engaged r $rd pa:s
+            r client pause 400 ALL
+            set start [clock milliseconds]
+            $rd {*}$cmd
+            assert_equal $expect [$rd read]
+            # As on main, the read waits for the pause to end.
+            assert_morethan [expr {[clock milliseconds] - $start}] 250
+        }
+        $rd close
+    }
+}
