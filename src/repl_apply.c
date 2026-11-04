@@ -720,4 +720,6 @@ void replApplyFlush(client *c) {
     ra_set_cmd->calls += ra_pending;
     ra_set_cmd->microseconds += usec;
     ra_pending = 0;
+    /* The held SETs' bytes were not published to the stream sender while they were unapplied. */
+    replStreamSenderPublishAppend(server.primary_repl_offset);
 }
