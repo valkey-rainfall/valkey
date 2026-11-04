@@ -209,6 +209,17 @@ tags {"wait aof network external:skip"} {
             waitForBgrewriteaof $master
         }
 
+        test {WAITAOF everysec returns only after the write's fsync completed} {
+            # The write's flush requests the fsync, which takes at least 500 ms.
+            $master debug aof-bio-fsync-sleep 500000
+            after 2200
+            $master set x y
+            set start [clock milliseconds]
+            assert_equal [$master waitaof 1 0 0] {1 0}
+            assert_morethan_equal [expr {[clock milliseconds] - $start}] 400
+            $master debug aof-bio-fsync-sleep 0
+        }
+
         test {WAITAOF local copy with appendfsync always} {
             r config set appendfsync always
             $master incr foo
