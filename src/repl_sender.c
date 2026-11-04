@@ -254,7 +254,7 @@ void replStreamSenderPublishStable(long long offset) {
  * no byte is streamed before it is on disk. */
 void replStreamSenderPublishAppend(long long offset) {
     if (!repl_sender_running || server.repl_stream_sender != REPL_STREAM_SENDER_APPEND) return;
-    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) return;
+    if (server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS) return;
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
     if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
@@ -399,11 +399,16 @@ void replStreamSenderTick(void) {
     if (!replStreamSenderActive()) return;
     replStreamSenderAccount();
     long long stable = server.primary_repl_offset;
-    /* Under appendfsync always the bound is the fsynced offset, so no byte is streamed
-     * (and no WAITAOF/WAIT waiter can observe it) before it is on disk. */
-    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS &&
-        server.fsynced_reploff != -1 && server.fsynced_reploff < stable)
-        stable = server.fsynced_reploff;
+    /* With AOF on, the bound is the offset last seen with nothing left for the AOF to write, so no
+     * byte is streamed (and no WAITAOF/WAIT waiter can observe it) before the AOF has it. */
+    static long long aof_bound = -1;
+    if (server.aof_state != AOF_OFF) {
+        if (!aofHoldsReplies()) aof_bound = stable;
+        if (aof_bound < 0) return;
+        if (aof_bound < stable) stable = aof_bound;
+    } else {
+        aof_bound = -1;
+    }
     replStreamSenderPublishStable(stable);
 }
 

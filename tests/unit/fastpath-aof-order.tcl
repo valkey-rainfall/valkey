@@ -137,3 +137,24 @@ start_server {tags {"fastpath aof modules external:skip tls:skip logreqres:skip"
         close $fd
     }
 }
+
+start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly no appendfsync always enable-debug-command yes save ""}} {
+    r select 0
+
+    test {AOF order: always, while AOF waits for its first rewrite a fast-path write acknowledges after the fsync (#38)} {
+        set fd [fao_fp_client]
+        populate 2000 fao:pop: 10
+        r config set rdb-key-save-delay 2000
+        r config set appendonly yes
+        assert_equal 1 [s aof_rewrite_in_progress]
+        for {set i 0} {$i < 3} {incr i} {
+            lassign [fao_reply_ms $fd $fao_sleep set fao:waitrw $i] ms reply
+            assert_equal {+OK} $reply
+            assert_morethan_equal $ms [expr {$fao_sleep - 50}]
+        }
+        assert_equal 1 [s aof_rewrite_in_progress]
+        r config set rdb-key-save-delay 0
+        waitForBgrewriteaof r
+        close $fd
+    }
+}
