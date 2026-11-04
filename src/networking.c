@@ -2032,8 +2032,10 @@ void clientAcceptHandler(connection *conn) {
 
     if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {
         connSetReadHandler(conn, NULL);
-    } else if (!c->flag.close_asap && tryPartitionClient(c) == C_OK) {
-        connSetReadHandler(conn, NULL);
+    } else if (!c->flag.close_asap) {
+        /* Turned away for now (a server-wide gate, staged mode off): it joins after a later command. */
+        if (fastpathMayJoinLater(c)) c->flag.fp_readmit = 1;
+        if (tryPartitionClient(c) == C_OK) connSetReadHandler(conn, NULL);
     }
 }
 
