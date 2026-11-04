@@ -51,6 +51,20 @@ proc slc_other_client_id {} {
     fail "no other client: [r client list]"
 }
 
+# Everything the server sends until it closes the connection; fails after 10 seconds.
+proc slc_read_until_eof {fd} {
+    fconfigure $fd -blocking 0
+    set got ""
+    set deadline [expr {[clock milliseconds] + 10000}]
+    while {1} {
+        if {[catch {append got [read $fd]}] || [eof $fd]} break
+        if {[clock milliseconds] > $deadline} { fail "connection not closed, got [string length $got] bytes: [string range $got 0 20]" }
+        after 10
+    }
+    catch {close $fd}
+    return $got
+}
+
 proc slc_wait_closed {fd count} {
     wait_for_condition 200 20 {
         [slc_client_count] == $count && [slc_fastpath_clients] == 0
@@ -131,6 +145,46 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         assert_equal 1 [r acl deluser slc-del]
         slc_wait_closed $fd $count
         assert_equal PONG [r ping]
+    }
+
+    test {Staged loop close: a client closed while its commands run gets none of their replies} {
+        # One packet: a write, then a GET whose reply passes the hard limit. The GET closes the
+        # client while the write's reply still waits to be sent. A serial server frees the closed
+        # client before writing anything more to it, so the socket sees EOF and no reply. The
+        # second round checks the same on the main path (a named client leaves the fast path).
+        r config set client-output-buffer-limit "normal 64kb 0 0"
+        # A copy-avoided reply is not counted toward the limit on the main path: keep it copied.
+        set avoid [lindex [r config get min-string-size-avoid-copy-reply-threaded] 1]
+        set avoid_threads [lindex [r config get min-io-threads-avoid-copy-reply] 1]
+        r config set min-string-size-avoid-copy-reply-threaded 0 min-io-threads-avoid-copy-reply 0
+        r set slc:big [string repeat x 200000]
+        foreach path {fast main} {
+            r del slc:closed
+            set count [slc_client_count]
+            set fd [slc_fastpath_socket]
+            if {$path eq "main"} {
+                puts -nonewline $fd [slc_resp client setname slc-main]
+                flush $fd
+                assert_equal "+OK" [string trim [gets $fd]]
+                wait_for_condition 200 20 {
+                    [slc_fastpath_clients] == 0
+                } else {
+                    fail "the socket did not leave the fast path"
+                }
+            }
+            puts -nonewline $fd "[slc_resp incr slc:closed][slc_resp get slc:big]"
+            flush $fd
+            set got [slc_read_until_eof $fd]
+            assert_equal {} $got
+            assert_equal 1 [r get slc:closed]
+            wait_for_condition 200 20 {
+                [slc_client_count] == $count && [slc_fastpath_clients] == 0
+            } else {
+                fail "client not closed: [r client list]"
+            }
+        }
+        r config set client-output-buffer-limit "normal 0 0 0"
+        r config set min-string-size-avoid-copy-reply-threaded $avoid min-io-threads-avoid-copy-reply $avoid_threads
     }
 
     test {Staged loop close: a fast-path client keeps working after other clients are closed} {
