@@ -20,6 +20,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -316,9 +317,14 @@ static int resolveSlot(const poller *p, const pollerSlot *s, pollerEvent *out) {
     return 1;
 }
 
-/* Main: the retired active buffer. Re-arm the one-shot MAIN fds it reported, then empty it. */
+/* Main: the retired active buffer. Re-arm the one-shot MAIN fds it reported, then empty it. A re-armed
+ * fd that is still ready goes straight into the next batch: left to epoll, it would race main's swap
+ * (or sit behind a full epoll_wait) and miss every other batch. */
 static void retireActive(poller *p) {
     pollerBuf *b = &p->buf[p->active];
+    struct pollfd ready[16];
+    uint32_t gens[16];
+    int nready = 0;
     for (int i = 0; i < b->n[POLLER_AFF_MAIN]; i++) {
         const pollerSlot *s = &b->e[POLLER_AFF_MAIN][i];
         if (s->fd < 0 || s->fd >= p->regs_cap) continue;
@@ -328,9 +334,24 @@ static void retireActive(poller *p) {
         ee.events = maskToEpoll(r->mask, r->affinity);
         ee.data.u64 = epollTag(s->fd, r->gen, r->affinity);
         epoll_ctl(p->epfd, EPOLL_CTL_MOD, s->fd, &ee);
+        if (nready < (int)(sizeof(ready) / sizeof(ready[0]))) {
+            short ev = (r->mask & POLLER_READABLE ? POLLIN : 0) | (r->mask & POLLER_WRITABLE ? POLLOUT : 0);
+            ready[nready] = (struct pollfd){.fd = s->fd, .events = ev};
+            gens[nready++] = r->gen;
+        }
     }
     bufClear(b);
     atomic_store_explicit(&p->cursor, 0, memory_order_relaxed);
+    if (nready == 0 || poll(ready, nready, 0) <= 0) return;
+    pthread_mutex_lock(&p->lock);
+    for (int i = 0; i < nready; i++) {
+        short re = ready[i].revents;
+        if (!re || (re & POLLNVAL)) continue;
+        int mask = (re & POLLIN ? POLLER_READABLE : 0) | (re & POLLOUT ? POLLER_WRITABLE : 0);
+        if (re & (POLLERR | POLLHUP)) mask |= POLLER_READABLE | POLLER_WRITABLE | POLLER_ERROR;
+        postLocked(p, ready[i].fd, gens[i], POLLER_AFF_MAIN, mask);
+    }
+    pthread_mutex_unlock(&p->lock);
 }
 
 static int timeoutMs(long long timeout_us) {
