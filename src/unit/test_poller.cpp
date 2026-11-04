@@ -159,6 +159,27 @@ TEST_F(PollerTest, AffinitySelectsClassEdgeAndOneShot) {
     EXPECT_EQ(pollerGetNextBatch(p, 0), 0);
 }
 
+/* A MAIN fd that stays ready is in every batch, even when the epoll thread already queued IO work so
+ * main swaps without waiting for the thread to report the re-armed fd. */
+TEST_F(PollerTest, ReadyMainFdInEveryBatchWithThread) {
+    auto [rio, wio] = makePipe();
+    auto [rmain, wmain] = makePipe();
+    ASSERT_EQ(pollerRegister(p, rio, POLLER_READABLE, noopHandler, nullptr, POLLER_AFF_IO), 0);
+    ASSERT_EQ(pollerRegister(p, rmain, POLLER_READABLE, noopHandler, nullptr, POLLER_AFF_MAIN), 0);
+    poke(wmain); /* never read: level-ready for the whole test */
+    ASSERT_EQ(pollerStart(p), 0);
+    int missed = 0;
+    for (int i = 0; i < 100; i++) {
+        poke(wio);
+        std::this_thread::sleep_for(milliseconds(2)); /* the thread has queued the IO edge */
+        ASSERT_GE(pollerGetNextBatch(p, 0), 1);
+        if (pollerMainCount(p) != 1) missed++;
+        claimAll();
+        drain(rio);
+    }
+    EXPECT_EQ(missed, 0);
+}
+
 TEST_F(PollerTest, HangupReportsErrorAndBothDirections) {
     auto [r, w] = makePipe();
     ASSERT_EQ(pollerRegister(p, r, POLLER_READABLE, noopHandler, nullptr, POLLER_AFF_IO), 0);
