@@ -10,11 +10,8 @@
 #include "repl_apply.h"
 #include "staged_loop.h"
 #include "fastpath.h"
-#include "bgiteration.h"
 #include "hotkeys.h"
-#include "throttle.h"
 #include "cluster_slot_stats.h"
-#include "module.h"
 
 
 _Thread_local int repl_apply_in_lane = 0;
@@ -585,15 +582,13 @@ int replApplyPending(void) {
     return ra_pending;
 }
 
-/* Nothing that observes an individual write may be active: those writes must go through call(). */
+/* Nothing that observes an individual write may be active: those writes must go through call(). The
+ * planned lanes' gate covers the server-wide state. */
 static int replApplyAllowed(client *c) {
     if (!server.replica_parallel_apply || !replApplySharded()) return 0;
     if (!c->flag.primary || c->flag.multi || !inMainThread()) return 0;
-    if (!stagedApplyReady()) return 0;
-    if (server.loading || server.aof_state != AOF_OFF || server.maxmemory) return 0;
-    if (server.paused_actions || listLength(server.monitors) || server.tracking_clients) return 0;
-    if (server.notify_keyspace_events || moduleObservesWrites()) return 0;
-    if (bgIteration_iterationActive() || throttle_anyThrottlers()) return 0;
+    if (!stagedApplyReady() || !fastpathStreamParallelAllowed()) return 0;
+    if (server.tracking_clients) return 0;
     if (dictSize(c->db->watched_keys) || dictSize(c->db->blocking_keys)) return 0;
     return 1;
 }
