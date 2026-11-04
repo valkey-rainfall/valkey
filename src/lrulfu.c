@@ -103,7 +103,10 @@ static uint32_t LFUDecay(uint32_t lfu) {
     uint16_t elapsed = now - prev_time; // Wrap-around expected/valid
     uint16_t num_periods = lfu_config_decay_time ? elapsed / lfu_config_decay_time : 0;
     freq = (num_periods > freq) ? 0 : freq - num_periods;
-    return ((uint32_t)now << 8) | freq;
+    /* Advance the time only by the periods consumed, so that reading the counter more often than
+     * lfu-decay-time does not hold back its decay. */
+    uint16_t decayed_time = (uint16_t)(prev_time + (uint32_t)num_periods * lfu_config_decay_time);
+    return ((uint32_t)decayed_time << 8) | freq;
 }
 
 
@@ -121,10 +124,9 @@ static uint8_t LFULogIncr(uint8_t freq, double r) {
 
 
 static uint32_t lfu_touchWithRandom(uint32_t lfu, double r) {
-    lfu = LFUDecay(lfu);
-    uint8_t freq = (uint8_t)lfu;
+    uint8_t freq = (uint8_t)LFUDecay(lfu);
     freq = LFULogIncr(freq, r);
-    return (lfu & ~(uint32_t)UINT8_MAX) | freq;
+    return lfu_import(freq);
 }
 
 uint32_t lfu_touch(uint32_t lfu) {
