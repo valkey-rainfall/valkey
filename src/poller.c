@@ -323,11 +323,10 @@ static int resolveSlot(const poller *p, const pollerSlot *s, pollerEvent *out) {
     return 1;
 }
 
-/* Main: the retired active buffer. Re-arm the one-shot MAIN fds it reported, then empty it. A re-armed
- * fd that is still ready goes straight into the next batch: left to epoll, it would race main's swap
- * (or sit behind a full epoll_wait) and miss every other batch. */
-static void retireActive(poller *p) {
-    pollerBuf *b = &p->buf[p->active];
+/* Main: re-arm the one-shot MAIN fds the retired buffer b reported. A re-armed fd that is still ready
+ * goes straight into the next batch: left to epoll, it would race main's swap (or sit behind a full
+ * epoll_wait) and miss every other batch. Out of line so a batch with no MAIN fd pays nothing. */
+static __attribute__((noinline)) void rearmMainFds(poller *p, const pollerBuf *b) {
     struct pollfd ready[16];
     uint32_t gens[16];
     int nready = 0;
@@ -346,8 +345,6 @@ static void retireActive(poller *p) {
             gens[nready++] = r->gen;
         }
     }
-    bufClear(b);
-    atomic_store_explicit(&p->cursor, 0, memory_order_relaxed);
     if (nready == 0 || poll(ready, nready, 0) <= 0) return;
     pthread_mutex_lock(&p->lock);
     for (int i = 0; i < nready; i++) {
@@ -358,6 +355,14 @@ static void retireActive(poller *p) {
         postLocked(p, ready[i].fd, gens[i], POLLER_AFF_MAIN, mask);
     }
     pthread_mutex_unlock(&p->lock);
+}
+
+/* Main: the retired active buffer. Re-arm the MAIN fds it reported, then empty it. */
+static void retireActive(poller *p) {
+    pollerBuf *b = &p->buf[p->active];
+    if (b->n[POLLER_AFF_MAIN] > 0) rearmMainFds(p, b);
+    bufClear(b);
+    atomic_store_explicit(&p->cursor, 0, memory_order_relaxed);
 }
 
 static int timeoutMs(long long timeout_us) {
