@@ -4011,6 +4011,12 @@ void bufferReplData(connection *conn) {
     }
 }
 
+/* Replies the replayed commands produced for the primary (REPLCONF ACK) leave now, as after a read of
+ * the primary, rather than once the whole buffer is replayed. */
+static void replStreamSendReplies(client *c) {
+    if (server.aof_fsync != AOF_FSYNC_ALWAYS) trySendWriteToIOThreads(c);
+}
+
 /* Replication: Replica side.
  * Streams accumulated replication data into the database while freeing read nodes */
 int streamReplDataBufToDb(client *c) {
@@ -4037,6 +4043,7 @@ int streamReplDataBufToDb(client *c) {
                     return C_ERR;
                 }
                 processInputBuffer(c);
+                replStreamSendReplies(c);
                 input = NULL;
                 input_len = 0;
 
@@ -4054,6 +4061,7 @@ int streamReplDataBufToDb(client *c) {
             c->querybuf = sdscatlen(c->querybuf, o->buf, used);
             c->repl_data->read_reploff += used;
             processInputBuffer(c);
+            replStreamSendReplies(c);
             replStreamProgressCallback(processed_bytes, used, &last_progress_callback);
             processed_bytes += used;
             if (!server.pending_repl_data.blocks) {
