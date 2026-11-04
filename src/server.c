@@ -4168,13 +4168,14 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
      * performEvictions() in processCommand()) is a decision of this node that is
      * not part of the proxied stream, so it must reach our replicas like any other
      * eviction. Note that c->flag.executing_command can't be used instead, it is
-     * cleared before call() propagates the command.
+     * cleared before call() propagates the command. The writes of module post
+     * execution unit jobs are decisions of this node too.
      *
      * However, if we need to propagate to AOF, we should still do that. */
     bool propagate_aof = (target & PROPAGATE_AOF) && server.aof_state != AOF_OFF;
     client *cc = ectx->current_client;
     if (cc != NULL && cc->slot_migration_job && isImportSlotMigrationJob(cc->slot_migration_job) &&
-        ectx->executing_client != NULL) {
+        ectx->executing_client != NULL && !moduleInPostExecUnitJobs()) {
         if (!propagate_aof) return;
         /* Disable propagation to replication (just do the AOF) */
         target &= ~PROPAGATE_REPL;

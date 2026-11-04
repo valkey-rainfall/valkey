@@ -9644,6 +9644,13 @@ bool moduleHasPostExecUnitJobs(void) {
     return listLength(modulePostExecUnitJobs) > 0;
 }
 
+/* Set while post execution unit jobs run. */
+static int post_exec_unit_jobs_running = 0;
+
+int moduleInPostExecUnitJobs(void) {
+    return post_exec_unit_jobs_running;
+}
+
 void firePostExecutionUnitJobs(void) {
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent
@@ -9651,6 +9658,7 @@ void firePostExecutionUnitJobs(void) {
      * This is a special case where we need to increase 'execution_nesting'
      * but we do not want to update the cached time */
     enterExecutionUnit(0, 0);
+    post_exec_unit_jobs_running++;
     while (listLength(modulePostExecUnitJobs) > 0) {
         listNode *ln = listFirst(modulePostExecUnitJobs);
         ValkeyModulePostExecUnitJob *job = listNodeValue(ln);
@@ -9666,6 +9674,7 @@ void firePostExecutionUnitJobs(void) {
         moduleFreeContext(&ctx);
         zfree(job);
     }
+    post_exec_unit_jobs_running--;
     exitExecutionUnit();
 }
 
