@@ -90,6 +90,8 @@ const void *testOnlyGetIOThreadActiveTimeSlot(int id);
 const void *testOnlyGetIOJobsFinishedCounter(void);
 const void *testOnlyGetIOJobsSubmittedCounter(void);
 void testOnlySetIOThreadReady(int tid, int epfd);
+void testOnlySetIOThreadSleeping(int tid, int fd);
+int testOnlyIOThreadSleeping(int tid);
 void testOnlySetCurTid(int tid);
 void trySendPollJobToIOThreads(void);
 int trySendAcceptToIOThreads(connection *conn);
