@@ -610,7 +610,7 @@ static int stagedStreamEligible(void) {
     if (server.staged_reply_overlap == STAGED_REPLY_OVERLAP_NONE) return 0;
     if (sl_depth != 0 || sl_workers <= 0) return 0;
     if (fastpathStagedStreamBatchCount() == 0) return 0;
-    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) return 0;
+    if (server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS) return 0;
     if (!sl_main_spins || !sl_main_lane) return 0; /* a worker shares main's CPU */
     if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
     if (fastpathStagedLanesWillRun()) return 0; /* the IO threads execute write lanes instead */
@@ -679,7 +679,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     /* With appendfsync always a write is acknowledged only once it is on disk: the write phase's
      * commands reach the AOF before the reply phase sends their replies. */
     t = getMonotonicUs();
-    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) {
+    if (server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS) {
         uint64_t t1 = stagedNowNs();
         flushAppendOnlyFile(0);
         fastpathRetryAofReadmits();
