@@ -530,6 +530,15 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * phase. */
     if (hotkeysEnabled()) return 0;
 
+    /* Main postpones or rejects the read: CLIENT PAUSE ALL postpones it, a yielding script or module
+     * (including a module thread yielding from a thread-safe context) postpones it or replies BUSY,
+     * and during FAILOVER_IN_PROGRESS a client that may be redirected waits for the new primary. All
+     * of this state changes only on main, outside the read phase. */
+    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL)) return 0;
+    if (isInsideYieldingLongCommand()) return 0;
+    if (server.failover_state == FAILOVER_IN_PROGRESS && clientSupportStandAloneRedirect(c) && !c->flag.readonly)
+        return 0;
+
     fastGetTouchBegin(c);
 
     /* Only a read that starts with a GET, or a SISMEMBER or HGET with io-threads-speculate-reads, is
