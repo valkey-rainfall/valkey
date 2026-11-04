@@ -389,6 +389,34 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         close $fd
     }
 
+    test {Write lanes: each lane command takes a fresh command time} {
+        # One key, so one lane runs every command in order: a TTL set before a slow SETRANGE and
+        # one set after it count from their own command times, as on a serial server, not from the
+        # start of the phase.
+        r del pwl:clock
+        r config resetstat
+        set fd [pwl_fast_socket r $host $port]
+        set before [pwl_lane_entries r]
+        set buf ""
+        append buf [pwl_resp set pwl:clock v PX 100000]
+        append buf [pwl_resp pexpiretime pwl:clock]
+        append buf [pwl_resp setrange pwl:clock 200000000 x]
+        append buf [pwl_resp pexpire pwl:clock 100000]
+        append buf [pwl_resp pexpiretime pwl:clock]
+        puts -nonewline $fd $buf
+        flush $fd
+        set got [pwl_read_replies $fd 5]
+        assert_equal [expr {$before + 5}] [pwl_lane_entries r]
+        assert_equal {+OK} [lindex $got 0]
+        regexp {usec=([0-9]+)} [getInfoProperty [r info commandstats] cmdstat_setrange] -> slow_us
+        # The SETRANGE must take long enough for the difference to show.
+        assert_morethan $slow_us 5000
+        set diff [expr {[string range [lindex $got 4] 1 end] - [string range [lindex $got 1] 1 end]}]
+        assert_morethan_equal $diff [expr {$slow_us / 1000 - 1}]
+        close $fd
+        r del pwl:clock
+    }
+
     test {Write lanes: a key a lane finds expired is deleted there and counted} {
         r debug set-active-expire 0
         set fd [pwl_fast_socket r $host $port]
