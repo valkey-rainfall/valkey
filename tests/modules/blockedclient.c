@@ -23,6 +23,8 @@ extern int VM_ReplyRaw(ValkeyModuleCtx *ctx, const char *proto, size_t proto_len
 /* used to test processing events during slow bg operation */
 static volatile int g_slow_bg_operation = 0;
 static volatile int g_is_in_slow_bg_operation = 0;
+/* used to test yielding with a pending effect: do_bg_rm_call INCRs this key before yielding */
+static volatile int g_write_before_slow_bg_operation = 0;
 
 void *sub_worker(void *arg) {
     // Get module context
@@ -156,6 +158,10 @@ void *bg_call_worker(void *arg) {
 
     // Test slow operation yielding
     if (g_slow_bg_operation) {
+        if (g_write_before_slow_bg_operation) {
+            ValkeyModuleCallReply *incr = ValkeyModule_Call(ctx, "INCR", "!c", "bg_write_before_yield");
+            ValkeyModule_FreeCallReply(incr);
+        }
         g_is_in_slow_bg_operation = 1;
         while (g_slow_bg_operation) {
             ValkeyModule_Yield(ctx, VALKEYMODULE_YIELD_FLAG_CLIENTS, "Slow module operation");
@@ -1016,6 +1022,16 @@ static int set_slow_bg_operation(ValkeyModuleCtx *ctx, ValkeyModuleString **argv
     return VALKEYMODULE_OK;
 }
 
+/* used to make do_bg_rm_call write before its slow operation */
+static int set_write_before_slow_bg_operation(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    long long ll;
+    if (ValkeyModule_StringToLongLong(argv[1], &ll) != VALKEYMODULE_OK)
+        return ValkeyModule_ReplyWithError(ctx, "Invalid integer value");
+    g_write_before_slow_bg_operation = ll;
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 /* used to test if we reached the slow operation in do_bg_rm_call */
 static int is_in_slow_bg_operation(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     UNUSED(argv);
@@ -1213,6 +1229,9 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "set_slow_bg_operation", set_slow_bg_operation, "allow-busy", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "set_write_before_slow_bg_operation", set_write_before_slow_bg_operation, "allow-busy", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "is_in_slow_bg_operation", is_in_slow_bg_operation, "allow-busy", 0, 0, 0) == VALKEYMODULE_ERR)

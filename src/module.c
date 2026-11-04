@@ -919,10 +919,14 @@ int VM_GetApi(const char *funcname, void **targetPtrPtr) {
     return VALKEYMODULE_OK;
 }
 
+/* Set while a module thread holding a thread-safe context is parked in VM_Yield. Its busy period
+ * lasts until it unlocks, so main's own execution units must not end it. Accessed with the GIL. */
+static int module_thread_yielding = 0;
+
 void modulePostExecutionUnitOperations(void) {
     if (ectx->execution_nesting) return;
 
-    if (server.busy_module_yield_flags) {
+    if (server.busy_module_yield_flags && !module_thread_yielding) {
         blockingOperationEnds();
         server.busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
         if (ectx->current_client) unprotectClient(ectx->current_client);
@@ -2640,10 +2644,18 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
                     }
                 } else {
                     /* Release the GIL, yielding CPU to give the main thread an opportunity to start
-                     * event processing, and then acquire the GIL again until the main thread releases it. */
+                     * event processing, and then acquire the GIL again until the main thread releases it.
+                     * Main runs its own execution units meanwhile, so end this thread's unit for
+                     * propagation first, and keep the busy period open until the thread unlocks. */
+                    int nesting = ectx->execution_nesting;
+                    ectx->execution_nesting = 0;
+                    propagatePendingEffects();
+                    module_thread_yielding = 1;
                     moduleReleaseGIL();
                     sched_yield();
                     moduleAcquireGILForThread();
+                    module_thread_yielding = 0;
+                    ectx->execution_nesting = nesting;
                 }
             } else {
                 /* If we are in the main thread, we can safely process events. */
