@@ -294,3 +294,44 @@ TEST_F(ObjectTest, metadata_changes_embed_threshold) {
     sdsfree(k);
     decrRefCount(obj);
 }
+
+/* The forkless save runs rdbSaveKeyValuePair off main while main may change
+ * the refcount, which shares a memory location with lru. Saving must therefore
+ * read the decayed LFU counter without storing it into the object. */
+TEST_F(ObjectTest, rdb_save_lfu_does_not_write_object_header) {
+    int saved_policy = server.maxmemory_policy;
+    int saved_decay = lfu_config_decay_time;
+    long long t0 = 1000LL * 60 * 60 * 24 * 365;
+
+    server.maxmemory_policy = MAXMEMORY_ALLKEYS_LFU;
+    lfu_config_decay_time = 1;
+    lrulfu_updateClockAndPolicy(t0, true);
+
+    robj *o = createKeyValueObject("lfukey", "value");
+    objectSetLRU(o, lfu_import(10));
+
+    /* Five minutes later the counter should read 5 after decay. */
+    lrulfu_updateClockAndPolicy(t0 + 5 * 60 * 1000, true);
+
+    unsigned char before[sizeof(robj)];
+    memcpy(before, o, sizeof(robj));
+
+    robj key;
+    initStaticStringObject(key, objectGetKey(o));
+    rio r;
+    rioInitWithBuffer(&r, sdsempty());
+    ASSERT_EQ(rdbSaveKeyValuePair(&r, &key, o, -1, 0, RDB_VERSION), 1);
+
+    /* The FREQ opcode and its byte come first. */
+    const unsigned char *buf = (const unsigned char *)r.io.buffer.ptr;
+    ASSERT_GE(sdslen(r.io.buffer.ptr), 2u);
+    EXPECT_EQ(buf[0], RDB_OPCODE_FREQ);
+    EXPECT_EQ(buf[1], 5);
+
+    EXPECT_EQ(memcmp(before, o, sizeof(robj)), 0) << "save wrote the object header";
+
+    sdsfree(r.io.buffer.ptr);
+    decrRefCount(o);
+    server.maxmemory_policy = saved_policy;
+    lfu_config_decay_time = saved_decay;
+}
