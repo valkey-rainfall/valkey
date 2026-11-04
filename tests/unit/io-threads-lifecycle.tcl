@@ -577,6 +577,25 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
     }
 }
 
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread yes}} {
+    test {Thread budget: an epoll thread that exits is logged and its IO thread comes back} {
+        r select 0
+        lc_wait_budget 2 1
+        set lines [count_log_lines 0]
+        assert_equal OK [r debug staged-epoll-thread-fail]
+        wait_for_log_messages 0 {"*the epoll thread exited (epoll_wait: Input/output error)*"} $lines 100 50
+        lc_wait_budget 3 0
+        # Failed under this configuration, it stays off: an IO thread holds its slot.
+        after 300
+        assert_equal 0 [lc_epoll]
+        r set lc:ep:k v
+        assert_equal v [r get lc:ep:k]
+        # A configuration change tries again.
+        assert_equal OK [r config set io-threads 5]
+        lc_wait_budget 3 1
+    }
+}
+
 proc lc_thread_tid {pid name} {
     foreach task [glob -nocomplain /proc/$pid/task/*] {
         if {[catch {set comm [string trim [exec cat $task/comm]]}]} continue
