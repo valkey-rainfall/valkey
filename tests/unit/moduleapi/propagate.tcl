@@ -681,6 +681,63 @@ tags "modules" {
             }
         }
     }
+
+    test {Module command FLUSHALL ASYNC frees the old keyspace after the command} {
+        start_server [list overrides [list loadmodule "$testmodule"]] {
+            set repl [attach_to_replication_stream]
+
+            set info [r propagate-test.set-flushall-async foo bar]
+            assert_match "*lazyfreed_objects:0\r*" $info
+            wait_lazyfree_done r
+            # foo, and the counter this module INCRs on every keyspace event.
+            assert_equal 2 [s lazyfreed_objects]
+
+            assert_replication_stream $repl {
+                {multi}
+                {select *}
+                {incr notifications}
+                {set foo bar}
+                {flushall ASYNC}
+                {exec}
+            }
+            close_replication_stream $repl
+        }
+    }
+
+    test {Module command FLUSHALL ASYNC waits for the command's argv to be freed} {
+        start_server [list overrides [list loadmodule "$testmodule"]] {
+            set rd [valkey_deferring_client]
+            $rd propagate-test.set-flushall-async-block foo [string repeat x 100]
+            $rd flush
+            wait_for_blocked_client
+
+            # The lazy-free thread runs jobs in order, so once this set is
+            # freed, a keyspace handed over before it is freed too.
+            if {[lindex [r config get io-threads] 1] > 1} {
+                # With IO threads only streams and module values are freed on BIO.
+                r xadd fence * f v
+            } else {
+                set members {}
+                for {set i 0} {$i < 200} {incr i} {lappend members m$i}
+                r sadd fence {*}$members
+            }
+            r unlink fence
+            wait_for_condition 50 100 {
+                [s lazyfreed_objects] >= 1
+            } else {
+                fail "lazyfree fence isn't done"
+            }
+            assert_equal 1 [s lazyfreed_objects]
+            # foo, and the counter this module INCRs on every keyspace event.
+            assert_equal 2 [s lazyfree_pending_objects]
+
+            r propagate-test.unblock
+            assert_equal OK [$rd read]
+            $rd close
+            wait_lazyfree_done r
+            assert_equal 3 [s lazyfreed_objects]
+        }
+    }
 }
 
 
