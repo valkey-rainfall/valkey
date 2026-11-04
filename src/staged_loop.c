@@ -79,9 +79,23 @@ int stagedEpollThreadConfigValid(int on, int io_threads, const char **err) {
     return 1;
 }
 
+/* The epoll thread failed to start or exited on its own under this configuration: it is not wanted
+ * again, and its IO thread is given back, until io-threads or an epoll-thread setting changes. */
+static int sl_epoll_failed = 0;
+static int sl_epoll_failed_cfg[3];
+
+static int stagedEpollThreadFailed(void) {
+    if (!sl_epoll_failed) return 0;
+    if (sl_epoll_failed_cfg[0] == server.io_threads_epoll_thread && sl_epoll_failed_cfg[1] == server.io_threads_num &&
+        sl_epoll_failed_cfg[2] == server.io_threads_epoll_thread_cpu)
+        return 1;
+    sl_epoll_failed = 0;
+    return 0;
+}
+
 int stagedEpollThreadWanted(void) {
 #ifdef HAVE_FASTPATH_EPOLL
-    if (!server.io_threads_epoll_thread) return 0;
+    if (!server.io_threads_epoll_thread || stagedEpollThreadFailed()) return 0;
     if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.sentinel_mode) return 0;
     return server.io_threads_num >= STAGED_EPOLL_THREAD_MIN_IO_THREADS;
 #else
@@ -155,7 +169,6 @@ static cpu_set_t sl_proc_cpus; /* main's CPUs when staged mode first started: th
 static int sl_proc_cpus_read = 0;
 static cpu_set_t sl_epoll_placed; /* the epoll thread's CPUs as main last placed it */
 static int sl_epoll_placed_set = 0;
-static int sl_epoll_start_failed = 0;
 
 /* Enrollment: main writes the sequence a newly enrolled worker waits from, then bumps its generation,
  * then sets enrolled, all between phases. A worker adopts the sequence once per generation. */
@@ -394,6 +407,12 @@ static void stagedPlaceEpollThread(void) {
     sl_epoll_placed_set = 1;
 }
 
+int stagedDebugFailEpollThread(void) {
+    if (!sl_poller || !pollerThreadRunning(sl_poller)) return 0;
+    pollerTestOnlyFailThread(sl_poller);
+    return 1;
+}
+
 void stagedEpollThreadReplace(void) {
     if (!sl_poller || !pollerThreadRunning(sl_poller)) return;
     sl_epoll_placed_set = 0; /* an explicit setting overrides an operator's pin */
@@ -403,16 +422,35 @@ void stagedEpollThreadReplace(void) {
 /* Main, at the iteration boundary while staged mode is on: run the epoll thread exactly when the
  * configuration asks for it. Started, it replaces the last IO thread, which the worker set no longer
  * has; stopped, main waits on epoll itself and keeps what the thread had queued. */
+static void stagedEpollThreadFail(void) {
+    sl_epoll_failed = 1;
+    sl_epoll_failed_cfg[0] = server.io_threads_epoll_thread;
+    sl_epoll_failed_cfg[1] = server.io_threads_num;
+    sl_epoll_failed_cfg[2] = server.io_threads_epoll_thread_cpu;
+    updateIOThreads(NULL); /* the thread slot it took goes back to an IO thread */
+}
+
 static void stagedFollowEpollThread(void) {
+    int err = 0;
+    if (pollerThreadExited(sl_poller, &err)) {
+        pollerStopThread(sl_poller);
+        serverLog(LL_WARNING,
+                  "Staged event loop: the epoll thread exited (epoll_wait: %s); main waits on epoll itself and an IO "
+                  "thread takes its place until io-threads or io-threads-epoll-thread changes",
+                  strerror(err));
+        stagedEpollThreadFail();
+        return;
+    }
     int want = stagedEpollThreadWanted() && sl_workers > 0;
-    if (!want) sl_epoll_start_failed = 0;
-    if (want == pollerThreadRunning(sl_poller) || (want && sl_epoll_start_failed)) return;
+    if (want == pollerThreadRunning(sl_poller)) return;
     if (want) {
         sl_epoll_placed_set = 0;
         stagedPlaceEpollThread();
         if (pollerStart(sl_poller) != 0) {
-            serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
-            sl_epoll_start_failed = 1;
+            serverLog(LL_WARNING,
+                      "Staged event loop: cannot start the epoll thread; main waits on epoll itself and an IO thread "
+                      "takes its place until io-threads or io-threads-epoll-thread changes");
+            stagedEpollThreadFail();
             return;
         }
         if (pollerGetThreadAffinity(sl_poller, &sl_epoll_placed, sizeof(sl_epoll_placed)) == 0) sl_epoll_placed_set = 1;
@@ -834,6 +872,10 @@ int stagedEpollThreadCpuValid(int cpu, const char **err) {
 }
 
 void stagedEpollThreadReplace(void) {
+}
+
+int stagedDebugFailEpollThread(void) {
+    return 0;
 }
 
 int stagedResize(int setsize) {
