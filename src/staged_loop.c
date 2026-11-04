@@ -601,7 +601,7 @@ static void readPhase(void) {
 }
 
 /* Main: a STREAM phase may overlap exec this iteration. Only when batches exist, workers are
- * enrolled, no nested depth, the base would not flush the AOF before replies (appendfsync always),
+ * enrolled, no nested depth, AOF off (replies wait for the AOF write after exec),
  * no worker shares main's CPU (a shared core would only take turns), and no BCAST tracking prefix is
  * set (the base sends replies before trackingBroadcastInvalidationMessages; streaming must not widen
  * that window). */
@@ -610,7 +610,7 @@ static int stagedStreamEligible(void) {
     if (server.staged_reply_overlap == STAGED_REPLY_OVERLAP_NONE) return 0;
     if (sl_depth != 0 || sl_workers <= 0) return 0;
     if (fastpathStagedStreamBatchCount() == 0) return 0;
-    if (server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS) return 0;
+    if (server.aof_state != AOF_OFF) return 0; /* replies follow the AOF write of their commands */
     if (!sl_main_spins || !sl_main_lane) return 0; /* a worker shares main's CPU */
     if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
     if (fastpathStagedLanesWillRun()) return 0; /* the IO threads execute write lanes instead */
@@ -676,13 +676,15 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     writePhase(el);
     cronStatsRecord(CRON_JOB_SL_WRITE, getMonotonicUs() - t);
-    /* With appendfsync always a write is acknowledged only once it is on disk: the write phase's
-     * commands reach the AOF before the reply phase sends their replies. */
+    /* A write is acknowledged only once the AOF has it (fsynced under always, written otherwise): the
+     * write phase's commands reach the AOF before the reply phase sends their replies, and main-path
+     * replies held for the flush go out in the same reply phase. */
     t = getMonotonicUs();
-    if (server.aof_state != AOF_OFF && server.aof_fsync == AOF_FSYNC_ALWAYS) {
+    if (aofHoldsReplies()) {
         uint64_t t1 = stagedNowNs();
         flushAppendOnlyFile(0);
         fastpathRetryAofReadmits();
+        if (listLength(server.clients_pending_write)) handleClientsWithPendingWrites();
         sl_main_ns[SL_T_AOF] += stagedNowNs() - t1;
     }
     cronStatsRecord(CRON_JOB_SL_AOF_ALWAYS, getMonotonicUs() - t);
