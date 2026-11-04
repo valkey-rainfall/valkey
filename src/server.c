@@ -2248,6 +2248,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         if (io_responses_after > 0) {
             server.el_iteration_active = true;
 
+            /* Their writes reach the AOF before their replies leave. */
+            if (aofHoldsReplies()) flushAppendOnlyFile(0);
             /* Any responses that failed to enqueue to IO threads need to be handled now */
             handleClientsWithPendingWrites();
         }
