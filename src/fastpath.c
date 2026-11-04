@@ -1732,42 +1732,72 @@ static int fpKeyDictsSettled(void) {
     return 1;
 }
 
-/* Main: nothing outside a lane's own hashtables would observe or order the iteration's writes. Every
- * condition is changed only by main between phases or by main-path commands, so it holds from the
- * read phase until the fast path's part of the write phase is done, unless a barrier entry changes
- * it; main re-checks after each one. */
-static int fpLanesAllowed(void) {
-    /* Cluster mode: one hashtable per slot already. An exporting slot's writes reach its export job
-     * through the replay, but keep the cutover simple: no lanes while one is exported. */
-    if (server.cluster_enabled ? clusterIsAnySlotExporting() : !server.keyspace_shard_bits) return 0;
-    if (server.primary_host || server.loading || server.async_loading) return 0;
-    if (server.paused_actions || listLength(server.monitors)) return 0;
-    if (!trackingIsIdle()) return 0;
-    if (server.notify_keyspace_events || moduleObservesWrites()) return 0;
-    if (bgIteration_iterationActive() || throttle_anyThrottlers()) return 0;
-    if (server.maxmemory || server.maxmemory_clients) return 0;
+static const char *const fp_veto_names[FP_VETO_COUNT] = {
+    "none", "off", "not-staged", "unsplit", "slot-migrating", "role", "loading",
+    "paused", "monitor", "tracking", "keyspace-events", "module", "forkless-save",
+    "throttle", "maxmemory", "hotkeys", "key-dicts", "disk-error", "min-replicas"};
+static int fp_last_veto[FP_PAR_COUNT] = {FP_VETO_NOT_STAGED, FP_VETO_NOT_STAGED};
+
+const char *fastpathParallelVetoName(int veto) {
+    return veto >= 0 && veto < FP_VETO_COUNT ? fp_veto_names[veto] : "?";
+}
+
+int fastpathLastParallelVeto(int role) {
+    return fp_last_veto[role];
+}
+
+static int fpBlockedOnKeys(void) {
+    return server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
+           server.blocked_clients_by_type[BLOCKED_STREAM];
+}
+
+/* Main: may a primary's client writes or MAINT run on lanes now. Both need the staged workers and a
+ * split keyspace. Client writes also need that nothing outside a lane's own hashtables observes or
+ * orders them; MAINT replays what observers need on main instead. A replica's stream has its own gate,
+ * fastpathStreamParallelAllowed. Every condition is changed only by main, between phases or by a
+ * command main runs, so a caller that runs commands on main between lane phases asks again after
+ * each one. */
+static int fpParallelVeto(int role) {
+    if (!(role == FP_PAR_CLIENTS ? server.io_threads_parallel_writes : server.cron_lanes)) return FP_VETO_OFF;
+    if (fpDepth() != 0 || !stagedApplyReady() || stagedLaneCount() < 2) return FP_VETO_NOT_STAGED;
+    if (!server.cluster_enabled && !server.keyspace_shard_bits) return FP_VETO_UNSPLIT;
+    if (role == FP_PAR_MAINT) return FP_VETO_NONE;
+    /* An exporting slot's writes reach its export job through the replay, but keep the cutover simple. */
+    if (server.cluster_enabled && clusterIsAnySlotExporting()) return FP_VETO_SLOT_MIGRATING;
+    if (server.primary_host) return FP_VETO_ROLE;
+    if (server.loading || server.async_loading) return FP_VETO_LOADING;
+    if (server.paused_actions) return FP_VETO_PAUSED;
+    if (listLength(server.monitors)) return FP_VETO_MONITOR;
+    if (!trackingIsIdle()) return FP_VETO_TRACKING;
+    if (server.notify_keyspace_events) return FP_VETO_KEYSPACE_EVENTS;
     /* A module can block a client on any key and wake it by its own rules. */
-    if (server.blocked_clients_by_type[BLOCKED_MODULE]) return 0;
-    int blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
-                  server.blocked_clients_by_type[BLOCKED_STREAM];
-    if ((blocked || server.watching_clients) && !fpKeyDictsSettled()) return 0;
-    if (hotkeysEnabled() || server.busy_module_yield_flags) return 0;
-    if (writeCommandsDeniedByDiskError() != DISK_ERROR_TYPE_NONE || !checkGoodReplicasStatus()) return 0;
-    return 1;
+    if (moduleObservesWrites() || server.blocked_clients_by_type[BLOCKED_MODULE] || server.busy_module_yield_flags)
+        return FP_VETO_MODULE;
+    if (bgIteration_iterationActive()) return FP_VETO_FORKLESS_SAVE;
+    if (throttle_anyThrottlers()) return FP_VETO_THROTTLE;
+    if (server.maxmemory || server.maxmemory_clients) return FP_VETO_MAXMEMORY;
+    if (hotkeysEnabled()) return FP_VETO_HOTKEYS;
+    if ((fpBlockedOnKeys() || server.watching_clients) && !fpKeyDictsSettled()) return FP_VETO_KEY_DICTS;
+    if (writeCommandsDeniedByDiskError() != DISK_ERROR_TYPE_NONE) return FP_VETO_DISK_ERROR;
+    if (!checkGoodReplicasStatus()) return FP_VETO_MIN_REPLICAS;
+    return FP_VETO_NONE;
+}
+
+int fastpathParallelVeto(int role) {
+    return fp_last_veto[role] = fpParallelVeto(role);
+}
+
+static int fpLanesAllowed(void) {
+    return fastpathParallelVeto(FP_PAR_CLIENTS) == FP_VETO_NONE;
 }
 
 void fastpathStagedPrepareLanes(void) {
-    int n = 0;
-    if (fpDepth() == 0 && server.io_threads_parallel_writes) {
-        fpMarkLaneCommands();
-        n = stagedWorkerCount() + stagedMainTakesLane();
-        if (n > FP_MAX_LANES) n = FP_MAX_LANES;
-    }
+    fpMarkLaneCommands();
+    int allowed = fpLanesAllowed();
     fp_lane_main = stagedMainTakesLane();
-    fp_nlanes = n;
-    fp_lanes_iter = n >= 2 && fpLanesAllowed();
-    fp_check_blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
-                       server.blocked_clients_by_type[BLOCKED_STREAM];
+    fp_nlanes = allowed ? stagedLaneCount() : 0;
+    fp_lanes_iter = allowed;
+    fp_check_blocked = fpBlockedOnKeys();
     fp_check_watched = server.watching_clients > 0;
     /* The previous iteration's replies were delivered in its reply phase. */
     for (int l = 0; l < FP_MAX_LANES; l++) {
