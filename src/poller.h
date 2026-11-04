@@ -103,6 +103,11 @@ void pollerStop(poller *p);
  * waits on epoll inline again. No-op when not started. */
 void pollerStopThread(poller *p);
 int pollerThreadRunning(const poller *p);
+/* Main: 1 when the started epoll thread has exited on its own (an epoll_wait error), with that error
+ * in *err; pollerStopThread then reaps it. */
+int pollerThreadExited(poller *p, int *err);
+/* Tests: make the epoll thread exit as on an epoll_wait error (EIO). */
+void pollerTestOnlyFailThread(poller *p);
 /* Main: CPU set (a cpu_set_t of cpusetsize bytes) for the epoll thread, applied now when it runs
  * and at every later start. 0 on success. */
 int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize);

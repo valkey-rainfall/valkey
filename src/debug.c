@@ -38,6 +38,7 @@
 #include "cluster.h"
 #include "threads_mngr.h"
 #include "io_threads.h"
+#include "staged_loop.h"
 #include "fastget.h"
 #include "sds.h"
 #include "module.h"
@@ -525,6 +526,8 @@ void debugCommand(client *c) {
             "    Stop the server for <seconds>. Decimals allowed.",
             "IO-THREADS-FAIL-CREATE <id>",
             "    Make the next attempt to create IO thread <id> fail (for testing rollback).",
+            "STAGED-EPOLL-THREAD-FAIL",
+            "    Make the staged loop's epoll thread exit as on an epoll_wait error (for testing).",
             "IO-WRITE-DONE-DELAY <microseconds>",
             "    IO threads wait this long after writing a reply before they report the write done (0 to stop).",
             "STRINGMATCH-TEST",
@@ -618,6 +621,12 @@ void debugCommand(client *c) {
             return;
         }
         ioThreadsDebugFailCreate((int)id);
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "staged-epoll-thread-fail") && c->argc == 2) {
+        if (!stagedDebugFailEpollThread()) {
+            addReplyError(c, "no epoll thread is running");
+            return;
+        }
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));

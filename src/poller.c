@@ -89,7 +89,9 @@ struct poller {
     pthread_cond_t ctl_cv;   /* pause/stop handshake */
     int main_waiting;
     int ctl, tstate;
-    int started; /* main only */
+    int exit_err;           /* errno of the epoll_wait that made the thread exit on its own, else 0 */
+    _Atomic(int) test_fail; /* tests: the thread exits as on an epoll_wait error */
+    int started;            /* main only */
     pthread_t thread;
     cpu_set_t cpuset;
     int has_cpuset;
@@ -471,8 +473,11 @@ static void *pollerThreadMain(void *arg) {
     struct epoll_event ev[POLLER_MAX_EVENTS];
     for (;;) {
         int n = epoll_wait(p->epfd, ev, POLLER_MAX_EVENTS, -1);
-        if (n < 0 && errno != EINTR) {
+        int err = n < 0 && errno != EINTR ? errno : 0;
+        if (atomic_load_explicit(&p->test_fail, memory_order_relaxed)) err = EIO;
+        if (err) {
             pthread_mutex_lock(&p->lock);
+            p->exit_err = err;
             break;
         }
         int ctl = 0;
@@ -504,6 +509,8 @@ int pollerStart(poller *p) {
     pthread_mutex_lock(&p->lock);
     p->ctl = POLLER_CTL_RUN;
     p->tstate = POLLER_T_RUNNING;
+    p->exit_err = 0;
+    atomic_store_explicit(&p->test_fail, 0, memory_order_relaxed);
     pthread_mutex_unlock(&p->lock);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -548,6 +555,21 @@ void pollerStop(poller *p) {
 
 int pollerThreadRunning(const poller *p) {
     return p->started;
+}
+
+int pollerThreadExited(poller *p, int *err) {
+    if (!p->started) return 0;
+    pthread_mutex_lock(&p->lock);
+    int exited = p->tstate == POLLER_T_EXITED && p->ctl != POLLER_CTL_STOP;
+    if (exited && err) *err = p->exit_err;
+    pthread_mutex_unlock(&p->lock);
+    return exited;
+}
+
+void pollerTestOnlyFailThread(poller *p) {
+    if (!p->started) return;
+    atomic_store_explicit(&p->test_fail, 1, memory_order_relaxed);
+    wakeThread(p);
 }
 
 int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize) {
@@ -687,6 +709,13 @@ int pollerGetThreadAffinity(const poller *p, void *cpuset, size_t cpusetsize) {
 int pollerThreadRunning(const poller *p) {
     (void)p;
     return 0;
+}
+int pollerThreadExited(poller *p, int *err) {
+    (void)p, (void)err;
+    return 0;
+}
+void pollerTestOnlyFailThread(poller *p) {
+    (void)p;
 }
 int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize) {
     (void)p, (void)cpuset, (void)cpusetsize;
