@@ -195,15 +195,19 @@ static int fp_nparts = 0, fp_parts_cap = 0;
 static mstime_t fp_phase_time = 0;
 /* Wall and monotonic clocks at the phase start: a lane command's time is the wall time at the phase
  * start plus the monotonic time since, so each command gets a fresh time without a clock call of
- * its own. */
+ * its own. For the first millisecond of a phase a command keeps the phase start, which is within the
+ * millisecond a serial server's command time has; only after it is the fresh time computed. */
+#define FP_FRESH_TIME_US 1000
 static ustime_t fp_phase_us = 0;
 static monotime fp_phase_mono = 0;
+static monotime fp_phase_fresh_mono = 0; /* fp_phase_mono + FP_FRESH_TIME_US */
 
 static void fpPhaseClockStart(void) {
     updateCachedTime(0);
     fp_phase_time = server.mstime;
     fp_phase_us = server.ustime;
     fp_phase_mono = getMonotonicUs();
+    fp_phase_fresh_mono = fp_phase_mono + FP_FRESH_TIME_US;
 }
 /* How a lane hands an entry's propagation to main. Main sets it before each lane phase; it stays fixed
  * through the phase and its merge, since only main-path commands and crons change the sinks. */
@@ -1866,8 +1870,10 @@ static void fpLaneCall(fpLane *L, client *c) {
     long long dirty = ectx->dirty;
     long long errors = ectx->stat_total_error_replies;
     monotime start = getMonotonicUs();
-    /* As call() does for a top-level command: relative TTLs and expiry checks use this command's time. */
-    if (ectx->execution_nesting == 0) ectx->cmd_time_snapshot = (fp_phase_us + (ustime_t)(start - fp_phase_mono)) / 1000;
+    /* As call() does for a top-level command: relative TTLs and expiry checks use this command's time
+     * once the phase has run past its first millisecond. */
+    if (start >= fp_phase_fresh_mono && ectx->execution_nesting == 0)
+        ectx->cmd_time_snapshot = (fp_phase_us + (ustime_t)(start - fp_phase_mono)) / 1000;
     enterExecutionUnit(0, 0);
     c->flag.executing_command = 1;
     c->flag.buffered_reply = 0;
