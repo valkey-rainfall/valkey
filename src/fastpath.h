@@ -127,7 +127,10 @@ int fastpathStagedLanesWillRun(void);
 void fastpathStagedWriteLane(int tid);
 
 /* Replica: the primary's stream on the write lanes (repl_apply.c). */
-/* Main: nothing outside a lane's own hashtables would observe or order the stream's writes. */
+/* Main: nothing outside a lane's own hashtables would observe or order the stream's writes, held or
+ * planned. */
+int fastpathStreamParallelAllowed(void);
+/* Main: as fastpathStreamParallelAllowed, and the stream may be planned onto the write lanes. */
 int fastpathStreamLanesAllowed(void);
 /* IO thread, read phase: the keyspace hashtable of every key the command declares, or -1 when it has
  * none, they are in several, or a client is blocked on or watches one. */
