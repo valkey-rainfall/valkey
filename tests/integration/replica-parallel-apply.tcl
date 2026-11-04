@@ -132,6 +132,29 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
             $replica config set replica-parallel-apply yes
         }
 
+        test {Parallel apply: held SETs reach the latency histogram and the commandlog} {
+            # One client without pipelining: the primary's reads are too small for a planned phase,
+            # so every SET is held.
+            $replica config resetstat
+            $replica config set slowlog-log-slower-than 0
+            $replica config set slowlog-max-len 10000
+            $replica slowlog reset
+            set before [parallel_applied $replica]
+            for {set i 0} {$i < 200} {incr i} { $primary set held:$i v }
+            assert_in_sync $primary $replica
+            assert_morethan [expr {[parallel_applied $replica] - $before}] 0
+            set calls [getInfoProperty [$replica info commandstats] cmdstat_set]
+            assert_match {calls=200,*} $calls
+            assert_match {*p50=*} [getInfoProperty [$replica info latencystats] latency_percentiles_usec_set]
+            set logged 0
+            foreach e [$replica slowlog get -1] {
+                if {[string match -nocase {set held:*} [lindex $e 3]]} { incr logged }
+            }
+            assert_equal 200 $logged
+            $replica config set slowlog-log-slower-than 10000
+            $replica slowlog reset
+        }
+
         test {Parallel apply: held SETs stop under every state that stops planned lanes} {
             # maxmemory-clients keeps planned lanes off; held SETs must stay off too.
             $replica config set maxmemory-clients 100mb
