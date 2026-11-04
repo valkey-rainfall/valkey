@@ -471,10 +471,13 @@ void maintRun(void) {
         mt_budget_us[MAINT_JOB_RESIZE] = mt_budget_us[MAINT_JOB_REHASH] = 0;
         if (!maintPending()) return;
     }
-    /* The EXPIRE gate is rechecked: serverCron can start a forkless save after databasesCron posted. */
+    /* The EXPIRE gate is rechecked: lanes can go off after the cycle was posted (a forkless save, cron-lanes
+     * no). The cycle then runs on main rather than being lost. */
     if (mt_requested[MAINT_JOB_EXPIRE] && !activeExpireInLanes()) {
+        uint64_t budget = mt_budget_us[MAINT_JOB_EXPIRE];
         mt_requested[MAINT_JOB_EXPIRE] = 0;
         mt_budget_us[MAINT_JOB_EXPIRE] = 0;
+        activeExpireRunPostedOnMain(budget);
         if (!maintPending()) return;
     }
 

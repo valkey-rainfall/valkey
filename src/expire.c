@@ -496,6 +496,8 @@ static unsigned char *lane_field_stale = NULL;
 static int lane_expire_tables = 0;
 static int lane_expire_hit_limit = 0; /* the last lane run cut a thread off at its budget */
 static int lane_expire_behind = 0;    /* the last phase stopped on its budget or found too much expired */
+static int lane_expire_posted_type = -1; /* cycle type posted for the next phase; slow wins over fast */
+static ustime_t activeExpireCycleOnMain(int type, ustime_t timelimit_us);
 static laneExpireStats lane_expire_stats[IO_THREADS_MAX_NUM];
 static long long *lane_ttl_sum = NULL;     /* [tid * dbnum + dbid] */
 static long long *lane_ttl_samples = NULL; /* [tid * dbnum + dbid] */
@@ -587,6 +589,7 @@ void activeExpireBudgetBegin(uint64_t budget_us, double replay_us, double field_
 }
 
 void activeExpireLaneBegin(void) {
+    lane_expire_posted_type = -1;
     int tables = server.cluster_enabled ? CLUSTER_SLOTS : 1 << server.keyspace_shard_bits;
     if (lane_expire_tables != tables) {
         zfree(lane_expire_cursor);
@@ -1002,9 +1005,6 @@ ustime_t activeExpireCycle(int type) {
         timelimit_us = config_cycle_slow_time_perc * 1000000 / server.hz / 100;
     }
 
-    static bool expireCycleStartWithFields = 0;
-    ustime_t elapsed = 0;
-
     /* Try to smoke-out bugs (ectx->also_propagate should be empty here) */
     serverAssert(ectx->also_propagate.numops == 0);
 
@@ -1015,9 +1015,27 @@ ustime_t activeExpireCycle(int type) {
          * phase only while expiry is behind (see activeExpireLaneEnd), so a keyspace with nothing due
          * gets the slow cycle's phases only. */
         if (type == ACTIVE_EXPIRE_CYCLE_FAST && !lane_expire_behind) return 0;
+        if (lane_expire_posted_type != ACTIVE_EXPIRE_CYCLE_SLOW) lane_expire_posted_type = type;
         maintRequest(MAINT_JOB_EXPIRE, timelimit_us);
         return 0;
     }
+
+    return activeExpireCycleOnMain(type, timelimit_us);
+}
+
+/* Main, from maintRun: lanes went off after an expire cycle was posted for them, so the cycle runs here
+ * as it would have when posted, unless expiry is now paused or no longer this node's to do. */
+void activeExpireRunPostedOnMain(uint64_t timelimit_us) {
+    int type = lane_expire_posted_type == ACTIVE_EXPIRE_CYCLE_FAST ? ACTIVE_EXPIRE_CYCLE_FAST : ACTIVE_EXPIRE_CYCLE_SLOW;
+    lane_expire_posted_type = -1;
+    if (!server.active_expire_enabled || !iAmPrimary() || server.import_mode) return;
+    if (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)) return;
+    activeExpireCycleOnMain(type, (ustime_t)timelimit_us);
+}
+
+static ustime_t activeExpireCycleOnMain(int type, ustime_t timelimit_us) {
+    static bool expireCycleStartWithFields = 0;
+    ustime_t elapsed = 0;
 
     if (expireCycleStartWithFields) {
         elapsed += activeExpireCycleJob(FIELDS, type, timelimit_us - elapsed);
