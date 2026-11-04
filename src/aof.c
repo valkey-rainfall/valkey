@@ -915,6 +915,15 @@ static int aofBioJobsPending(void) {
     return bioPendingJobsOfType(BIO_AOF_FSYNC) != 0 || bioPendingJobsOfType(BIO_CLOSE_AOF) != 0;
 }
 
+/* Wait until no background AOF fsync or fsync-and-close job is pending, so
+ * none of them can publish an offset of the previous AOF afterwards. */
+static void aofDrainBioJobs(void) {
+    while (aofBioJobsPending()) {
+        bioDrainWorker(BIO_CLOSE_AOF);
+        bioDrainWorker(BIO_AOF_FSYNC);
+    }
+}
+
 /* Starts a background task that performs fsync() against the specified
  * file descriptor (the one of the AOF file) in another thread. */
 void aof_background_fsync(int fd) {
@@ -1080,7 +1089,7 @@ int restartAOFWithSyncRdb(void) {
 
     /* Drain pending fsync jobs from the previous AOF before publishing the new
      * fsynced offset to avoid races on fsynced_reploff_pending. */
-    bioDrainWorker(BIO_AOF_FSYNC);
+    aofDrainBioJobs();
     atomic_store_explicit(&server.fsynced_reploff_pending, server.primary_repl_offset, memory_order_relaxed);
     server.fsynced_reploff =
         atomic_load_explicit(&server.fsynced_reploff_pending, memory_order_relaxed);
@@ -2801,7 +2810,7 @@ int rewriteAppendOnlyFileBackground(void) {
          * to the previous AOF, and the new one. This concern is specific for a full
          * sync scenario where we don't wanna risk the ACKed replication offset
          * jumping backwards or forward when switching to a different primary. */
-        bioDrainWorker(BIO_AOF_FSYNC);
+        aofDrainBioJobs();
 
         /* Set the initial repl_offset, which will be applied to fsynced_reploff
          * when AOFRW finishes (after possibly being updated by a bio thread) */
