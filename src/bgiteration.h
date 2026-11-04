@@ -27,6 +27,7 @@
 typedef struct serverObject dbEntry; // An object with key/value inserted into main dictionary
 typedef struct serverObject robj;    // An object with a value used for command parameters
 typedef struct client client;
+typedef struct _kvstore kvstore;
 
 /* The bgIterator is an opaque structure.  */
 typedef struct bgIterator bgIterator;
@@ -303,6 +304,11 @@ void bgIteration_keyDelete(int dbid, const_sds key);
  * the standard "blockClientIfRequired" interface.  This interface is for cases where Valkey
  * performs the FLUSHALL operation independently of clients (e.g. when syncing with master). */
 void bgIteration_flushall(void);
+
+
+/* A keyspace about to be freed off the main thread must first drop the entries an iterator still
+ * holds, so their last references are released on main, not raced by the free. */
+void bgIteration_unlinkInUseEntries(kvstore *keys, kvstore *expires, kvstore *keys_with_volatile_items);
 
 
 /* Updating value or expiration of an existing key may lead to reallocation of the dbEntry (robj).

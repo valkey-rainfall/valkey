@@ -1892,3 +1892,30 @@ test {Server starts with bgsave-default-method before forkless-infrastructure-en
 }
 
 } ;# tags
+
+start_server {tags {"external:skip"} overrides {forkless-infrastructure-enabled yes save ""}} {
+    foreach flush {FLUSHALL FLUSHDB} {
+        test "$flush ASYNC during a forkless save leaves the key the save holds to main" {
+            r flushall sync
+            for {set i 0} {$i < 10} {incr i} {r set k$i v$i}
+            r config resetstat
+            r config set rdb-key-save-delay 1000000
+            r config set bgsave-default-method forkless
+            r bgsave
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "forkless bgsave did not start"
+            }
+            # Let the save thread take the first key and sleep on it.
+            after 300
+            r $flush async
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+            wait_lazyfree_done r
+            # The held key is released by main, so the lazy-free thread frees only the other nine.
+            assert_equal 9 [s lazyfreed_objects]
+            assert_equal 0 [r dbsize]
+        } {} {needs:config-resetstat}
+    }
+}
