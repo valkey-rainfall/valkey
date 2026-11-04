@@ -2202,3 +2202,32 @@ start_server {overrides {save ""}} {
 }
 
 } ;# tags
+
+start_server {tags {"external:skip"} overrides {forkless-infrastructure-enabled yes save ""}} {
+    foreach flush {FLUSHALL FLUSHDB} {
+        test "$flush ASYNC during a forkless save leaves the key the save holds to main" {
+            r flushall sync
+            # More keys than the save queues at once: a save that has queued every key and COMPLETE
+            # is not terminated by the flush (#5365), so it would still hold them all.
+            populate 1000
+            r config resetstat
+            r config set rdb-key-save-delay 1000000
+            r config set forkless-policy prefer-forkless
+            r bgsave
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "forkless bgsave did not start"
+            }
+            # Let the save thread take the first key and sleep on it.
+            after 300
+            r $flush async
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+            wait_lazyfree_done r
+            # The held key is released by main, so the lazy-free thread frees only the other 999.
+            assert_equal 999 [s lazyfreed_objects]
+            assert_equal 0 [r dbsize]
+        } {} {needs:config-resetstat}
+    }
+}
