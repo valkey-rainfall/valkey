@@ -868,6 +868,12 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
 
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
 
+/* True once main recorded a close for the client. IO threads read it while main may set it (the
+ * STREAM phase runs beside the write phase), so it is accessed atomically. */
+static int fpCloseRecorded(ClientControl *cc) {
+    return cc && __atomic_load_n(&cc->closing, __ATOMIC_ACQUIRE);
+}
+
 /* Reads at the head of what a client just sent execute here, in the read phase, on the IO thread
  * reading the client: a contiguous prefix of GETs is answered from the keyspace and the replies go
  * straight to the socket. The first command that cannot be executed here, and every
@@ -969,9 +975,10 @@ static void fpCheckOutLimit(fpThread *t, client *c) {
         fpBeginLeave(t, c, FP_LEAVING);
 }
 
-/* Buffered bytes always precede newly returned replies. */
+/* Buffered bytes always precede newly returned replies. A client main asked to close gets nothing
+ * more, as a serial server frees it before writing its pending replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
-    if (c->control->lifecycle == FP_CLOSING) return;
+    if (c->control->lifecycle == FP_CLOSING || fpCloseRecorded(c->control)) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
         fpCheckOutLimit(t, c);
@@ -1190,7 +1197,7 @@ static client *fpExecutor(int tid) {
 /* A client main asked to close runs no more queued commands, as with close_asap. Read from the control
  * so main tests an entry without touching the connection. */
 static int fpControlDetaching(ClientControl *cc) {
-    return cc && cc->closing;
+    return fpCloseRecorded(cc);
 }
 
 static _Thread_local cmdEntry *fp_exec_entry = NULL; /* the entry this thread's executor is running */
@@ -1365,7 +1372,7 @@ static int fpPrefetchRange(cmdBatch *b, int from, int to) {
 void fastpathRequestDetach(client *c) {
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
-    c->control->closing = 1;
+    __atomic_store_n(&c->control->closing, 1, __ATOMIC_RELEASE);
     if (!fp_staged_closing) fp_staged_closing = listCreate();
     listAddNodeTail(fp_staged_closing, c);
 }
@@ -1601,7 +1608,7 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
     client *c = privdata;
     int tid = fp_cur_tid;
     fpThread *t = &fp_threads[tid];
-    if (c->control->lifecycle != FP_ACTIVE) return;
+    if (c->control->lifecycle != FP_ACTIVE || fpCloseRecorded(c->control)) return;
     /* A nested iteration skips clients whose entries of the outer iteration are still on main; the
      * edge it consumed is handed to the next batch. */
     if (c->fp_inflight > 0) {

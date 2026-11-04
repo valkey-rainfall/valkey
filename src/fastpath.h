@@ -23,7 +23,7 @@
 typedef struct ClientControl {
     uint64_t client_id; /* Immutable: the connection's stable client id, set once at init. */
     uint8_t lifecycle;  /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
-    uint8_t closing;    /* Main only: freeClient asked to close it; its entries are skipped. */
+    uint8_t closing;    /* Set by main: freeClient asked to close it; its entries are skipped and its replies dropped. */
 } ClientControl;
 
 /* Produced by an IO thread in the read phase, executed by main in the write phase, replied by the same IO thread. */
