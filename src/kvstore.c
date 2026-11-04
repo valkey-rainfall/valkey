@@ -268,6 +268,18 @@ static hashtable *createHashtableIfNeeded(kvstore *kvs, int didx) {
     return kvs->hashtables[didx];
 }
 
+/* Release an empty table and drop its buckets from bucket_count. Releasing a rehashing table runs
+ * kvstoreHashtableRehashingCompleted, which removes the old table's buckets itself. */
+static void releaseHashtable(kvstore *kvs, int didx) {
+    hashtable *ht = kvs->hashtables[didx];
+    size_t from = 0, to = 0;
+    if (hashtableIsRehashing(ht)) hashtableRehashingInfo(ht, &from, &to);
+    kvs->bucket_count -= hashtableBuckets(ht) - from;
+    hashtableRelease(ht);
+    kvs->hashtables[didx] = NULL;
+    kvs->allocated_hashtables--;
+}
+
 /* Called when the hashtable will delete entries, the function will check
  * KVSTORE_FREE_EMPTY_HASHTABLES to determine whether the empty hashtable needs
  * to be freed.
@@ -286,9 +298,7 @@ static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
         kvstoreMarkDirty(m);
         return;
     }
-    hashtableRelease(kvs->hashtables[didx]);
-    kvs->hashtables[didx] = NULL;
-    kvs->allocated_hashtables--;
+    releaseHashtable(kvs, didx);
 }
 
 /*************************************/
@@ -925,9 +935,7 @@ void kvstoreReconcile(kvstore *kvs) {
                 listDelNode(kvs->rehashing, m->rehashing_node);
                 m->rehashing_node = NULL;
             }
-            hashtableRelease(ht);
-            kvs->hashtables[didx] = NULL;
-            kvs->allocated_hashtables--;
+            releaseHashtable(kvs, didx);
         }
     }
     atomic_store_explicit(&kvs->dirty_count, 0, memory_order_relaxed);
