@@ -40,6 +40,7 @@
 #include "valkeymodule.h"
 #include <pthread.h>
 #include <errno.h>
+#include <unistd.h>
 
 #define UNUSED(V) ((void) V)
 
@@ -338,6 +339,62 @@ int propagateTestIncr(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
     return VALKEYMODULE_OK;
 }
 
+int propagateTestSetFlushallAsync(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
+{
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    ValkeyModuleCallReply *reply;
+
+    reply = ValkeyModule_Call(ctx, "SET", "!ss", argv[1], argv[2]);
+    ValkeyModule_FreeCallReply(reply);
+    reply = ValkeyModule_Call(ctx, "FLUSHALL", "!c", "ASYNC");
+    ValkeyModule_FreeCallReply(reply);
+
+    /* Long enough for the lazy-free thread to free the old keyspace if it
+     * already has it. */
+    usleep(200000);
+
+    reply = ValkeyModule_Call(ctx, "INFO", "c", "memory");
+    ValkeyModule_ReplyWithCallReply(ctx, reply);
+    ValkeyModule_FreeCallReply(reply);
+    return VALKEYMODULE_OK;
+}
+
+static ValkeyModuleBlockedClient *flushall_blocked_client = NULL;
+
+int propagateTestUnblockReply(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
+{
+    UNUSED(argv);
+    UNUSED(argc);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+/* Like set-flushall-async, but blocks the client until propagate-test.unblock,
+ * so the command's argv stay allocated. */
+int propagateTestSetFlushallAsyncBlock(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
+{
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    if (flushall_blocked_client) return ValkeyModule_ReplyWithError(ctx, "ERR already blocked");
+    ValkeyModuleCallReply *reply;
+
+    reply = ValkeyModule_Call(ctx, "SET", "!ss", argv[1], argv[2]);
+    ValkeyModule_FreeCallReply(reply);
+    reply = ValkeyModule_Call(ctx, "FLUSHALL", "!c", "ASYNC");
+    ValkeyModule_FreeCallReply(reply);
+
+    flushall_blocked_client = ValkeyModule_BlockClient(ctx, propagateTestUnblockReply, NULL, NULL, 0);
+    return VALKEYMODULE_OK;
+}
+
+int propagateTestUnblock(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
+{
+    UNUSED(argv);
+    UNUSED(argc);
+    if (!flushall_blocked_client) return ValkeyModule_ReplyWithError(ctx, "ERR not blocked");
+    ValkeyModule_UnblockClient(flushall_blocked_client, NULL);
+    flushall_blocked_client = NULL;
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -411,6 +468,21 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (ValkeyModule_CreateCommand(ctx,"propagate-test.obeyed",
                 propagateTestObeyed,
                 "",1,1,1) == VALKEYMODULE_ERR)
+            return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"propagate-test.set-flushall-async",
+                propagateTestSetFlushallAsync,
+                "write",1,1,1) == VALKEYMODULE_ERR)
+            return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"propagate-test.set-flushall-async-block",
+                propagateTestSetFlushallAsyncBlock,
+                "write",1,1,1) == VALKEYMODULE_ERR)
+            return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"propagate-test.unblock",
+                propagateTestUnblock,
+                "",0,0,0) == VALKEYMODULE_ERR)
             return VALKEYMODULE_ERR;
 
     return VALKEYMODULE_OK;
