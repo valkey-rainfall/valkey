@@ -114,3 +114,15 @@ start_server {tags {"modules external:skip"} overrides {requirepass mypass enabl
         assert_error "ERR *MODULE command not allowed*" {r module load $testmodule}
     }
 }
+
+start_server {tags {"modules external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless}} {
+    r module load $testmodule
+
+    test "Module without forkless support counts its fork fallback reason" {
+        r bgsave
+        waitForBgsave r
+        assert_equal fork [getInfoProperty [r info persistence] rdb_last_bgsave_type]
+        assert_equal 1 [getInfoProperty [r info stats] forkless_fallbacks_module]
+    }
+}
+

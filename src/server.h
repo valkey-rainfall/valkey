@@ -474,12 +474,14 @@ typedef enum {
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM (1 << 3) /* Supports skipping RDB checksum for sync requests. */
 #define REPLICA_CAPA_LZ4 (1 << 4)               /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD (1 << 5)              /* Accepts Zstd streaming-compressed replication payloads. */
+#define REPLICA_CAPA_INBAND_REPL (1 << 6)       /* Supports RDB_OPCODE_UPDATE for inline replication. */
 #define REPLICA_CAPA_COMPRESSION_MASK (REPLICA_CAPA_LZ4 | REPLICA_CAPA_ZSTD)
 
 /* Replica capability strings */
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM_STR "skip-rdb-checksum" /* Supports skipping RDB checksum for sync requests. */
 #define REPLICA_CAPA_LZ4_STR "lz4"                             /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD_STR "zstd"                           /* Accepts Zstd streaming-compressed replication payloads. */
+#define REPLICA_CAPA_INBAND_REPL_STR "inband-repl"             /* Supports RDB_OPCODE_UPDATE for inline replication. */
 
 /* Replica requirements */
 #define REPLICA_REQ_NONE 0
@@ -1010,6 +1012,7 @@ typedef struct functionsLibCtx functionsLibCtx;
 typedef struct rdbLoadingCtx {
     serverDb **dbarray;
     functionsLibCtx *functions_lib_ctx;
+    client *update_client; /* Fake client for executing inline replication commands during RDB load. */
 } rdbLoadingCtx;
 
 typedef sds (*rdbAuxFieldEncoder)(int flags);
@@ -1329,6 +1332,8 @@ typedef struct ClientFlags {
     uint64_t fp_detach_sent : 1;           /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
     uint64_t fp_readmit : 1;               /* On main but able to join the fast path; retried after each command until it joins or never can. */
     uint64_t main_read_direct : 1;         /* main-read-batch: the last read held more than one command or a multi-key one, so the next is run directly. */
+    uint64_t forkless_managed : 1;         /* Client is owned by forkless save. Written only on the
+                                            * main thread. The save thread only reads it */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1393,6 +1398,8 @@ typedef struct ClientReplicationData {
     char *replica_addr;                  /* Optionally given by REPLCONF ip-address */
     int replica_version;                 /* Version on the form 0xMMmmpp. */
     short replica_capa;                  /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
+    _Atomic(int) forkless_pending_close; /* Main thread asks the forkless save to hand this replica
+                                          * back for closing. Atomic (relaxed) since both threads access it without a lock. */
     short replica_req;                   /* Replica requirements: REPLICA_REQ_* */
     uint64_t associated_rdb_client_id;   /* The client id of this replica's rdb connection */
     time_t rdb_client_disconnect_time;   /* Time of the first freeClient call on this client. Used for delaying free. */
@@ -1642,11 +1649,12 @@ typedef struct client {
 /* Forward declaration */
 bool isImportSlotMigrationJob(slotMigrationJob *job);
 
-/* Absolute postpone mask from client IO offload state (not artificial READ hold). */
+/* Absolute postpone mask from client IO offload state and forkless ownership (not artificial READ hold). */
 static inline int clientConnPostponeMaskFromIOState(client *c) {
     int mask = 0;
     if (c->io_read_state != CLIENT_IDLE) mask |= CONN_POSTPONE_READ;
     if (c->io_write_state != CLIENT_IDLE) mask |= CONN_POSTPONE_WRITE;
+    if (c->flag.forkless_managed) mask |= CONN_POSTPONE_WRITE;
     return mask;
 }
 
@@ -2213,6 +2221,12 @@ struct valkeyServer {
     long long stat_fork_time;                      /* Time needed to perform latest fork() */
     double stat_fork_rate;                         /* Fork rate in GB/sec. */
     long long stat_total_forks;                    /* Total count of fork. */
+    long long stat_forkless_fallbacks_module;              /* Forkless fallbacks caused by loaded modules. */
+    long long stat_forkless_fallbacks_slot_import;         /* Forkless fallbacks caused by slot imports. */
+    long long stat_forkless_fallbacks_exclude_data;        /* Forkless fallbacks caused by data-excluding RDB requests. */
+    long long stat_forkless_fallbacks_missing_inband_repl; /* Forkless fallbacks caused by missing inline replication support. */
+    long long stat_forkless_fallbacks_compression;         /* Forkless fallbacks caused by stream compression. */
+    long long stat_forkless_fallbacks_old_rdb_version;     /* Forkless fallbacks caused by an old RDB version. */
     long long stat_rejected_conn;                  /* Clients rejected because of maxclients */
     long long stat_rejected_priority_conn;         /* Prioritized clients rejected because of maxclients */
     long long stat_num_active_priority_clients;    /* Number of active prioritized clients */
@@ -2390,7 +2404,7 @@ struct valkeyServer {
     time_t lastbgsave_try;                /* Unix time of last attempted bgsave */
     time_t rdb_save_time_last;            /* Time used by last RDB save run. */
     time_t rdb_save_time_start;           /* Current RDB save start time. */
-    rdbBgsaveType rdb_bgsave_scheduled;   /* BGSAVE when possible if non-zero. */
+    int rdb_bgsave_scheduled;             /* BGSAVE when possible if true. */
     rdbWriteTarget rdb_write_target;      /* Type of save by active child. */
     rdbBgsaveType cur_bgsave_type;        /* Current bgsave type. */
     rdbBgsaveType lastbgsave_type;        /* Last completed bgsave type. */
@@ -2968,6 +2982,13 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  * This is the meaning of the flags:
  *
  * CMD_WRITE:       Write command (may modify the key space).
+ *                  WARNING: a command marked CMD_WRITE (or CMD_MAY_REPLICATE)
+ *                  is accepted by the RDB inline-replication opcode
+ *                  (RDB_OPCODE_UPDATE) and will be executed through a fake
+ *                  client, with ACL checks bypassed, when such an RDB is
+ *                  loaded - including a persisted dump.rdb or AOF preamble, not
+ *                  only a live replication stream. Only mark a command with
+ *                  these flags if it is safe to run unconditionally on load.
  *
  * CMD_READONLY:    Commands just reading from keys without changing the content.
  *                  Note that commands that don't read from the keyspace such as
@@ -3018,6 +3039,11 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  *                      EVAL, which may execute write commands, which are replicated,
  *                      or may just execute read commands. A command can not be marked
  *                      both CMD_WRITE and CMD_MAY_REPLICATE
+ *                      WARNING: like CMD_WRITE, a command marked CMD_MAY_REPLICATE
+ *                      is accepted by the RDB inline-replication opcode and runs
+ *                      on load through a fake client with ACL checks bypassed. Only
+ *                      mark a command with it if it is safe to run unconditionally
+ *                      on load.
  *
  * CMD_SENTINEL:    This command is present in sentinel mode.
  *
@@ -3802,6 +3828,7 @@ static inline int aofHoldsReplies(void) {
     return !server.aof_flush_postponed_start && server.aof_last_write_status == C_OK;
 }
 void feedAppendOnlyFile(int dictid, robj **argv, int argc);
+sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv);
 void aofRemoveTempFile(pid_t childpid, int from_signal);
 int rewriteAppendOnlyFileBackground(void);
 int loadAppendOnlyFiles(aofManifest *am);
