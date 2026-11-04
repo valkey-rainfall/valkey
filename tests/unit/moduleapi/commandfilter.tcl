@@ -242,3 +242,43 @@ test {Filtering based on the fast-path origin client id} {
         $late close
     }
 }
+
+# A filter sends every fast-path command back to main. A command still arriving behind them, of which
+# only the multibulk header has been read, must survive the hand-back with its parser state.
+start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 4}} {
+    r module load $testmodule log-key 0
+    r select 0 ;# the db of the raw socket
+
+    proc cf_resp {args} {
+        set cmd "*[llength $args]\r\n"
+        foreach a $args { append cmd "$[string length $a]\r\n$a\r\n" }
+        return $cmd
+    }
+
+    test {Command Filter: a handed-back fast-path client keeps a command whose header alone arrived} {
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation binary -blocking 1 -buffering full
+        puts -nonewline $fd [cf_resp ping]
+        flush $fd
+        assert_equal +PONG [string trim [gets $fd]]
+        for {set round 0} {$round < 20} {incr round} {
+            wait_for_condition 100 20 {
+                [getInfoProperty [r info fastpath] fastpath_clients] == 1
+            } else {
+                fail "the raw client did not join the fast path: [r info fastpath]"
+            }
+            # One read: a command the filter sends to main, then the header of the next one.
+            set tail [cf_resp set tail$round @replaceme]
+            puts -nonewline $fd "[cf_resp set head$round @replaceme][string range $tail 0 8]"
+            flush $fd
+            assert_equal +OK [string trim [gets $fd]]
+            after 20
+            puts -nonewline $fd [string range $tail 9 end]
+            flush $fd
+            assert_equal +OK [string trim [gets $fd]]
+            assert_equal --replaced-- [r get head$round]
+            assert_equal --replaced-- [r get tail$round]
+        }
+        close $fd
+    }
+}
