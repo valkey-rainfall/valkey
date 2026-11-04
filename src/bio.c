@@ -319,7 +319,13 @@ void *bioProcessBackgroundJobs(void *arg) {
                 }
             } else {
                 atomic_store_explicit(&server.aof_bio_fsync_status, C_OK, memory_order_relaxed);
-                atomic_store_explicit(&server.fsynced_reploff_pending, job->fd_args.offset, memory_order_relaxed);
+                /* Never move the fsynced offset back: the main thread may already have
+                 * published a larger one, for instance for a later fsync under always. */
+                long long cur = atomic_load_explicit(&server.fsynced_reploff_pending, memory_order_relaxed);
+                while (cur < job->fd_args.offset &&
+                       !atomic_compare_exchange_weak_explicit(&server.fsynced_reploff_pending, &cur,
+                                                              job->fd_args.offset, memory_order_relaxed,
+                                                              memory_order_relaxed));
             }
 
             if (job->fd_args.need_reclaim_cache) {
