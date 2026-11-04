@@ -33,6 +33,7 @@
 #define POLLER_READABLE 1
 #define POLLER_WRITABLE 2
 #define POLLER_ERROR 4 /* only ever reported to a handler, never requested */
+#define POLLER_HUP 8   /* IO fds: the peer closed its side; reported only, never requested */
 
 /* Which stage consumes a ready fd and on which thread its handler runs. */
 typedef enum {
