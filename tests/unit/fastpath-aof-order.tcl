@@ -260,3 +260,29 @@ foreach mode {append iteration} {
         }
     }
 }
+
+start_server {tags {"aof wait external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync everysec save ""}} {
+    waitForBgrewriteaof r
+
+    test {AOF order: everysec, a pipelined write and WAITAOF return once the fsync completes, not at the next timer (#64)} {
+        set fd [fao_fp_client]
+        r config set hz 1
+        set times {}
+        for {set i 0} {$i < 5} {incr i} {
+            after 1100
+            set t0 [clock milliseconds]
+            puts -nonewline $fd "[fao_resp set fao:waitaof $i][fao_resp waitaof 1 0 0]"
+            flush $fd
+            assert_equal {+OK} [fao_read_line $fd]
+            assert_equal {*2} [fao_read_line $fd]
+            assert_equal {:1} [fao_read_line $fd]
+            assert_equal {:0} [fao_read_line $fd]
+            lappend times [expr {[clock milliseconds] - $t0}]
+        }
+        r config set hz 10
+        # With hz 1 the next timer is up to a second away; the fsync itself takes milliseconds.
+        set sorted [lsort -integer $times]
+        assert_lessthan [lindex $sorted 2] 200
+        close $fd
+    }
+}
