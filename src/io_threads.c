@@ -1310,16 +1310,12 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
     }
 }
 
-/* Drain the private and shared job inboxes; returns the number of jobs run. With a nonzero deadline,
- * jobs are taken one at a time and draining stops once the deadline passes; the rest wait for a later
- * phase. */
-static int ioThreadDrainInboxesUntil(long id, void **batch_jobs, monotime deadline) {
+/* Drain the private and shared job inboxes; returns the number of jobs run. */
+static int ioThreadDrainInboxes(long id, void **batch_jobs) {
     int processed = 0;
     size_t batch_count;
-    size_t batch_max = deadline ? 1 : BATCH_SIZE;
     /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-    while ((!deadline || getMonotonicUs() < deadline) &&
-           (batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, batch_max)) > 0) {
+    while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
         for (size_t i = 0; i < batch_count; i++) {
             void *data;
             int type;
@@ -1346,7 +1342,6 @@ static int ioThreadDrainInboxesUntil(long id, void **batch_jobs, monotime deadli
     }
 
     for (int shared_n = 0; shared_n < 64; shared_n++) {
-        if (deadline && getMonotonicUs() >= deadline) break;
         void *tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH]);
         if (!tagged_job) tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
         if (!tagged_job) break;
@@ -1360,13 +1355,10 @@ static int ioThreadDrainInboxesUntil(long id, void **batch_jobs, monotime deadli
     return processed;
 }
 
-static int ioThreadDrainInboxes(long id, void **batch_jobs) {
-    return ioThreadDrainInboxesUntil(id, batch_jobs, 0);
-}
-
-/* Staged loop worker: run each phase main opens until a SYNC phase or shutdown. Every phase except
- * MAINT starts by draining the job inboxes, so free offload keeps working while the thread waits on
- * the barrier; MAINT drains only within its deadline, after its jobs. */
+/* Staged loop worker: run each phase main opens until a SYNC phase or shutdown. Queued jobs (reads,
+ * writes and frees for clients main serves) run only at the start of a READ or REPLY phase, or when
+ * main asks for them (DRAIN, SYNC). The phases that execute commands (WRITE, APPLY, MAINT) never
+ * send anything to a client. */
 static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
     phaseBarrier *b = stagedBarrier();
     for (;;) {
@@ -1374,9 +1366,9 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
         if (phase == PHASE_BARRIER_EXIT) return;
         monotime start = getMonotonicUs();
         uint64_t start_ns = stagedNowNs();
-        /* A MAINT phase serves no client, so its jobs run first and the inboxes only get the time left
-         * before the phase deadline; whatever remains waits for the next phase. */
-        if (phase != STAGED_PHASE_MAINT) ioThreadDrainInboxes(id, batch_jobs);
+        if (phase == STAGED_PHASE_READ || phase == STAGED_PHASE_REPLY || phase == STAGED_PHASE_DRAIN ||
+            phase == STAGED_PHASE_SYNC)
+            ioThreadDrainInboxes(id, batch_jobs);
         if (phase == STAGED_PHASE_READ)
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
@@ -1385,11 +1377,9 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
             fastpathStagedStreamPhase((int)id);
         else if (phase == STAGED_PHASE_APPLY)
             stagedRunLane(phase, (int)id);
-        else if (phase == STAGED_PHASE_MAINT) {
+        else if (phase == STAGED_PHASE_MAINT)
             stagedRunLane(phase, (int)id);
-            monotime deadline = maintPhaseDeadline();
-            if (deadline && getMonotonicUs() < deadline) ioThreadDrainInboxesUntil(id, batch_jobs, deadline);
-        } else if (phase == STAGED_PHASE_WRITE)
+        else if (phase == STAGED_PHASE_WRITE)
             fastpathStagedWriteLane((int)id);
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
