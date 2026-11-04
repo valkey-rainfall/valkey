@@ -679,6 +679,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) {
         uint64_t t1 = stagedNowNs();
         flushAppendOnlyFile(0);
+        fastpathRetryAofReadmits();
         sl_main_ns[SL_T_AOF] += stagedNowNs() - t1;
     }
     cronStatsRecord(CRON_JOB_SL_AOF_ALWAYS, getMonotonicUs() - t);
