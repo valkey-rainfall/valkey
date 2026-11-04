@@ -908,6 +908,13 @@ int aofFsyncInProgress(void) {
     return bioPendingJobsOfType(BIO_AOF_FSYNC) != 0;
 }
 
+/* Return true if any background job that fsyncs an AOF file (and publishes
+ * its offset when done) is still queued or running, including the
+ * fsync-and-close of a previous INCR file. */
+static int aofBioJobsPending(void) {
+    return bioPendingJobsOfType(BIO_AOF_FSYNC) != 0 || bioPendingJobsOfType(BIO_CLOSE_AOF) != 0;
+}
+
 /* Starts a background task that performs fsync() against the specified
  * file descriptor (the one of the AOF file) in another thread. */
 void aof_background_fsync(int fd) {
@@ -1204,12 +1211,16 @@ void flushAppendOnlyFile(int force) {
                    server.aof_last_incr_fsync_offset != server.aof_last_incr_size) {
             goto try_fsync;
         } else {
-            /* All data is fsync'd already: Update fsynced_reploff_pending just in case.
+            /* If all data is fsync'd already, update fsynced_reploff_pending just in case.
              * This is needed to avoid a WAITAOF hang in case a module used RM_Call with the NO_AOF flag,
              * in which case primary_repl_offset will increase but fsynced_reploff_pending won't be updated
              * (because there's no reason, from the AOF POV, to call fsync) and then WAITAOF may wait on
-             * the higher offset (which contains data that was only propagated to replicas, and not to AOF) */
-            if (!sync_in_progress && server.aof_fsync != AOF_FSYNC_NO)
+             * the higher offset (which contains data that was only propagated to replicas, and not to AOF).
+             * Every written byte must have been fsynced: none still awaiting a fsync request and no
+             * background fsync still running, or the offset would count bytes not yet on disk. */
+            if (server.aof_fsync != AOF_FSYNC_NO && server.aof_last_incr_fsync_offset == server.aof_last_incr_size &&
+                !aofBioJobsPending() &&
+                atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_acquire) == C_OK)
                 atomic_store_explicit(&server.fsynced_reploff_pending, server.primary_repl_offset,
                                       memory_order_relaxed);
             return;

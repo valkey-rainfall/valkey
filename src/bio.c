@@ -126,6 +126,7 @@ typedef union bio_job {
                                           * the file is closed. */
         unsigned need_reclaim_cache : 1; /* A flag to indicate that reclaim cache is required before
                                           * the file is closed. */
+        int sleep_usec;                  /* Micros to sleep before an AOF fsync. (used by tests) */
     } fd_args;
 
     struct {
@@ -158,6 +159,14 @@ void *bioProcessBackgroundJobs(void *arg);
  * stack traces, allowing a targeted Valgrind suppression for BIO job leaks */
 __attribute__((noinline)) static bio_job *allocBioJob(size_t extra) {
     return zmalloc(sizeof(bio_job) + extra);
+}
+
+/* Micros an AOF fsync job sleeps before its fsync, set by DEBUG AOF-BIO-FSYNC-SLEEP.
+ * Only the main thread reads it, when it creates a job. */
+static int bio_aof_fsync_sleep_usec = 0;
+
+void bioSetAofFsyncSleep(int usec) {
+    bio_aof_fsync_sleep_usec = usec;
 }
 
 
@@ -223,6 +232,7 @@ void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache) {
     job->fd_args.offset = offset;
     job->fd_args.need_fsync = 1;
     job->fd_args.need_reclaim_cache = need_reclaim_cache;
+    job->fd_args.sleep_usec = bio_aof_fsync_sleep_usec;
 
     bioSubmitJob(BIO_CLOSE_AOF, job);
 }
@@ -232,6 +242,7 @@ void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     job->fd_args.fd = fd;
     job->fd_args.offset = offset;
     job->fd_args.need_reclaim_cache = need_reclaim_cache;
+    job->fd_args.sleep_usec = bio_aof_fsync_sleep_usec;
 
     bioSubmitJob(BIO_AOF_FSYNC, job);
 }
@@ -297,6 +308,7 @@ void *bioProcessBackgroundJobs(void *arg) {
             /* The fd may be closed by main thread and reused for another
              * socket, pipe, or file. We just ignore these errno because
              * aof fsync did not really fail. */
+            if (job->fd_args.sleep_usec) usleep(job->fd_args.sleep_usec);
             if (valkey_fsync(job->fd_args.fd) == -1 && errno != EBADF && errno != EINVAL) {
                 int last_status = atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_relaxed);
 

@@ -410,6 +410,8 @@ void debugCommand(client *c) {
         const char *help[] = {
             "AOF-FLUSH-SLEEP <microsec>",
             "    Server will sleep before flushing the AOF, this is used for testing.",
+            "AOF-BIO-FSYNC-SLEEP <microsec>",
+            "    Background AOF fsync jobs created from now on sleep before their fsync, this is used for testing.",
             "ASSERT",
             "    Crash by assertion failed.",
             "CHANGE-REPL-ID",
@@ -1045,6 +1047,9 @@ void debugCommand(client *c) {
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "aof-flush-sleep") && c->argc == 3) {
         server.aof_flush_sleep = atoi(objectGetVal(c->argv[2]));
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "aof-bio-fsync-sleep") && c->argc == 3) {
+        bioSetAofFsyncSleep(atoi(objectGetVal(c->argv[2])));
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "replicate") && c->argc >= 3) {
         replicationFeedReplicas(-1, c->argv + 2, c->argc - 2);
