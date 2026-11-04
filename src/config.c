@@ -112,6 +112,12 @@ configEnum copy_avoid_mode_enum[] = {
     {"off", COPY_AVOID_MODE_OFF},
     {NULL, 0}};
 
+configEnum staged_main_lane_enum[] = {
+    {"auto", STAGED_MAIN_LANE_AUTO},
+    {"yes", STAGED_MAIN_LANE_YES},
+    {"no", STAGED_MAIN_LANE_NO},
+    {NULL, 0}};
+
 configEnum staged_reply_overlap_enum[] = {
     {"none", STAGED_REPLY_OVERLAP_NONE},
     {"exec", STAGED_REPLY_OVERLAP_EXEC},
@@ -3646,6 +3652,7 @@ standardConfig static_configs[] = {
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
     createEnumConfig("avoid-copy-reply-mode", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, copy_avoid_mode_enum, server.copy_avoid_mode, COPY_AVOID_MODE_STATIC, NULL, NULL),
+    createEnumConfig("staged-main-lane", NULL, MODIFIABLE_CONFIG, staged_main_lane_enum, server.staged_main_lane, STAGED_MAIN_LANE_AUTO, NULL, NULL),
     createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
