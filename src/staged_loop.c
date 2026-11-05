@@ -214,9 +214,9 @@ static void stagedStreamOpen(void) {
     sl_stream_open = 1;
 }
 
-/* Main: close an open STREAM phase. abort asks the workers to stop at a batch boundary first, used
- * when main must open another phase before it finished executing (a nested iteration mid-exec); the
- * undelivered runs then go out in the following REPLY phase. With abort 0 main has finished executing,
+/* Main: close an open STREAM phase. abort asks the workers to stop after the runs already published,
+ * used when main must open another phase before it finished executing (a nested iteration mid-exec);
+ * the undelivered runs then go out in the following REPLY phase. With abort 0 main has finished executing,
  * so every batch's executed equals its count and the workers drain naturally. */
 static void stagedStreamClose(int abort) {
     if (!sl_stream_open) return;
@@ -731,9 +731,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     replyPhase();
     cronStatsRecord(CRON_JOB_SL_REPLY, getMonotonicUs() - t);
-    /* repl-stream-sender: the staged loop does not run beforeSleep, so service the sender
-     * here: account for last iteration's sends and publish this iteration's new data as the
-     * next stable offset. No-op when the sender is off. */
+    /* Publish the next stable offset now, so this iteration's writes need not wait for the next collect. */
     replStreamSenderTick();
     t = getMonotonicUs();
     crons(el);

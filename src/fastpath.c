@@ -3029,7 +3029,7 @@ void fastpathStagedStreamBegin(void) {
     atomic_store_explicit(&fp_stream_abort, 0, memory_order_relaxed);
 }
 
-/* Main: tell STREAM workers to stop at a batch boundary; the barrier close then waits for them. */
+/* Main: tell STREAM workers to stop after the runs already published; the barrier close waits for them. */
 void fastpathStagedStreamAbort(void) {
     atomic_store_explicit(&fp_stream_abort, 1, memory_order_release);
 }

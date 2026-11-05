@@ -10,13 +10,13 @@
 /* Staged main event loop for the IO-thread fast path.
  *
  * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2), one main iteration
- * runs collect -> read -> write -> reply -> crons, and IO threads work only inside the read and reply
- * phases, and in the write phase's lanes. Otherwise the loop is stock
- * ae. Non-epoll builds are always stock.
+ * runs collect (beforeSleep, poll) -> read -> write -> AOF write -> reply -> crons -> maint, and IO
+ * threads work only inside the phases main opens: read, STREAM, reply, DRAIN, and the lanes of write,
+ * APPLY and MAINT. Otherwise the loop is stock ae. Non-epoll builds are always stock.
  *
  * Invariants:
- * - IO threads read the keyspace only in the read phase; main mutates it only in the write phase
- *   and crons. The barrier between phases is the only synchronization.
+ * - IO threads touch the keyspace only in the read phase and in lane phases, where each thread
+ *   touches only its own tables. The barrier between phases is the only synchronization.
  * - Within one iteration exactly one IO thread reads a fast-path client, owns its batch entries and
  *   writes their replies, so a client's replies stay in order. Main touches the client itself only
  *   at a handoff, between phases.
