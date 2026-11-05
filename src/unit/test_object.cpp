@@ -375,3 +375,44 @@ TEST_F(ObjectTest, lfu_reads_do_not_reset_decay_clock) {
     server.maxmemory_policy = saved_policy;
     lfu_config_decay_time = saved_decay;
 }
+
+/* LFU touches run on lane threads as well as main, so they must not draw from the process-wide rand()
+ * (a lock under glibc, a data race under musl): touching leaves rand()'s sequence untouched. */
+TEST_F(ObjectTest, lfu_touch_does_not_use_process_rand) {
+    int saved_factor = lfu_config_log_factor;
+    lfu_config_log_factor = 10;
+    lrulfu_updateClockAndPolicy(1000LL * 60 * 60 * 24 * 365, true);
+
+    srand(12345);
+    int expected[4];
+    for (int i = 0; i < 4; i++) expected[i] = rand();
+
+    srand(12345);
+    uint32_t lfu = lfu_import(100);
+    for (int i = 0; i < 1000; i++) lfu = lrulfu_touch(lfu);
+    for (int i = 0; i < 4; i++) EXPECT_EQ(rand(), expected[i]);
+
+    lfu_config_log_factor = saved_factor;
+}
+
+/* The per-thread generator still gives the logarithmic increment its expected rate. */
+TEST_F(ObjectTest, lfu_touch_increment_rate) {
+    int saved_factor = lfu_config_log_factor;
+    int saved_decay = lfu_config_decay_time;
+    lfu_config_log_factor = 10;
+    lfu_config_decay_time = 0;
+    lrulfu_updateClockAndPolicy(1000LL * 60 * 60 * 24 * 365, true);
+
+    /* From 15 (baseval 10) each touch increments with p = 1/101; reset after each hit. */
+    int hits = 0;
+    const int n = 200000;
+    for (int i = 0; i < n; i++) {
+        uint8_t freq;
+        lfu_getFrequency(lrulfu_touch(lfu_import(15)), &freq);
+        hits += freq == 16;
+    }
+    EXPECT_NEAR((double)hits / n, 1.0 / 101, 0.0015);
+
+    lfu_config_log_factor = saved_factor;
+    lfu_config_decay_time = saved_decay;
+}
