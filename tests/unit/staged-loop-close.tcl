@@ -81,6 +81,7 @@ proc slc_wait_closed {fd count} {
 }
 
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3}} {
+    r client setname fp-control
     r select 0
 
     test {Staged loop close: output buffer limit disconnects a fast-path client doing big GETs} {

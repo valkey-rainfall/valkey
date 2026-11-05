@@ -247,6 +247,7 @@ test {Filtering based on the fast-path origin client id} {
 # only the multibulk header has been read, must survive the hand-back with its parser state.
 start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 4}} {
     r module load $testmodule log-key 0
+    r client setname cf-control
     r select 0 ;# the db of the raw socket
 
     proc cf_resp {args} {

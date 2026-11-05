@@ -94,6 +94,8 @@ proc cc_assert_healthy {} {
 
 start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 4} [r config get io-threads]
+    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    r client setname cc-control
     r select 0
 
     test {Control: a client disconnecting in flight drops its work without asserting} {
@@ -386,6 +388,7 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
 
 start_server {tags {"io-threads-client-control external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-epoll-thread no}} {
     test {Control: shutdown while reconfiguring under load exits with no worker-destruction assert} {
+        r client setname cc-control
         r select 0
         set clients {}
         for {set i 0} {$i < 8} {incr i} {
