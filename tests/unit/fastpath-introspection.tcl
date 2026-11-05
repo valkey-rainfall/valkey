@@ -211,3 +211,72 @@ start_server {tags {"fastpath repl external:skip tls:skip logreqres:skip"} overr
         }
     }
 }
+
+proc fpi_histogram_calls {c cmd} {
+    set h [$c latency histogram $cmd]
+    if {[llength $h] == 0} { return 0 }
+    return [dict get [lindex $h 1] calls]
+}
+
+start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+    r client setname fpi-control
+    r select 0
+    r config set notify-keyspace-events ""
+
+    test {Write lanes: a command split over lanes is logged and timed once, whole} {
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-max-len 1000
+        r config set commandlog-reply-larger-than 0
+        r config resetstat
+        r slowlog reset
+        r commandlog reset large-reply
+        set fd [fpi_socket]
+        puts -nonewline $fd [fpi_resp ping]
+        flush $fd
+        assert_equal {+PONG} [fpi_read_reply $fd]
+        fpi_wait_fastpath_clients 1
+        set before [fpi_lane_entries r]
+        set mset {mset}
+        set mget {mget}
+        for {set k 0} {$k < 12} {incr k} {
+            lappend mset fpi:m$k v$k
+            lappend mget fpi:m$k
+        }
+        # A long argument is kept as the commandlog keeps it: its first bytes and its length.
+        set long [string repeat x 200]
+        lappend mset fpi:mlong $long
+        lappend mget fpi:mlong
+        set buf ""
+        for {set i 0} {$i < 20} {incr i} { append buf [fpi_resp set fpi:s$i $i] }
+        append buf [fpi_resp {*}$mset] [fpi_resp {*}$mget]
+        puts -nonewline $fd $buf
+        flush $fd
+        fpi_read_replies $fd 22
+        close $fd
+        # Each split command added one entry per part to the lanes.
+        assert_morethan [expr {[fpi_lane_entries r] - $before}] 22
+        set logged_mset {}
+        set logged_mget {}
+        foreach e [r slowlog get -1] {
+            set argv [lindex $e 3]
+            switch [string tolower [lindex $argv 0]] {
+                mset { lappend logged_mset $argv }
+                mget { lappend logged_mget $argv }
+            }
+        }
+        set kept "[string repeat x 128]... (72 more bytes)"
+        assert_equal [list [lreplace $mset end end $kept]] $logged_mset
+        assert_equal [list $mget] $logged_mget
+        assert_equal 1 [fpi_histogram_calls r mset]
+        assert_equal 1 [fpi_histogram_calls r mget]
+        assert_match {*cmdstat_mset:calls=1,*} [r info commandstats]
+        # The reply size is the whole reply's: *13, ten 2-byte values, two 3-byte ones and the long one.
+        set sizes {}
+        foreach e [r commandlog get -1 large-reply] {
+            if {[string tolower [lindex $e 3 0]] eq {mget}} { lappend sizes [lindex $e 2] }
+        }
+        assert_equal [expr {5 + 10 * 8 + 2 * 9 + 208}] $sizes
+        r config set commandlog-reply-larger-than 1048576
+        r config set slowlog-log-slower-than 10000
+    }
+}

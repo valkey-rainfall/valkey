@@ -23,6 +23,7 @@
 #include "cluster_migrateslots.h"
 #include "cluster_slot_stats.h"
 #include "hdr_histogram.h"
+#include "commandlog.h"
 #include <sys/uio.h>
 #include <sched.h>
 
@@ -83,6 +84,7 @@ typedef struct fpThread {
     size_t sa_used;
     struct fpSplit **splits;
     int nsplits, splits_cap;
+    int msplit; /* Main, merge after a lane phase: the first split entry not folded yet. */
 } fpThread;
 
 /* A multi-key command whose keys belong to several lanes runs as one part per lane, each with the keys
@@ -92,10 +94,16 @@ typedef struct fpPart {
     cmdEntry e;     /* first member: the lane runs the part as an entry */
     cmdEntry *orig; /* the batch entry the part belongs to */
     int *orig_idx;  /* orig_idx[j]: the index in orig->argv of the part's argv[j], j >= 1 */
+    /* Written by the lane that runs the part, read by main after the phase: the command is timed and
+     * logged once, for all its parts. */
+    long long duration; /* -1: the part did not run */
+    unsigned long long out_bytes;
+    size_t largs_off, largs_len; /* its arguments as the commandlog keeps them, in its lane's largs */
 } fpPart;
 
 typedef struct fpSplit {
     int nparts, nkeys, mset;
+    uint32_t seg; /* the segment of the entry */
     fpPart **parts;   /* in the order of the lanes of the command's first keys */
     uint8_t *keypart; /* keypart[i]: the part that holds the command's i-th key */
 } fpSplit;
@@ -183,6 +191,9 @@ typedef struct __attribute__((aligned(64))) fpLane {
     int nrun, run_cap;
     void *pf;
     long long prefetches; /* this phase: prefetch batches run */
+    /* Write phase: the arguments of this lane's split parts as the commandlog keeps them. */
+    char *largs;
+    size_t largs_used, largs_cap;
     /* Latency histograms by command id, kept across phases; main folds them before a reader. */
     struct hdr_histogram **hist;
     struct serverCommand **hist_cmd;
@@ -691,6 +702,7 @@ static int fpTrySplit(fpThread *t, cmdEntry *e, client *c) {
     s->nparts = nparts;
     s->nkeys = nkeys;
     s->mset = mset;
+    s->seg = e->seg;
     s->keypart = keypart;
     s->parts = fpSplitAlloc(t, sizeof(fpPart *) * (size_t)nparts);
     for (int p = 0; p < nparts; p++) {
@@ -717,6 +729,9 @@ static int fpTrySplit(fpThread *t, cmdEntry *e, client *c) {
         pt->e.prop = NULL;
         pt->e.frames_off = pt->e.frames_len = 0;
         pt->e.frames_wrap = 0;
+        pt->duration = -1;
+        pt->out_bytes = 0;
+        pt->largs_off = pt->largs_len = 0;
         s->parts[p] = pt;
     }
     for (int i = 0; i < nkeys; i++) {
@@ -775,6 +790,7 @@ static void fpReleaseSplits(fpThread *t) {
         }
     }
     t->nsplits = 0;
+    t->msplit = 0;
     t->sa_cur = 0;
     t->sa_used = 0;
 }
@@ -1913,19 +1929,26 @@ static void fpLaneCall(fpLane *L, client *c) {
     if (dirty < 0) dirty = 0;
 
     laneCmdStat *cs = fpLaneCmdStat(L, real_cmd);
-    /* A split command is one call: its first part counts it, every part adds its time. */
-    int counted = !(fp_exec_entry && fp_exec_entry->part_extra);
+    /* A split command is one call: its first part counts it, every part adds its time, and main times
+     * and logs it once with the time of all its parts (fpFoldSplit). */
+    fpPart *part = fp_exec_entry && fp_exec_entry->part ? (fpPart *)fp_exec_entry : NULL;
+    int counted = !(part && part->e.part_extra);
     if (ectx->stat_total_error_replies > errors || c->deferred_reply_errors) cs->failed++;
-    latencyAddSampleIfNeeded((real_cmd->flags & CMD_FAST) ? "fast-command" : "command", duration);
-    if (ectx->execution_nesting == 0 && counted) {
-        L->dur_cnt++;
-        L->dur_sum += duration;
-        if (duration > L->dur_max) L->dur_max = duration;
+    if (part) {
+        part->duration = duration;
+        part->out_bytes = c->net_output_bytes_curr_cmd;
+    } else {
+        latencyAddSampleIfNeeded((real_cmd->flags & CMD_FAST) ? "fast-command" : "command", duration);
+        if (ectx->execution_nesting == 0) {
+            L->dur_cnt++;
+            L->dur_sum += duration;
+            if (duration > L->dur_max) L->dur_max = duration;
+        }
     }
     c->duration = duration;
     void *entries[3];
     int types[3];
-    int n = counted ? commandlogPrepareCurrentCommand(c, real_cmd, entries, types) : 0;
+    int n = part ? 0 : commandlogPrepareCurrentCommand(c, real_cmd, entries, types);
     for (int i = 0; i < n; i++) {
         FP_GROW(L->logs, L->nlogs, L->logs_cap, 4);
         L->logs[L->nlogs++] = (laneLog){.entry = entries[i], .type = types[i], .at = fpLaneAtNow()};
@@ -1933,7 +1956,7 @@ static void fpLaneCall(fpLane *L, client *c) {
     c->duration = 0;
     if (counted) cs->calls++;
     cs->usec += duration;
-    if (server.latency_tracking_enabled) fpLaneHistogram(L, real_cmd, duration * 1000);
+    if (server.latency_tracking_enabled && !part) fpLaneHistogram(L, real_cmd, duration * 1000);
     /* A slot maps to exactly one lane (shard % fp_nlanes), and main runs only its own lane in the
      * phase, so no other thread writes this slot's CLUSTER SLOT-STATS counters. */
     clusterSlotStatsAddCpuDuration(c, duration);
@@ -1997,6 +2020,52 @@ static void fpLaneTakeProp(fpLane *L, cmdEntry *e, client *ec) {
     e->prop = p;
 }
 
+static int fpCommandlogOn(void) {
+    for (int type = 0; type < COMMANDLOG_TYPE_NUM; type++)
+        if (server.commandlog[type].threshold >= 0 && server.commandlog[type].max_len != 0) return 1;
+    return 0;
+}
+
+typedef struct fpLaneArg {
+    int idx;          /* index in the command's argv */
+    uint32_t len;     /* the argument's length */
+    uint32_t stored;  /* bytes kept, at most COMMANDLOG_ENTRY_MAX_STRING */
+} fpLaneArg;
+
+/* Lane thread, before a split part runs: keep its arguments as the commandlog would, as running it
+ * can hand them to the keyspace. Only the arguments an entry keeps are kept. */
+static void fpLaneCopyPartArgs(fpLane *L, fpPart *pt) {
+    int argc = pt->orig->argc;
+    int keep = argc > COMMANDLOG_ENTRY_MAX_ARGC ? COMMANDLOG_ENTRY_MAX_ARGC - 1 : argc;
+    pt->largs_off = L->largs_used;
+    for (int j = 1; j < pt->e.argc; j++) {
+        int idx = pt->orig_idx[j];
+        if (idx >= keep) continue;
+        robj *o = pt->e.argv[j];
+        char num[LONG_STR_SIZE];
+        const char *p;
+        size_t len;
+        if (sdsEncodedObject(o)) {
+            p = objectGetVal(o);
+            len = sdslen(objectGetVal(o));
+        } else {
+            len = ll2string(num, sizeof(num), (long)objectGetVal(o));
+            p = num;
+        }
+        size_t stored = len > COMMANDLOG_ENTRY_MAX_STRING ? COMMANDLOG_ENTRY_MAX_STRING : len;
+        size_t need = sizeof(fpLaneArg) + stored;
+        if (L->largs_used + need > L->largs_cap) {
+            L->largs_cap = (L->largs_used + need) * 2;
+            L->largs = zrealloc(L->largs, L->largs_cap);
+        }
+        fpLaneArg a = {.idx = idx, .len = (uint32_t)len, .stored = (uint32_t)stored};
+        memcpy(L->largs + L->largs_used, &a, sizeof(a));
+        memcpy(L->largs + L->largs_used + sizeof(a), p, stored);
+        L->largs_used += need;
+    }
+    pt->largs_len = L->largs_used - pt->largs_off;
+}
+
 /* Lane thread: execute one entry on the lane's executor, its reply into the lane arena. */
 static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     client *ec = L->ec;
@@ -2029,6 +2098,7 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     ec->flag.pending_command = 1;
     ec->woff = 0;
 
+    if (e->part && fpCommandlogOn()) fpLaneCopyPartArgs(L, (fpPart *)e);
     fp_exec_entry = e;
     ectx->current_client = ec;
     fpLaneCall(L, ec);
@@ -2103,6 +2173,7 @@ void fastpathStagedWriteLane(int tid) {
     fp_cur_lane = L;
     exec_lane = 1;
     if (L->frames) sdsclear(L->frames); /* main fed the previous phase's frames in its merge */
+    L->largs_used = 0;                  /* and logged the previous phase's split commands */
     /* The lane's entries of this phase, in T order, so their keys can be prefetched ahead of them. */
     L->nrun = 0;
     for (int p = 0; p < fp_nparts; p++) {
@@ -2294,6 +2365,80 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
     for (int l = 0; l < nlanes; l++) fp_lanes[l].nerrors = fp_lanes[l].nlat = fp_lanes[l].nlogs = 0;
 }
 
+/* Main: the commandlog entry for a split command, its arguments from what its parts' lanes kept. */
+static void *fpSplitLogEntry(fpSplit *s, long long value) {
+    cmdEntry *orig = s->parts[0]->orig;
+    int argc = orig->argc;
+    int ceargc = argc > COMMANDLOG_ENTRY_MAX_ARGC ? COMMANDLOG_ENTRY_MAX_ARGC : argc;
+    robj **argv = zcalloc(sizeof(robj *) * (size_t)ceargc);
+    robj *name = orig->argv[0];
+    argv[0] = sdsEncodedObject(name) ? createStringObject(objectGetVal(name), sdslen(objectGetVal(name)))
+                                     : createStringObject(orig->cmd->fullname, sdslen(orig->cmd->fullname));
+    if (ceargc != argc)
+        argv[ceargc - 1] =
+            createObject(OBJ_STRING, sdscatprintf(sdsempty(), "... (%d more arguments)", argc - ceargc + 1));
+    for (int p = 0; p < s->nparts; p++) {
+        fpPart *pt = s->parts[p];
+        const char *q = fp_lanes[pt->e.lane].largs + pt->largs_off, *end = q + pt->largs_len;
+        while (q < end) {
+            fpLaneArg a;
+            memcpy(&a, q, sizeof(a));
+            q += sizeof(a);
+            sds v = sdsnewlen(q, a.stored);
+            if (a.len > a.stored) v = sdscatprintf(v, "... (%lu more bytes)", (unsigned long)(a.len - a.stored));
+            argv[a.idx] = createObject(OBJ_STRING, v);
+            q += a.stored;
+        }
+    }
+    for (int j = 0; j < ceargc; j++)
+        if (!argv[j]) argv[j] = createStringObject("", 0); /* its part did not run */
+    client *ec = fp_lanes[s->parts[0]->e.lane].ec;
+    ec->origin = &orig->origin;
+    void *entry = commandlogNewEntryFromArgv(ec, argv, ceargc, value);
+    ec->origin = NULL;
+    return entry;
+}
+
+/* Main, after a write phase: time and log a split command once, with the time of all its parts, as
+ * call() does for a command. */
+static void fpFoldSplit(fpSplit *s) {
+    fpPart *first = s->parts[0];
+    if (first->duration < 0) return; /* its client is closing: nothing ran or counted it */
+    cmdEntry *orig = first->orig;
+    struct serverCommand *cmd = orig->cmd;
+    long long duration = 0;
+    unsigned long long out = 0;
+    for (int p = 0; p < s->nparts; p++) {
+        fpPart *pt = s->parts[p];
+        if (pt->duration < 0) continue;
+        duration += pt->duration;
+        /* MGET's reply is one array of its parts' elements; MSET's is +OK. */
+        if (!s->mset) out += pt->out_bytes - (unsigned long long)(sdigits10((uint64_t)(pt->e.argc - 1)) + 3);
+    }
+    out = s->mset ? 5 : out + (unsigned long long)(sdigits10((uint64_t)s->nkeys) + 3);
+    fpLane *L = &fp_lanes[first->e.lane];
+    L->dur_cnt++;
+    L->dur_sum += duration;
+    if (duration > L->dur_max) L->dur_max = duration;
+    if (server.latency_tracking_enabled) updateCommandLatencyHistogram(&cmd->latency_histogram, duration * 1000);
+    laneAt at = {.e = orig};
+    if (server.latency_monitor_threshold && duration >= server.latency_monitor_threshold) {
+        FP_GROW(L->lat, L->nlat, L->lat_cap, 8);
+        L->lat[L->nlat++] = (laneLatency){
+            .event = (cmd->flags & CMD_FAST) ? "fast-command" : "command", .us = duration, .at = at};
+    }
+    if (cmd->flags & CMD_SKIP_COMMANDLOG) return;
+    const int order[3] = {COMMANDLOG_TYPE_SLOW, COMMANDLOG_TYPE_LARGE_REQUEST, COMMANDLOG_TYPE_LARGE_REPLY};
+    const long long values[3] = {duration, (long long)first->e.input_bytes, (long long)out};
+    for (int k = 0; k < 3; k++) {
+        int type = order[k];
+        if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) continue;
+        if (values[k] < server.commandlog[type].threshold) continue;
+        FP_GROW(L->logs, L->nlogs, L->logs_cap, 4);
+        L->logs[L->nlogs++] = (laneLog){.entry = fpSplitLogEntry(s, values[k]), .type = type, .at = at};
+    }
+}
+
 /* Main, merge after a write phase: propagate a split entry's parts as one transaction, in part order.
  * Returns 0 when no part propagated anything. The propagation mode is the phase's, so either every
  * part formatted frames or every part captured ops. */
@@ -2346,6 +2491,14 @@ static int fpFeedSplitPropagation(cmdEntry *e) {
 
 /* Main, after a write phase: fold what the lanes accumulated and replay their propagation in T order. */
 static void fpMergeLanes(void) {
+    for (int p = 0; p < fp_nparts; p++) {
+        fpThread *t = &fp_threads[fp_parts[p].tid];
+        uint32_t seg = fp_parts[p].seg;
+        while (t->msplit < t->nsplits && t->splits[t->msplit]->seg <= seg) {
+            fpSplit *s = t->splits[t->msplit++];
+            if (s->seg == seg) fpFoldSplit(s); /* an earlier segment's ran whole on main */
+        }
+    }
     fpFoldLaneStats(fp_nlanes, 0);
     /* Propagation in T order: each part's entries in its IO thread's harvest order. A client's writes
      * of one iteration are contiguous there, so its replication offset is stored once per run. With no

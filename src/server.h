@@ -4018,6 +4018,7 @@ void preventCommandReplication(client *c);
 void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd);
 int commandlogPrepareCurrentCommand(client *c, struct serverCommand *cmd, void **entries, int *types);
 void commandlogPushPrepared(void *entry, int type);
+void *commandlogNewEntryFromArgv(client *c, robj **argv, int argc, long long value);
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist);
 void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram, int64_t duration_hist, int64_t count);
 int prepareForShutdown(client *c, int flags);
