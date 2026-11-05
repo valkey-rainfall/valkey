@@ -421,7 +421,8 @@ void fastpathFreeThread(int tid) {
 /* A connection that can never join: its transport, or a role that lasts for the life of the connection. */
 static int fpNeverEligible(client *c) {
     if (!c->conn || c->flag.fake) return 1;
-    if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 1;
+    int conn_type = connGetType(c->conn);
+    if (conn_type != CONN_TYPE_SOCKET && conn_type != CONN_TYPE_TLS) return 1;
     if (c->flag.replica || c->flag.primary || c->slot_migration_job || c->flag.import_source) return 1;
     if (c->flag.repl_rdb_channel || c->repl_data) return 1;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 1;
