@@ -120,3 +120,94 @@ start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides 
         fpi_wait_fastpath_clients 0
     }
 }
+
+proc fpi_lane_entries {c} {
+    return [getInfoProperty [$c info fastpath] fastpath_write_lane_entries]
+}
+
+# The keys of the commandlog's SET entries whose key starts with prefix, oldest entry first.
+proc fpi_logged_set_keys {c prefix} {
+    set keys {}
+    foreach e [lreverse [$c slowlog get -1]] {
+        set argv [lindex $e 3]
+        if {[string tolower [lindex $argv 0]] eq {set} && [string match $prefix* [lindex $argv 1]]} {
+            lappend keys [lindex $argv 1]
+        }
+    }
+    return $keys
+}
+
+start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+    r client setname fpi-control
+    r select 0
+    r config set notify-keyspace-events ""
+
+    test {Write lanes: commandlog entries follow command order} {
+        r config set slowlog-log-slower-than 0
+        r config set slowlog-max-len 1000
+        r slowlog reset
+        set fd [fpi_socket]
+        puts -nonewline $fd [fpi_resp ping]
+        flush $fd
+        assert_equal {+PONG} [fpi_read_reply $fd]
+        fpi_wait_fastpath_clients 1
+        set before [fpi_lane_entries r]
+        set buf ""
+        set expect {}
+        for {set i 0} {$i < 200} {incr i} {
+            append buf [fpi_resp set fpi:o$i $i]
+            lappend expect fpi:o$i
+        }
+        puts -nonewline $fd $buf
+        flush $fd
+        fpi_read_replies $fd 200
+        close $fd
+        assert_morethan_equal [expr {[fpi_lane_entries r] - $before}] 100
+        assert_equal $expect [fpi_logged_set_keys r fpi:o]
+        r config set slowlog-log-slower-than 10000
+    }
+}
+
+start_server {tags {"fastpath repl external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+    set primary [srv 0 client]
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+    $primary client setname fpi-control
+    $primary select 0
+    $primary config set notify-keyspace-events ""
+    start_server {overrides {io-threads 3 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+        set replica [srv 0 client]
+        $replica client setname fpi-replica-control
+        $replica select 0
+        $replica config set notify-keyspace-events ""
+        $replica replicaof $primary_host $primary_port
+        wait_for_condition 100 50 {
+            [s 0 master_link_status] eq {up}
+        } else {
+            fail "replica did not connect"
+        }
+
+        test {Replica lanes: commandlog entries follow the stream's order} {
+            $replica config set slowlog-log-slower-than 0
+            $replica config set slowlog-max-len 1000
+            $replica slowlog reset
+            set before [getInfoProperty [$replica info stats] repl_parallel_applied]
+            set fd [socket $primary_host $primary_port]
+            fconfigure $fd -translation {crlf binary} -blocking 1 -buffering full
+            set buf ""
+            set expect {}
+            for {set i 0} {$i < 300} {incr i} {
+                append buf [fpi_resp set fpi:r$i $i]
+                lappend expect fpi:r$i
+            }
+            puts -nonewline $fd $buf
+            flush $fd
+            fpi_read_replies $fd 300
+            close $fd
+            wait_for_ofs_sync $primary $replica
+            assert_morethan_equal [expr {[getInfoProperty [$replica info stats] repl_parallel_applied] - $before}] 100
+            assert_equal $expect [fpi_logged_set_keys $replica fpi:r]
+            $replica config set slowlog-log-slower-than 10000
+        }
+    }
+}
