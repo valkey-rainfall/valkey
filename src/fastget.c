@@ -333,8 +333,8 @@ static double fastGetTouchRandom(void) {
     return (double)((x * UINT64_C(0x2545F4914F6CDD1D)) >> 11) / (double)(UINT64_C(1) << 53);
 }
 
-/* What touching means for the read being answered: off (CLIENT NO-TOUCH, or a running child, whose
- * pages a write would copy), set the LRU field to a fixed clock value, or an LFU increment. */
+/* What touching means for the read being answered: off (CLIENT NO-TOUCH, a running child, whose pages a
+ * write would copy, or a forkless save, whose thread reads the word plainly), set the LRU field to a fixed clock value, or an LFU increment. */
 static _Thread_local struct {
     int on;
     int lru;
@@ -351,7 +351,7 @@ static void fastGetTouchBegin(client *c) {
         __atomic_store_n(&mask, m, __ATOMIC_RELAXED);
     }
     uint32_t clock = 0;
-    fastget_touch.on = m && !c->flag.no_touch && !hasActiveChildProcess();
+    fastget_touch.on = m && !c->flag.no_touch && !__atomic_load_n(&server.key_touch_paused, __ATOMIC_RELAXED);
     fastget_touch.lru = lrulfu_touchIsConstant(&clock);
     fastget_touch.mask = m;
     fastget_touch.shift = m ? __builtin_ctz(m) : 0;
