@@ -914,8 +914,10 @@ static int fpCloseRecorded(ClientControl *cc) {
 static void fpSpeculate(fpThread *t, int tid, client *c) {
     if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
     if (fpDepth() > 0) return; /* main is blocked: every command goes to main for its BUSY/LOADING reply */
+    struct serverCommand *cmd = c->parsed_cmd; /* every command answered here is of this one's kind */
     int n = fastGetSpeculateBatch(c, tid);
     if (n <= 0) return;
+    c->lastcmd = cmd;
     fastGetConsumeSpeculated(c, n, tid);
     if (c->argc == 0) c->net_input_bytes_curr_cmd = 0; /* resetClient never runs for this client */
     t->speculated += n;
@@ -1211,6 +1213,7 @@ static void fpDeliverRange(fpThread *t, cmdBatch *b, int from, int to) {
         if (n) fpSend(t, c, iov, n);
         c->fp_inflight -= (j - i);
         c->commands_processed += (j - i) - requeued;
+        if (j - i > requeued) c->lastcmd = b->e[j - requeued - 1].cmd; /* CLIENT LIST cmd= */
         if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
         fpFreeEntries(&b->e[i], j - i);
         i = j;
