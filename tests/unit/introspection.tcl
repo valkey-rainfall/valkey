@@ -2124,3 +2124,17 @@ start_server {overrides {forkless-infrastructure-enabled yes} tags {"introspecti
         } {} {needs:save}
     }
 }
+
+# A protected client is never freed, so it gets a server of its own.
+start_server {tags {"introspection"}} {
+    test {CLIENT LIST shows read interest for a client whose reads are held} {
+        set rd [valkey_client]
+        $rd client setname held-reads
+        set id [$rd client id]
+        r debug protect-client $id
+        set line [lsearch -inline [split [r client list] "\n"] "*name=held-reads *"]
+        assert_match {* events=r *} $line
+        $rd close
+        set _ done
+    } {done} {needs:debug}
+}
