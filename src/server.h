@@ -895,18 +895,44 @@ typedef struct ValkeyModuleType moduleType;
  *                                                      +--- present because hasembval == 0
  */
 
+/* The header is two 32-bit words. The first holds type, encoding and the LRU clock or LFU counter;
+ * the second holds the embedded-data flags and the refcount. The zero-width bit-field between them
+ * makes the two words separate memory locations in the sense of C11 (3.14): a store into one may
+ * not touch the other, so no compiler may update refcount or lru with a read-modify-write of the
+ * whole 8-byte header. The union gives each word a name, so a thread that must access the first
+ * word atomically can: fast GET on an IO thread touches lru with a compare-and-swap while other IO
+ * threads read type and encoding of the same value (fastGetTouch, objectHeaderWord0), and the
+ * forkless save reads it from its own thread. The layout is unchanged: lru ends exactly at bit 32,
+ * so the zero-width field adds nothing. */
 struct serverObject {
-    unsigned type : 4;
-    unsigned encoding : 4;
-    unsigned lru : LRULFU_BITS;
-    unsigned hasexpire : 1;
-    unsigned hasembkey : 1;
-    unsigned hasembval : 1;
-    unsigned refcount : OBJ_REFCOUNT_BITS;
+    union {
+        __extension__ struct {
+            unsigned type : 4;
+            unsigned encoding : 4;
+            unsigned lru : LRULFU_BITS;
+            unsigned : 0; /* word boundary: a separate memory location starts here */
+            unsigned hasexpire : 1;
+            unsigned hasembkey : 1;
+            unsigned hasembval : 1;
+            unsigned refcount : OBJ_REFCOUNT_BITS;
+        };
+        uint32_t hdr[2]; /* hdr[0]: type, encoding, lru. hdr[1]: flags, refcount. */
+    };
     void *val_ptr; /* Not always present. Use objectGetVal(obj) and
                     * objectSetVal(obj, val) instead. */
 };
 static_assert(sizeof(struct serverObject) <= 8 + sizeof(void *), "unexpected size - verify struct is packed correctly");
+static_assert(LRULFU_BITS == 24, "type, encoding and lru must fill hdr[0] exactly");
+static_assert(OBJ_REFCOUNT_BITS == 29, "the flags and the refcount must fill hdr[1] exactly");
+
+/* The first header word of o (type, encoding, lru), read atomically. Callers that run on an IO
+ * thread in the read phase must read these three fields through this load, because fast GET on
+ * another IO thread may store lru at the same time (fastGetTouch). A relaxed load compiles to a
+ * plain load; it only tells the compiler not to split or merge it. Decode with a local robj:
+ *     robj h; h.hdr[0] = objectHeaderWord0(o); ... h.type, h.encoding, h.lru ... */
+static inline uint32_t objectHeaderWord0(const struct serverObject *o) {
+    return __atomic_load_n(&o->hdr[0], __ATOMIC_RELAXED);
+}
 
 /* The string name for an object's type as listed above
  * Native types are checked against the OBJ_STRING, OBJ_LIST, OBJ_* defines,

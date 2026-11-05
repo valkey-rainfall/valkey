@@ -1307,11 +1307,7 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
 /* The LRU/LFU field of val. A forkless save reads it while IO threads answering reads swap the 32-bit
  * word holding type, encoding and that field, so the word is read atomically. */
 static unsigned int rdbReadObjectLRU(robj *val) {
-    uint32_t word = __atomic_load_n((uint32_t *)(void *)val, __ATOMIC_RELAXED);
-    robj header;
-    memset(&header, 0, sizeof(header));
-    memcpy(&header, &word, sizeof(word));
-    return header.lru;
+    return objectGetLRU(val); /* one atomic load of hdr[0], decoded on a copy */
 }
 
 /* Save a key-value pair, with expire time, type, key, value.

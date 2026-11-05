@@ -439,3 +439,44 @@ TEST_F(ObjectTest, lfu_touch_increment_rate) {
     lfu_config_log_factor = saved_factor;
     lfu_config_decay_time = saved_decay;
 }
+
+/* The object header is two 32-bit words that are separate memory locations: hdr[0] holds type,
+ * encoding and lru, hdr[1] the embedded-data flags and the refcount. Fast GET on an IO thread swaps
+ * hdr[0] while main may change the refcount in hdr[1]; a store into one word must not touch the
+ * other. This checks the layout the zero-width bit-field in struct serverObject promises: every field
+ * decodes from its own word, and a write to a field of one word leaves the other word's bits as they
+ * were. Stack object only; no server state. */
+TEST(ObjectHeaderTest, HeaderWordsAreSeparateAndDecodeTheFields) {
+    robj o;
+    memset(&o, 0, sizeof(o));
+    o.type = OBJ_HASH;
+    o.encoding = OBJ_ENCODING_LISTPACK;
+    o.lru = 0xABCDEF;
+    o.hasexpire = 1;
+    o.hasembkey = 0;
+    o.hasembval = 1;
+    o.refcount = 0x1234567;
+
+    robj h;
+    memset(&h, 0, sizeof(h));
+    h.hdr[0] = objectHeaderWord0(&o);
+    EXPECT_EQ(h.type, (unsigned)OBJ_HASH);
+    EXPECT_EQ(h.encoding, (unsigned)OBJ_ENCODING_LISTPACK);
+    EXPECT_EQ(h.lru, 0xABCDEFu);
+    EXPECT_EQ(h.refcount, 0u) << "the refcount is not in the first word";
+    EXPECT_EQ(objectGetType(&o), OBJ_HASH);
+    EXPECT_EQ(objectGetEncoding(&o), OBJ_ENCODING_LISTPACK);
+    EXPECT_EQ(objectGetLRU(&o), 0xABCDEFu);
+
+    uint32_t w0 = o.hdr[0], w1 = o.hdr[1];
+    o.refcount = 0x1234568; /* a write to the second word */
+    EXPECT_EQ(o.hdr[0], w0) << "a refcount change touched the first word";
+    EXPECT_NE(o.hdr[1], w1);
+    w1 = o.hdr[1];
+    o.lru = 0x123456; /* a write to the first word */
+    EXPECT_EQ(o.hdr[1], w1) << "an lru change touched the second word";
+    EXPECT_EQ(o.refcount, 0x1234568u);
+    EXPECT_EQ(o.hasexpire, 1u);
+    EXPECT_EQ(o.hasembval, 1u);
+    EXPECT_EQ(sizeof(o.hdr), 8u);
+}

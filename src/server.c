@@ -693,8 +693,9 @@ const void *hashtableObjectGetKey(const void *entry) {
 /* Prefetch the value if it's not embedded. */
 void hashtableObjectPrefetchValue(const void *entry) {
     const robj *obj = entry;
-    if (obj->encoding != OBJ_ENCODING_EMBSTR &&
-        obj->encoding != OBJ_ENCODING_INT) {
+    int encoding = objectGetEncoding(obj); /* the header word fast GET may be storing on another thread */
+    if (encoding != OBJ_ENCODING_EMBSTR &&
+        encoding != OBJ_ENCODING_INT) {
         valkey_prefetch(objectGetVal(obj));
     }
 }

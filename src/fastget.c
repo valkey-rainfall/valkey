@@ -361,7 +361,7 @@ static void fastGetTouchBegin(client *c) {
 /* An LFU touch that loses the swap to another thread's touch is applied again on top of that one, with
  * the same random draw, so concurrent touches add up as they would one after another on main. */
 static __attribute__((noinline, cold)) void fastGetTouchLfu(robj *o) {
-    uint32_t *word = (uint32_t *)(void *)o;
+    uint32_t *word = &o->hdr[0];
     uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
     double r = fastGetTouchRandom();
     for (;;) {
@@ -381,7 +381,7 @@ static inline __attribute__((always_inline)) void fastGetTouch(robj *o) {
         fastGetTouchLfu(o);
         return;
     }
-    uint32_t *word = (uint32_t *)(void *)o;
+    uint32_t *word = &o->hdr[0];
     uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
     if ((seen & fastget_touch.mask) == fastget_touch.lru_word) return;
     uint32_t touched = (seen & ~fastget_touch.mask) | fastget_touch.lru_word;

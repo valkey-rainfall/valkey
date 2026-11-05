@@ -54,8 +54,14 @@
 
 /* ===================== Accessor functions for serverObject fields ==================== */
 
+/* type, encoding and lru share the first header word, which fast GET stores on an IO thread while
+ * other IO threads read it (fastGetTouch): the three getters read the word with one atomic load and
+ * decode it on a copy. The second word (flags, refcount) has no concurrent writer, so its getters
+ * read the bit-fields directly. */
 int objectGetType(const robj *o) {
-    return o->type;
+    robj h;
+    h.hdr[0] = objectHeaderWord0(o);
+    return h.type;
 }
 
 void objectSetType(robj *o, int type) {
@@ -63,7 +69,9 @@ void objectSetType(robj *o, int type) {
 }
 
 int objectGetEncoding(const robj *o) {
-    return o->encoding;
+    robj h;
+    h.hdr[0] = objectHeaderWord0(o);
+    return h.encoding;
 }
 
 void objectSetEncoding(robj *o, int encoding) {
@@ -75,7 +83,9 @@ unsigned int objectGetRefcount(const robj *o) {
 }
 
 unsigned int objectGetLRU(const robj *o) {
-    return o->lru;
+    robj h;
+    h.hdr[0] = objectHeaderWord0(o);
+    return h.lru;
 }
 
 void objectSetLRU(robj *o, unsigned int lru) {
