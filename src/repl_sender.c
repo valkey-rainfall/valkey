@@ -228,8 +228,7 @@ static void replStreamSenderWaitQuiescent(client *replica) {
     }
 }
 
-/* Main: publish a newer stable offset and wake the sender. Called from
- * replStreamSenderTick (beforeSleep and the staged loop iteration). */
+/* Main: publish a newer stable offset and wake the sender. Called from replStreamSenderTick. */
 void replStreamSenderPublishStable(long long offset) {
     if (!repl_sender_running) return;
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
@@ -389,8 +388,7 @@ unsigned long replStreamSenderOwnedReplicas(void) {
 
 /* Main: one service step of the sender from the event loop. Starts/stops the thread to
  * follow the config, accounts for what the sender streamed (advance cursors, drop
- * refcounts, enforce COB/disconnect, trim), then publishes the next stable offset. Called
- * from beforeSleep AND from the staged loop iteration, which does not run beforeSleep. */
+ * refcounts, enforce COB/disconnect, trim), then publishes the next stable offset. */
 void replStreamSenderTick(void) {
     if (server.repl_stream_sender && !replStreamSenderActive())
         replStreamSenderInit();

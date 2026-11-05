@@ -22,7 +22,7 @@
 /* Jobs a cron can request for the next MAINT phase. */
 #define MAINT_JOB_REHASH 0
 #define MAINT_JOB_RESIZE 1
-#define MAINT_JOB_EXPIRE 2 /* active expire of keys; hash fields stay on main */
+#define MAINT_JOB_EXPIRE 2 /* active expire of keys and hash fields */
 #define MAINT_JOB_COUNT 3
 
 struct serverObject;

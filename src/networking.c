@@ -3576,10 +3576,8 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
         if (isStrRefPayload(header->payload_type)) {
             atomic_store_explicit(&header->tracked_for_cob, 0, memory_order_release);
 
-            /* When net byte tracking was disabled in the main thread (commandlog-reply-larger-than -1)
-             * at the time this reply was added, we account for cluster slot stats here in the IO thread
-             * after writing the reply. When tracking was enabled, it's already accounted in the main thread
-             * via afterCommand() -> clusterSlotStatsAddNetworkBytesOutForUserClient(). */
+            /* Without net byte tracking when this reply was added (commandlog-reply-larger-than -1),
+             * its slot stats are counted here; otherwise afterCommand already counted them. */
             if (!header->track_bytes) {
                 clusterSlotStatsAddNetworkBytesOutForSlot(header->slot, header->reply_len);
             }
