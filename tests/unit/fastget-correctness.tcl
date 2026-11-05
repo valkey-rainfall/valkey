@@ -467,3 +467,37 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
         r config set io-threads-speculate-reads no
     }
 }
+
+# A forkless save reads each key's LFU frequency while reading threads touch it. (Run under TSan for the
+# race; without it this checks the snapshot loads.)
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkless-infrastructure-enabled yes bgsave-default-method forkless maxmemory-policy allkeys-lfu}} {
+    r select 0
+
+    test {A forkless save runs beside reads that touch the keys it saves} {
+        exec {*}[valkeybenchmark [srv 0 host] [srv 0 port] {-c 16 -P 16 -n 200000 -r 200000 --sequential -d 100 -q SET fs:__rand_int__ __data__}] > /dev/null 2>@1
+        assert_equal 200000 [r dbsize]
+        set before [fastget_speculated r]
+        exec {*}[valkeybenchmark [srv 0 host] [srv 0 port] {-c 16 -P 16 -n 4000000 -r 200000 -q GET fs:__rand_int__}] > /dev/null 2>@1 &
+        wait_for_condition 100 20 {
+            [fastget_speculated r] > $before + 10000
+        } else {
+            fail "the benchmark's reads did not run on the reading threads"
+        }
+        for {set i 0} {$i < 3} {incr i} {
+            r bgsave
+            wait_for_condition 500 20 {
+                [s rdb_bgsave_in_progress] == 0
+            } else {
+                fail "the forkless save did not finish"
+            }
+            assert_equal ok [s rdb_last_bgsave_status]
+        }
+        wait_for_condition 1000 20 {
+            [s connected_clients] == 1
+        } else {
+            fail "the benchmark did not finish"
+        }
+        r debug reload nosave
+        assert_equal 200000 [r dbsize]
+    }
+}

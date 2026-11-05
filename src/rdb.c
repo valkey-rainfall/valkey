@@ -1304,6 +1304,16 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
     return len;
 }
 
+/* The LRU/LFU field of val. A forkless save reads it while IO threads answering reads swap the 32-bit
+ * word holding type, encoding and that field, so the word is read atomically. */
+static unsigned int rdbReadObjectLRU(robj *val) {
+    uint32_t word = __atomic_load_n((uint32_t *)(void *)val, __ATOMIC_RELAXED);
+    robj header;
+    memset(&header, 0, sizeof(header));
+    memcpy(&header, &word, sizeof(word));
+    return header.lru;
+}
+
 /* Save a key-value pair, with expire time, type, key, value.
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
@@ -1319,14 +1329,15 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
 
     /* Save the LRU info. */
     if (savelru) {
-        uint64_t idletime = objectGetLRUIdleSecs(val);
+        uint64_t idletime = lru_getIdleSecs(rdbReadObjectLRU(val));
         if (rdbSaveType(rdb, RDB_OPCODE_IDLE) == -1) return -1;
         if (rdbSaveLen(rdb, idletime) == -1) return -1;
     }
 
     /* Save the LFU info. */
     if (savelfu) {
-        uint8_t freq = objectPeekLFUFrequency(val);
+        uint8_t freq;
+        lfu_getFrequency(rdbReadObjectLRU(val), &freq);
         /* We can encode this in exactly two bytes: the opcode and an 8
          * bit counter, since the frequency is logarithmic with a 0-255 range.
          * Note that we do not store the halving time because to reset it
