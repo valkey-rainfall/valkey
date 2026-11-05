@@ -144,7 +144,7 @@ int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int 
 void fastpathStreamLanesPrepare(int nlanes, int main_lane);
 /* Lane thread, APPLY phase: enter the lane, apply commands of the stream on it, leave. */
 void fastpathStreamLaneEnter(int lane);
-void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard);
+void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard, uint64_t pos);
 void fastpathStreamLaneLeave(void);
 /* Main, after an APPLY phase of the stream: fold what lanes [0, nlanes) accumulated. */
 void fastpathStreamLanesMerge(int nlanes);

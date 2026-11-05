@@ -125,20 +125,31 @@ typedef struct laneCmdStat {
     long long calls, usec, failed;
 } laneCmdStat;
 
+/* Where a lane record's command stands in command order: the write-phase entry that produced it, or
+ * with no entry the position in the primary's stream of the replica command that did. Main folds the
+ * records of all lanes in this order. */
+typedef struct laneAt {
+    const struct cmdEntry *e;
+    uint64_t pos;
+} laneAt;
+
 typedef struct laneError {
     sds msg; /* the reply's first bytes: enough to find the error prefix */
     int flags;
     struct serverCommand *cmd;
+    laneAt at;
 } laneError;
 
 typedef struct laneLatency {
     const char *event;
     long long us;
+    laneAt at;
 } laneLatency;
 
 typedef struct laneLog {
     void *entry;
     int type;
+    laneAt at;
 } laneLog;
 
 typedef struct __attribute__((aligned(64))) fpLane {
@@ -180,6 +191,7 @@ typedef struct __attribute__((aligned(64))) fpLane {
 
 static fpLane fp_lanes[FP_MAX_LANES];
 static _Thread_local fpLane *fp_cur_lane = NULL;
+static _Thread_local uint64_t fp_stream_pos = 0; /* replica lane: stream position of the running command */
 /* Main writes these before the read phase; IO threads read them in it. Like every plain variable
  * shared across a phase, they are ordered by the phase barrier (release on begin, acquire on wait). */
 static int fp_lanes_iter = 0; /* this iteration's entries are sorted into lanes */
@@ -1242,6 +1254,10 @@ static int fpControlDetaching(ClientControl *cc) {
 
 static _Thread_local cmdEntry *fp_exec_entry = NULL; /* the entry this thread's executor is running */
 
+static inline laneAt fpLaneAtNow(void) {
+    return (laneAt){.e = fp_exec_entry, .pos = fp_stream_pos};
+}
+
 static void fpLanePushClose(fpLane *L, cmdEntry *e);
 
 /* Main: close a client whose executor reply passed the output buffer hard limit. */
@@ -1788,13 +1804,13 @@ void fastpathLaneErrorReply(client *c, const char *s, size_t len, int flags) {
     ectx->stat_total_error_replies++;
     FP_GROW(L->errors, L->nerrors, L->errors_cap, 8);
     L->errors[L->nerrors++] =
-        (laneError){.msg = sdsnewlen(s, len < 64 ? len : 64), .flags = flags, .cmd = c->realcmd};
+        (laneError){.msg = sdsnewlen(s, len < 64 ? len : 64), .flags = flags, .cmd = c->realcmd, .at = fpLaneAtNow()};
 }
 
 void fastpathLaneLatencySample(const char *event, long long latency_us) {
     fpLane *L = fp_cur_lane;
     FP_GROW(L->lat, L->nlat, L->lat_cap, 8);
-    L->lat[L->nlat++] = (laneLatency){.event = event, .us = latency_us};
+    L->lat[L->nlat++] = (laneLatency){.event = event, .us = latency_us, .at = fpLaneAtNow()};
 }
 
 static laneCmdStat *fpLaneCmdStat(fpLane *L, struct serverCommand *cmd) {
@@ -1912,7 +1928,7 @@ static void fpLaneCall(fpLane *L, client *c) {
     int n = counted ? commandlogPrepareCurrentCommand(c, real_cmd, entries, types) : 0;
     for (int i = 0; i < n; i++) {
         FP_GROW(L->logs, L->nlogs, L->logs_cap, 4);
-        L->logs[L->nlogs++] = (laneLog){.entry = entries[i], .type = types[i]};
+        L->logs[L->nlogs++] = (laneLog){.entry = entries[i], .type = types[i], .at = fpLaneAtNow()};
     }
     c->duration = 0;
     if (counted) cs->calls++;
@@ -2147,6 +2163,57 @@ void fastpathStagedWriteLane(int tid) {
     ectx = saved;
 }
 
+/* Main, after a write or apply phase: the position in command order of a lane record. A write-phase
+ * entry is ordered by the segment part it belongs to, then by its place in its IO thread's batches; a
+ * split entry's part by the entry it belongs to. */
+static uint64_t fpLaneAtKey(laneAt at) {
+    const cmdEntry *e = at.e;
+    if (!e) return at.pos;
+    if (e->part) e = ((const fpPart *)e)->orig;
+    for (int p = 0; p < fp_nparts; p++) {
+        if (fp_parts[p].seg != e->seg) continue;
+        fpThread *t = &fp_threads[fp_parts[p].tid];
+        for (int bi = 0; bi < t->sbn[0]; bi++) {
+            cmdBatch *b = t->sb[0][bi];
+            if (e >= b->e && e < b->e + b->count)
+                return ((uint64_t)p << 40) | ((uint64_t)bi << 20) | (uint64_t)(e - b->e);
+        }
+    }
+    return UINT64_MAX;
+}
+
+typedef struct fpRecRef {
+    uint64_t key;
+    int lane, idx;
+} fpRecRef;
+
+enum { FP_REC_ERROR, FP_REC_LATENCY, FP_REC_LOG };
+static fpRecRef *fp_rec_order = NULL;
+static int fp_rec_order_cap = 0;
+
+static int fpRecRefCompare(const void *a, const void *b) {
+    const fpRecRef *x = a, *y = b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    if (x->lane != y->lane) return x->lane < y->lane ? -1 : 1;
+    return x->idx < y->idx ? -1 : (x->idx > y->idx);
+}
+
+/* Main: the lanes' records of one kind in command order, in fp_rec_order. Returns how many. */
+static int fpOrderLaneRecords(int nlanes, int kind) {
+    int n = 0;
+    for (int l = 0; l < nlanes; l++) {
+        fpLane *L = &fp_lanes[l];
+        int cnt = kind == FP_REC_ERROR ? L->nerrors : kind == FP_REC_LATENCY ? L->nlat : L->nlogs;
+        for (int i = 0; i < cnt; i++) {
+            laneAt at = kind == FP_REC_ERROR ? L->errors[i].at : kind == FP_REC_LATENCY ? L->lat[i].at : L->logs[i].at;
+            FP_GROW(fp_rec_order, n, fp_rec_order_cap, 64);
+            fp_rec_order[n++] = (fpRecRef){.key = fpLaneAtKey(at), .lane = l, .idx = i};
+        }
+    }
+    if (n > 1) qsort(fp_rec_order, (size_t)n, sizeof(fpRecRef), fpRecRefCompare);
+    return n;
+}
+
 /* Main, after a write or apply phase: fold what lanes [0, nlanes) accumulated. A lane error of the primary's
  * stream is logged as main logs one for the primary client. */
 static void fpFoldLaneStats(int nlanes, int from_primary) {
@@ -2178,30 +2245,6 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
             if ((long long)ds->max < L->dur_max) ds->max = L->dur_max;
             L->dur_cnt = L->dur_sum = L->dur_max = 0;
         }
-        for (int i = 0; i < L->nerrors; i++) {
-            incrementErrorStatsForReply(L->errors[i].msg, sdslen(L->errors[i].msg), L->errors[i].flags);
-            if (from_primary) {
-                const char *cmdname = L->errors[i].cmd ? L->errors[i].cmd->fullname : "<unknown>";
-                serverLog(LL_WARNING,
-                          "== CRITICAL == This replica is sending an error to its primary: '%.*s' after processing "
-                          "the command '%s'",
-                          (int)sdslen(L->errors[i].msg), L->errors[i].msg, cmdname);
-                if (server.repl_backlog && server.repl_backlog->histlen > 0) showLatestBacklog();
-                server.stat_unexpected_error_replies++;
-                if (server.repl_replica_ro &&
-                    (server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC ||
-                     server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS))
-                    serverPanic("This replica panicked sending an error to its primary after processing the "
-                                "command '%s'",
-                                cmdname);
-            }
-            sdsfree(L->errors[i].msg);
-        }
-        L->nerrors = 0;
-        for (int i = 0; i < L->nlat; i++) latencyAddSample(L->lat[i].event, L->lat[i].us);
-        L->nlat = 0;
-        for (int i = 0; i < L->nlogs; i++) commandlogPushPrepared(L->logs[i].entry, L->logs[i].type);
-        L->nlogs = 0;
         for (int i = 0; i < L->ncloses; i++) fpCloseOverLimit(L->closes[i]);
         L->ncloses = 0;
         fp_stat_lane_entries += L->executed;
@@ -2213,6 +2256,42 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
             clientSetUser(L->ec, DefaultUser, 0); /* never keep a principal that may retire */
         }
     }
+    /* Errors, latency samples and commandlog entries in command order, as a serial run adds them. */
+    int records = 0;
+    for (int l = 0; l < nlanes; l++) records |= fp_lanes[l].nerrors | fp_lanes[l].nlat | fp_lanes[l].nlogs;
+    if (!records) return;
+    int n = fpOrderLaneRecords(nlanes, FP_REC_ERROR);
+    for (int i = 0; i < n; i++) {
+        laneError *er = &fp_lanes[fp_rec_order[i].lane].errors[fp_rec_order[i].idx];
+        incrementErrorStatsForReply(er->msg, sdslen(er->msg), er->flags);
+        if (from_primary) {
+            const char *cmdname = er->cmd ? er->cmd->fullname : "<unknown>";
+            serverLog(LL_WARNING,
+                      "== CRITICAL == This replica is sending an error to its primary: '%.*s' after processing "
+                      "the command '%s'",
+                      (int)sdslen(er->msg), er->msg, cmdname);
+            if (server.repl_backlog && server.repl_backlog->histlen > 0) showLatestBacklog();
+            server.stat_unexpected_error_replies++;
+            if (server.repl_replica_ro &&
+                (server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC ||
+                 server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS))
+                serverPanic("This replica panicked sending an error to its primary after processing the "
+                            "command '%s'",
+                            cmdname);
+        }
+        sdsfree(er->msg);
+    }
+    n = fpOrderLaneRecords(nlanes, FP_REC_LATENCY);
+    for (int i = 0; i < n; i++) {
+        laneLatency *lt = &fp_lanes[fp_rec_order[i].lane].lat[fp_rec_order[i].idx];
+        latencyAddSample(lt->event, lt->us);
+    }
+    n = fpOrderLaneRecords(nlanes, FP_REC_LOG);
+    for (int i = 0; i < n; i++) {
+        laneLog *lg = &fp_lanes[fp_rec_order[i].lane].logs[fp_rec_order[i].idx];
+        commandlogPushPrepared(lg->entry, lg->type);
+    }
+    for (int l = 0; l < nlanes; l++) fp_lanes[l].nerrors = fp_lanes[l].nlat = fp_lanes[l].nlogs = 0;
 }
 
 /* Main, merge after a write phase: propagate a split entry's parts as one transaction, in part order.
@@ -2384,8 +2463,9 @@ void fastpathStreamLaneEnter(int lane) {
     exec_lane = 1;
 }
 
-void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard) {
+void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard, uint64_t pos) {
     fpLane *L = &fp_lanes[lane];
+    fp_stream_pos = pos;
     client *ec = L->sec;
     ec->argv = argv;
     ec->argc = argc;
