@@ -2239,9 +2239,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int client_writes = handleClientsWithPendingWrites();
     if (client_writes > 0) server.el_iteration_active = true;
 
-    /* repl-stream-sender: follow the config, account for what the sender streamed, and
-     * publish the next stable offset. Also called from the staged loop iteration, which
-     * does not run beforeSleep. */
     replStreamSenderTick();
 
     /* Try to process more IO reads that are ready to be processed. Not when a module listens to the
