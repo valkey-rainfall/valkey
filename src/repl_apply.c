@@ -386,11 +386,11 @@ static void rpRunLane(int lane) {
             }
             if (idx == 0) {
                 fastpathStreamLaneCall(lane, e->db, c->parsed_cmd, c->argv, c->argc, c->argv_len, c->argv_len_sum,
-                                       c->net_input_bytes_curr_cmd, e->shard);
+                                       c->net_input_bytes_curr_cmd, e->shard, (uint64_t)idx);
             } else {
                 parsedCommand *p = &c->cmd_queue.cmds[idx - 1];
                 fastpathStreamLaneCall(lane, e->db, p->cmd, p->argv, p->argc, p->argv_len, p->argv_len_sum,
-                                       p->input_bytes, e->shard);
+                                       p->input_bytes, e->shard, (uint64_t)idx);
             }
         }
         cur->chunk++;
