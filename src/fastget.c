@@ -593,53 +593,63 @@ static int fastGetSpeculateMget(client *c, int tid, monotime spec_start) {
     return speculated;
 }
 
-/* Called from the IO thread after parsing is complete. Executes a contiguous
- * prefix of GET commands, using batched incremental finds to overlap memory
- * prefetches across keys before replying in command order.
+/* IO thread, read phase: is this read kept from fast GET? Returns 1 when the commands at its head must
+ * go to main, 0 when they may be answered here, with *kind_out the fast GET kind of the read. Every
+ * check runs once per read. Main changes the state the checks read only outside the read phase (CLIENT
+ * PAUSE, FAILOVER, the replication state machine, module and monitor registration, cluster state and
+ * the client's own flags and buffer all move on main), so the plain reads are ordered by the phase
+ * barrier like every other gate.
  *
- * REPLY ORDERING: all speculative replies are written into c->buf BEFORE the
- * main thread processes any punted command, whose replies append after.
- *
- * Returns the number of commands speculatively completed. */
-int fastGetSpeculateBatch(client *c, int tid) {
-    int speculated = 0;
-
-    if (server.io_threads_num <= 1) return 0;
+ * The checks are compiled apart from the lookup loop of fastGetSpeculateBatch on purpose (noinline).
+ * The gates cost no cache line of their own: the client fields they read are on the line of the
+ * client that fastGetWriteBulkReply writes for every reply, and the shared words (the main gate, the
+ * module and monitor gates) are one load each. What a check can still cost is its effect on the code
+ * the compiler generates for the loop when both share one function: on S1, adding one gate moved the
+ * loop's register allocation and its hot/cold split (gcc 11, x86: prefix_open spilled to the stack,
+ * the split point moved) and cost 2.8 percent of 512 B GET throughput on Graviton 4, which came back
+ * when the gates were compiled apart. With the checks in their own function the loop's code is the
+ * same whatever the checks do, now and after the next gate is added. */
+static __attribute__((noinline)) int fastGetReadGated(client *c, int *kind_out) {
+    if (server.io_threads_num <= 1) return 1;
 
     /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
-    if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
+    if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 1;
 
     /* Inside MULTI a GET must be queued, not run. A blocked or just-unblocked client's replies must
      * follow its unblock reply. The reply is written as plain RESP into c->buf, which would corrupt a
      * buffer in copy-avoidance encoded mode, and would reorder replies if the reply list is not
-     * empty. */
-    if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
-        c->flag.buf_encoded || listLength(c->reply) != 0)
-        return 0;
+     * empty.
+     *
+     * pending_write (F11): main queued a write of this client's buffers (a tracking push to a REDIRECT
+     * target) and owns that write; sending c->buf from here too would send those bytes twice. The bit
+     * is in the flag word the four tests before it load, so it costs one more bit in the same mask. */
+    if (c->flag.multi || c->flag.blocked || c->flag.unblocked || c->flag.buf_encoded || c->flag.pending_write ||
+        listLength(c->reply) != 0)
+        return 1;
 
-    /* Main wrote into this client's buffer (a tracking push to a REDIRECT target) and owns that
-     * write: sending c->buf from here too would send those bytes twice. The tracking gate below
-     * refuses the client that turned tracking on, not the target its pushes are redirected to. */
-    if (c->bufpos != 0 || c->flag.pending_write) return 0;
+    /* F11, second half: main's bytes are in c->buf although no write is queued any more (main wrote
+     * part of them and installed a write handler for the rest). Same cache line as the flag word. The
+     * tracking gate below refuses the client that turned tracking on, not the target of its pushes. */
+    if (c->bufpos != 0) return 1;
 
     /* A tracking client must have its keys remembered, which this path skips, or a later write would
      * not invalidate its cache. BCAST tracking invalidates by prefix and is unaffected. Main does not
      * run this client's commands while its read is parsed, so the plain flags are stable here. */
-    if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
+    if (c->flag.tracking && !c->flag.tracking_bcast) return 1;
 
     /* A module subscribed to command results (see fastGetOnCommandResultListenersChanged). */
-    if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 0;
+    if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 1;
 
     /* A module command filter may rewrite or redirect the GET. Filters change only on main, which
      * waits at the barrier while IO threads run this. */
-    if (moduleHasCommandFilters()) return 0;
+    if (moduleHasCommandFilters()) return 1;
 
     /* An attached monitor (see fastGetOnMonitorsChanged). */
-    if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 0;
+    if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 1;
 
     /* Hot-key detection counts lookups on main. hotkeys-top-k changes only on main, outside the read
      * phase. */
-    if (hotkeysEnabled()) return 0;
+    if (hotkeysEnabled()) return 1;
 
     /* Main postpones or rejects the read: CLIENT PAUSE ALL postpones it, a yielding script or module
      * (including a module thread yielding from a thread-safe context) postpones it or replies BUSY,
@@ -647,14 +657,14 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * of this state changes only on main, outside the read phase, and main refreshes the gate after
      * the GIL is back and before the read phase opens. */
     if (atomic_load_explicit(&fastget_main_gate.on, memory_order_relaxed)) {
-        if (isPausedActions(PAUSE_ACTION_CLIENT_ALL)) return 0;
-        if (isInsideYieldingLongCommand()) return 0;
+        if (isPausedActions(PAUSE_ACTION_CLIENT_ALL)) return 1;
+        if (isInsideYieldingLongCommand()) return 1;
         if (server.failover_state == FAILOVER_IN_PROGRESS && clientSupportStandAloneRedirect(c) && !c->flag.readonly)
-            return 0;
+            return 1;
     }
 
     /* A replica whose link is down and that may not serve stale data replies MASTERDOWN from main. */
-    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 0;
+    if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 1;
 
     fastGetTouchBegin(c);
 
@@ -667,10 +677,9 @@ int fastGetSpeculateBatch(client *c, int tid) {
             break;
         }
     }
-    if (kind < 0 || !fastGetKindArgcOk(kind, c->argc)) return 0;
-    if (kind != FASTGET_KIND_GET && !server.io_threads_speculate_reads) return 0;
+    if (kind < 0 || !fastGetKindArgcOk(kind, c->argc)) return 1;
+    if (kind != FASTGET_KIND_GET && !server.io_threads_speculate_reads) return 1;
     struct serverCommand *kind_cmd = c->parsed_cmd;
-    int kind_argc = fastget_kind_argc[kind];
 
     /* Answer the read here only when every complete command in it is of the same kind. A prefix
      * answered here while the rest waits for main splits one pipeline's replies into two writes; the
@@ -679,18 +688,38 @@ int fastGetSpeculateBatch(client *c, int tid) {
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break; /* the trailing partial */
-        if (p->cmd != kind_cmd || !fastGetKindArgcOk(kind, p->argc)) return 0;
+        if (p->cmd != kind_cmd || !fastGetKindArgcOk(kind, p->argc)) return 1;
     }
 
     /* In cluster mode only a command this node answers without a redirect: the same check main runs, on
      * cluster state main changes only outside the read phase. A slot being migrated or imported needs
      * key-by-key checks and a possible ASK or TRYAGAIN, so its commands go to main. With per-slot stats
      * on, main runs every command so the stats count it. */
-    if (server.cluster_enabled && server.cluster_slot_stats_enabled) return 0;
-    if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 0;
+    if (server.cluster_enabled && server.cluster_slot_stats_enabled) return 1;
+    if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 1;
 
     /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
-    if (!(atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire) & (1 << kind))) return 0;
+    if (!(atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire) & (1 << kind))) return 1;
+
+    *kind_out = kind;
+    return 0;
+}
+
+/* Called from the IO thread after parsing is complete. Executes a contiguous
+ * prefix of GET commands, using batched incremental finds to overlap memory
+ * prefetches across keys before replying in command order.
+ *
+ * REPLY ORDERING: all speculative replies are written into c->buf BEFORE the
+ * main thread processes any punted command, whose replies append after.
+ *
+ * Returns the number of commands speculatively completed. */
+int fastGetSpeculateBatch(client *c, int tid) {
+    int speculated = 0;
+    int kind;
+
+    if (fastGetReadGated(c, &kind)) return 0;
+    struct serverCommand *kind_cmd = c->parsed_cmd;
+    int kind_argc = fastget_kind_argc[kind];
 
     /* Time the batch for commandstats parity: speculated commands bypass call(),
      * so their duration must be accumulated per-thread and folded into the
