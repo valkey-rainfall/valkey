@@ -1952,9 +1952,12 @@ static int fpBlockedOnKeys(void) {
  * fastpathStreamParallelAllowed. Every condition is changed only by main, between phases or by a
  * command main runs, so a caller that runs commands on main between lane phases asks again after
  * each one. */
+static int fp_test_nlanes; /* unit tests: lane count without a lane executor */
+
 static int fpParallelVeto(int role) {
     if (!(role == FP_PAR_CLIENTS ? server.io_threads_parallel_writes : server.cron_lanes)) return FP_VETO_OFF;
-    if (fpDepth() != 0 || !stagedApplyReady() || stagedLaneCount() < 2) return FP_VETO_NOT_STAGED;
+    int lanes = fp_test_nlanes ? fp_test_nlanes : (stagedApplyReady() ? stagedLaneCount() : 0);
+    if (fpDepth() != 0 || lanes < 2) return FP_VETO_NOT_STAGED;
     if (!server.cluster_enabled && !server.keyspace_shard_bits) return FP_VETO_UNSPLIT;
     if (role == FP_PAR_MAINT) return FP_VETO_NONE;
     /* An exporting slot's writes reach its export job through the replay, but keep the cutover simple. */
@@ -2022,6 +2025,7 @@ int fastpathStagedLanesWillRun(void) {
 }
 
 void testOnlyFastpathSetLanes(int nlanes) {
+    fp_test_nlanes = nlanes;
     fp_lane_main = 0;
     fp_nlanes = nlanes;
     fp_lanes_iter = nlanes >= 2 && fpLanesAllowed();
