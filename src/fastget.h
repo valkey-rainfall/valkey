@@ -91,6 +91,11 @@ void fastGetRefreshMainGate(void);
  * tid = IO thread index (1..N-1). */
 int fastGetSpeculateBatch(struct client *c, int tid);
 
+/* Test seam: the pointer the value prefetch stage issues a prefetch for, given the
+ * keyspace object o (a RAW string, its sds outside the object), or NULL when
+ * the stage issues no prefetch for it (EMBSTR and INT values, other types). */
+char *fastGetValueToPrefetch(const robj *o);
+
 /* IO thread, after fastGetSpeculateBatch: free the argv of the speculated
  * commands, advance the command queue and count them per thread. */
 void fastGetConsumeSpeculated(struct client *c, int count, int tid);

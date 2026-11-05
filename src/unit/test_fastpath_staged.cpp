@@ -891,3 +891,87 @@ TEST_F(FastpathStagedTest, ClientReadmittedAfterPauseIsFreedOnClose) {
     if (!freed) freeClient(c);
 }
 
+
+/* One pipelined read of GETs over values of every storage the batch's value stage distinguishes:
+ * embedded (EMBSTR, up to 97 bytes with a 16-byte key), a separate sds (RAW, from 98 bytes), INT, a
+ * missing key and an oversize value (above FASTGET_MAX_SPECULATIVE_VALUE_LEN, which punts). The
+ * replies must be the stored values in command order whether the stage prefetched them or not, and
+ * the GETs before the first punt are answered in the read phase. */
+TEST_F(FastpathStagedTest, FastGetAnswersEmbeddedAndSeparateValuesInOnePipeline) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    fastGetRecomputeSpecAclOk(c);
+
+    const size_t lens[] = {1, 16, 44, 45, 89, 90, 97, 98, 100, 255, 256, 512, 1024};
+    std::vector<std::string> get, reply; /* one GET command and its expected reply per key */
+    std::string sets, gets, expected;
+    auto keyOf = [](size_t len) { /* 16 bytes, like the benchmark keys */
+        std::string n = std::to_string(len);
+        return "vp:" + std::string(13 - n.size(), '0') + n;
+    };
+    for (size_t len : lens) {
+        std::string k = keyOf(len);
+        std::string v(len, 'a' + (len % 26));
+        sets += "*3\r\n$3\r\nSET\r\n$" + std::to_string(k.size()) + "\r\n" + k + "\r\n$" + std::to_string(len) + "\r\n" + v + "\r\n";
+        get.push_back("*2\r\n$3\r\nGET\r\n$" + std::to_string(k.size()) + "\r\n" + k + "\r\n");
+        reply.push_back("$" + std::to_string(len) + "\r\n" + v + "\r\n");
+    }
+    sets += "*3\r\n$3\r\nSET\r\n$16\r\nvp:0000000000int\r\n$5\r\n12345\r\n";
+    get.push_back("*2\r\n$3\r\nGET\r\n$16\r\nvp:0000000000int\r\n");
+    reply.push_back("$5\r\n12345\r\n");
+    for (size_t i = 0; i < get.size(); i++) gets += get[i], expected += reply[i];
+    send(peer, sets);
+    iteration();
+    std::string oks;
+    for (size_t i = 0; i < get.size(); i++) oks += "+OK\r\n";
+    ASSERT_EQ(recv(peer), oks);
+
+    /* The stored encodings are the ones the stage decides on. */
+    robj *k16 = createStringObject(keyOf(16).c_str(), 16);
+    robj *k97 = createStringObject(keyOf(97).c_str(), 16);
+    robj *k98 = createStringObject(keyOf(98).c_str(), 16);
+    robj *kint = createStringObject("vp:0000000000int", 16);
+    EXPECT_EQ(objectGetEncoding(lookupKeyRead(server.db[0], k16)), OBJ_ENCODING_EMBSTR);
+    EXPECT_EQ(objectGetEncoding(lookupKeyRead(server.db[0], k97)), OBJ_ENCODING_EMBSTR);
+    EXPECT_EQ(objectGetEncoding(lookupKeyRead(server.db[0], k98)), OBJ_ENCODING_RAW);
+    EXPECT_EQ(objectGetEncoding(lookupKeyRead(server.db[0], kint)), OBJ_ENCODING_INT);
+    decrRefCount(k16);
+    decrRefCount(k97);
+    decrRefCount(k98);
+    decrRefCount(kint);
+
+    /* All found and all within the size limit: the whole pipeline is answered in the read phase. */
+    send(peer, gets);
+    readPhase();
+    EXPECT_EQ(recv(peer), expected);
+    EXPECT_EQ(c->fp_inflight, 0u);
+    writeAndReplyPhases();
+
+    /* The same pipeline with a miss in the middle and an oversize value at the end: the GETs up to the
+     * miss are answered in the read phase, the rest by main, and the replies stay in order. */
+    std::string big(1024 + 1, 'z'); /* FASTGET_MAX_SPECULATIVE_VALUE_LEN is 1024 */
+    send(peer, "*3\r\n$3\r\nSET\r\n$16\r\nvp:0000000000big\r\n$" + std::to_string(big.size()) + "\r\n" + big + "\r\n");
+    iteration();
+    ASSERT_EQ(recv(peer), "+OK\r\n");
+    const size_t miss_at = 7; /* after the 97-byte value (embedded), before the 98-byte one (separate) */
+    std::string mixed, in_read, by_main;
+    for (size_t i = 0; i < get.size(); i++) {
+        if (i == miss_at) {
+            mixed += "*2\r\n$3\r\nGET\r\n$16\r\nvp:000000000none\r\n";
+            by_main += "$-1\r\n";
+        }
+        mixed += get[i];
+        (i < miss_at ? in_read : by_main) += reply[i];
+    }
+    mixed += "*2\r\n$3\r\nGET\r\n$16\r\nvp:0000000000big\r\n";
+    by_main += "$" + std::to_string(big.size()) + "\r\n" + big + "\r\n";
+    send(peer, mixed);
+    readPhase();
+    EXPECT_EQ(recv(peer), in_read) << "the GETs before the miss are answered in the read phase";
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), by_main);
+
+    freeStaged(c, peer);
+}
+
