@@ -372,6 +372,8 @@ TEST_F(FastpathStagedTest, ReclaimWithoutControlIsSafe) {
 TEST_F(FastpathStagedTest, LanesWillRunCountsEachSegment) {
     int saved_bits = server.keyspace_shard_bits;
     int saved_min = server.io_threads_parallel_writes_min;
+    int saved_pw = server.io_threads_parallel_writes;
+    server.io_threads_parallel_writes = 1;
     int saved_batch = server.io_batch_commands;
     server.keyspace_shard_bits = 1; /* lanes need keyspace shards outside cluster mode */
     server.io_threads_parallel_writes_min = 32;
@@ -421,5 +423,6 @@ TEST_F(FastpathStagedTest, LanesWillRunCountsEachSegment) {
     freeStaged(c, peer);
     server.keyspace_shard_bits = saved_bits;
     server.io_threads_parallel_writes_min = saved_min;
+    server.io_threads_parallel_writes = saved_pw;
     server.io_batch_commands = saved_batch;
 }
