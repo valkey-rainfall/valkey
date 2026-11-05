@@ -2059,6 +2059,8 @@ struct valkeyServer {
     int module_pipe[2];                /* Pipe used to awake the event loop by module threads. */
     pid_t child_pid;                   /* PID of current child */
     int child_type;                    /* Type of current child */
+    int key_touch_paused;              /* A child or a forkless save reads the keys: lookups leave their
+                                          LRU/LFU alone. Written by main; IO threads load it atomically. */
     _Atomic(int) module_gil_acquiring; /* Indicates whether the GIL is being acquiring by the main thread. */
     _Atomic(int) module_gil_acquired;  /* Indicates if the main thread has the GIL acquired. */
     /* Networking */
@@ -3814,6 +3816,7 @@ int serverFork(int purpose);
 int hasActiveChildProcess(void);
 int isSaveInProgress(void);
 int hasActiveSaveOrChild(void);
+void updateKeyTouchPolicy(void);
 int isForkBgsaveInProgress(void);
 void resetChildState(void);
 int isMutuallyExclusiveChildType(int type);

@@ -920,9 +920,17 @@ int hasActiveSaveOrChild(void) {
     return hasActiveChildProcess() || isSaveInProgress();
 }
 
+/* A fork child would copy the pages a touch writes, and a forkless save thread reads the header word a
+ * touch writes, so while either runs a lookup leaves the key's LRU/LFU field alone. */
+void updateKeyTouchPolicy(void) {
+    __atomic_store_n(&server.key_touch_paused, hasActiveChildProcess() || isForklessSaveInProgress(),
+                     __ATOMIC_RELAXED);
+}
+
 void resetChildState(void) {
     server.child_type = CHILD_TYPE_NONE;
     server.child_pid = -1;
+    updateKeyTouchPolicy();
     server.stat_current_cow_peak = 0;
     server.stat_current_cow_bytes = 0;
     server.stat_current_cow_updated = 0;
@@ -8019,6 +8027,7 @@ int serverFork(int purpose) {
             server.stat_current_save_keys_total = dbTotalServerKeyCount();
         }
 
+        updateKeyTouchPolicy();
         updateDictResizePolicy();
         moduleFireServerEvent(VALKEYMODULE_EVENT_FORK_CHILD, VALKEYMODULE_SUBEVENT_FORK_CHILD_BORN, NULL);
     }
