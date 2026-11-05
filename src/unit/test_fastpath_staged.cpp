@@ -32,6 +32,7 @@ extern hashtableType commandSetType;
 extern dictType keylistDictType;
 void createSharedObjects(void);
 void fastGetRecomputeSpecAclOk(client *c); /* from fastget.h, declared here to avoid <stdatomic.h> in C++ */
+void fastGetRefreshMainGate(void);     /* main folds the pause, yield and failover states into one gate word */
 }
 
 static const char *st_logfile = "/dev/null";
@@ -160,6 +161,16 @@ class FastpathStagedTest : public ::testing::Test {
 
     static std::string mainBuf(client *c) {
         return std::string(c->buf, c->bufpos);
+    }
+
+    /* Run iterations until the client is freed (it leaves server.clients) or the bound is reached. */
+    static bool iterateUntilFreed(client *c, int bound) {
+        for (int i = 0; i < bound; i++) {
+            iteration();
+            freeClientsInAsyncFreeQueue();
+            if (!listSearchKey(server.clients, c)) return true;
+        }
+        return false;
     }
 
     static void freeStaged(client *c, int peer) {
@@ -651,5 +662,235 @@ TEST_F(FastpathStagedTest, ManyLeaversAreMergedInOneSortedPass) {
     }
     iteration();
     freeClientsInAsyncFreeQueue();
+}
+
+
+/* CLIENT PAUSE ALL (and FAILOVER, which pauses ALL) must hold a fast-path client's reads too. A
+ * client admitted before the pause keeps its fd on the staged poller, so without a pause gate in
+ * fastGetSpeculateBatch its GET is answered on the IO thread during the pause. Stock holds every
+ * read until unpause. This test fails on the superset binary before the fix (the read phase writes
+ * the reply) and passes after it. A read is not held by PAUSE WRITE, which the last block checks. */
+TEST_F(FastpathStagedTest, ClientPauseAllHoldsFastGet) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    fastGetRecomputeSpecAclOk(c);
+
+    send(peer, "*3\r\n$3\r\nSET\r\n$3\r\npgk\r\n$1\r\nv\r\n");
+    iteration();
+    EXPECT_EQ(recv(peer), "+OK\r\n");
+
+    /* Pause all client actions (isPausedActions reads server.paused_actions directly). */
+    server.paused_actions = PAUSE_ACTION_CLIENT_ALL;
+    fastGetRefreshMainGate();
+    send(peer, "*2\r\n$3\r\nGET\r\n$3\r\npgk\r\n");
+    readPhase();
+    EXPECT_EQ(recv(peer), ""); /* held: nothing served in the read phase while paused ALL */
+
+    /* Unpause and finish the iteration: the held GET was harvested for main and now replies. This
+     * also drains the client so the next block starts with nothing in flight (a precondition for
+     * fast GET to speculate again). */
+    server.paused_actions = 0;
+    fastGetRefreshMainGate();
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+
+    /* A read is not held by PAUSE WRITE: fast GET serves it in the read phase. */
+    server.paused_actions = PAUSE_ACTION_CLIENT_WRITE;
+    fastGetRefreshMainGate();
+    send(peer, "*2\r\n$3\r\nGET\r\n$3\r\npgk\r\n");
+    readPhase();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+
+    server.paused_actions = 0;
+    fastGetRefreshMainGate();
+    writeAndReplyPhases();
+    freeStaged(c, peer);
+}
+
+/* REPL-15: on a replica whose link is down, with replica-serve-stale-data no, a GET must be
+ * refused with -MASTERDOWN, as processCommand does on main. Fast GET must not answer it. */
+TEST_F(FastpathStagedTest, FastGetRefusesStaleDataWhenReplicaLinkIsDown) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*3\r\n$3\r\nSET\r\n$7\r\nst:rpl1\r\n$1\r\nv\r\n");
+    iteration();
+    ASSERT_EQ(recv(peer), "+OK\r\n");
+
+    sds saved_host = server.primary_host;
+    int saved_state = server.repl_state, saved_stale = server.repl_serve_stale_data;
+    server.primary_host = sdsnew("primary.example");
+    server.primary_port = 1;
+    server.repl_state = REPL_STATE_CONNECT;
+    server.repl_serve_stale_data = 0;
+
+    send(peer, "*2\r\n$3\r\nGET\r\n$7\r\nst:rpl1\r\n");
+    readPhase();
+    EXPECT_EQ(c->fp_inflight, 1u) << "the GET must reach main while the link is down";
+    EXPECT_EQ(recv(peer), "") << "fast GET served stale data";
+    writeAndReplyPhases();
+    std::string got = recv(peer);
+    EXPECT_EQ(got.compare(0, 11, "-MASTERDOWN"), 0) << "reply was: " << got;
+
+    sdsfree(server.primary_host);
+    server.primary_host = saved_host;
+    server.repl_state = saved_state;
+    server.repl_serve_stale_data = saved_stale;
+    freeStaged(c, peer);
+}
+
+/* A transaction or a WATCH sends the client to main (MULTI, WATCH, EXEC and UNWATCH are not fast-path
+ * commands). Once the transaction is over and nothing is watched, the client is as eligible as it was
+ * before, so main readmits it at handoff, exactly as it does after SELECT. The control case runs first
+ * to prove the harness readmits. */
+TEST_F(FastpathStagedTest, ClientRejoinsAfterSelect) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.fastpath, 1u) << "control: a SELECT client is readmitted at handoff";
+    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE);
+    freeStaged(c, peer);
+}
+
+TEST_F(FastpathStagedTest, ClientRejoinsAfterTransactionEnds) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$4\r\nst:t\r\n$1\r\n1\r\n*1\r\n$4\r\nEXEC\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.multi, 0u);
+    EXPECT_EQ(c->flag.fastpath, 1u) << "a client whose EXEC finished must rejoin the fast path";
+    freeStaged(c, peer);
+}
+
+TEST_F(FastpathStagedTest, ClientRejoinsAfterUnwatch) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$5\r\nWATCH\r\n$4\r\nst:w\r\n*1\r\n$7\r\nUNWATCH\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.fastpath, 1u) << "a client that watches nothing any more must rejoin the fast path";
+    freeStaged(c, peer);
+}
+
+/* While a key is watched or the transaction is open the client must stay on main: WATCH needs
+ * touchWatchedKey from main and MULTI queues commands there. */
+TEST_F(FastpathStagedTest, ClientStaysOnMainWhileWatchingOrInMulti) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$5\r\nWATCH\r\n$4\r\nst:w\r\n");
+    iteration();
+    EXPECT_EQ(c->flag.fastpath, 0u) << "a client with a watched key is not readmitted";
+    EXPECT_EQ(fastpathEligible(c), 0);
+    unwatchAllKeys(c);
+    EXPECT_EQ(fastpathEligible(c), 1) << "nothing watched any more: eligible again";
+    c->flag.multi = 1;
+    EXPECT_EQ(fastpathEligible(c), 0) << "an open MULTI keeps the client on main";
+    c->flag.multi = 0;
+    close(peer);
+    freeClient(c);
+}
+
+/* N1: main hands batched entries back (fpMustRunOnMain: a forkless save, a pause, a failover, a
+ * throttler ...) while the client has a trailing partial command whose "*N" header is parsed but no
+ * argument yet (argc 0, multibulklen > 0). The partial's argv must survive the requeue: the parser
+ * continues into c->argv without allocating it again. Here a failover in progress makes main return
+ * the entries; on S1 the partial's argv is dropped and the next parse writes through a NULL argv. */
+TEST_F(FastpathStagedTest, RequeueKeepsTrailingPartialWithNoArgumentYet) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*2\r\n$4\r\nPING\r\n$1\r\na\r\n*2\r\n$4\r\nPING\r\n$1\r\nb\r\n*2\r\n$4\r\n");
+    readPhase();
+    /* The trailing partial: header and first bulk length parsed, no argument yet. */
+    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE);
+    EXPECT_EQ(c->argc, 0);
+    EXPECT_EQ(c->multibulklen, 2);
+    EXPECT_EQ(c->bulklen, 4);
+    ASSERT_NE(c->argv, nullptr);
+
+    server.failover_state = FAILOVER_WAIT_FOR_SYNC; /* fpMustRunOnMain: every entry is requeued */
+    writeAndReplyPhases();
+    server.failover_state = NO_FAILOVER;
+    std::string out = recv(peer) + mainBuf(c);
+    EXPECT_EQ(out, "$1\r\na\r\n$1\r\nb\r\n");
+    /* The parser state and its argv still go together, wherever the client is now. */
+    EXPECT_EQ(c->multibulklen, 2);
+    ASSERT_TRUE(c->multibulklen == 0 || c->argv != nullptr)
+        << "partial parse state with a NULL argv: the next read writes through it";
+
+    c->bufpos = 0;
+    send(peer, "PING\r\n$1\r\nc\r\n");
+    if (c->flag.fastpath) {
+        iteration();
+    } else {
+        readQueryFromClient(c->conn);
+    }
+    out = recv(peer) + mainBuf(c);
+    EXPECT_EQ(out, "$1\r\nc\r\n");
+    EXPECT_EQ(c->multibulklen, 0);
+    if (c->flag.fastpath) {
+        freeStaged(c, peer);
+    } else {
+        close(peer);
+        freeClient(c);
+    }
+}
+
+/* A client that closes while its last bytes are still unread: the peer's data and its close arrive
+ * before the poller reports the fd, so one edge-triggered report carries both. The read phase must
+ * read the bytes and still notice the close, or the client stays registered forever: no new edge
+ * ever comes for a socket whose state no longer changes. */
+TEST_F(FastpathStagedTest, TrailingBytesAndCloseInOneEdgeFreeTheClient) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk1\r\n$1\r\n1\r\n");
+    iteration();
+    EXPECT_EQ(recv(peer), "+OK\r\n");
+
+    /* The header of a second command with no argument yet, then the close, with no read phase
+     * between them: the fd reports readable and hung up in one edge. */
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk1\r\n");
+    close(peer);
+    bool freed = iterateUntilFreed(c, 4);
+    EXPECT_TRUE(freed) << "closed client with a trailing partial was never freed; fastpath_clients="
+                       << fastpathClientCount();
+    EXPECT_EQ(fastpathClientCount(), 0u);
+    if (!freed) freeClient(c);
+}
+
+/* The same close after the client went to main under CLIENT PAUSE and came back: the paused command is
+ * postponed on main, runs at unpause, and the quiescent client is readmitted to the fast path with
+ * a fresh poller registration. The close must still be noticed. */
+TEST_F(FastpathStagedTest, ClientReadmittedAfterPauseIsFreedOnClose) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk2\r\n$1\r\n1\r\n");
+    readPhase();
+
+    /* Pause all actions: the batch is requeued and the client leaves for main, where the postponed
+     * SET blocks it (BLOCKED_POSTPONE). */
+    server.paused_actions = PAUSE_ACTION_CLIENT_ALL;
+    fastGetRefreshMainGate();
+    writeAndReplyPhases();
+    EXPECT_EQ(c->flag.fastpath, 0u) << "client should have been handed back to main under pause";
+    EXPECT_EQ(c->flag.blocked, 1u);
+
+    /* Unpause and run the deferred re-processing, as beforeSleep does: the SET runs on main and the
+     * quiescent client rejoins the fast path. */
+    server.paused_actions = 0;
+    fastGetRefreshMainGate();
+    unblockPostponedClients();
+    processUnblockedClients();
+    EXPECT_EQ(c->flag.blocked, 0u);
+    ASSERT_EQ(c->flag.fastpath, 1u) << "control: a quiescent client is readmitted after unpause";
+    EXPECT_EQ(recv(peer) + mainBuf(c), "+OK\r\n");
+
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nlkk2\r\n");
+    close(peer);
+    bool freed = iterateUntilFreed(c, 4);
+    EXPECT_TRUE(freed) << "readmitted client that closed was never freed; fastpath_clients="
+                       << fastpathClientCount();
+    EXPECT_EQ(fastpathClientCount(), 0u);
+    if (!freed) freeClient(c);
 }
 
