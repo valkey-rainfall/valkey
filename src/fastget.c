@@ -213,9 +213,10 @@ static int fastGetWriteRaw(client *c, const char *s, size_t len) {
 /* --- LRU/LFU touch ---
  * A key answered here is touched as lookupKey touches it on main. Other IO threads may touch the same
  * object in the same read phase, so the reader swaps the 32-bit word holding type, encoding and the
- * LRU/LFU field only if the word is still what it read: a lost race drops one touch, never undoes
- * another. Main changes objects, the LRU clock and the policy only outside the read phase, so what
- * fastGetTouchBegin reads holds for the whole read. */
+ * LRU/LFU field only if the word is still what it read: an LRU touch that loses the race is dropped,
+ * since the winner wrote the same clock, and an LFU touch is retried. Main changes objects, the LRU
+ * clock and the policy only outside the read phase, so what fastGetTouchBegin reads holds for the
+ * whole read. */
 
 /* The lru field's bits within the object's first 32-bit word, or 0 when type, encoding and lru do not
  * fill exactly that word. */
@@ -274,14 +275,19 @@ static void fastGetTouchBegin(client *c) {
     fastget_touch.lru_word = (clock << fastget_touch.shift) & m;
 }
 
+/* An LFU touch that loses the swap to another thread's touch is applied again on top of that one, with
+ * the same random draw, so concurrent touches add up as they would one after another on main. */
 static __attribute__((noinline, cold)) void fastGetTouchLfu(robj *o) {
     uint32_t *word = (uint32_t *)(void *)o;
     uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
-    uint32_t lfu = (seen & fastget_touch.mask) >> fastget_touch.shift;
-    uint32_t next = lrulfu_touchWithRandom(lfu, fastGetTouchRandom());
-    if (next == lfu) return;
-    uint32_t touched = (seen & ~fastget_touch.mask) | ((next << fastget_touch.shift) & fastget_touch.mask);
-    __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    double r = fastGetTouchRandom();
+    for (;;) {
+        uint32_t lfu = (seen & fastget_touch.mask) >> fastget_touch.shift;
+        uint32_t next = lrulfu_touchWithRandom(lfu, r);
+        if (next == lfu) return;
+        uint32_t touched = (seen & ~fastget_touch.mask) | ((next << fastget_touch.shift) & fastget_touch.mask);
+        if (__atomic_compare_exchange_n(word, &seen, touched, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    }
 }
 
 /* Touch a key answered on this thread. Under LRU a key already at the current clock is left unwritten,
