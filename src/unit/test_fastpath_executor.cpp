@@ -10,6 +10,7 @@
  * cannot fault, and origin data must still be intact. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -49,11 +50,11 @@ class FastpathExecutorTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
-        ACLInit();
+        unitTestPopulateCommandTable();
+        unitTestACLInit();
 
         server.dbnum = 1;
         server.db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *)));
@@ -83,7 +84,7 @@ class FastpathExecutorTest : public ::testing::Test {
         server.io_threads_fast_path = 1;
         server.io_threads_strict_offload = 1;
         server.io_batch_commands = 16;
-        connTypeInitialize();
+        unitTestConnTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
         fastpathInitThread(1);
@@ -94,6 +95,7 @@ class FastpathExecutorTest : public ::testing::Test {
         fastpathFreeThread(1);
         testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
+        unitTestDeleteEventLoop();
     }
 
     void SetUp() override {

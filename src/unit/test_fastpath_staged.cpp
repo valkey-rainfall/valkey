@@ -10,6 +10,7 @@
  * the reply barrier. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <cstring>
 #include <string>
@@ -49,11 +50,11 @@ class FastpathStagedTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
-        ACLInit();
+        unitTestPopulateCommandTable();
+        unitTestACLInit();
 
         server.dbnum = 1;
         server.db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *)));
@@ -84,7 +85,7 @@ class FastpathStagedTest : public ::testing::Test {
         server.io_threads_fast_path = 1;
         server.io_threads_strict_offload = 1;
         server.io_batch_commands = 16;
-        connTypeInitialize();
+        unitTestConnTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
         fastpathInitThread(1);
@@ -95,6 +96,7 @@ class FastpathStagedTest : public ::testing::Test {
         fastpathFreeThread(1);
         testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
+        unitTestDeleteEventLoop();
     }
 
     void SetUp() override {
@@ -385,13 +387,16 @@ TEST_F(FastpathStagedTest, LanesWillRunCountsEachSegment) {
     int peer;
     client *c = newStagedClient(&peer);
     const std::string ping = "*1\r\n$4\r\nPING\r\n";
-    const std::string barrier = "*2\r\n$4\r\nINCR\r\n$4\r\nst:w\r\n"; /* not a lane command here */
+    /* A command that is never a lane command (not in fp_lane_commands), so it is a barrier whether or
+     * not an earlier suite in this process marked the lane commands (fpMarkLaneCommands runs once per
+     * process). SETBIT that leaves a clear bit clear replies :0 every time. */
+    const std::string barrier = "*4\r\n$6\r\nSETBIT\r\n$4\r\nst:w\r\n$1\r\n0\r\n$1\r\n0\r\n";
 
     /* 50 lane entries, every run between barriers 5 long. */
     std::string req, expect;
     for (int i = 1; i <= 10; i++) {
         req += barrier;
-        expect += ":" + std::to_string(i) + "\r\n";
+        expect += ":0\r\n";
         for (int j = 0; j < 5; j++) {
             req += ping;
             expect += "+PONG\r\n";
@@ -409,13 +414,13 @@ TEST_F(FastpathStagedTest, LanesWillRunCountsEachSegment) {
     req.clear();
     expect.clear();
     req += barrier;
-    expect += ":11\r\n";
+    expect += ":0\r\n";
     for (int j = 0; j < 32; j++) {
         req += ping;
         expect += "+PONG\r\n";
     }
     req += barrier;
-    expect += ":12\r\n";
+    expect += ":0\r\n";
     send(peer, req);
     testOnlyFastpathSetLanes(2);
     readPhase();
