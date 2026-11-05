@@ -40,6 +40,7 @@ proc fps_read {s} {
 }
 
 start_server {tags {"fastpath external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes save ""}} {
+    r client setname fp-control
     r select 0
     r set k v
 

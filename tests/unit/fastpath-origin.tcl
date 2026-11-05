@@ -706,6 +706,7 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         set replica_port [srv 0 port]
         # Fast-path raw clients live on db 0; align the master/replica control clients so their
         # reads and WAIT see the same keyspace and offset.
+        $master client setname fp-control
         $master select 0
         $replica select 0
 
