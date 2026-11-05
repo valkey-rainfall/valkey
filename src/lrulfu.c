@@ -1,5 +1,5 @@
 #include "lrulfu.h"
-#include <stdlib.h>
+#include <time.h>
 
 static const uint32_t LRULFU_MASK = (1 << LRULFU_BITS) - 1;
 
@@ -129,8 +129,28 @@ static uint32_t lfu_touchWithRandom(uint32_t lfu, double r) {
     return lfu_import(freq);
 }
 
+/* xorshift64*, one generator per thread: lane threads touch keys too, and rand() is process-wide. */
+static _Thread_local uint64_t lrulfu_rng = 0;
+
+static double lrulfu_random(void) {
+    uint64_t x = lrulfu_rng;
+    if (x == 0) {
+        /* splitmix64 of the thread's state address and the time: distinct per thread. */
+        x = (uint64_t)(uintptr_t)&lrulfu_rng ^ ((uint64_t)time(NULL) << 32);
+        x += UINT64_C(0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)) * UINT64_C(0x94D049BB133111EB);
+        x = (x ^ (x >> 31)) | 1;
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    lrulfu_rng = x;
+    return (double)((x * UINT64_C(0x2545F4914F6CDD1D)) >> 11) / (double)(UINT64_C(1) << 53);
+}
+
 uint32_t lfu_touch(uint32_t lfu) {
-    return lfu_touchWithRandom(lfu, (double)rand() / RAND_MAX);
+    return lfu_touchWithRandom(lfu, lrulfu_random());
 }
 
 
