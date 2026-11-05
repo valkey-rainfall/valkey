@@ -71,6 +71,8 @@ start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly
 }
 
 start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly yes appendfsync everysec io-threads 4 io-threads-always-active yes save ""}} {
+    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    r client setname fp-control
     r select 0
     waitForBgrewriteaof r
     proc fpa_speculated {} { getInfoProperty [r info fastpath] fastpath_speculated }

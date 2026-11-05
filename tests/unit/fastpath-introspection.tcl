@@ -19,7 +19,11 @@ proc fpi_read_reply {fd} {
     switch -- [string index $line 0] {
         {$} {
             if {$line eq {$-1}} { return {(nil)} }
-            return [gets $fd]
+            # The channel reads CRLF as a line end: gather lines until the bulk's bytes are in.
+            set len [string range $line 1 end]
+            set out [gets $fd]
+            while {[string length $out] < $len} { append out "\r\n" [gets $fd] }
+            return $out
         }
         {*} {
             set out {}
@@ -63,6 +67,8 @@ proc fpi_client_field {fd field} {
 }
 
 start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
+    # A named client stays off the fast path.
+    r client setname fpi-control
     r select 0
 
     test {CLIENT LIST cmd= names the last command a fast-path client ran} {
@@ -85,6 +91,31 @@ start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides 
         assert_morethan [fpi_info_field fastpath fastpath_speculated] $spec
         assert_equal get [fpi_client_field $fd cmd]
         assert_equal 1 [fpi_info_field fastpath fastpath_clients]
+        close $fd
+        fpi_wait_fastpath_clients 0
+    }
+}
+
+start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
+    # A named client stays off the fast path.
+    r client setname fpi-control
+    r select 0
+
+    test {INFO fastpath_clients counts the fast-path client that asks} {
+        set fd [fpi_socket]
+        puts -nonewline $fd [fpi_resp set fpi:k 1]
+        flush $fd
+        assert_equal {+OK} [fpi_read_reply $fd]
+        fpi_wait_fastpath_clients 1
+        puts -nonewline $fd [fpi_resp info fastpath]
+        flush $fd
+        assert_equal 1 [getInfoProperty [fpi_read_reply $fd] fastpath_clients]
+        # It rejoins after INFO, and asks again.
+        fpi_wait_fastpath_clients 1
+        puts -nonewline $fd "[fpi_resp incr fpi:k][fpi_resp info fastpath]"
+        flush $fd
+        assert_equal {:2} [fpi_read_reply $fd]
+        assert_equal 1 [getInfoProperty [fpi_read_reply $fd] fastpath_clients]
         close $fd
         fpi_wait_fastpath_clients 0
     }

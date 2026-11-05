@@ -279,6 +279,9 @@ static list *fp_staged_closing = NULL;
 static list fp_staged_clients;
 static _Thread_local int fp_cur_tid = 0; /* thread running the current staged phase; 0 is main */
 static size_t fastpath_clients = 0;      /* main thread only */
+/* Main: a fast-path client handed back to run the commands main must run, while it runs them. INFO
+ * from it still counts it, as it rejoins once they are done. */
+static client *fp_handback_client = NULL;
 static int fp_slots = 0;                 /* main thread only: 1 + highest initialized thread */
 static long long fp_retired[6];          /* main thread only: counters of threads since retired */
 
@@ -1546,7 +1549,10 @@ void fastpathHandoffDone(client *c, int closing) {
         handleParseError(c); /* replies, sets close_after_reply; the write path closes it */
         return;
     }
-    if (processPendingCommandAndInputBuffer(c) != C_OK) return;
+    fp_handback_client = c;
+    int processed = processPendingCommandAndInputBuffer(c);
+    fp_handback_client = NULL;
+    if (processed != C_OK) return;
     /* The command that sent it to main does not keep it there: it rejoins once main has nothing further
      * to do for it and it is still eligible. */
     if (!fp_staged_admit) {
@@ -1586,7 +1592,7 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_barriers:%lld\r\n"
                          "fastpath_write_serial_segments:%lld\r\n"
                          "fastpath_write_lane_prefetches:%lld\r\n",
-                         fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
+                         fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
                          fp_stat_serial_segments, fp_stat_lane_prefetches);
 }

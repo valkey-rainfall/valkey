@@ -113,6 +113,7 @@ proc lc_run_behind_sleep {ctl secs cmds} {
 
 start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 16} [r config get io-threads]
+    r client setname fp-control
     r select 0
 
     test {Lifecycle: io-threads 16 -> 1 keeps active fast-path clients and their reply order} {
@@ -200,6 +201,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
 
 start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 4} [r config get io-threads]
+    r client setname fp-control
     r select 0
 
     test {Lifecycle: disabling the fast path transitions existing fast-path clients} {
@@ -420,6 +422,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
 
 start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
     test {Lifecycle: shutdown under active fast-path traffic exits cleanly} {
+        r client setname fp-control
         r select 0
         set clients {}
         for {set i 0} {$i < 8} {incr i} {
@@ -477,6 +480,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
 }
 
 start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 1 io-threads-always-active yes}} {
+    r client setname fp-control
     test {Lifecycle: a client whose command is still arriving joins the fast path on scale-up} {
         set fd [socket [srv 0 host] [srv 0 port]]
         fconfigure $fd -translation binary -buffering none
@@ -524,6 +528,7 @@ proc lc_wait_budget {running epoll} {
 }
 
 start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
+    r client setname fp-control
     r select 0
 
     if {[lsearch -exact $::global_overrides io-threads-epoll-thread] < 0} {
@@ -579,6 +584,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
 
 start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread yes}} {
     test {Thread budget: an epoll thread that exits is logged and its IO thread comes back} {
+        r client setname fp-control
         r select 0
         lc_wait_budget 2 1
         set lines [count_log_lines 0]

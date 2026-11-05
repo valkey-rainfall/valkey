@@ -446,6 +446,7 @@ proc slo_write_acl {path rules} {
 slo_write_acl $slo_acl_file "~* &* +@all"
 
 start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3] tags {"staged-loop external:skip tls:skip logreqres:skip"}] {
+    r client setname fp-control
     r select 0
 
     test {Staged overlap: ACL LOAD narrowing a pipelining user refuses every later command} {
@@ -502,6 +503,7 @@ start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3
 }
 
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip valgrind:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
+    r client setname fp-control
     r select 0
 
     test {Staged overlap: with appendfsync always a reply never leaves before its write reaches the AOF} {
@@ -550,6 +552,7 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip valgrind:
         }
         restart_server 0 true false
         wait_done_loading r
+        r client setname fp-control
         r select 0
         set sum [expr [join $last +]]
         # The kill must have interrupted the stream for the check to mean anything.

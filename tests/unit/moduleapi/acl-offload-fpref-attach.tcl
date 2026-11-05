@@ -21,6 +21,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         "enable-module-command" "yes" "loadmodule" $modpath] tags [list acl acl-offload modules external:skip tls:skip]] {
 
     proc fpa_fpc {} { getInfoProperty [r info fastpath] fastpath_clients }
+    r client setname fpa-control
 
     test {password-authed restricted client attaches to the fast path (control)} {
         r acl setuser fpu on >pw ~h:* +@read +@write +@connection

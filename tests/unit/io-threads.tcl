@@ -213,6 +213,8 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
 }
 
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:skip"} overrides {io-threads 5}} {
+    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    r client setname fp-control
     proc fastpath_clients {} {
         regexp {fastpath_clients:(\d+)} [r info fastpath] -> n
         return $n
@@ -573,6 +575,8 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
 }
 
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:skip"} overrides {io-threads 5}} {
+    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    r client setname fp-control
     proc fastpath_count {} {
         return [getInfoProperty [r info fastpath] fastpath_clients]
     }
