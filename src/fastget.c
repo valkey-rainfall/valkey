@@ -201,6 +201,89 @@ static long long fastGetCommandlogThreshold(int type) {
     return server.commandlog[type].threshold;
 }
 
+/* --- Slow commandlog ---
+ * A command answered here takes the average time of its read's commands, as in commandstats. One whose
+ * time reaches the slow threshold gets its commandlog entry built here; main adds it in the next fold. */
+typedef struct fastGetSlowlog {
+    pthread_mutex_t lock;
+    void **entries;
+    int *types;
+    int n, cap;
+} __attribute__((aligned(CACHE_LINE_SIZE))) fastGetSlowlog;
+
+static fastGetSlowlog fastget_slowlog[FASTGET_MAX_IO_THREADS];
+static _Atomic int fastget_slowlog_pending = 0; /* some thread has entries for main */
+static pthread_once_t fastget_slowlog_once = PTHREAD_ONCE_INIT;
+
+static void fastGetSlowlogInit(void) {
+    for (int i = 0; i < FASTGET_MAX_IO_THREADS; i++) pthread_mutex_init(&fastget_slowlog[i].lock, NULL);
+}
+
+/* IO thread: build the entries of one answered command that took usec. */
+static void fastGetSlowlogCommand(client *c, int tid, struct serverCommand *cmd, robj **argv, int argc, size_t input_bytes, long long usec) {
+    robj **saved_argv = c->argv;
+    int saved_argc = c->argc;
+    long saved_duration = c->duration;
+    unsigned long long saved_in = c->net_input_bytes_curr_cmd, saved_out = c->net_output_bytes_curr_cmd;
+    c->argv = argv;
+    c->argc = argc;
+    c->duration = usec;
+    /* Under their thresholds, or the command would have gone to main: only the slow entry is built. */
+    c->net_input_bytes_curr_cmd = input_bytes;
+    c->net_output_bytes_curr_cmd = 0;
+    void *entries[COMMANDLOG_TYPE_NUM];
+    int types[COMMANDLOG_TYPE_NUM];
+    int n = commandlogPrepareCurrentCommand(c, cmd, entries, types);
+    c->argv = saved_argv;
+    c->argc = saved_argc;
+    c->duration = saved_duration;
+    c->net_input_bytes_curr_cmd = saved_in;
+    c->net_output_bytes_curr_cmd = saved_out;
+    if (n == 0) return;
+    pthread_once(&fastget_slowlog_once, fastGetSlowlogInit);
+    fastGetSlowlog *log = &fastget_slowlog[tid];
+    pthread_mutex_lock(&log->lock);
+    if (log->n + n > log->cap) {
+        log->cap = log->cap ? log->cap * 2 : 16;
+        if (log->cap < log->n + n) log->cap = log->n + n;
+        log->entries = zrealloc(log->entries, sizeof(void *) * log->cap);
+        log->types = zrealloc(log->types, sizeof(int) * log->cap);
+    }
+    for (int i = 0; i < n; i++) {
+        log->entries[log->n] = entries[i];
+        log->types[log->n] = types[i];
+        log->n++;
+    }
+    pthread_mutex_unlock(&log->lock);
+    atomic_store_explicit(&fastget_slowlog_pending, 1, memory_order_release);
+}
+
+/* IO thread, after a read's commands were answered in usec: log those the slow threshold catches. */
+static void fastGetSlowlogRead(client *c, int tid, int kind, int speculated, long long usec) {
+    long long threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW);
+    if (threshold < 0 || usec < threshold * speculated) return;
+    long long each = usec / speculated;
+    if (each < threshold) return;
+    struct serverCommand *cmd = fastGetKindCmd(kind);
+    if (c->read_flags & READ_FLAGS_FASTGET_SPECULATED)
+        fastGetSlowlogCommand(c, tid, cmd, c->argv, c->argc, c->net_input_bytes_curr_cmd, each);
+    cmdQueue *queue = &c->cmd_queue;
+    for (int i = queue->off; i < queue->len; i++) {
+        parsedCommand *p = &queue->cmds[i];
+        if (!(p->read_flags & READ_FLAGS_FASTGET_SPECULATED)) break;
+        fastGetSlowlogCommand(c, tid, cmd, p->argv, p->argc, p->input_bytes, each);
+    }
+}
+
+/* Main: add the entries built on thread tid to the commandlog. */
+static void fastGetSlowlogDrain(int tid) {
+    fastGetSlowlog *log = &fastget_slowlog[tid];
+    pthread_mutex_lock(&log->lock);
+    for (int i = 0; i < log->n; i++) commandlogPushPrepared(log->entries[i], log->types[i]);
+    log->n = 0;
+    pthread_mutex_unlock(&log->lock);
+}
+
 /* Write a short fixed reply into the client's buffer. Returns 0 if it does not fit. */
 static int fastGetWriteRaw(client *c, const char *s, size_t len) {
     if (len > c->buf_usable_size - c->bufpos) return 0;
@@ -503,8 +586,10 @@ static int fastGetSpeculateMget(client *c, int tid, monotime spec_start) {
     }
     /* fastGetConsumeSpeculated counts one keyspace hit per command; an MGET hit every key. */
     fastget_thread_stats[tid].keyspace_hits += keys - speculated;
+    long long usec = (long long)(getMonotonicUs() - spec_start);
     fastget_thread_stats[tid].calls[FASTGET_KIND_MGET] += speculated;
-    fastget_thread_stats[tid].usec[FASTGET_KIND_MGET] += (long long)(getMonotonicUs() - spec_start);
+    fastget_thread_stats[tid].usec[FASTGET_KIND_MGET] += usec;
+    fastGetSlowlogRead(c, tid, FASTGET_KIND_MGET, speculated, usec);
     return speculated;
 }
 
@@ -602,10 +687,6 @@ int fastGetSpeculateBatch(client *c, int tid) {
     /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
     if (!(atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire) & (1 << kind))) return 0;
 
-    /* With a slow threshold of 0 the commandlog records every command, so every command goes to main,
-     * which records it. Large requests and replies are checked per command. */
-    if (fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
-
     /* Time the batch for commandstats parity: speculated commands bypass call(),
      * so their duration must be accumulated per-thread and folded into the
      * command's microseconds by fastGetAggregateStats (as with calls). */
@@ -691,8 +772,10 @@ int fastGetSpeculateBatch(client *c, int tid) {
 
     /* Commandstats parity: fold calls and execution time into the per-thread counters. */
     if (speculated > 0) {
+        long long usec = (long long)(getMonotonicUs() - spec_start);
         fastget_thread_stats[tid].calls[kind] += speculated;
-        fastget_thread_stats[tid].usec[kind] += (long long)(getMonotonicUs() - spec_start);
+        fastget_thread_stats[tid].usec[kind] += usec;
+        fastGetSlowlogRead(c, tid, kind, speculated, usec);
     }
     return speculated;
 }
@@ -757,9 +840,9 @@ void fastGetConsumeSpeculated(client *c, int count, int tid) {
 }
 
 /* Main: fold the per-thread counts of GETs answered on IO threads into stat_numcommands,
- * stat_keyspace_hits and GET's commandstats. Runs in beforeSleep, and also before CONFIG RESETSTAT
- * zeroes the stats and before INFO renders them, so a reset clears pending counts and a read includes
- * them. */
+ * stat_keyspace_hits and GET's commandstats, and add their slow commandlog entries. Runs in beforeSleep,
+ * and also before CONFIG RESETSTAT zeroes the stats and before INFO renders them, so a reset clears
+ * pending counts and a read includes them. */
 void fastGetAggregateStats(void) {
     /* IO threads only ever increase their counters; main folds the growth since its last snapshot.
      * Zeroing a counter from main would race an IO thread's increment and lose counts, while a stale
@@ -771,6 +854,11 @@ void fastGetAggregateStats(void) {
     /* Threads retired by lowering io-threads keep their last counts, so fold every thread ever started. */
     static int threads_seen = 0;
     if (server.io_threads_num > threads_seen) threads_seen = server.io_threads_num;
+    /* Cleared before the drains, so entries added meanwhile set it again for the next fold. */
+    if (atomic_load_explicit(&fastget_slowlog_pending, memory_order_relaxed) &&
+        atomic_exchange_explicit(&fastget_slowlog_pending, 0, memory_order_acq_rel)) {
+        for (int i = 0; i < threads_seen; i++) fastGetSlowlogDrain(i);
+    }
     for (int i = 0; i < threads_seen; i++) {
         long long n = fastget_thread_stats[i].commands_processed;
         if (n > seen_n[i]) {

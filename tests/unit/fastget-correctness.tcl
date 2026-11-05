@@ -414,3 +414,56 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
         }
     }
 }
+
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    test {Reads answered on the reading thread reach the slow commandlog, and a threshold of 0 keeps them there} {
+        r set sl:k v
+        r set sl:m v
+        r config set io-threads-speculate-reads yes
+        set rd [fastget_client]
+        ensure_engaged r $rd sl:k
+        r config set slowlog-max-len 1000
+        r config set slowlog-log-slower-than 0
+        r slowlog reset
+        set before [fastget_speculated r]
+        for {set i 0} {$i < 20} {incr i} { $rd get sl:k }
+        for {set i 0} {$i < 20} {incr i} { assert_equal v [$rd read] }
+        for {set i 0} {$i < 10} {incr i} { $rd mget sl:k sl:m }
+        for {set i 0} {$i < 10} {incr i} { assert_equal {v v} [$rd read] }
+        # A threshold of 0 still leaves the reads on the reading thread.
+        assert_equal 30 [expr {[fastget_speculated r] - $before}]
+        set gets 0
+        set mgets 0
+        wait_for_condition 50 20 {
+            [llength [r slowlog get -1]] >= 32
+        } else {
+            fail "the reads were not slow-logged"
+        }
+        foreach e [r slowlog get -1] {
+            set args [lindex $e 3]
+            if {$args eq {get sl:k}} {
+                incr gets
+                assert_match {127.0.0.1:*} [lindex $e 4]
+            } elseif {$args eq {mget sl:k sl:m}} {
+                incr mgets
+            }
+        }
+        assert_equal 20 $gets
+        assert_equal 10 $mgets
+
+        # A threshold no read reaches logs none of them.
+        r config set slowlog-log-slower-than 10000000
+        r slowlog reset
+        set before [fastget_speculated r]
+        for {set i 0} {$i < 20} {incr i} { $rd get sl:k }
+        for {set i 0} {$i < 20} {incr i} { assert_equal v [$rd read] }
+        assert_equal 20 [expr {[fastget_speculated r] - $before}]
+        r ping
+        assert_equal 0 [r slowlog len]
+        $rd close
+        r config set slowlog-log-slower-than 10000
+        r config set io-threads-speculate-reads no
+    }
+}
