@@ -108,6 +108,19 @@ int commandlogPrepareCurrentCommand(client *c, struct serverCommand *cmd, void *
     return n;
 }
 
+/* A parallel write lane's command whose parts ran on several lanes: the entry for the whole command,
+ * built by main from arguments already formatted as an entry keeps them. Takes argv. */
+void *commandlogNewEntryFromArgv(client *c, robj **argv, int argc, long long value) {
+    commandlogEntry *ce = zmalloc(sizeof(*ce));
+    ce->argc = argc;
+    ce->argv = argv;
+    ce->time = time(NULL);
+    ce->value = value;
+    ce->peerid = sdsnew(getClientPeerId(c));
+    ce->cname = c->name ? sdsnew(objectGetVal(c->name)) : sdsempty();
+    return ce;
+}
+
 void commandlogPushPrepared(void *entry, int type) {
     commandlogEntry *ce = entry;
     ce->id = server.commandlog[type].entry_id++;
