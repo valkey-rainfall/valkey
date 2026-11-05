@@ -1,3 +1,5 @@
+source tests/support/benchmark.tcl
+
 # Fast GET read correctness: GETs executed on IO threads must return complete,
 # current values while writes, expiry churn and rehashing run on main.
 
@@ -375,5 +377,40 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
             assert_morethan [expr {[clock milliseconds] - $start}] 250
         }
         $rd close
+    }
+}
+
+proc fastget_get_calls {} {
+    if {[regexp {cmdstat_get:calls=(\d+)} [r info commandstats] -> calls]} { return $calls }
+    return 0
+}
+
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    test {Lowering io-threads under read load leaves no count of the retired threads for later} {
+        r set lo:k v
+        for {set attempt 0} {$attempt < 5} {incr attempt} {
+            r config set io-threads 4
+            set before [fastget_speculated r]
+            exec {*}[valkeybenchmark [srv 0 host] [srv 0 port] {-c 32 -P 16 -n 1000000 -q GET lo:k}] > /dev/null 2>@1 &
+            wait_for_condition 100 20 {
+                [fastget_speculated r] > $before + 10000
+            } else {
+                fail "the benchmark's reads did not run on the reading threads"
+            }
+            r config set io-threads 2
+            wait_for_condition 500 20 {
+                [s connected_clients] == 1
+            } else {
+                fail "the benchmark did not finish"
+            }
+            # Every GET above was sent before the reset, so the reset clears all of them.
+            r config resetstat
+            r config set io-threads 4
+            r ping
+            after 100
+            assert_equal 0 [fastget_get_calls]
+        }
     }
 }

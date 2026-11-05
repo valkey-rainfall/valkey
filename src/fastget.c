@@ -768,7 +768,10 @@ void fastGetAggregateStats(void) {
     static long long seen_calls[FASTGET_MAX_IO_THREADS][FASTGET_KINDS] = {{0}};
     static long long seen_usec[FASTGET_MAX_IO_THREADS][FASTGET_KINDS] = {{0}};
     static long long seen_hits[FASTGET_MAX_IO_THREADS] = {0};
-    for (int i = 0; i < server.io_threads_num; i++) {
+    /* Threads retired by lowering io-threads keep their last counts, so fold every thread ever started. */
+    static int threads_seen = 0;
+    if (server.io_threads_num > threads_seen) threads_seen = server.io_threads_num;
+    for (int i = 0; i < threads_seen; i++) {
         long long n = fastget_thread_stats[i].commands_processed;
         if (n > seen_n[i]) {
             ectx->stat_numcommands += n - seen_n[i];
