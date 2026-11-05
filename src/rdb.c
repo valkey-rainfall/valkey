@@ -4862,6 +4862,7 @@ void rdbRecordStartMetrics(int bgsave_type, int write_target) {
     server.rdb_save_time_start = time(NULL);
     server.rdb_write_target = write_target;
     server.cur_bgsave_type = bgsave_type;
+    updateKeyTouchPolicy();
 }
 
 /* Reset save timing and target state. Called after any background save or
@@ -4871,6 +4872,7 @@ void rdbClearSaveState(time_t save_end) {
     server.rdb_save_time_start = -1;
     server.rdb_write_target = RDB_WRITE_TARGET_NONE;
     server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
+    updateKeyTouchPolicy();
 }
 
 /* Record persistence metrics when a background save completes. */

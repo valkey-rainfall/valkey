@@ -501,3 +501,44 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkl
         assert_equal 200000 [r dbsize]
     }
 }
+
+# A forkless save's thread reads the header word a touch writes, so reads leave the LRU/LFU field alone
+# until the save ends, on the reading thread and on main alike, as they do while a child runs.
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkless-infrastructure-enabled yes bgsave-default-method forkless maxmemory-policy allkeys-lfu lfu-log-factor 0 lfu-decay-time 0}} {
+    r select 0
+    r config set io-threads-speculate-reads yes
+
+    test {Reads during a forkless save leave the frequency alone until the save ends} {
+        for {set i 0} {$i < 10} {incr i} { r set fln:$i v }
+        r set fln:io v
+        r set fln:main v
+        set rd [fastget_client]
+        ensure_engaged r $rd fln:0
+        # Each key takes 500 ms to save, so the save stays open for the reads below.
+        r config set rdb-key-save-delay 500000
+        r bgsave
+        assert_equal forkless [s rdb_current_bgsave_type]
+        set before [fastget_speculated r]
+        for {set i 0} {$i < 50} {incr i} { $rd get fln:io }
+        for {set i 0} {$i < 50} {incr i} { $rd read }
+        # The SELECT took this client off the fast path, so main runs its GETs through lookupKey.
+        for {set i 0} {$i < 50} {incr i} { r get fln:main }
+        assert_equal 50 [expr {[fastget_speculated r] - $before}]
+        assert_equal 1 [s rdb_bgsave_in_progress]
+        assert_equal 5 [r object freq fln:io]
+        assert_equal 5 [r object freq fln:main]
+        r config set rdb-key-save-delay 0
+        wait_for_condition 500 20 {
+            [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "the forkless save did not finish"
+        }
+        assert_equal ok [s rdb_last_bgsave_status]
+        for {set i 0} {$i < 10} {incr i} { $rd get fln:io }
+        for {set i 0} {$i < 10} {incr i} { $rd read }
+        for {set i 0} {$i < 10} {incr i} { r get fln:main }
+        $rd close
+        assert_equal 15 [r object freq fln:io]
+        assert_equal 15 [r object freq fln:main]
+    }
+}
