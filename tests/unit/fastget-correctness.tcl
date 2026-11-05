@@ -259,6 +259,28 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} maxme
         assert_equal 1 [r exists lfu:hash]
     }
 
+    test {LFU: concurrent reads of one key on several reading threads lose no increment} {
+        # lfu-log-factor 0 makes every touch an increment, so a serial server ends at exactly 5 + reads.
+        r set lfu:warm v
+        set clients {}
+        for {set j 0} {$j < 8} {incr j} {
+            set rd [fastget_client]
+            ensure_engaged r $rd lfu:warm
+            lappend clients $rd
+        }
+        set short {}
+        for {set round 0} {$round < 200} {incr round} {
+            r del lfu:contend
+            r set lfu:contend v
+            for {set i 0} {$i < 30} {incr i} { foreach rd $clients { $rd get lfu:contend } }
+            foreach rd $clients { for {set i 0} {$i < 30} {incr i} { $rd read } }
+            set freq [r object freq lfu:contend]
+            if {$freq != 245} { lappend short $freq }
+        }
+        foreach rd $clients { $rd close }
+        assert_equal {} $short
+    }
+
     test {CLIENT NO-TOUCH reads leave the frequency alone} {
         r set lfu:nt v
         set rd [fastget_client]
