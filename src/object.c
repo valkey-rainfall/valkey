@@ -1841,10 +1841,12 @@ sds getMemoryDoctorReport(void) {
     return s;
 }
 
-/* Return the LFU frequency for an object. */
+/* Return the LFU frequency for an object. The decayed value is stored back unless a child or a forkless
+ * save reads the keys. */
 uint8_t objectGetLFUFrequency(robj *o) {
     uint8_t freq;
-    objectSetLRU(o, lfu_getFrequency(objectGetLRU(o), &freq));
+    unsigned int lru = lfu_getFrequency(objectGetLRU(o), &freq);
+    if (!server.key_touch_paused) objectSetLRU(o, lru);
     return freq;
 }
 
@@ -1862,10 +1864,12 @@ uint32_t objectGetLRUIdleSecs(robj *o) {
     return lru_getIdleSecs(objectGetLRU(o));
 }
 
-/* Return an indication of idleness.  Larger numbers are more idle. */
+/* Return an indication of idleness.  Larger numbers are more idle. The updated field is stored back
+ * unless a child or a forkless save reads the keys. */
 uint32_t objectGetIdleness(robj *o) {
     uint32_t idleness;
-    objectSetLRU(o, lrulfu_getIdleness(objectGetLRU(o), &idleness));
+    unsigned int lru = lrulfu_getIdleness(objectGetLRU(o), &idleness);
+    if (!server.key_touch_paused) objectSetLRU(o, lru);
     return idleness;
 }
 
