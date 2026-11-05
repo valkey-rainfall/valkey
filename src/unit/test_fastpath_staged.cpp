@@ -28,6 +28,7 @@ extern "C" {
 extern hashtableType commandSetType;
 extern dictType keylistDictType;
 void createSharedObjects(void);
+void fastGetRecomputeSpecAclOk(client *c); /* from fastget.h, declared here to avoid <stdatomic.h> in C++ */
 }
 
 static const char *st_logfile = "/dev/null";
@@ -444,4 +445,57 @@ TEST(FastpathEntryTest, BigReplyLengthSurvivesThe4GiBBoundary) {
     size_t just_over = (one << 32) + 1;
     e.reply_big_len = just_over;
     EXPECT_EQ((size_t)e.reply_big_len, just_over);
+}
+
+/* Fast GET answers a pure-GET read on the IO thread during the read phase, before the write and
+ * reply phases run. This proves the speculate path is exercised, so the gates tested below are
+ * real gates and not tests that pass because fast GET never engaged. */
+TEST_F(FastpathStagedTest, FastGetServesPureGetInReadPhase) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    fastGetRecomputeSpecAclOk(c); /* default (no) user is unrestricted: gate opens */
+
+    send(peer, "*3\r\n$3\r\nSET\r\n$3\r\nfgk\r\n$1\r\nv\r\n");
+    iteration();
+    EXPECT_EQ(recv(peer), "+OK\r\n");
+
+    /* A pure-GET read: the reply is written straight to the socket in the read phase. */
+    send(peer, "*2\r\n$3\r\nGET\r\n$3\r\nfgk\r\n");
+    readPhase();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+    writeAndReplyPhases();
+    freeStaged(c, peer);
+}
+
+/* SPT-14 / SPT-15 (audit F11): main wrote into c->buf (a tracking push to a REDIRECT target) and
+ * owns that write. A fast GET must not answer this read: sending c->buf from the IO thread too
+ * would send main's bytes twice (97 pushes seen for 50 invalidations). The GET goes to main. */
+TEST_F(FastpathStagedTest, FastGetPuntsWhenMainWroteIntoClientBuffer) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    c->flag.authenticated = 1;
+    fastGetRecomputeSpecAclOk(c);
+    send(peer, "*3\r\n$3\r\nSET\r\n$7\r\nst:spt1\r\n$1\r\nv\r\n");
+    iteration();
+    ASSERT_EQ(recv(peer), "+OK\r\n");
+
+    const std::string push = ">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n";
+    ASSERT_LT(push.size(), (size_t)c->buf_usable_size);
+    memcpy(c->buf, push.data(), push.size());
+    c->bufpos = (int)push.size();
+    c->flag.pending_write = 1; /* main queued its own write of these bytes */
+
+    send(peer, "*2\r\n$3\r\nGET\r\n$7\r\nst:spt1\r\n");
+    readPhase();
+    EXPECT_EQ(c->fp_inflight, 1u) << "the GET must be harvested for main, not answered by fast GET";
+    EXPECT_EQ(recv(peer), "") << "the IO thread sent bytes that main owns";
+    EXPECT_EQ(mainBuf(c), push) << "main's bytes were consumed or moved by the IO thread";
+
+    /* Hand main's bytes back so freeStaged sees a clean client. */
+    c->bufpos = 0;
+    c->flag.pending_write = 0;
+    writeAndReplyPhases();
+    EXPECT_EQ(recv(peer), "$1\r\nv\r\n");
+    freeStaged(c, peer);
 }
