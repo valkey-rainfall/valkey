@@ -17,6 +17,7 @@ static const uint32_t LRU_CLOCK_RESOLUTION = 1000; /* LRU clock resolution in ms
 int lfu_config_log_factor;
 int lfu_config_decay_time;
 
+/* Written by main, read also by other threads (IO threads, lanes, a forkless save), so accessed atomically. */
 static uint32_t lru_clock; // Normally seconds (unless LRU_CLOCK_RESOLUTION altered)
 static uint16_t lfu_clock_minutes;
 static bool is_using_lfu_policy;
@@ -24,7 +25,7 @@ static bool is_using_lfu_policy;
 
 // Current time in seconds (24 least significant bits).  Designed to roll over.
 static uint32_t LRUGetClockTime(void) {
-    return lru_clock;
+    return __atomic_load_n(&lru_clock, __ATOMIC_RELAXED);
 }
 
 
@@ -86,7 +87,7 @@ uint32_t lru_getIdleSecs(uint32_t lru) {
 
 // Current time in minutes (16 least significant bits).  Designed to roll over.
 static uint16_t LFUGetTimeInMinutes(void) {
-    return lfu_clock_minutes;
+    return __atomic_load_n(&lfu_clock_minutes, __ATOMIC_RELAXED);
 }
 
 
@@ -164,14 +165,14 @@ uint32_t lfu_getFrequency(uint32_t lfu, uint8_t *freq) {
 /**************** Generic API ****************/
 
 void lrulfu_updateClockAndPolicy(long long mstime, bool is_policy_lfu) {
-    lru_clock = (uint32_t)((mstime / LRU_CLOCK_RESOLUTION) & LRULFU_MASK);
-    lfu_clock_minutes = (uint16_t)(mstime / 60000);
-    is_using_lfu_policy = is_policy_lfu;
+    __atomic_store_n(&lru_clock, (uint32_t)((mstime / LRU_CLOCK_RESOLUTION) & LRULFU_MASK), __ATOMIC_RELAXED);
+    __atomic_store_n(&lfu_clock_minutes, (uint16_t)(mstime / 60000), __ATOMIC_RELAXED);
+    __atomic_store_n(&is_using_lfu_policy, is_policy_lfu, __ATOMIC_RELAXED);
 }
 
 
 bool lrulfu_isUsingLFU(void) {
-    return is_using_lfu_policy;
+    return __atomic_load_n(&is_using_lfu_policy, __ATOMIC_RELAXED);
 }
 
 
