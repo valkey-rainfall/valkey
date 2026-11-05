@@ -5431,7 +5431,12 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
 
     p = events;
     if (client->conn) {
-        if (connHasReadHandler(client->conn) || client->flag.partitioned) *p++ = 'r';
+        /* A client whose reads are held while it waits (throttled, blocked on a key in use, protected)
+         * shows the read interest it regains, as a client reading on an IO thread does. */
+        int reads_held = !client->flag.close_asap &&
+                         (client->flag.throttled || client->flag.protected ||
+                          (client->flag.blocked && client->bstate && client->bstate->btype == BLOCKED_INUSE));
+        if (connHasReadHandler(client->conn) || client->flag.partitioned || reads_held) *p++ = 'r';
         if (connHasWriteHandler(client->conn)) *p++ = 'w';
     }
     *p = '\0';
