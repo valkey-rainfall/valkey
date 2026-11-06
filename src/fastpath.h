@@ -42,7 +42,7 @@ typedef struct cmdEntry {
     int read_flags;
     uint32_t reply_off;
     uint32_t reply_len;
-    uint32_t reply_big_len;
+    size_t reply_big_len; /* A reply list can exceed 4 GiB: never a 32-bit field. */
     uint8_t resp;
     uint8_t requeued;      /* Main did not execute it; the IO thread hands it back for the main path. */
     uint8_t readonly;      /* The client sent READONLY: a cluster replica serves its reads. */
