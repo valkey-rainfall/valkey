@@ -210,6 +210,23 @@ static int fp_nlanes = 0;     /* lanes of this iteration */
 static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
 static int fp_replies_deferred = 0; /* the last iteration's replies go out in this read phase */
 
+#ifdef STAGED_CHECKS
+/* The empty window (design 4.7): from the sampling of the observer sets before READ until the write
+ * step has run the batches. While it is open, main runs no command of a real client (only executors
+ * run, through fpExecute) and no cluster bus packet, and no key becomes watched or blocked on; so the
+ * facts an entry was classified under in READ still hold when its lane runs it. The checks are the
+ * stagedCheck calls in processCommand, clusterProcessPacket, watchForKey and blockForKeys. */
+static int fp_window_open = 0;
+
+int fastpathWindowOpen(void) {
+    return fp_window_open;
+}
+
+void fastpathWindowClose(void) {
+    fp_window_open = 0;
+}
+#endif
+
 /* Main, between phases, once no reply points into the lane arenas. */
 static void fpResetLaneArenas(void) {
     for (int l = 0; l < FP_MAX_LANES; l++) {
@@ -2022,6 +2039,9 @@ void fastpathStagedPrepareLanes(void) {
     fp_lanes_iter = allowed;
     fp_check_blocked = fpBlockedOnKeys();
     fp_check_watched = server.watching_clients > 0;
+#ifdef STAGED_CHECKS
+    if (fpDepth() == 0) fp_window_open = allowed; /* a nested iteration never opens one */
+#endif
     /* The previous iteration's replies were delivered in its reply phase, or are delivered from the
      * lane arenas in this read phase, which then resets them (fastpathStagedDeferredDelivered). */
     if (!fp_replies_deferred) fpResetLaneArenas();
@@ -2344,6 +2364,23 @@ static void fpLaneCopyPartArgs(fpLane *L, fpPart *pt) {
     pt->largs_len = L->largs_used - pt->largs_off;
 }
 
+#ifdef STAGED_CHECKS
+/* Lane thread: the facts the entry was classified under in READ still hold now that its lane runs it:
+ * none of its keys is watched or blocked on (design 4.7). Main waits at the barrier and the dicts are
+ * not rehashing while lanes run, so the lookups only read. */
+static void fpCheckEntryUnobserved(cmdEntry *e) {
+    if (!e->cmd || (e->read_flags & READ_FLAGS_BAD_ARITY)) return;
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int n = getKeysFromCommand(e->cmd, e->argv, e->argc, &result);
+    for (int i = 0; i < n; i++) {
+        robj *k = e->argv[result.keys[i].pos];
+        stagedCheck(!dictFind(e->db->blocking_keys, k) && !dictFind(e->db->watched_keys, k));
+    }
+    getKeysFreeResult(&result);
+}
+#endif
+
 /* Lane thread: execute one entry on the lane's executor, its reply into the lane arena. */
 static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     client *ec = L->ec;
@@ -2351,6 +2388,9 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
 
     if (fpControlDetaching(e->control)) goto release_argv; /* no reply: main is closing it */
+#ifdef STAGED_CHECKS
+    fpCheckEntryUnobserved(e);
+#endif
 
     ec->user = e->origin.principal;
     ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;

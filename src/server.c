@@ -4957,6 +4957,9 @@ void unprepareCommand(client *c) {
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
+    /* The empty window (design 4.7): only executors run here, plus the clients a barrier entry woke
+     * from a key block, which the stock server also serves right after the command that readied the key. */
+    stagedCheck(!fastpathWindowOpen() || c->flag.executor || c->flag.reexecuting_command);
 
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be

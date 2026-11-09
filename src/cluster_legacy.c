@@ -4101,6 +4101,7 @@ static inline int clusterExtractSlotFromWord(uint64_t *slot_word, size_t slot_wo
  * processing lead to some inconsistency error (for instance a PONG
  * received from the wrong sender ID). */
 int clusterProcessPacket(clusterLink *link) {
+    stagedCheck(!fastpathWindowOpen()); /* the empty window, design 4.7 */
     /* Validate that the packet is well-formed */
     if (!clusterIsValidPacket(link)) {
         clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;

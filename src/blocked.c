@@ -475,6 +475,10 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     list *l;
     int j;
 
+    /* Inside the empty window the blocked set only shrinks, except for a woken client that blocks again
+     * on the keys it was already blocked on, which were observed when the iteration was classified. */
+    stagedCheck(!fastpathWindowOpen() || c->flag.reexecuting_command);
+
     initClientBlockingState(c);
 
     if (!c->flag.reexecuting_command) {

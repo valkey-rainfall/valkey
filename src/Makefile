@@ -137,6 +137,11 @@ ifeq ($(DEBUG_FORCE_DEFRAG), yes)
 	SERVER_CFLAGS +=-DHAVE_DEFRAG -DDEBUG_FORCE_DEFRAG
 endif
 
+# Run-time checks of the staged loop's invariants (stagedCheck in server.h). Debug builds only.
+ifeq ($(STAGED_CHECKS), yes)
+	SERVER_CFLAGS +=-DSTAGED_CHECKS
+endif
+
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(SERVER_CFLAGS) $(CPPFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(SERVER_LDFLAGS) $(DEBUG)
 FINAL_LIBS=-lm

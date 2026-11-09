@@ -490,6 +490,8 @@ void watchForKey(client *c, robj *key) {
     list *clients = NULL;
     watchedKey *wk;
 
+    stagedCheck(!fastpathWindowOpen()); /* the watched set only shrinks inside the empty window */
+
     if (listLength(&c->mstate->watched_keys) == 0) server.watching_clients++;
 
     /* Lazily allocate the per-db hashtable array. */

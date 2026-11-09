@@ -751,6 +751,14 @@ typedef enum {
  * when the server config 'enable-debug-assert' is true. This is useful for adding
  * assertions that are too computationally expensive or risky to run in normal
  * operation, but are valuable for debugging or testing. */
+/* Checks of the staged loop's invariants (the empty window, the lane memory partition). Compiled in
+ * with `make STAGED_CHECKS=yes`; in every other build the macro and its argument are gone. */
+#ifdef STAGED_CHECKS
+#define stagedCheck(...) serverAssert(__VA_ARGS__)
+int fastpathWindowOpen(void); /* fastpath.c: inside this iteration's empty window (4.7) */
+#else
+#define stagedCheck(...) ((void)0)
+#endif
 #define debugServerAssert(...) (server.enable_debug_assert ? serverAssert(__VA_ARGS__) : (void)0)
 #define debugServerAssertWithInfo(...) (server.enable_debug_assert ? serverAssertWithInfo(__VA_ARGS__) : (void)0)
 

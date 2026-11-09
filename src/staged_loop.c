@@ -714,6 +714,9 @@ static void writePhase(aeEventLoop *el) {
     }
     uint64_t t1 = stagedNowNs();
     sl_main_ns[SL_T_EXEC] += t1 - t0;
+#ifdef STAGED_CHECKS
+    fastpathWindowClose(); /* the batches ran; main-path clients and the cluster bus come next */
+#endif
     /* Close the stream (wait for the workers to finish delivering) before main does anything that
      * reads worker-owned client state or opens another phase. A nested iteration inside exec already
      * aborted and closed it through stagedRunPhase. */
