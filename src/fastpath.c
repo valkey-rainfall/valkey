@@ -562,7 +562,7 @@ static void fpBeginLeave(fpThread *t, client *c, int state) {
  * execution context, frozen for the phase, or a reason fpLanesAllowed turns the lanes off. Commands
  * that draw random numbers (SPOP, SRANDMEMBER, HRANDFIELD, ZRANDMEMBER) stay off: the generators are
  * process-wide. */
-static const char *fp_lane_commands[] = {
+static const char *const fp_lane_commands[] = {
     /* strings and keys */
     "set", "setnx", "setex", "psetex", "getset", "getdel", "getex", "get", "mget", "mset",
     "strlen", "append", "setrange", "getrange", "substr", "incr", "decr", "incrby", "decrby",
@@ -588,7 +588,7 @@ static const char *fp_lane_commands[] = {
 
 /* Unit tests: the lane allowlist (NULL-terminated) and the fast-path command gate, checked against the
  * command table's key specs and flags. */
-const char **testOnlyFastpathLaneCommands(void) {
+const char *const *testOnlyFastpathLaneCommands(void) {
     return fp_lane_commands;
 }
 

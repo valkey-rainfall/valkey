@@ -102,7 +102,7 @@ class FastpathListsTest : public ::testing::Test {
 
 /* Item 4 of the proof-check list: the allowlist declares all keys. */
 TEST_F(FastpathListsTest, LaneAllowlistDeclaresAllKeys) {
-    const char **names = testOnlyFastpathLaneCommands();
+    const char *const *names = testOnlyFastpathLaneCommands();
     int n = 0;
     for (; names[n]; n++) {
         struct serverCommand *cmd = lookupCommandByCString(names[n]);

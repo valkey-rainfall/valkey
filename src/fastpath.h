@@ -167,7 +167,7 @@ int fastpathStagedLanesWillRun(void);
 /* Test only: sort the next read phase's entries into nlanes lanes, as fastpathStagedPrepareLanes does
  * with that many lane threads (0 turns the lanes off). */
 void testOnlyFastpathSetLanes(int nlanes);
-const char **testOnlyFastpathLaneCommands(void);
+const char *const *testOnlyFastpathLaneCommands(void);
 int testOnlyFastpathCommandAllowed(struct serverCommand *cmd);
 /* Thread tid (0 = main): run its lane of the current write segment. */
 void fastpathStagedWriteLane(int tid);
