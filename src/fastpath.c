@@ -564,6 +564,16 @@ static const char *fp_lane_commands[] = {
     "lpush", "rpush", "lpushx", "rpushx", "linsert", "lset", "lrem", "ltrim", "lpop", "rpop", "lmpop",
     "lindex", "llen", "lrange", "lpos", "lmove", "rpoplpush", NULL};
 
+/* Unit tests: the lane allowlist (NULL-terminated) and the fast-path command gate, checked against the
+ * command table's key specs and flags. */
+const char **testOnlyFastpathLaneCommands(void) {
+    return fp_lane_commands;
+}
+
+int testOnlyFastpathCommandAllowed(struct serverCommand *cmd) {
+    return fpCommandAllowed(cmd);
+}
+
 /* Command names of the parts: shared, so lanes running parts of one command at once never touch a
  * common refcount. Created by main with the lane commands. */
 static robj *fp_part_name_mget = NULL, *fp_part_name_mset = NULL;
