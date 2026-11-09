@@ -222,9 +222,14 @@ int fastpathWindowOpen(void) {
     return fp_window_open;
 }
 
-void fastpathWindowClose(void) {
+/* Main, when the write step's batch execution ends: main-path clients and the cluster bus may run
+ * from here on. Here rather than in the loop, so the unit-test harnesses that drive the two halves
+ * themselves close it too. */
+static void fpWindowClose(void) {
     fp_window_open = 0;
 }
+#else
+#define fpWindowClose() ((void)0)
 #endif
 
 /* Main, between phases, once no reply points into the lane arenas. */
@@ -2490,6 +2495,7 @@ void fastpathStagedWriteLane(int tid) {
     ectx->cmd_time_snapshot = fp_phase_time;
     fp_cur_lane = L;
     exec_lane = 1;
+    KVSTORE_OWN_TABLES(fp_nlanes, lane); /* the memory partition: lane l owns the tables l, l + n, ... */
     if (L->frames) sdsclear(L->frames); /* main fed the previous phase's frames in its merge */
     L->largs_used = 0;                  /* and logged the previous phase's split commands */
     /* The lane's entries of this phase, in T order, so their keys can be prefetched ahead of them. */
@@ -2547,6 +2553,7 @@ void fastpathStagedWriteLane(int tid) {
         for (; i < end; i++) fpLaneExecute(L, L->run[i]);
     }
     if (use_prefetch) prefetchLaneBatchUse(NULL);
+    KVSTORE_OWN_TABLES(0, -1);
     exec_lane = 0;
     fp_cur_lane = NULL;
     ectx = saved;
@@ -3082,7 +3089,11 @@ static int fpExecuteWithLanes(void) {
 /* Main, write phase: execute every batch the read phase published, filling each entry's reply. */
 int fastpathStagedExecute(void) {
     int d = fpDepth();
-    if (d == 0 && fp_lanes_iter) return fpExecuteWithLanes();
+    if (d == 0 && fp_lanes_iter) {
+        int n = fpExecuteWithLanes();
+        fpWindowClose();
+        return n;
+    }
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
@@ -3105,6 +3116,7 @@ int fastpathStagedExecute(void) {
             total += b->count;
         }
     }
+    if (d == 0) fpWindowClose();
     return total;
 }
 
@@ -3249,7 +3261,10 @@ int fastpathStagedExecuteStreaming(void) {
         ecs[n] = fpExecutor(tid);
         n++;
     }
-    if (n == 0) return 0;
+    if (n == 0) {
+        if (d == 0) fpWindowClose();
+        return 0;
+    }
 
     /* Entries main executes for one thread between publishes. */
     const int chunk = 16;
@@ -3300,6 +3315,7 @@ int fastpathStagedExecuteStreaming(void) {
         ecs[i]->origin = NULL;
         clientSetUser(ecs[i], DefaultUser, 0); /* never keep a principal that may retire */
     }
+    if (d == 0) fpWindowClose();
     return total;
 }
 

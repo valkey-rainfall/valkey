@@ -381,6 +381,7 @@ static void rpRunLane(int lane) {
             if (seg < rp.seg) continue; /* its segment ran on main */
             if (!entered) {
                 fastpathStreamLaneEnter(lane);
+                KVSTORE_OWN_TABLES(rp.nlanes, lane);
                 repl_apply_plan_lane = 1;
                 entered = 1;
             }
@@ -399,6 +400,7 @@ static void rpRunLane(int lane) {
 done:
     if (entered) {
         repl_apply_plan_lane = 0;
+        KVSTORE_OWN_TABLES(0, -1);
         fastpathStreamLaneLeave();
     }
 }
@@ -708,6 +710,7 @@ void replApplyRunLane(int tid) {
     replApplyLane *l = &ra_lanes[lane];
     if (!l->len) return;
     repl_apply_in_lane = 1;
+    KVSTORE_OWN_TABLES(ra_nlanes, lane);
     monotime start = getMonotonicUs();
     int slot_stats = server.cluster_enabled && server.cluster_slot_stats_enabled;
     int histogram = server.latency_tracking_enabled;
@@ -755,6 +758,7 @@ void replApplyRunLane(int tid) {
         }
     }
     l->usec = getMonotonicUs() - start;
+    KVSTORE_OWN_TABLES(0, -1);
     repl_apply_in_lane = 0;
 }
 

@@ -147,13 +147,38 @@ hashtableType intHashtableType = {.instant_rehashing = 1};
 /*** Helpers **********************/
 /**********************************/
 
+#ifdef STAGED_CHECKS
+/* The thread's claim on the tables of kvstores in concurrent mode (kvstore.h). */
+static _Thread_local int kvs_owned_mod = 0, kvs_owned_lane = -1, kvs_owned_only = -1;
+
+void kvstoreOwnTables(int mod, int lane) {
+    kvs_owned_mod = mod;
+    kvs_owned_lane = lane;
+}
+
+void kvstoreOwnTable(int didx) {
+    kvs_owned_only = didx;
+}
+
+/* Every access to a table goes through here. The memory partition of the lane phase: a table of a
+ * kvstore in concurrent mode is touched only by the thread that owns it. */
+static inline void kvstoreCheckOwned(kvstore *kvs, int didx) {
+    if (!kvstoreConcurrent(kvs)) return;
+    assert((kvs_owned_mod > 0 && didx % kvs_owned_mod == kvs_owned_lane) || didx == kvs_owned_only);
+}
+#else
+#define kvstoreCheckOwned(kvs, didx) ((void)0)
+#endif
+
 /* Get the hash table pointer based on hashtable-index.
  * May be NULL if no keys have been added. */
 hashtable *kvstoreGetHashtable(kvstore *kvs, int didx) {
+    kvstoreCheckOwned(kvs, didx);
     return kvs->hashtables[didx];
 }
 
 static hashtable **kvstoreGetHashtableRef(kvstore *kvs, int didx) {
+    kvstoreCheckOwned(kvs, didx);
     return &kvs->hashtables[didx];
 }
 
@@ -789,6 +814,7 @@ static hashtable *kvstoreIteratorNextHashtable(kvstoreIterator *kvs_it) {
     if (kvs_it->next_didx != KVSTORE_INDEX_NOT_FOUND) {
         kvs_it->next_didx = kvstoreGetNextNonEmptyHashtableIndex(kvs_it->kvs, kvs_it->didx);
     }
+    kvstoreCheckOwned(kvs_it->kvs, kvs_it->didx);
     return kvs_it->kvs->hashtables[kvs_it->didx];
 }
 

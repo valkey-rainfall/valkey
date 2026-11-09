@@ -204,6 +204,7 @@ static void maintNoteCut(int claim_index) {
 /* Run every requested job on one unit as thread tid, honoring tid's remaining per-job budget. */
 static void maintRunUnit(int tid, int claim_index, const maintUnit *u, uint64_t remain_us[MAINT_JOB_COUNT]) {
     serverDb *db = server.db[u->dbid];
+    KVSTORE_OWN_TABLE(u->didx); /* the memory partition: this unit's table of every kvstore of its db */
 
     /* A unit claimed after this thread's EXPIRE budget ran out gets no expiry: the next phase starts here. */
     if (mt_requested[MAINT_JOB_EXPIRE] && remain_us[MAINT_JOB_EXPIRE] == 0 &&
@@ -273,6 +274,7 @@ static void maintLane(int tid) {
         int i = atomic_fetch_add_explicit(&mt_cursor, 1, memory_order_relaxed);
         if (i >= mt_units_len) break;
         maintRunUnit(tid, i, &mt_units[(mt_start + i) % mt_units_len], remain_us);
+        KVSTORE_OWN_TABLE(-1);
         if (mt_requested[MAINT_JOB_RESIZE]) continue;
         int left = 0;
         for (int j = 0; j < MAINT_JOB_COUNT; j++)

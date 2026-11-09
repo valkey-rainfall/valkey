@@ -45,6 +45,11 @@ char *stringFromInt(int value) {
 
 class KvstoreTest : public ::testing::Test {
   protected:
+    /* The tests that drive concurrent mode from this thread are its only lane: claim every table
+     * (didx % 1 == 0) for the STAGED_CHECKS memory-partition check. */
+    void SetUp() override { KVSTORE_OWN_TABLES(1, 0); }
+    void TearDown() override { KVSTORE_OWN_TABLES(0, -1); }
+
     static void SetUpTestSuite() {
         monotonicInit();
 
@@ -257,6 +262,7 @@ char *tableKey(int didx, int n) {
 /* Insert keys_per_table keys into each owned table, delete every third, then rehash to completion. */
 void runTableWork(kvstore *kvs, int first, int last, int kpt) {
     for (int didx = first; didx <= last; didx++) {
+        KVSTORE_OWN_TABLE(didx); /* this thread is the table's lane for the phase (STAGED_CHECKS) */
         for (int n = 0; n < kpt; n++) kvstoreHashtableAdd(kvs, didx, tableKey(didx, n));
         for (int n = 0; n < kpt; n += 3) {
             void *popped = nullptr;
@@ -267,6 +273,7 @@ void runTableWork(kvstore *kvs, int first, int last, int kpt) {
         kvstoreTryResizeHashtable(kvs, didx);
         while (kvstoreRehashHashtable(kvs, didx, 1000) > 0) {
         }
+        KVSTORE_OWN_TABLE(-1);
     }
 }
 

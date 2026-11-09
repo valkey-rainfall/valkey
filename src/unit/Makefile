@@ -88,6 +88,11 @@ ifdef FORCE_RUN_SKIPPED_TESTS
 	TEST_CFLAGS+=-DFORCE_RUN_SKIPPED_TESTS
 endif
 
+# The server's invariant checks (src/Makefile): a test that plays a lane claims its tables.
+ifeq ($(STAGED_CHECKS), yes)
+	TEST_CFLAGS+=-DSTAGED_CHECKS
+endif
+
 # Track compilation flags to force rebuild when they change
 .flags: FORCE
 	@echo '$(TEST_CFLAGS)' | cmp -s - $@ || echo '$(TEST_CFLAGS)' > $@

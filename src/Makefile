@@ -137,9 +137,13 @@ ifeq ($(DEBUG_FORCE_DEFRAG), yes)
 	SERVER_CFLAGS +=-DHAVE_DEFRAG -DDEBUG_FORCE_DEFRAG
 endif
 
-# Run-time checks of the staged loop's invariants (stagedCheck in server.h). Debug builds only.
+# Run-time checks of the staged loop's invariants (stagedCheck in server.h). Debug builds only. Like
+# the other settings it stays in .make-settings until `make distclean`; added once, so a rebuild with
+# the same settings does not change FINAL_CFLAGS.
 ifeq ($(STAGED_CHECKS), yes)
+ifeq (,$(findstring -DSTAGED_CHECKS,$(SERVER_CFLAGS)))
 	SERVER_CFLAGS +=-DSTAGED_CHECKS
+endif
 endif
 
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(SERVER_CFLAGS) $(CPPFLAGS)

@@ -22,6 +22,19 @@ typedef void (*kvstoreScanFunction)(void *privdata, void *entry, int didx);
 /* Main, outside lane phases: let threads mutate distinct hashtables of kvs concurrently (on), or end
  * that after the threads joined (off), then call kvstoreReconcile. Other kvstores are unaffected. */
 void kvstoreSetConcurrent(kvstore *kvs, int on);
+/* STAGED_CHECKS builds: while a kvstore is in concurrent mode, a thread may touch only the tables it
+ * claimed for the phase: every table with didx % mod == lane (a write or apply lane), or one table
+ * (a MAINT unit). mod 0 or didx -1 releases the claim. Any other access, by a lane, by main or by an
+ * IO thread's inbox job, is a memory-partition violation and asserts. Absent from other builds. */
+#ifdef STAGED_CHECKS
+void kvstoreOwnTables(int mod, int lane);
+void kvstoreOwnTable(int didx);
+#define KVSTORE_OWN_TABLES(mod, lane) kvstoreOwnTables(mod, lane)
+#define KVSTORE_OWN_TABLE(didx) kvstoreOwnTable(didx)
+#else
+#define KVSTORE_OWN_TABLES(mod, lane) ((void)0)
+#define KVSTORE_OWN_TABLE(didx) ((void)0)
+#endif
 kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags);
 void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *));
 void kvstoreRelease(kvstore *kvs);
