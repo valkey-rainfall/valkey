@@ -1,7 +1,8 @@
 # CLU-06: with tls-cluster yes and a plain TCP port open, a plain-TCP client must get MOVED and ASK
 # with the plain TCP port of the target node (stock: shouldReturnTlsInfo looks at the client's
-# connection). Fast-path clients are plain TCP only (TLS connections are not admitted), and their
-# redirects are built on the executor client, whose conn is NULL. This file only runs with --tls.
+# connection). Fast-path clients may be plain TCP or TLS, and their redirects are built on the
+# executor client, whose conn is NULL, so shouldReturnTlsInfo follows the origin client's conn_type.
+# This file only runs with --tls.
 
 proc sct_socket {idx} {
     set fd [socket [srv $idx host] [srv $idx pport]]
