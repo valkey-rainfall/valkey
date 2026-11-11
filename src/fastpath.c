@@ -547,9 +547,6 @@ static void fpSubmit(fpThread *t) {
 }
 
 /* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
- * the reply phase. */
-
-/* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
  * the reply phase. The client keeps the arrival stamp of its last claimed read (fp_leave_seq, set in
  * fastpathStagedEvent), whichever phase it leaves in: a client requeued or failed in the STREAM or
  * REPLY phase is ordered by the read that produced its entries, not by whatever this thread claimed
