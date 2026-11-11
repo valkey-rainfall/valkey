@@ -5545,6 +5545,9 @@ int finishShutdown(void) {
     bool nosave = (server.shutdown_flags & SHUTDOWN_NOSAVE) != 0;
     bool force = (server.shutdown_flags & SHUTDOWN_FORCE) != 0;
 
+#ifdef STAGED_CHECKS
+    fastpathCheckStreamLog();
+#endif
     /* Stop the replication stream sender before tearing replication down, so it
      * holds no reference to a replica or a backlog block when they are freed. */
     if (replStreamSenderActive()) replStreamSenderStop();

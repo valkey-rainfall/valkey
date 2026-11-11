@@ -240,11 +240,14 @@ class FastpathDifftest : public ::testing::Test {
         while ((n = ::recv(peer, buf, sizeof(buf), MSG_DONTWAIT)) > 0) out.append(buf, n);
     }
 
+    static inline bool dt_stream = false; /* MODE_STREAM*: the write step runs the STREAM executor */
+
     static void iteration() {
         fastpathStagedPrepareLanes();
         pollerGetNextBatch(stagedPoller(), 0);
         fastpathStagedReadPhase(1);
-        fastpathStagedExecute();
+        if (dt_stream) fastpathStagedExecuteStreaming();
+        else fastpathStagedExecute();
         if (fastpathStagedRepliesPending()) fastpathStagedReplyPhase(1);
         fastpathStagedFinish();
     }
@@ -422,6 +425,7 @@ class FastpathDifftest : public ::testing::Test {
         std::vector<std::string> replies; /* per client, all rounds */
         std::string dump;
         long long lane_phases, lane_entries, serial_segments, barriers, lane_prefetches;
+        long long stream_entries, stream_cuts; /* STAGED_CHECKS builds only; -1 delta otherwise */
     };
 
     /* Four executors for one stream: MODE_LANES runs every segment on the lanes with the lane key prefetch
@@ -430,15 +434,23 @@ class FastpathDifftest : public ::testing::Test {
      * segments and barriers but fpSerialSegment runs each segment's entries whole on main; MODE_PLAIN turns
      * lane planning off (io-threads-parallel-writes 0), so fastpathStagedExecute runs every batch in stream
      * order with no classification, segments or barriers: the executor the design had before the lanes. */
-    enum { MODE_LANES = 0, MODE_SERIAL = 1, MODE_PLAIN = 2, MODE_LANES_PREFETCH = 3 };
+    enum { MODE_LANES = 0, MODE_SERIAL = 1, MODE_PLAIN = 2, MODE_LANES_PREFETCH = 3, MODE_STREAM = 4, MODE_STREAM_CUT = 5 };
 
-    /* Run the scenario on an empty database with the given executor. */
+    /* Run the scenario on an empty database with the given executor. MODE_STREAM plans segments as the
+     * server does when no segment reaches the lane threshold, then runs the write step with the STREAM
+     * executor (fastpathStagedExecuteStreaming: one client run at a time, publishing at run boundaries);
+     * MODE_STREAM_CUT the same with prefetch-batch-max-size 2, so runs are cut and resume in a later
+     * round. With one IO thread the STREAM order S equals T, so the plain executor is the oracle. */
     static RunResult run(const Scenario &s, int mode) {
         RunResult res;
         emptyDbStructure(server.db, -1, 0, NULL);
+        dt_stream = mode == MODE_STREAM || mode == MODE_STREAM_CUT;
+        server.prefetch_batch_max_size = mode == MODE_STREAM_CUT ? 2 : 16;
         server.io_threads_parallel_writes = mode == MODE_PLAIN ? 0 : 1;
         server.io_threads_parallel_writes_min = (mode == MODE_LANES || mode == MODE_LANES_PREFETCH) ? 1 : 1000000;
         server.io_threads_lane_prefetch = mode == MODE_LANES_PREFETCH ? 1 : 0;
+        long long sentries0 = infoStat("staged_check_stream_entries");
+        long long scuts0 = infoStat("staged_check_stream_cuts");
         long long prefetches0 = infoStat("fastpath_write_lane_prefetches");
         long long phases0 = infoStat("fastpath_write_lane_phases");
         long long entries0 = infoStat("fastpath_write_lane_entries");
@@ -480,6 +492,8 @@ class FastpathDifftest : public ::testing::Test {
         res.serial_segments = infoStat("fastpath_write_serial_segments") - serial0;
         res.barriers = infoStat("fastpath_write_barriers") - barriers0;
         res.lane_prefetches = infoStat("fastpath_write_lane_prefetches") - prefetches0;
+        res.stream_entries = infoStat("staged_check_stream_entries") - sentries0;
+        res.stream_cuts = infoStat("staged_check_stream_cuts") - scuts0;
         close(dpeer);
         freeClient(dc);
         for (int c = 0; c < s.nclients; c++) {
@@ -491,6 +505,8 @@ class FastpathDifftest : public ::testing::Test {
         server.io_threads_parallel_writes = 1;
         server.io_threads_parallel_writes_min = 1;
         server.io_threads_lane_prefetch = 0;
+        server.prefetch_batch_max_size = 16;
+        dt_stream = false;
         return res;
     }
 
@@ -611,4 +627,42 @@ TEST_F(FastpathDifftest, SerialExecutorIsDeterministic) {
         ASSERT_EQ(a.dump, b.dump) << "seed " << seed;
         for (int c = 0; c < s.nclients; c++) ASSERT_EQ(a.replies[c], b.replies[c]) << "seed " << seed << " client " << c;
     }
+}
+
+/* The STREAM executor (window 16 and window 2) gives the plain executor's bytes: every reply of every
+ * client and the final dataset. Checks that S keeps each client's program order and that a run cut by
+ * the window resumes at its cursor. In STAGED_CHECKS builds the STREAM path must have run every seed. */
+TEST_F(FastpathDifftest, StreamExecutorMatchesPlainOverRandomPrograms) {
+    uint64_t first = envNum("DIFFTEST_FIRST", 1);
+    uint64_t n = envNum("DIFFTEST_SEEDS", 2000);
+    int failed = 0;
+    long long entries = 0, cuts = 0;
+    for (uint64_t seed = first; seed < first + n; seed++) {
+        Scenario s = makeScenario(seed);
+        RunResult plain = run(s, MODE_PLAIN);
+        RunResult st = run(s, MODE_STREAM);
+        RunResult cut = run(s, MODE_STREAM_CUT);
+        bool ok = st.dump == plain.dump && cut.dump == plain.dump;
+        for (int c = 0; c < s.nclients && ok; c++)
+            ok = st.replies[c] == plain.replies[c] && cut.replies[c] == plain.replies[c];
+        if (!ok) {
+            std::string msg = showScenario(seed, s);
+            for (int c = 0; c < s.nclients; c++) {
+                msg += " c" + std::to_string(c) + " plain : " + printable(plain.replies[c]) + "\n";
+                msg += " c" + std::to_string(c) + " stream: " + printable(st.replies[c]) + "\n";
+                msg += " c" + std::to_string(c) + " cut   : " + printable(cut.replies[c]) + "\n";
+            }
+            ADD_FAILURE() << "the STREAM and plain executors differ\n" << msg;
+            if (++failed >= (int)envNum("DIFFTEST_MAXFAIL", 3)) break;
+        }
+#ifdef STAGED_CHECKS
+        EXPECT_GT(st.stream_entries, 0) << "seed " << seed << ": the STREAM run did not use the STREAM executor";
+        EXPECT_GT(cut.stream_entries, 0) << "seed " << seed;
+#endif
+        entries += st.stream_entries + cut.stream_entries;
+        cuts += cut.stream_cuts;
+    }
+    printf("STREAM difftest: seeds %llu, stream entries %lld, cut runs %lld, failed %d\n", (unsigned long long)n,
+           entries, cuts, failed);
+    EXPECT_EQ(failed, 0);
 }

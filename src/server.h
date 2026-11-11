@@ -756,6 +756,8 @@ typedef enum {
 #ifdef STAGED_CHECKS
 #define stagedCheck(...) serverAssert(__VA_ARGS__)
 int fastpathWindowOpen(void); /* fastpath.c: inside this iteration's empty window (4.7) */
+void fastpathCheckStreamInfo(sds *info); /* fastpath.c: STREAM-path coverage counters */
+void fastpathCheckStreamLog(void);
 #else
 #define stagedCheck(...) ((void)0)
 #endif

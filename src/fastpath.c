@@ -1805,6 +1805,9 @@ void fastpathInfo(sds *info) {
                          fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
                          fp_stat_serial_segments, fp_stat_lane_prefetches);
+#ifdef STAGED_CHECKS
+    fastpathCheckStreamInfo(info);
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -3163,6 +3166,29 @@ static cmdBatch *fpStreamRunAt(fpThread *t, fpStreamCursor *c, int d) {
  * The caller publishes b->executed at chunk granularity (always on a run boundary, since a run runs
  * whole), so a STREAM worker that reads executed with acquire sees every reply byte of the runs in
  * [prev published, executed). Prefetch is done by the caller window. */
+#ifdef STAGED_CHECKS
+/* STAGED_CHECKS builds: STREAM-path coverage, main only. execs: write steps that ran the streaming
+ * executor; multi: those with runs from two or more threads (S can differ from T); runs, entries:
+ * client runs and entries main executed there; cuts: runs that ended before the client's
+ * consecutive entries did (window cut), so the client continues in a later round. */
+static long long fp_chk_stream_execs, fp_chk_stream_multi, fp_chk_stream_runs, fp_chk_stream_entries,
+    fp_chk_stream_cuts;
+
+void fastpathCheckStreamInfo(sds *info) {
+    *info = sdscatprintf(*info,
+                         "staged_check_stream_execs:%lld\r\nstaged_check_stream_multi:%lld\r\n"
+                         "staged_check_stream_runs:%lld\r\nstaged_check_stream_entries:%lld\r\n"
+                         "staged_check_stream_cuts:%lld\r\n",
+                         fp_chk_stream_execs, fp_chk_stream_multi, fp_chk_stream_runs, fp_chk_stream_entries,
+                         fp_chk_stream_cuts);
+}
+
+void fastpathCheckStreamLog(void) {
+    serverLog(LL_NOTICE, "STAGED_CHECKS stream coverage: execs %lld multi %lld runs %lld entries %lld cuts %lld",
+              fp_chk_stream_execs, fp_chk_stream_multi, fp_chk_stream_runs, fp_chk_stream_entries, fp_chk_stream_cuts);
+}
+#endif
+
 static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c, int max) {
     int from = c->ei;
     client *cl = b->e[from].c;
@@ -3172,6 +3198,11 @@ static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c, int max)
         j++;
     }
     c->ei = j;
+#ifdef STAGED_CHECKS
+    fp_chk_stream_runs++;
+    fp_chk_stream_entries += j - from;
+    if (j < b->count && b->e[j].c == cl) fp_chk_stream_cuts++;
+#endif
 }
 
 /* True when the cursor sits at the start of a run (or the end of its batch). */
@@ -3265,6 +3296,10 @@ int fastpathStagedExecuteStreaming(void) {
         if (d == 0) fpWindowClose();
         return 0;
     }
+#ifdef STAGED_CHECKS
+    fp_chk_stream_execs++;
+    if (n >= 2) fp_chk_stream_multi++;
+#endif
 
     /* Entries main executes for one thread between publishes. */
     const int chunk = 16;
