@@ -18,6 +18,18 @@
 #define PHASE_BARRIER_SPIN_US 100
 #define PHASE_BARRIER_SPIN_CHECK 64
 
+/* Adaptive spin (PHASE_BARRIER_SPIN_ADAPTIVE): a worker keeps one spin budget per phase it last ran, since
+ * the wait after a phase depends on which phase it was (the next phase of the same iteration opens within
+ * microseconds, the first phase of the next iteration waits for new requests). A wait that ends within
+ * PHASE_BARRIER_SPIN_WORTH_US was worth spinning for: the budget grows to cover it. A longer wait costs
+ * more spinning than one wake, so the budget halves, down to sleeping at once. Under load every wait is
+ * short and the budget stays at PHASE_BARRIER_SPIN_US; at low load it reaches 0 within a few waits. */
+#define PHASE_BARRIER_SPIN_WORTH_US 50
+#define PHASE_BARRIER_SPIN_SLOTS 16
+static __thread int pb_spin_budget[PHASE_BARRIER_SPIN_SLOTS];
+static __thread int pb_spin_ready;
+static __thread int pb_spin_slot;
+
 static inline void phaseBarrierRelax(void) {
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
@@ -26,10 +38,21 @@ static inline void phaseBarrierRelax(void) {
 #endif
 }
 
-/* Spin step i (from 1) of a wait that started at start: 0 once the spin budget is spent. */
-static inline int phaseBarrierKeepSpinning(unsigned i, monotime start) {
+/* Spin step i (from 1) of a wait that started at start: 0 once budget_us is spent. */
+static inline int phaseBarrierKeepSpinning(unsigned i, monotime start, int budget_us) {
     phaseBarrierRelax();
-    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 || getMonotonicUs() - start < PHASE_BARRIER_SPIN_US;
+    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 || getMonotonicUs() - start < (monotime)budget_us;
+}
+
+/* The adaptive budget after a wait of waited_us that followed the phase in slot. */
+static void phaseBarrierAdaptSpin(int slot, monotime waited_us) {
+    int *b = &pb_spin_budget[slot];
+    if (waited_us <= PHASE_BARRIER_SPIN_WORTH_US) {
+        int want = (int)waited_us * 2 + 1;
+        if (want > *b) *b = want > PHASE_BARRIER_SPIN_US ? PHASE_BARRIER_SPIN_US : want;
+    } else {
+        *b /= 2;
+    }
 }
 
 static inline uint32_t stateSeq(uint64_t st) {
@@ -103,7 +126,7 @@ void phaseBarrierWaitAllDone(phaseBarrier *b, int spin) {
         monotime start = getMonotonicUs();
         for (unsigned i = 1;; i++) {
             if (atomic_load_explicit(&b->pending, memory_order_acquire) == 0) return;
-            if (!phaseBarrierKeepSpinning(i, start)) break;
+            if (!phaseBarrierKeepSpinning(i, start, PHASE_BARRIER_SPIN_US)) break;
         }
     }
     pthread_mutex_lock(&b->lock);
@@ -138,14 +161,23 @@ static inline int takePhase(uint64_t st, int worker_id, uint64_t *last_seen, int
 
 int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin) {
     int phase;
-    if (spin) {
-        monotime start = getMonotonicUs();
+    int adaptive = spin == PHASE_BARRIER_SPIN_ADAPTIVE;
+    int budget = spin > 0 ? spin : 0;
+    if (adaptive) {
+        if (!pb_spin_ready) {
+            for (int j = 0; j < PHASE_BARRIER_SPIN_SLOTS; j++) pb_spin_budget[j] = PHASE_BARRIER_SPIN_US;
+            pb_spin_ready = 1;
+        }
+        budget = pb_spin_budget[pb_spin_slot];
+    }
+    monotime start = (budget || adaptive) ? getMonotonicUs() : 0;
+    if (budget) {
         for (unsigned i = 1;; i++) {
             if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) return PHASE_BARRIER_EXIT;
             uint64_t st = atomic_load_explicit(&b->state, memory_order_acquire);
-            if (takePhase(st, worker_id, last_seen, &phase)) return phase;
+            if (takePhase(st, worker_id, last_seen, &phase)) goto done;
             if (worker_id >= stateN(st)) break; /* not a participant now: park instead of spinning */
-            if (!phaseBarrierKeepSpinning(i, start)) break;
+            if (!phaseBarrierKeepSpinning(i, start, budget)) break;
         }
     }
     pthread_mutex_lock(&b->lock);
@@ -170,6 +202,12 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
         }
     }
     pthread_cleanup_pop(1);
+    if (phase == PHASE_BARRIER_EXIT) return phase;
+done:
+    if (adaptive) {
+        phaseBarrierAdaptSpin(pb_spin_slot, getMonotonicUs() - start);
+        pb_spin_slot = phase & (PHASE_BARRIER_SPIN_SLOTS - 1);
+    }
     return phase;
 }
 
