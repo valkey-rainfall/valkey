@@ -171,6 +171,10 @@ int fastpathStagedLanesWillRun(void);
 void testOnlyFastpathSetLanes(int nlanes);
 /* Thread tid (0 = main): run its lane of the current write segment. */
 void fastpathStagedWriteLane(int tid);
+/* A write-lane phase under maxmemory is running: every table allocation on a lane is charged to the
+ * phase's budget (hashtableResizeAllowed). Take reports whether `bytes` fit the rest of it. */
+int fastpathMaxmemoryPhase(void);
+int fastpathMaxmemoryTakeBudget(size_t bytes);
 
 /* Replica: the primary's stream on the write lanes (repl_apply.c). */
 /* Main: nothing outside a lane's own hashtables would observe or order the stream's writes, held or

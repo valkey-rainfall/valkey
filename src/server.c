@@ -529,6 +529,9 @@ uint64_t dictEncObjHash(const void *key) {
 int hashtableResizeAllowed(size_t moreMem, double usedRatio) {
     UNUSED(usedRatio);
 
+    /* A write lane under maxmemory: the allocation must fit the budget main reserved for the phase. */
+    if (exec_lane && fastpathMaxmemoryPhase()) return fastpathMaxmemoryTakeBudget(moreMem);
+
     /* Avoid resizing over max memory. */
     return !overMaxmemoryAfterAlloc(moreMem);
 }

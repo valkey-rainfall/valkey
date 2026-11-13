@@ -3554,6 +3554,7 @@ standardConfig static_configs[] = {
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes", NULL, MODIFIABLE_CONFIG, server.io_threads_parallel_writes, 1, NULL, NULL),
+    createBoolConfig("io-threads-parallel-writes-maxmemory", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_parallel_writes_maxmemory, 1, NULL, NULL),
     createBoolConfig("io-threads-lane-prefetch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_lane_prefetch, 1, NULL, NULL),
     createBoolConfig("io-threads-free-on-bio", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_free_on_bio, 0, NULL, NULL),
     createBoolConfig("main-read-batch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.main_read_batch, 0, NULL, NULL),

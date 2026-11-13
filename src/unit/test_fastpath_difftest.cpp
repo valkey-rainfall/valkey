@@ -66,6 +66,11 @@ static const char *dt_fields[] = {"f1", "f2", "f3"};
 static const char *dt_values[] = {"1", "2", "10", "a", "bb", "-3", "x7"};
 static const char *dt_far_pxat = "4102444800000"; /* 2100-01-01, never expires during the test */
 
+/* maxmemory runs: per-seed engagement checks off; lane phases run and OOM replies the lane runs got. */
+static bool dt_mm_relaxed = false;
+static long long dt_mm_lane_phases = 0;
+static long long dt_mm_oom_replies = 0;
+
 typedef std::vector<std::string> Cmd;
 typedef std::vector<Cmd> Program;
 
@@ -561,6 +566,17 @@ class FastpathDifftest : public ::testing::Test {
             else printf("%s", msg.c_str());
         }
         /* engagement: the lane runs must have used lanes (and the prefetch stage), the serial run must not */
+        dt_mm_lane_phases += lane.lane_phases + lanepf.lane_phases;
+        for (int c = 0; c < s.nclients; c++) {
+            for (size_t at = lane.replies[c].find("-OOM "); at != std::string::npos; at = lane.replies[c].find("-OOM ", at + 1))
+                dt_mm_oom_replies++;
+        }
+        if (dt_mm_relaxed) {
+            /* Under maxmemory some programs hold only barrier commands, and over the limit no segment
+             * may run on the lanes: the tests check engagement over all seeds instead. */
+            EXPECT_EQ(serial.lane_phases, 0) << "seed " << seed << ": the serial run ran a lane phase";
+            return ok;
+        }
         EXPECT_GT(lane.lane_phases, 0) << "seed " << seed << ": the lane run ran no lane phase";
         EXPECT_GT(lane.lane_entries, 0) << "seed " << seed;
         EXPECT_EQ(lane.lane_prefetches, 0) << "seed " << seed << ": the lane run prefetched with the stage off";
@@ -611,4 +627,45 @@ TEST_F(FastpathDifftest, SerialExecutorIsDeterministic) {
         ASSERT_EQ(a.dump, b.dump) << "seed " << seed;
         for (int c = 0; c < s.nclients; c++) ASSERT_EQ(a.replies[c], b.replies[c]) << "seed " << seed << " client " << c;
     }
+}
+
+/* maxmemory with room to spare: lanes run the segments whose growth bound fits, every other command is
+ * a barrier, and every reply and the final dataset still agree with the serial executor. */
+TEST_F(FastpathDifftest, LanesMatchSerialExecutorUnderMaxmemoryWithRoom) {
+    server.maxmemory = 4ull * 1024 * 1024 * 1024;
+    server.maxmemory_policy = MAXMEMORY_NO_EVICTION;
+    server.io_threads_parallel_writes_maxmemory = 1;
+    dt_mm_relaxed = true;
+    dt_mm_lane_phases = dt_mm_oom_replies = 0;
+    uint64_t n = envNum("DIFFTEST_SEEDS", 2000);
+    int failed = 0;
+    for (uint64_t seed = 1; seed <= n; seed++) {
+        if (!checkSeed(seed, false) && ++failed >= (int)envNum("DIFFTEST_MAXFAIL", 3)) break;
+    }
+    dt_mm_relaxed = false;
+    server.maxmemory = 0;
+    EXPECT_EQ(failed, 0) << "replay with DIFFTEST_SEED=<seed>";
+    EXPECT_GT(dt_mm_lane_phases, 0) << "no seed ran a lane phase under maxmemory";
+    EXPECT_EQ(dt_mm_oom_replies, 0);
+}
+
+/* maxmemory under the used memory with noeviction: every command that may grow memory is refused. No
+ * segment may run on the lanes, and the replies, OOM errors included, are the serial executor's. */
+TEST_F(FastpathDifftest, OverMaxmemoryNoevictionKeepsSerialReplies) {
+    server.maxmemory = 1;
+    server.maxmemory_policy = MAXMEMORY_NO_EVICTION;
+    server.io_threads_parallel_writes_maxmemory = 1;
+    dt_mm_relaxed = true;
+    dt_mm_lane_phases = dt_mm_oom_replies = 0;
+    uint64_t n = envNum("DIFFTEST_SEEDS", 2000) / 4 + 1;
+    int failed = 0;
+    for (uint64_t seed = 1; seed <= n; seed++) {
+        if (!checkSeed(seed, false) && ++failed >= (int)envNum("DIFFTEST_MAXFAIL", 3)) break;
+    }
+    dt_mm_relaxed = false;
+    server.maxmemory = 0;
+    server.stat_last_eviction_exceeded_time = 0;
+    EXPECT_EQ(failed, 0) << "replay with DIFFTEST_SEED=<seed>";
+    EXPECT_EQ(dt_mm_lane_phases, 0) << "a lane phase ran over maxmemory";
+    EXPECT_GT(dt_mm_oom_replies, 0) << "no command was refused over maxmemory";
 }

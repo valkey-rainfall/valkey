@@ -117,6 +117,7 @@ uint64_t hashtablePointerHash(const void *key);
 
 /* Global resize policy */
 void hashtableSetResizePolicy(hashtableResizePolicy policy);
+void hashtableSetResizeAskAlways(int on);
 
 /* Hashtable instance */
 hashtable *hashtableCreate(hashtableType *type);

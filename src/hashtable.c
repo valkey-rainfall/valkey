@@ -75,6 +75,9 @@ uint64_t siphash_nocase(const uint8_t *in, const size_t inlen, const uint8_t *k)
 static uint8_t hash_function_seed[16];
 static hashtableResizePolicy resize_policy = HASHTABLE_RESIZE_ALLOW;
 static bool hashtable_can_abort_shrink = true;
+/* Per thread: the resizeAllowed callback is asked before every resize of a table that has one, at any
+ * fill factor and for shrinks too (hashtableSetResizeAskAlways). */
+static _Thread_local int resize_ask_always = 0;
 
 /* --- Fill factor --- */
 
@@ -155,6 +158,13 @@ uint64_t hashtablePointerHash(const void *key) {
  */
 void hashtableSetResizePolicy(hashtableResizePolicy policy) {
     resize_policy = policy;
+}
+
+/* This thread only: while on, a table with a resizeAllowed callback resizes only with its consent,
+ * also above the hard fill limit and when shrinking. A write lane under maxmemory uses it so every
+ * table allocation it makes is charged to a budget main reserved below the limit. */
+void hashtableSetResizeAskAlways(int on) {
+    resize_ask_always = on;
 }
 
 /* Set whether the hashtable can abort shrinking.
@@ -778,7 +788,12 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
         /* Refuse to resize if resizing is forbidden and we already have a primary table. */
         return false;
     }
-    if (exp > old_exp && ht->type->resizeAllowed) {
+    if (resize_ask_always && ht->type->resizeAllowed && ht->tables[0]) {
+        /* Every allocation of a table that has one, growing or shrinking at any fill, needs the
+         * callback's consent; a refusal keeps the table as it is, as a forbidden resize does. */
+        double fill_factor = (double)min_capacity / ((double)numBuckets(old_exp) * ENTRIES_PER_BUCKET);
+        if (!ht->type->resizeAllowed(alloc_size, fill_factor)) return false;
+    } else if (exp > old_exp && ht->type->resizeAllowed) {
         /* If we're growing the table, let's check if the resizeAllowed callback allows the resize. */
         double fill_factor = (double)min_capacity / ((double)numBuckets(old_exp) * ENTRIES_PER_BUCKET);
         if (fill_factor * 100 < MAX_FILL_PERCENT_HARD && !ht->type->resizeAllowed(alloc_size, fill_factor)) {
