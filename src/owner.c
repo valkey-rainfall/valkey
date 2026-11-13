@@ -635,6 +635,10 @@ static void ownerTakeReadable(void) {
     struct epoll_event evs[OWNER_EVENTS];
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
+        /* Clients main handed over that the owner has not registered yet are in no epoll set at
+         * all: take them too, so their input is seen. */
+        listNode *ln;
+        while ((ln = listFirst(o->inbox))) ownerTakeToMain(listNodeValue(ln));
         int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, 0);
         for (int k = 0; k < n; k++) {
             uint64_t d = evs[k].data.u64;
