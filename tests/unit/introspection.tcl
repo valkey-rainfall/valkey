@@ -1330,6 +1330,10 @@ start_server {tags {"introspection"}} {
             cluster-databases
             io-threads
             keyspace-shard-bits
+            owner-threads
+            owner-port
+            owner-cpulist
+            owner-adopt-all
             acl-offload
             logfile
             unixsocketperm
