@@ -168,6 +168,10 @@ start_server {tags {"staged-loop maxmemory external:skip tls:skip"} overrides {i
 
     test {Lanes under maxmemory: hash, set and list writes run on the lanes, conversions included} {
         r flushall
+        set hle [lindex [r config get hash-max-listpack-entries] 1]
+        set sle [lindex [r config get set-max-listpack-entries] 1]
+        r config set hash-max-listpack-entries 128
+        r config set set-max-listpack-entries 128
         set phases [mml_fp r fastpath_write_maxmemory_lane_phases]
         set barriers [mml_fp r fastpath_write_maxmemory_barriers]
         set fds [mml_open_fast r $host $port 2]
@@ -197,6 +201,8 @@ start_server {tags {"staged-loop maxmemory external:skip tls:skip"} overrides {i
         }
         assert {[mml_fp r fastpath_write_maxmemory_lane_phases] > $phases}
         assert_equal $barriers [mml_fp r fastpath_write_maxmemory_barriers]
+        r config set hash-max-listpack-entries $hle
+        r config set set-max-listpack-entries $sle
     }
 
     test {Lanes under maxmemory: the kill switch and maxmemory-clients keep the veto} {
