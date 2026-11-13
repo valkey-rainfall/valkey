@@ -748,10 +748,11 @@ int fastpathMaxmemoryTakeBudget(size_t bytes) {
 }
 
 /* The lane gate allows lanes with maxmemory set. Client eviction and batched eviction keep them off:
- * both decide on main between commands from state a lane changes. */
+ * both decide on main between commands from state a lane changes. In cluster mode a lane's tables are
+ * slots it serves stably (fpLaneOf); lanes never evict, so no key of an importing slot is touched. */
 static int fpMmLanesAllowed(void) {
     return server.io_threads_parallel_writes_maxmemory && !server.maxmemory_clients &&
-           !server.maxmemory_eviction_batch && !server.cluster_enabled;
+           !server.maxmemory_eviction_batch;
 }
 
 static size_t fpMmArgLen(robj *o) {
