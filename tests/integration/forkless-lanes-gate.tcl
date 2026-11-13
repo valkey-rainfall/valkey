@@ -7,7 +7,7 @@ proc fkg_fp {r field} {
     getInfoProperty [$r info fastpath] $field
 }
 
-foreach {mode lanes load} {A no disabled B yes disabled} {
+foreach {mode lanes load} {A no disabled B yes disabled A no on-empty-db B yes on-empty-db} {
     start_server [list tags {"repl external:skip tls:skip"} overrides [list save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 io-threads 4 io-threads-parallel-writes-min 1 notify-keyspace-events {""}]] {
         set primary [srv 0 client]
         set ph [srv 0 host]
