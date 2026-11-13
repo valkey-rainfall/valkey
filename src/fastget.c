@@ -799,6 +799,7 @@ void fastGetConsumeSpeculated(client *c, int count, int tid) {
         for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
         zfree(c->argv);
         c->argv = NULL;
+        clientDropShardHint(c);
         c->argc = 0;
         c->cmd = NULL;
         c->parsed_cmd = NULL;

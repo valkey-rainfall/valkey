@@ -1439,6 +1439,8 @@ typedef struct parsedCommand {
     robj **argv;
     int argv_len;
     int slot;
+    sds shard_key; /* argv string whose standalone shard is in 'shard', NULL when none */
+    int shard;
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
@@ -1598,6 +1600,12 @@ typedef struct client {
     int nread;                                    /* Number of bytes of the last read. */
     int read_flags;                               /* Client Read flags - used to communicate the client read state. */
     int slot;                                     /* The slot the client is executing against. Set to -1 if no slot is being used */
+    /* Standalone keyspace shard of the argument whose string is shard_key, valid only while
+     * argv == shard_argv. Set by the key prefetch or by the first lookup of that argument, so a
+     * command hashes its key once. */
+    robj **shard_argv;
+    sds shard_key;
+    int shard;
     listNode *mem_usage_bucket_node;
     clientMemUsageBucket *mem_usage_bucket;
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -3349,6 +3357,12 @@ void freeClientOriginalArgv(client *c);
 void freeClientArgv(client *c);
 void sendReplyToClient(connection *conn);
 int isDeferredReplyEnabled(client *c);
+/* Forget the keyspace shard kept for an argument of c->argv (see getKVStoreIndexUsingCachedSlot()). Every
+ * place that frees, replaces or gives away c->argv calls it, and so does the end of call(). */
+static inline void clientDropShardHint(client *c) {
+    c->shard_argv = NULL;
+    c->shard_key = NULL;
+}
 void initDeferredReplyBuffer(client *c);
 void *addReplyDeferredLen(client *c);
 void setDeferredArrayLen(client *c, void *node, long length);

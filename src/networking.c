@@ -427,6 +427,7 @@ client *createClient(connection *conn) {
     c->raw_flag2 = 0;
     c->capa = 0;
     c->slot = -1;
+    clientDropShardHint(c);
     c->ctime = c->last_interaction = server.unixtime;
     c->duration = 0;
     clientSetDefaultAuth(c);
@@ -2284,6 +2285,7 @@ clear:
     c->argv_len_sum = 0;
     c->argv_len = 0;
     c->argv = NULL;
+    clientDropShardHint(c);
 }
 
 /* Close all the replicas connections. This is useful in chained replication
@@ -4102,6 +4104,7 @@ void unprotectClient(client *c) {
  * to be executed inside the client structure.
  * Sets the client read_flags to indicate the parsing outcome. */
 void parseInlineBuffer(client *c) {
+    clientDropShardHint(c);
     char *newline;
     int argc, j, linefeed_chars = 1;
     sds *argv;
@@ -4242,6 +4245,7 @@ static void setProtocolError(const char *errstr, client *c) {
  * command is in RESP format, so the first byte in the command is found
  * to be '*'. Otherwise, for inline commands parseInlineBuffer() is called. */
 void parseMultibulkBuffer(client *c) {
+    clientDropShardHint(c);
     int flag = parseMultibulk(c, &c->argc, &c->argv, &c->argv_len,
                               &c->argv_len_sum, &c->net_input_bytes_curr_cmd);
     c->read_flags |= flag;
@@ -4773,6 +4777,9 @@ bool consumeCommandQueue(client *c) {
     c->net_input_bytes_curr_cmd = p->input_bytes;
     c->parsed_cmd = p->cmd;
     c->slot = p->slot;
+    c->shard_argv = p->argv;
+    c->shard_key = p->shard_key;
+    c->shard = p->shard;
     c->qb_applied += p->input_bytes;
     if (queue->off == queue->len) {
         /* The queue is empty. Don't free it here, because if parsing is done in
@@ -4802,6 +4809,8 @@ static int addKeysToIncrFindBatch(client *c,
                                   struct serverCommand *cmd,
                                   robj **argv,
                                   int argc,
+                                  sds *shard_key,
+                                  int *shard,
                                   hashtableIncrementalFindState *incr_states,
                                   int num,
                                   int max) {
@@ -4816,12 +4825,16 @@ static int addKeysToIncrFindBatch(client *c,
         }
         hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
         for (int i = 0; i < numkeys && num < max; i++) {
-            robj *keyobj = argv[result.keys[i].pos];
+            sds key = objectGetVal(argv[result.keys[i].pos]);
             /* Standalone shards hold keys by their own hash, not by the first key's. */
-            if (!server.cluster_enabled && server.keyspace_shard_bits)
-                ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(keyobj)));
+            if (!server.cluster_enabled && server.keyspace_shard_bits) {
+                int idx = getKVStoreIndexForKey(key);
+                /* Keep the first key's shard for the command's own lookups. */
+                if (i == 0) *shard_key = key, *shard = idx;
+                ht = kvstoreGetHashtable(c->db->keys, idx);
+            }
             if (ht == NULL) continue;
-            hashtableIncrementalFindInit(&incr_states[num++], ht, objectGetVal(keyobj));
+            hashtableIncrementalFindInit(&incr_states[num++], ht, key);
         }
     }
     getKeysFreeResult(&result);
@@ -4845,8 +4858,10 @@ static void prefetchCommandQueueKeys(client *c) {
 
     /* If the command is valid, add keys to incremental find batch. */
     if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
-        num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
+        c->shard_key = NULL;
+        num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc, &c->shard_key, &c->shard,
                                           key_incr_states, num_keys, max_keys);
+        c->shard_argv = c->argv;
     } else {
         /* Command is already found to be incomplete, non-existing, etc. */
         debugServerAssert(!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
@@ -4868,7 +4883,7 @@ static void prefetchCommandQueueKeys(client *c) {
                               (p->read_flags & READ_FLAGS_BAD_ARITY));
             continue;
         }
-        num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
+        num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc, &p->shard_key, &p->shard,
                                           key_incr_states, num_keys, max_keys);
     }
     if (num_keys <= 1) return; /* No point to prefetch a single key */
@@ -6947,6 +6962,8 @@ void securityWarningCommand(client *c) {
 static void backupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) {
     robj **old_argv = c->argv;
     int old_argc = c->argc;
+
+    clientDropShardHint(c); /* the argument whose shard was kept may be replaced */
 
     /* Store original arguments if not already saved */
     if (!c->original_argv) {

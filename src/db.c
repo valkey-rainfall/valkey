@@ -276,15 +276,36 @@ int getKVStoreIndexForKey(sds key) {
     return 0;
 }
 
+/* The standalone part of getKVStoreIndexUsingCachedSlot() when the client holds no shard for the key.
+ * Kept out of line so the common case stays a few instructions inside its callers. */
+static __attribute__((noinline)) int getKVStoreIndexSlow(client *c, sds key) {
+    /* A write lane's executor carries the shard of every key its command declared. */
+    if (exec_lane) return (c && c->slot >= 0 && c->flag.executing_command) ? c->slot : getKVStoreIndexForKey(key);
+    int shard = getKVStoreIndexForKey(key);
+    if (c && c->flag.executing_command) {
+        for (int j = 1; j < c->argc && j <= 3; j++) {
+            if (c->argv[j] && key == objectGetVal(c->argv[j])) {
+                c->shard_argv = c->argv;
+                c->shard_key = key;
+                c->shard = shard;
+                break;
+            }
+        }
+    }
+    return shard;
+}
+
 /* Same as getKVStoreIndexForKey(), but reuses the slot cached on the client rather than hashing the key.
- * Only valid for keys the currently executing command declared, since the cached slot is that command's. */
+ * Only valid for keys the currently executing command declared, since the cached slot is that command's.
+ * Standalone: the command's own key is hashed once per command. The shard is kept for one argument
+ * string of the current argv only (cleared when argv is freed or rewritten), so any other key, including
+ * one a script or a SORT pattern looks up, hashes again. Lane executors never set it. */
 int getKVStoreIndexUsingCachedSlot(sds key) {
     if (server.cluster_enabled) return getCachedKeySlot(key);
     if (!server.keyspace_shard_bits) return 0;
-    /* A write lane's executor carries the shard of every key its command declared. */
     client *c = ectx->current_client;
-    if (exec_lane && c && c->slot >= 0 && c->flag.executing_command) return c->slot;
-    return getKVStoreIndexForKey(key);
+    if (c && key == c->shard_key && c->shard_argv == c->argv) return c->shard;
+    return getKVStoreIndexSlow(c, key);
 }
 
 /* Returns the slot cached on the client for the currently executing command, computing it from the key

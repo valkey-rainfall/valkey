@@ -879,6 +879,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             fpAppendEntry(t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
                           c->parsed_cmd, c->slot, c->read_flags);
             c->argv = NULL;
+            clientDropShardHint(c);
             c->argc = 0;
             c->argv_len = 0;
             c->argv_len_sum = 0;
