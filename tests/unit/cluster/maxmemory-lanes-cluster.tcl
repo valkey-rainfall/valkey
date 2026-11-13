@@ -55,6 +55,8 @@ start_cluster 2 0 {tags {external:skip cluster staged-loop maxmemory tls:skip lo
         }
         set fd [mmc_socket 0]
         assert_equal +PONG [lindex [mmc_pipeline $fd {{PING}}] 0]
+        [srv 0 client] config set notify-keyspace-events ""
+        wait_for_condition 100 20 {[mmc_fp 0 fastpath_clients] >= 1} else { fail "client did not join the fast path" }
         set phases [mmc_fp 0 fastpath_write_maxmemory_lane_phases]
         set cmds {}
         set expect {}
