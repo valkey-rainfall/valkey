@@ -536,6 +536,14 @@ int hashtableResizeAllowed(size_t moreMem, double usedRatio) {
     return !overMaxmemoryAfterAlloc(moreMem);
 }
 
+/* The tables of hashes and sets: only a write lane under maxmemory is asked, and charges its budget;
+ * elsewhere they resize as without a callback. */
+int hashtableCollectionResizeAllowed(size_t moreMem, double usedRatio) {
+    UNUSED(usedRatio);
+    if (exec_lane && fastpathMaxmemoryPhase()) return fastpathMaxmemoryTakeBudget(moreMem);
+    return 1;
+}
+
 const void *hashtableCommandGetCurrentName(const void *element) {
     struct serverCommand *command = (struct serverCommand *)element;
     return command->current_name;
@@ -641,7 +649,8 @@ hashtableType objectHashtableType = {
 hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+    .entryDestructor = dictSdsDestructor,
+    .resizeAllowed = hashtableCollectionResizeAllowed};
 
 /* Zset hashtable callbacks for fbtree backend.
  * Stored entries are packed [8B score][element]. Lookup keys are plain sds
@@ -774,6 +783,7 @@ hashtableType hashHashtableType = {
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = hashHashtableTypeDestructor,
     .getMetadataSize = hashHashtableTypeMetadataSize,
+    .resizeAllowed = hashtableCollectionResizeAllowed,
 };
 
 hashtableType hashWithVolatileItemsHashtableType = {
@@ -783,6 +793,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
     .entryDestructor = hashHashtableTypeDestructor,
     .getMetadataSize = hashHashtableTypeMetadataSize,
     .validateEntry = hashHashtableTypeValidate,
+    .resizeAllowed = hashtableCollectionResizeAllowed,
 };
 
 /* Hashtable type without destructor */

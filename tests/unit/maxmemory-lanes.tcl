@@ -157,13 +157,46 @@ start_server {tags {"staged-loop maxmemory external:skip tls:skip"} overrides {i
             append buf [mml_resp set mml:b:$i x]
             append buf [mml_resp append mml:b:$i y]
             append buf [mml_resp get mml:b:$i]
-            append buf [mml_resp sadd mml:s $i]
+            append buf [mml_resp zadd mml:z $i m$i]
             lappend e {+OK} {:2} xy {:1}
         }
         assert_equal [list $e] [mml_pipelines $fds [list $buf] {400}]
         mml_close_all
         assert {[mml_fp r fastpath_write_maxmemory_barriers] - $barriers >= 200}
-        assert_equal 100 [r scard mml:s]
+        assert_equal 100 [r zcard mml:z]
+    }
+
+    test {Lanes under maxmemory: hash, set and list writes run on the lanes, conversions included} {
+        r flushall
+        set phases [mml_fp r fastpath_write_maxmemory_lane_phases]
+        set barriers [mml_fp r fastpath_write_maxmemory_barriers]
+        set fds [mml_open_fast r $host $port 2]
+        set bufs {}
+        set counts {}
+        for {set s 0} {$s < 2} {incr s} {
+            set buf ""
+            # 300 fields, members and elements per key: past the listpack and intset limits.
+            for {set i 0} {$i < 300} {incr i} {
+                append buf [mml_resp hset mml:h:$s f$i $i]
+                append buf [mml_resp sadd mml:s:$s m$i]
+                append buf [mml_resp rpush mml:l:$s $i]
+                append buf [mml_resp hincrby mml:h:$s n 1]
+            }
+            lappend bufs $buf
+            lappend counts 1200
+        }
+        mml_pipelines $fds $bufs $counts
+        mml_close_all
+        for {set s 0} {$s < 2} {incr s} {
+            assert_equal 301 [r hlen mml:h:$s]
+            assert_equal 300 [r hget mml:h:$s n]
+            assert_equal 300 [r scard mml:s:$s]
+            assert_equal 300 [r llen mml:l:$s]
+            assert_equal hashtable [r object encoding mml:s:$s]
+            assert_equal hashtable [r object encoding mml:h:$s]
+        }
+        assert {[mml_fp r fastpath_write_maxmemory_lane_phases] > $phases}
+        assert_equal $barriers [mml_fp r fastpath_write_maxmemory_barriers]
     }
 
     test {Lanes under maxmemory: the kill switch and maxmemory-clients keep the veto} {
@@ -233,6 +266,36 @@ start_server {tags {"staged-loop maxmemory external:skip tls:skip"} overrides {i
         # The serial run stops one write past the limit at most.
         assert {[s used_memory] <= $limit + 64 * 1024}
         assert {[mml_fp r fastpath_write_maxmemory_serial_segments] > $serial}
+        r config set maxmemory 0
+    }
+
+    test {Lanes under maxmemory: near the limit with noeviction, hash writes stop at the limit} {
+        r flushall
+        r config set maxmemory-policy noeviction
+        r debug populate 20000 mml:base 100
+        set limit [expr {[s used_memory] + 512 * 1024}]
+        r config set maxmemory $limit
+        set val [string repeat x 100]
+        set fds [mml_open_fast r $host $port 4]
+        set bufs {}
+        set counts {}
+        for {set s 0} {$s < 4} {incr s} {
+            set buf ""
+            for {set i 0} {$i < 3000} {incr i} { append buf [mml_resp hset mml:hh:$s:[expr {$i % 50}] f$i $val] }
+            lappend bufs $buf
+            lappend counts 3000
+        }
+        set ok 0
+        set oom 0
+        foreach rs [mml_pipelines $fds $bufs $counts] {
+            foreach reply $rs {
+                if {$reply eq {:1}} { incr ok } elseif {[string match {-OOM *} $reply]} { incr oom } else { fail "unexpected reply $reply" }
+            }
+        }
+        mml_close_all
+        mml_wait_fastpath_clients r 0
+        assert {$ok > 0 && $oom > 0}
+        assert {[s used_memory] <= $limit + 64 * 1024}
         r config set maxmemory 0
     }
 

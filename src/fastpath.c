@@ -24,6 +24,7 @@
 #include "cluster_slot_stats.h"
 #include "hdr_histogram.h"
 #include "commandlog.h"
+#include "intset.h"
 #include <sys/uio.h>
 #include <sched.h>
 
@@ -83,6 +84,7 @@ typedef struct fpThread {
     long long mm_barriers; /* entries this thread made barriers because their growth has no bound here, ever */
     struct fpMmRead *mm_reads; /* the read phase's string reads whose lengths join the segment bounds */
     int mm_nreads, mm_reads_cap;
+    size_t mm_coll_bytes, mm_coll_elems; /* argument bytes and arguments of this iteration's collection writes */
     /* Main, write phase: where serial execution of this thread's batches resumes. */
     int scur_b, scur_e;
     /* Main, write phase: the first barrier whose keys are not prefetched yet. */
@@ -716,10 +718,13 @@ static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc,
  *
  * The bound is computed in the read phase, per entry, from the arguments and, for a command that
  * returns a stored string, from the length of that string now; it covers the keyspace data, table
- * entries, the reply and the propagated frames. Only commands whose growth that covers are lane
+ * entries, the reply and the propagated frames. For a hash or set write it also covers converting the
+ * key out of a listpack or intset: up to 16x what the key holds now (looked up) plus 16x everything the
+ * iteration adds to collections, charged once per segment. Only commands whose growth that covers are lane
  * entries under maxmemory (fpMmEntryBound); every other command is a barrier entry and runs through
- * processCommand at its place. Table resizes on a lane are charged to the budget main reserves with
- * the rest of the headroom (hashtableResizeAllowed); a resize that does not fit is skipped, as a
+ * processCommand at its place. Table resizes on a lane, the keyspace's and the hashes' and sets' own,
+ * are charged to the budget main reserves with the rest of the headroom (hashtableResizeAllowed,
+ * hashtableCollectionResizeAllowed); a resize that does not fit is skipped, as a
  * forbidden resize is. A string read may return a value written earlier in the iteration: its bound
  * adds the longest string any lane entry of the iteration writes, and once a barrier that may write
  * has run, segments with string reads run serially (fpExecuteWithLanes).
@@ -759,15 +764,36 @@ static size_t fpMmArgLen(robj *o) {
     return sdsEncodedObject(o) ? sdslen(objectGetVal(o)) : LONG_STR_SIZE;
 }
 
-/* A string a lane entry returns, whose length now the read phase looks up in batches. */
+/* A string a lane entry returns, or a hash, set or list it adds to, whose size now the read phase
+ * looks up in batches. */
 typedef struct fpMmRead {
     serverDb *db;
     robj *key;
     int shard;
-    int seg; /* the segment whose bound gets the length */
+    int seg;  /* the segment whose bound gets the size */
+    int coll; /* a collection write: its conversion out of a compact encoding is charged */
 } fpMmRead;
 
 #define FP_MM_FIND_BATCH 16
+#define FP_MM_ELEM 128      /* per element of a hash, set or list: entry, sds headers, node share */
+#define FP_MM_CONV_BYTES 16 /* a compact encoding's bytes, converted to a table, take at most this many times */
+
+/* The memory converting a hash or set out of its listpack or intset encoding can allocate. */
+static size_t fpMmConvBound(robj *o) {
+    size_t bytes, n;
+    if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        unsigned char *lp = objectGetVal(o);
+        bytes = lpBytes(lp);
+        n = bytes < 2 * 65535 ? lpLength(lp) : bytes / 2; /* below that size the header holds the count */
+    } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
+        intset *is = objectGetVal(o);
+        bytes = intsetBlobLen(is);
+        n = intsetLen(is);
+    } else {
+        return 0;
+    }
+    return FP_MM_CONV_BYTES * bytes + FP_MM_ELEM * n;
+}
 
 /* The thread that read the entries (or main, between phases, for any thread that did not get to it):
  * add the length of each string the queued reads return now to its segment's bound. The finds run 16
@@ -795,15 +821,20 @@ static void fpMmResolveReads(fpThread *t) {
             void *found;
             if (live[k] != 2 || !hashtableIncrementalFindGetResult(&fs[k], &found)) continue;
             robj *o = found;
-            if (objectGetType(o) == OBJ_STRING) t->seg_mem[t->mm_reads[i + k].seg] += stringObjectLen(o);
+            fpMmRead *r = &t->mm_reads[i + k];
+            if (r->coll) {
+                if (objectGetType(o) == OBJ_HASH || objectGetType(o) == OBJ_SET) t->seg_mem[r->seg] += fpMmConvBound(o);
+            } else if (objectGetType(o) == OBJ_STRING) {
+                t->seg_mem[r->seg] += stringObjectLen(o);
+            }
         }
     }
     t->mm_nreads = 0;
 }
 
-static void fpMmQueueRead(fpThread *t, cmdEntry *e, robj *key) {
+static void fpMmQueueRead(fpThread *t, cmdEntry *e, robj *key, int coll) {
     FP_GROW(t->mm_reads, t->mm_nreads, t->mm_reads_cap, 64);
-    t->mm_reads[t->mm_nreads++] = (fpMmRead){.db = e->db, .key = key, .shard = e->shard, .seg = t->nbarriers};
+    t->mm_reads[t->mm_nreads++] = (fpMmRead){.db = e->db, .key = key, .shard = e->shard, .seg = t->nbarriers, .coll = coll};
 }
 
 /* IO thread, read phase: a bound on the memory a serial run of the entry can add, or SIZE_MAX when the
@@ -847,6 +878,23 @@ static size_t fpMmEntryBound(fpThread *t, cmdEntry *e, int *reads, size_t *wlen)
         read_step = argc;
     } else if (p == mgetCommand) {
         read_from = 1;
+    } else if (p == hsetCommand || p == hsetnxCommand || p == hincrbyCommand || p == saddCommand ||
+               p == lpushCommand || p == rpushCommand || p == lpushxCommand || p == rpushxCommand ||
+               p == hdelCommand || p == sremCommand) {
+        int list = p == lpushCommand || p == rpushCommand || p == lpushxCommand || p == rpushxCommand;
+        if (list && server.list_compress_depth) return SIZE_MAX; /* compressing a node allocates up to its size */
+        /* Each element: its bytes again in the structure, plus its entry or node share. */
+        b += e->argv_len_sum + FP_MM_ELEM * (size_t)argc;
+        if (p != hdelCommand && p != sremCommand) {
+            /* A hash or set may convert out of its compact encoding: what it holds now (looked up),
+             * plus what this iteration adds to any collection (fpMmMaxWrite). */
+            if (!list) {
+                fpMmQueueRead(t, e, argv[1], 1);
+                (*reads)++; /* like a string read, its lookup is stale once a barrier has written */
+            }
+            t->mm_coll_bytes += e->argv_len_sum;
+            t->mm_coll_elems += (size_t)argc;
+        }
     } else if (!(p == delCommand || p == unlinkCommand || p == existsCommand || p == touchCommand ||
                  p == typeCommand || p == ttlCommand || p == pttlCommand || p == expiretimeCommand ||
                  p == pexpiretimeCommand || p == persistCommand || p == expireCommand || p == pexpireCommand ||
@@ -855,7 +903,7 @@ static size_t fpMmEntryBound(fpThread *t, cmdEntry *e, int *reads, size_t *wlen)
     }
     if (read_from) {
         for (int j = read_from; j < argc; j += read_step) {
-            fpMmQueueRead(t, e, argv[j]);
+            fpMmQueueRead(t, e, argv[j], 0);
             b += FP_MM_REPLY;
             (*reads)++;
         }
@@ -890,13 +938,21 @@ static int fpMmAccount(fpThread *t, cmdEntry *e) {
 }
 
 /* Main, after the read phase: the longest string value any lane entry of the iteration writes. Also
- * resolves any read a thread left queued, so every segment bound is complete. */
+ * resolves any read a thread left queued, so every segment bound is complete, and sets
+ * fp_mm_coll_growth: what converting the iteration's additions to hashes and sets can allocate,
+ * charged to every segment (each added byte is converted at most once). */
+static size_t fp_mm_coll_growth = 0;
 static size_t fpMmMaxWrite(void) {
-    size_t m = 0;
+    size_t m = 0, cb = 0, ce = 0;
     for (int tid = 0; tid < fp_slots; tid++) {
-        if (fp_threads[tid].mm_nreads) fpMmResolveReads(&fp_threads[tid]);
-        if (fp_threads[tid].sbn[0] && fp_threads[tid].mm_max_write > m) m = fp_threads[tid].mm_max_write;
+        fpThread *t = &fp_threads[tid];
+        if (t->mm_nreads) fpMmResolveReads(t);
+        if (!t->sbn[0]) continue;
+        if (t->mm_max_write > m) m = t->mm_max_write;
+        cb += t->mm_coll_bytes;
+        ce += t->mm_coll_elems;
     }
+    fp_mm_coll_growth = FP_MM_CONV_BYTES * cb + FP_MM_ELEM * ce;
     return m;
 }
 
@@ -904,7 +960,7 @@ static size_t fpMmMaxWrite(void) {
  * would find used memory under maxmemory before every entry. On success the rest of the headroom is
  * the lanes' budget for table allocations. Changes nothing. */
 static int fpMmHeadroom(int n, size_t mem, int reads, size_t max_write, long long *budget) {
-    size_t need = mem + (size_t)reads * max_write + FP_MM_SLACK;
+    size_t need = mem + (size_t)reads * max_write + fp_mm_coll_growth + FP_MM_SLACK;
     for (int type = 0; type < COMMANDLOG_TYPE_NUM; type++) {
         if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) continue;
         size_t logs = (size_t)server.commandlog[type].max_len < (size_t)n ? (size_t)server.commandlog[type].max_len : (size_t)n;
@@ -1104,6 +1160,7 @@ static void fpResetLaneVectors(fpThread *t) {
     if (fp_mm_iter) fpMmSegOpen(t, 0);
     t->mm_max_write = 0;
     t->mm_nreads = 0;
+    t->mm_coll_bytes = t->mm_coll_elems = 0;
     t->scur_b = t->scur_e = 0;
     t->mcur_b = t->mcur_e = 0;
     t->pf_barrier = 0;
