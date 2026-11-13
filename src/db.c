@@ -31,6 +31,7 @@
 #include "repl_apply.h"
 #include "listpack.h"
 #include "hotkeys.h"
+#include "owner.h"
 #include "ordered_index.h"
 #include "fastget.h"
 #include "cluster.h"
@@ -271,7 +272,8 @@ static int keyspaceShard(sds key) {
 }
 
 int getKVStoreIndexForKey(sds key) {
-    if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
+    /* Owner threads (owner.c) own slot ranges, so their standalone keyspace is split by slot too. */
+    if (server.cluster_enabled || server.owner_threads) return (int)keyHashSlot(key, (int)sdslen(key));
     if (server.keyspace_shard_bits) return keyspaceShard(key);
     return 0;
 }
@@ -528,7 +530,7 @@ robj *dbRandomKey(serverDb *db) {
 int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index) {
     /* Fast GET: keyspace deletes must run on main -- IO threads punt.
      * See expireIfNeededWithDictIndex for the rationale. */
-    debugServerAssert(inMainThread() || exec_lane);
+    debugServerAssert(inMainThread() || exec_lane || own_self);
     hashtablePosition pos;
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
@@ -2391,7 +2393,7 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
      * to main (fastget.c) -- they must never reach this point. Checked
      * invariant so any future IO-thread path that forgets the punt rule
      * trips immediately in debug builds instead of corrupting silently. */
-    debugServerAssert(inMainThread() || exec_lane);
+    debugServerAssert(inMainThread() || exec_lane || own_self);
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;
     if (static_key) {

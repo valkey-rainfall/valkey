@@ -922,6 +922,11 @@ int getCurTid(void) {
     return thread_id;
 }
 
+/* An owner thread (owner.c) is neither main nor an IO thread. */
+void ioThreadsMarkOwnerThread(void) {
+    thread_id = -1;
+}
+
 void commitIOJobs(void) {
     for (int i = 1; i < server.active_io_threads_num; i++) {
         if (spscCommit(&io_private_inbox[i])) ioThreadWake(i);

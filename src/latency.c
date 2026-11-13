@@ -34,6 +34,7 @@
  */
 
 #include "server.h"
+#include "owner.h"
 #include "hdr_histogram.h"
 
 /* Dictionary type for latency events. */
@@ -79,6 +80,8 @@ void latencyAddSample(const char *event, ustime_t latency_us) {
         fastpathLaneLatencySample(event, latency_us);
         return;
     }
+    /* Owner threads run only while the latency monitor is off (owner.c vetoes it). */
+    if (own_self) return;
     mstime_t latency = latency_us / 1000;
     struct latencyTimeSeries *ts = dictFetchValue(server.latency_events, event);
     time_t now = time(NULL);

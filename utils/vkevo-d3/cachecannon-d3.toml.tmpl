@@ -1,0 +1,47 @@
+# cachecannon (1bea936 / v0.0.34) cluster-mode TOML for D3. Same keys as round 1's vkbench
+# cachecannon_toml() with cluster = true. One seed is enough: cachecannon sends CLUSTER SLOTS
+# (answered by the D3 server with its owner ports 6400+i), builds the CRC16 slot table and sends
+# each key to its slot's owner. D3 never answers -MOVED: a misrouted key is still served (main-path
+# fallback), so a correct routing run shows errors 0 AND INFO owners owner_handoffs_to_main ~ 0.
+# 1bea936 has only "pinned" routing: connection c serves node c % N and keys are sampled inside
+# that node's slots, so CONNS should be a multiple of N (>= THREADS x N for an even spread).
+# Fill the @...@ fields (sed) per cell.
+[general]
+duration = "@DURATION@s"
+warmup = "@WARMUP@s"
+threads = @THREADS@
+cpu_list = "@CLIENT_CPUS@"
+io_engine = "uring"
+
+[target]
+endpoints = ["@SEED@"]
+protocol = "resp"
+cluster = true
+
+[connection]
+connections = @CONNS@
+pipeline_depth = @PIPELINE@
+
+[workload]
+prefill = true
+prefill_settle = "0s"
+
+[workload.keyspace]
+length = 16
+count = @KEYS@
+distribution = "@DIST@"
+
+[workload.commands]
+get = @GET@
+set = @SET@
+delete = 0
+
+[workload.values]
+length = @VLEN@
+
+[timestamps]
+enabled = true
+mode = "userspace"
+
+[admin]
+format = "json"

@@ -42,6 +42,7 @@
 #include "cluster_slot_stats.h"
 #include "module.h"
 #include "crc16_slottable.h"
+#include "owner.h"
 
 #include <ctype.h>
 
@@ -888,6 +889,8 @@ void clusterKeySlotCommand(client *c) {
 
 void clusterCommand(client *c) {
     if (server.cluster_enabled == 0) {
+        /* Owner threads announce their slot ranges as a cluster (owner.c). */
+        if (ownerClusterCommand(c)) return;
         addReplyError(c, "This instance has cluster support disabled");
         return;
     }

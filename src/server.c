@@ -33,6 +33,7 @@
  */
 #include "server.h"
 #include "hotkeys.h"
+#include "owner.h"
 #include "cronstats.h"
 #include "ordered_index.h"
 #include "connection.h"
@@ -1261,6 +1262,9 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
 static bool clientsCronTcpIsClosing(client *c) {
     if (!c->conn) return false;
 
+    /* An owner thread watches its clients' sockets itself. */
+    if (c->owner_tid != OWNER_ON_MAIN) return false;
+
     /* If the fd is still watched by the event loop, it detects the close and frees the client itself. */
     if (connHasReadHandler(c->conn) || connHasWriteHandler(c->conn)) return false;
 
@@ -2347,6 +2351,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * watch, so main polls without blocking until it has been idle a while; then the IO threads wake it. */
     if (ioThreadsMainMustPoll()) aeSetDontWait(server.el, 1);
 
+    /* Idle guests go back to their owner threads, which run until main wakes up. */
+    ownerBeforeSleepEnd();
+
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
      * time. */
@@ -2412,6 +2419,9 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     /* Pause, yield and failover state changes on main, or on a module thread under the GIL, before
      * this point; the staged loop's read phase follows. */
     fastGetRefreshMainGate();
+
+    /* Owner threads stop for as long as main runs, and their handed-off clients join main. */
+    ownerAfterSleep();
 }
 
 /* Callback invoked by the event loop after draining priority events.
@@ -3292,7 +3302,10 @@ bool dbsHaveNoKeys(void) {
  * created. */
 #define KEYSPACE_SHARD_BITS_AUTO_WIDE_MIN_IO_THREADS 16
 void resolveKeyspaceShardBits(void) {
-    if (server.keyspace_shard_bits_config >= 0) {
+    if (server.owner_threads && !server.cluster_enabled) {
+        /* Owner threads own slot ranges: one table per slot, as in cluster mode (owner.c). */
+        server.keyspace_shard_bits = CLUSTER_SLOT_MASK_BITS;
+    } else if (server.keyspace_shard_bits_config >= 0) {
         server.keyspace_shard_bits = server.keyspace_shard_bits_config;
     } else if (server.cluster_enabled || server.io_threads_num < 2) {
         server.keyspace_shard_bits = 0;
@@ -7785,6 +7798,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         stagedInfo(&info);
     }
 
+    if (all_sections || (dictFind(section_dict, "owners") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscat(info, "# Owners\r\n");
+        ownerInfo(&info);
+    }
+
     return info;
 }
 
@@ -8739,6 +8758,14 @@ __attribute__((weak)) int main(int argc, char **argv) {
     if (server.cluster_enabled) {
         clusterInitLast();
     }
+    if (server.owner_threads) {
+        const char *err = NULL;
+        if (ownerValidateConfig(&err) != C_OK) {
+            serverLog(LL_WARNING, "Fatal: %s", err);
+            exit(1);
+        }
+        ownerThreadsInit();
+    }
 
 #if defined(LUA_ENABLED) && STATIC_LUA
     /* Initialize the LUA scripting engine on-startup only when LUA is built statically.
@@ -8804,6 +8831,8 @@ __attribute__((weak)) int main(int argc, char **argv) {
 
     serverSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
+    /* Owner threads start stopped; the first beforeSleep lets them run. */
+    if (ownerThreadsEnabled()) ownerThreadsStart();
 
     stagedMain(server.el);
     aeDeleteEventLoop(server.el);

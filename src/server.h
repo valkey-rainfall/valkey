@@ -1646,6 +1646,13 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
+    /* Owner threads (owner.c). */
+    int owner_tid;               /* Serving thread: owner id, OWNER_ON_MAIN or OWNER_IN_TRANSIT. */
+    int owner_home;              /* Owner of the port the client came in on, -1 for none. */
+    int owner_why;               /* Why the owner handed the client to main (owner.c). */
+    unsigned owner_onloop : 1;   /* Registered in its owner's epoll set. */
+    unsigned owner_wantout : 1;  /* Its owner waits for EPOLLOUT. */
+    listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -2136,6 +2143,11 @@ struct valkeyServer {
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int keyspace_shard_bits_config;           /* Configured value: -1 means auto (resolve at startup from cluster mode). */
+    int owner_threads;                        /* owner-threads: D3 owner threads, 0 = off (owner.c). */
+    int owner_port;                           /* owner-port: owner i listens on owner_port + i; 0 = no owner ports. */
+    char *owner_cpulist;                      /* owner-cpulist: owner i is pinned to the i-th CPU of the list. */
+    char *owner_announce_ip;                  /* owner-announce-ip: address CLUSTER SLOTS announces. */
+    int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
@@ -3523,6 +3535,13 @@ void ringExecuteOne(client *c);
 extern _Thread_local sds thread_shared_qb;
 int isParsingError(client *c);
 void resetSharedQueryBuf(client *c);
+void trimCommandQueue(client *c);
+int _writeToClient(client *c);
+int ownerRunParsedInput(client *c, int (*try_native)(client *c));
+void ownerResumeOnMain(client *c);
+void ownerPostWriteToClient(client *c);
+void ownerCountNetOut(long long n);
+int clientTotalPubSubSubscriptionCount(client *c);
 int processClientIOReadsDone(client *c);
 void processClientIOWriteDone(client *c);
 int settleClientWrite(client *c);

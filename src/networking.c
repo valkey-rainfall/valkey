@@ -48,6 +48,7 @@
 #include "connection.h"
 #include "zmalloc.h"
 #include "staged_loop.h"
+#include "owner.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -347,6 +348,8 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
         if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
     }
     if (c->flag.fake || c->flag.executor || isDeferredReplyEnabled(c)) return 0;
+    /* Owner threads write plain buffers: no reply references a value across threads. */
+    if (c->owner_home >= 0) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 
@@ -484,6 +487,12 @@ client *createClient(connection *conn) {
     c->io_last_written.data_len = 0;
     c->io_tid = 0;
     c->ring_seen = 0;
+    c->owner_tid = OWNER_ON_MAIN;
+    c->owner_home = conn ? owner_accept_home : -1;
+    c->owner_why = 0;
+    c->owner_onloop = 0;
+    c->owner_wantout = 0;
+    c->owner_guest_node = NULL;
     return c;
 }
 
@@ -578,6 +587,14 @@ int prepareClientToWrite(client *c) {
     if (c->io_write_state == CLIENT_COMPLETED_IO) {
         reconcileLazyWrite(c);
         if (c->flag.close_asap) return C_ERR;
+    }
+
+    /* A client an owner thread serves gets replies only from that thread, which writes them
+     * after the read that produced them; main never queues it. */
+    if (c->owner_tid != OWNER_ON_MAIN) {
+        serverAssert(own_self && c->owner_tid >= 0);
+        if (!isDeferredReplyEnabled(c)) c->flag.buffered_reply = 1;
+        return C_OK;
     }
 
     /* Schedule the client to write the output buffers to the socket, unless
@@ -1004,6 +1021,11 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
     if (exec_lane) {
         /* The error stats belong to main; an executor's reply never reaches a primary or replica. */
         fastpathLaneErrorReply(c, s, len, flags);
+        return;
+    }
+    if (own_self) {
+        /* Same for an owner thread: it serves only normal clients. */
+        ownerErrorReply(c, s, len, flags);
         return;
     }
     if (!(flags & ERR_REPLY_FLAG_NO_STATS_UPDATE)) {
@@ -1997,6 +2019,17 @@ void clientAcceptHandler(connection *conn) {
     server.stat_numconnections++;
     moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
 
+    /* A connection on an owner port (or any TCP client under owner-adopt-all) is served by its
+     * owner thread from now on. */
+    if (!c->flag.close_asap && ownerThreadsEnabled()) {
+        if (c->owner_home < 0 && server.owner_adopt_all && connGetType(conn) == CONN_TYPE_SOCKET)
+            c->owner_home = (int)(c->id % (uint64_t)server.owner_threads);
+        if (c->owner_home >= 0) {
+            ownerAdoptAccepted(c);
+            return;
+        }
+    }
+
     if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {
         connSetReadHandler(conn, NULL);
     } else if (!c->flag.close_asap) {
@@ -2464,6 +2497,11 @@ void clearClientConnectionState(client *c) {
 int freeClient(client *c) {
     listNode *ln;
 
+    /* An owner thread's client comes back to main first; owners are stopped while main runs. */
+    serverAssert(c->owner_tid != OWNER_IN_TRANSIT);
+    if (c->owner_tid >= 0) ownerReclaim(c);
+    if (c->owner_guest_node) ownerClientFreed(c);
+
     /* repl-stream-sender: ensure the sender thread holds no reference to this client
      * before we free it. Takes the sender mutex, so after this returns the sender has
      * released the client (it serialises per-replica against the sender's send). Safe
@@ -2626,6 +2664,11 @@ int freeClient(client *c) {
  * a context where calling freeClient() is not possible, because the client
  * should be valid for the continuation of the flow of the program. */
 void freeClientAsync(client *c) {
+    if (own_self) {
+        /* An owner thread hands the client to main, which queues the close (ownerTakeOne). */
+        c->flag.close_asap = 1;
+        return;
+    }
     debugServerAssert(inMainThread());
     /* A staged client needs the close recorded, or it stays on the fast path and is never freed. */
     if (c->flag.fastpath) fastpathRequestDetach(c);
@@ -3572,6 +3615,8 @@ static void _postWriteToClient(client *c) {
     if (c->nwritten <= 0) return;
     if (getClientType(c) == CLIENT_TYPE_SLOT_EXPORT) {
         server.stat_net_cluster_slot_export_bytes += c->nwritten;
+    } else if (own_self) {
+        ownerCountNetOut(c->nwritten);
     } else {
         server.stat_net_output_bytes += c->nwritten;
     }
@@ -7538,7 +7583,10 @@ int closeClientOnOutputBufferLimitReached(client *c, int async) {
             serverLog(LL_WARNING, "Client %s closed for overcoming of output buffer limits.", client);
         }
         sdsfree(client);
-        server.stat_client_outbuf_limit_disconnections++;
+        if (own_self)
+            ownerCountOutbufDisconnect();
+        else
+            server.stat_client_outbuf_limit_disconnections++;
         return 1;
     }
     return 0;
@@ -7919,6 +7967,48 @@ int processClientIOReadsDone(client *c) {
         if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
     }
     return needs_post_read_update;
+}
+
+/* Owner thread (owner.c): run the commands parsed for a client the owner serves, in order and as
+ * processInputBuffer() would, for as long as try_native() runs them. The current command is in
+ * c->argv, the next ones in the command queue or still in the query buffer. Returns 1 when main
+ * must take the client, with its current command (if any) parsed and not executed. */
+int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
+    bool popped = false;
+    for (;;) {
+        if (!canParseCommand(c) || isParsingError(c)) return 1;
+        parseResult res = handleParseResults(c);
+        if (res == PARSE_NEEDMORE) {
+            /* The rest of a command read off the wire earlier: parse on, or wait for it. A partial
+             * taken from the queue may have its completion bytes in the query buffer already. */
+            if (!popped) return 0;
+        } else if (c->argc > 0 && !try_native(c)) {
+            return 1;
+        }
+        c->read_flags = authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+        if (res != PARSE_NEEDMORE && consumeCommandQueue(c)) {
+            popped = true;
+            continue;
+        }
+        if (!c->querybuf || c->qb_pos >= sdslen(c->querybuf)) return 0;
+        parseInputBuffer(c);
+        prepareCommandQueue(c);
+        popped = false;
+    }
+}
+
+/* Main: go on with a client an owner thread handed over, as processClientIOReadsDone() goes on
+ * after a read: its current command first, then the rest of its input. */
+void ownerResumeOnMain(client *c) {
+    parseResult res = handleParseResults(c);
+    if (res == PARSE_ERR) return;
+    if (res == PARSE_OK && c->argc > 0 && !c->flag.blocked) c->flag.pending_command = 1;
+    if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
+}
+
+/* Owner thread: the buffer bookkeeping of a write (its bytes count for the owner). */
+void ownerPostWriteToClient(client *c) {
+    _postWriteToClient(c);
 }
 
 /* Returns the actual client eviction limit based on current configuration or
