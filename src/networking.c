@@ -2286,6 +2286,21 @@ void freeClientArgv(client *c) {
         goto clear;
     }
 
+    /* No IO thread takes frees: do directly what the off-main path below ends up doing. A shared or
+     * string argument is a plain decrement in every case of freeValueNeverOnMain(), and the array
+     * cannot be offloaded. */
+    if (server.active_io_threads_num <= 1) {
+        for (int j = 0; j < c->argc; j++) {
+            robj *o = c->argv[j];
+            if (o->refcount > 1 || o->type == OBJ_STRING)
+                decrRefCount(o);
+            else
+                freeValueNeverOnMain(NULL, o, -1);
+        }
+        zfree(c->argv);
+        goto clear;
+    }
+
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
     if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
