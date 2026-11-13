@@ -170,6 +170,7 @@ static void deferClientRead(client *c);
 char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
 static int clientMatchesFilter(client *client, clientFilter *client_filter);
+static void clientReleaseIdentityAttr(client *c, robj *o);
 static void clientKillVictimGone(uint64_t id);
 static int validateClientFlagFilter(sds flag_filter);
 static int validateClientCapaFilter(sds capa);
@@ -2440,7 +2441,7 @@ void clearClientConnectionState(client *c) {
     freeClientPubSubData(c);
 
     if (c->name) {
-        decrRefCount(c->name);
+        clientReleaseIdentityAttr(c, c->name);
         c->name = NULL;
     }
 
@@ -5297,6 +5298,20 @@ uint64_t getClientOriginId(client *c) {
     return c->origin ? c->origin->client_id : c->id;
 }
 
+/* CLIENT SETNAME name, and CLIENT SETINFO lib-name / lib-ver, of the client a command came from (NULL
+ * when unset): the origin's while an executor runs a fast-path entry. */
+robj *getClientOriginName(client *c) {
+    return c->origin ? c->origin->name : c->name;
+}
+
+robj *getClientOriginLibName(client *c) {
+    return c->origin ? c->origin->lib_name : c->lib_name;
+}
+
+robj *getClientOriginLibVer(client *c) {
+    return c->origin ? c->origin->lib_ver : c->lib_ver;
+}
+
 /* Transport of the client a command came from: the origin's captured type while an executor runs a
  * fast-path entry (its own conn is NULL), otherwise the live connection. Lets MONITOR and tracing
  * render the real transport without touching the IO-owned connection. */
@@ -5395,6 +5410,9 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     /* Compute the total memory consumed by this client. */
     size_t obufmem, total_mem = getClientMemoryUsage(client, &obufmem);
 
+    robj *name = getClientOriginName(client), *lib_name = getClientOriginLibName(client);
+    robj *lib_ver = getClientOriginLibVer(client);
+
     size_t used_blocks_of_repl_buf = 0;
     if (client->repl_data && client->repl_data->ref_repl_buf_node) {
         replBufBlock *last = listNodeValue(listLast(server.repl_buffer_blocks));
@@ -5408,7 +5426,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " addr=%s", getClientPeerId(client),
             " laddr=%s", getClientSockname(client),
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
-            " name=%s", hide_user_data ? "*redacted*" : (client->name ? (char *)objectGetVal(client->name) : ""),
+            " name=%s", hide_user_data ? "*redacted*" : (name ? (char *)objectGetVal(name) : ""),
             " age=%I", (long long)(commandTimeSnapshot() / 1000 - client->ctime),
             " idle=%I", (long long)(server.unixtime - client->last_interaction),
             " flags=%s", flags,
@@ -5434,8 +5452,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " user=%s", hide_user_data ? "*redacted*" : (client->user ? client->user->name : "(superuser)"),
             " redir=%I", (client->flag.tracking) ? (long long)client->pubsub_data->client_tracking_redirection : -1,
             " resp=%i", client->resp,
-            " lib-name=%s", client->lib_name ? (char *)objectGetVal(client->lib_name) : "",
-            " lib-ver=%s", client->lib_ver ? (char *)objectGetVal(client->lib_ver) : "",
+            " lib-name=%s", lib_name ? (char *)objectGetVal(lib_name) : "",
+            " lib-ver=%s", lib_ver ? (char *)objectGetVal(lib_ver) : "",
             " tot-net-in=%U", client->net_input_bytes,
             " tot-net-out=%U", client->net_output_bytes,
             " tot-cmds=%U", client->commands_processed));
@@ -5451,6 +5469,8 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
 sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
     char conninfo[CONN_INFO_LEN];
+    robj *name = getClientOriginName(client), *lib_name = getClientOriginLibName(client);
+    robj *lib_ver = getClientOriginLibVer(client);
 
     sds ret = sdscatfmt(
         s,
@@ -5459,10 +5479,10 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
             " addr=%s", getClientPeerId(client),
             " laddr=%s", getClientSockname(client),
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
-            " name=%s", hide_user_data ? "*redacted*" : (client->name ? (char *)objectGetVal(client->name) : ""),
+            " name=%s", hide_user_data ? "*redacted*" : (name ? (char *)objectGetVal(name) : ""),
             " user=%s", hide_user_data ? "*redacted*" : (client->user ? client->user->name : "(superuser)"),
-            " lib-name=%s", client->lib_name ? (char *)objectGetVal(client->lib_name) : "",
-            " lib-ver=%s", client->lib_ver ? (char *)objectGetVal(client->lib_ver) : ""));
+            " lib-name=%s", lib_name ? (char *)objectGetVal(lib_name) : "",
+            " lib-ver=%s", lib_ver ? (char *)objectGetVal(lib_ver) : ""));
     return ret;
 }
 
@@ -5525,22 +5545,33 @@ int validateClientName(robj *name, const char **err) {
     return C_OK;
 }
 
+/* Release a client's previous name, lib-name or lib-ver. Fast-path entries harvested before the change
+ * borrow it in their origin (CommandOrigin), so for a client on the fast path it is released at the
+ * next beforeSleep instead. */
+static void clientReleaseIdentityAttr(client *c, robj *o) {
+    if (c->flag.fastpath)
+        fastpathDeferDecrRefCount(o);
+    else
+        decrRefCount(o);
+}
+
 /* Returns C_OK if the name has been set or C_ERR if the name is invalid. */
 int clientSetName(client *c, robj *name, const char **err) {
     if (validateClientName(name, err) == C_ERR) {
         return C_ERR;
     }
     int len = (name != NULL) ? sdslen(objectGetVal(name)) : 0;
+    robj *old = c->name;
     /* Setting the client name to an empty string actually removes
      * the current name. */
     if (len == 0) {
-        if (c->name) decrRefCount(c->name);
         c->name = NULL;
-        return C_OK;
+    } else {
+        c->name = name;
+        incrRefCount(name);
     }
-    if (c->name) decrRefCount(c->name);
-    c->name = name;
-    incrRefCount(name);
+    /* Fast-path entries of this client harvested before the change still borrow the old name. */
+    if (old) clientReleaseIdentityAttr(c, old);
     return C_OK;
 }
 
@@ -5581,7 +5612,7 @@ void clientSetinfoCommand(client *c) {
         addReplyErrorFormat(c, "%s cannot contain spaces, newlines or special characters.", attr);
         return;
     }
-    if (*destvar) decrRefCount(*destvar);
+    if (*destvar) clientReleaseIdentityAttr(c, *destvar);
     if (sdslen(val)) {
         *destvar = valob;
         incrRefCount(valob);

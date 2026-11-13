@@ -82,6 +82,7 @@ proc slc_wait_closed {fd count} {
 
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3}} {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged loop close: output buffer limit disconnects a fast-path client doing big GETs} {
@@ -152,7 +153,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         # One packet: a write, then a GET whose reply passes the hard limit. The GET closes the
         # client while the write's reply still waits to be sent. A serial server frees the closed
         # client before writing anything more to it, so the socket sees EOF and no reply. The
-        # second round checks the same on the main path (a named client leaves the fast path).
+        # second round checks the same on the main path (an excluded client leaves the fast path).
         r config set client-output-buffer-limit "normal 64kb 0 0"
         # A copy-avoided reply is not counted toward the limit on the main path: keep it copied.
         set avoid [lindex [r config get min-string-size-avoid-copy-reply-threaded] 1]
@@ -164,7 +165,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             set count [slc_client_count]
             set fd [slc_fastpath_socket]
             if {$path eq "main"} {
-                puts -nonewline $fd [slc_resp client setname slc-main]
+                puts -nonewline $fd [slc_resp debug fastpath-exclude 1]
                 flush $fd
                 assert_equal "+OK" [string trim [gets $fd]]
                 wait_for_condition 200 20 {

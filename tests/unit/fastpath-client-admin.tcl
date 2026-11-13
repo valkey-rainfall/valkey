@@ -2,9 +2,9 @@
 #
 # Each test first puts a raw client on the fast path and checks INFO fastpath
 # (fastpath_clients, fastpath_speculated, fastpath_net_output_bytes), so a pass
-# proves the fast path was engaged. The control connection `r` is named (CLIENT
-# SETNAME), which keeps it on the main path; on this branch INFO fastpath_clients
-# counts the asking client too (issue 77), so an unnamed `r` would count as one.
+# proves the fast path was engaged. The control connection `r` is excluded from the fast
+# path (DEBUG FASTPATH-EXCLUDE), which keeps it on the main path; on this branch INFO fastpath_clients
+# counts the asking client too (issue 77), so an admitted `r` would count as one.
 
 proc fpca_info {field} { getInfoProperty [r info fastpath] $field }
 
@@ -46,6 +46,7 @@ start_server {tags {"fastpath client-admin idle-timeout external:skip tls:skip"}
     r select 9
     # A named client stays off the fast path, so it is not counted in fastpath_clients.
     r client setname fpca-control
+    r debug fastpath-exclude 1
 
     test {CLI-13: a fast-path client slowly reading a 32 MB reply is not closed by timeout 1} {
         set size 33554432

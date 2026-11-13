@@ -22,6 +22,7 @@ start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appe
     assert_equal {appendfsync always} [r config get appendfsync]
     # A named, main-path control connection to observe INFO and the shared dataset.
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Fast path appendfsync always: interleaved writes and reads stay correct and ordered} {
@@ -71,8 +72,9 @@ start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appe
 }
 
 start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appendfsync everysec io-threads 4 io-threads-always-active yes save ""}} {
-    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    # An excluded client (DEBUG FASTPATH-EXCLUDE) stays off the fast path, so INFO from it counts only the clients under test.
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
     waitForBgrewriteaof r
     proc fpa_speculated {} { getInfoProperty [r info fastpath] fastpath_speculated }

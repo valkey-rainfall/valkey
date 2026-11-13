@@ -367,6 +367,18 @@ int test_setname(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         return ValkeyModule_ReplyWithError(ctx, strerror(errno));
 }
 
+/* Rename another client, by id. */
+int test_setnamebyid(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    long long id;
+    if (ValkeyModule_StringToLongLong(argv[1], &id) != VALKEYMODULE_OK)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid client id");
+    if (ValkeyModule_SetClientNameById((uint64_t)id, argv[2]) == VALKEYMODULE_OK)
+        return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+    else
+        return ValkeyModule_ReplyWithError(ctx, strerror(errno));
+}
+
 int test_log_tsctx(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc)
 {
     ValkeyModuleCtx *tsctx = ValkeyModule_GetDetachedThreadSafeContext(ctx);
@@ -719,6 +731,8 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (ValkeyModule_CreateCommand(ctx,"test.getname", test_getname,"",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx,"test.setname", test_setname,"",0,0,0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx,"test.setnamebyid", test_setnamebyid,"",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx,"test.serverversion", test_serverversion,"",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;

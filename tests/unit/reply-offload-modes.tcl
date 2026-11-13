@@ -9,7 +9,8 @@ proc mkbig {nbytes} {
 
 start_server {tags {"reply-offload external:skip needs:debug logreqres:skip"} overrides {io-threads 6 enable-debug-command yes save ""}} {
     assert_equal {io-threads 6} [r config get io-threads]
-    r client setname reply-offload-modes ;# a named client stays on the main path, where replies avoid copies
+    r client setname reply-offload-modes ;# excluded from the fast path below: on the main path replies avoid copies
+    r debug fastpath-exclude 1
 
     test {avoid-copy-reply-mode off: large GET byte-exact and zero offload} {
         r config set avoid-copy-reply-mode off

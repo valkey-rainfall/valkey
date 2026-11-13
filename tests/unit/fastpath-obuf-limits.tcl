@@ -23,6 +23,7 @@ proc fpol_disconnections {} {
 start_server {tags {"fastpath obuf-limits external:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0 ;# the same db as the raw fast-path clients
 
     test {Fast path COB: a large reply over the hard limit closes the client before delivery} {

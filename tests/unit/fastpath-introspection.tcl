@@ -67,8 +67,9 @@ proc fpi_client_field {fd field} {
 }
 
 start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
-    # A named client stays off the fast path.
+    # An excluded client (DEBUG FASTPATH-EXCLUDE) stays off the fast path.
     r client setname fpi-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {CLIENT LIST cmd= names the last command a fast-path client ran} {
@@ -97,8 +98,9 @@ start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides 
 }
 
 start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
-    # A named client stays off the fast path.
+    # An excluded client (DEBUG FASTPATH-EXCLUDE) stays off the fast path.
     r client setname fpi-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {INFO fastpath_clients counts the fast-path client that asks} {
@@ -139,6 +141,7 @@ proc fpi_logged_set_keys {c prefix} {
 
 start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
     r client setname fpi-control
+    r debug fastpath-exclude 1
     r select 0
     r config set notify-keyspace-events ""
 
@@ -173,11 +176,13 @@ start_server {tags {"fastpath repl external:skip tls:skip logreqres:skip"} overr
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
     $primary client setname fpi-control
+    $primary debug fastpath-exclude 1
     $primary select 0
     $primary config set notify-keyspace-events ""
     start_server {overrides {io-threads 3 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
         set replica [srv 0 client]
         $replica client setname fpi-replica-control
+        $replica debug fastpath-exclude 1
         $replica select 0
         $replica config set notify-keyspace-events ""
         $replica replicaof $primary_host $primary_port
@@ -220,6 +225,7 @@ proc fpi_histogram_calls {c cmd} {
 
 start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
     r client setname fpi-control
+    r debug fastpath-exclude 1
     r select 0
     r config set notify-keyspace-events ""
 

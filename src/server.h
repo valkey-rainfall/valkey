@@ -1323,6 +1323,7 @@ typedef struct ClientFlags {
     uint64_t fp_detach_sent : 1;           /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
     uint64_t fp_readmit : 1;               /* On main but able to join the fast path; retried after each command until it joins or never can. */
     uint64_t main_read_direct : 1;         /* main-read-batch: the last read held more than one command or a multi-key one, so the next is run directly. */
+    uint64_t fp_excluded : 1;              /* DEBUG FASTPATH-EXCLUDE: never admitted to the fast path (tests use it for control connections). */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1490,6 +1491,14 @@ typedef struct {
     uint8_t authenticated;   /* flag.authenticated of the origin; authRequired() is evaluated live by main. */
     int8_t conn_type;        /* Origin connection type (CONN_TYPE_*), captured by the IO owner at admission; lets main render transport (MONITOR unix, tracing) without touching the connection. CONN_TYPE_INVALID if unknown. */
     uint32_t acl_epoch_seen; /* acl-offload: low 32 bits of the ACL epoch this entry's ALLOW verdict was tagged under; main trusts READ_FLAGS_ACL_ALLOWED only while it still matches. Fills the padding hole after conn_type; no struct growth. */
+    /* The origin's CLIENT SETNAME name and CLIENT SETINFO lib-name / lib-ver (NULL when unset), so
+     * COMMANDLOG and ACL LOG name the real client. Borrowed: a client changes them itself only on
+     * the main path, and when main renames a fast-path client (VM_SetClientNameById) the old object
+     * is released only at the next beforeSleep (fastpathDeferDecrRefCount), after every phase that
+     * could read it. */
+    robj *name;
+    robj *lib_name;
+    robj *lib_ver;
 } CommandOrigin;
 
 typedef struct client {
@@ -3431,6 +3440,9 @@ int peerIdentityFromSockaddr(PeerIdentity *peer, const struct sockaddr *sa, sock
 int peerIdentityFormat(const PeerIdentity *peer, char *buf, size_t buf_len);
 int peerIdentityToIp(const PeerIdentity *peer, char *ip, size_t ip_len, int *port);
 uint64_t getClientOriginId(client *c);
+robj *getClientOriginName(client *c);
+robj *getClientOriginLibName(client *c);
+robj *getClientOriginLibVer(client *c);
 int getClientConnType(client *c);
 sds catClientInfoString(sds s, client *client, int hide_user_data);
 sds catClientInfoShortString(sds s, client *client, int hide_user_data);

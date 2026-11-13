@@ -126,6 +126,7 @@ proc slo_check_big_reply {reply size} {
 
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname slo-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged overlap: long mixed pipelines on one key keep exact per-connection order} {
@@ -447,6 +448,7 @@ slo_write_acl $slo_acl_file "~* &* +@all"
 
 start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3] tags {"staged-loop external:skip tls:skip logreqres:skip"}] {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged overlap: ACL LOAD narrowing a pipelining user refuses every later command} {
@@ -504,6 +506,7 @@ start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3
 
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip valgrind:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged overlap: with appendfsync always a reply never leaves before its write reaches the AOF} {
@@ -553,6 +556,7 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip valgrind:
         restart_server 0 true false
         wait_done_loading r
         r client setname fp-control
+        r debug fastpath-exclude 1
         r select 0
         set sum [expr [join $last +]]
         # The kill must have interrupted the stream for the check to mean anything.

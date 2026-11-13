@@ -61,6 +61,7 @@ start_server {tags {"wave2 repl shutdown external:skip tls:skip"} overrides {io-
     set port [srv 0 port]
     set dir [lindex [$primary config get dir] 1]
     $primary client setname w4-control
+    $primary debug fastpath-exclude 1
     $primary config set repl-ping-replica-period 3600
 
     test {finishShutdown accounts the one in-flight replica write and does not re-offload the backlog} {

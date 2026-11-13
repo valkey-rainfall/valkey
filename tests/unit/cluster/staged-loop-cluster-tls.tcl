@@ -51,7 +51,7 @@ proc sct_fast_client {idx} {
 
 proc sct_main_client {idx} {
     set fd [sct_socket $idx]
-    assert_equal "+OK\r\n" [lindex [sct_pipeline_raw $fd {{CLIENT SETNAME mainpath}}] 0]
+    assert_equal [list "+OK\r\n" "+OK\r\n"] [sct_pipeline_raw $fd {{CLIENT SETNAME mainpath} {DEBUG FASTPATH-EXCLUDE 1}}]
     return $fd
 }
 

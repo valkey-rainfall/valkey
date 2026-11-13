@@ -43,6 +43,7 @@ proc fprm_assert_stays_on_main {fd} {
 start_server {tags {"fastpath readmit external:skip tls:skip"} overrides {io-threads 4}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fprm-control
+    r debug fastpath-exclude 1
     r select 0 ;# the db of the raw sockets
 
     test {Fast path readmit: a client sent to main by a pause rejoins once the pause lifts} {
@@ -72,16 +73,21 @@ start_server {tags {"fastpath readmit external:skip tls:skip"} overrides {io-thr
         fprm_wait_fastpath_clients 0
     }
 
-    test {Fast path readmit: a client rejoins once its name is cleared} {
+    test {Fast path readmit: a named client rejoins, and an excluded client rejoins once the exclusion is lifted} {
         set a [fprm_socket]
         assert_equal +PONG [fprm_cmd $a ping]
         fprm_wait_fastpath_clients 1
+        # CLIENT SETNAME runs on main; the named client then joins again.
         assert_equal +OK [fprm_cmd $a client setname named]
-        fprm_wait_fastpath_clients 0
-        fprm_assert_stays_on_main $a
-        assert_equal +OK [fprm_cmd $a client setname ""]
         assert_equal +PONG [fprm_cmd $a ping]
         fprm_wait_fastpath_clients 1
+        assert_equal +OK [fprm_cmd $a debug fastpath-exclude 1]
+        fprm_wait_fastpath_clients 0
+        fprm_assert_stays_on_main $a
+        assert_equal +OK [fprm_cmd $a debug fastpath-exclude 0]
+        assert_equal +PONG [fprm_cmd $a ping]
+        fprm_wait_fastpath_clients 1
+        assert_match {*name=named*} [r client list]
         close $a
         fprm_wait_fastpath_clients 0
     }

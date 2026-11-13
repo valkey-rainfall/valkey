@@ -188,7 +188,8 @@ start_server {} {
 
 test {Filtering based on the fast-path origin client id} {
     start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} {
-        r client setname control ;# named clients stay on the main path
+        r client setname control ;# excluded from the fast path below
+        r debug fastpath-exclude 1
         r select 0
 
         # One client joins the fast path before the filter is registered, one connects after.
@@ -248,6 +249,7 @@ test {Filtering based on the fast-path origin client id} {
 start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 4}} {
     r module load $testmodule log-key 0
     r client setname cf-control
+    r debug fastpath-exclude 1
     r select 0 ;# the db of the raw socket
 
     proc cf_resp {args} {

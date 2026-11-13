@@ -1,7 +1,8 @@
 # Copy-avoiding replies preserve wire bytes, order, lifetime, partial writes, and COB accounting.
 
 proc reply_offload_on {} {
-    r client setname reply-offload ;# a named client stays on the main path, where replies avoid copies
+    r client setname reply-offload ;# excluded from the fast path below: on the main path replies avoid copies
+    r debug fastpath-exclude 1
     if {$::ca_mode eq "adaptive"} {
         r config set avoid-copy-reply-mode adaptive
         r debug copy-avoid engage 1
@@ -169,6 +170,9 @@ start_server {tags {"reply-offload external:skip needs:debug logreqres:skip"} ov
         set fd [socket [srv 0 host] [srv 0 port]]
         fconfigure $fd -translation binary -blocking 1
         puts -nonewline $fd "*3\r\n\$6\r\nclient\r\n\$7\r\nsetname\r\n\$3\r\nrol\r\n"
+        flush $fd
+        assert_equal "+OK" [string trim [gets $fd]]
+        puts -nonewline $fd "*3\r\n\$5\r\ndebug\r\n\$16\r\nfastpath-exclude\r\n\$1\r\n1\r\n"
         flush $fd
         assert_equal "+OK" [string trim [gets $fd]]
         puts -nonewline $fd "*2\r\n\$6\r\nselect\r\n\$1\r\n9\r\n"

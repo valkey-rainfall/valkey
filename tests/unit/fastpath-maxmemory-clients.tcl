@@ -24,6 +24,7 @@ proc fpmm_evicted {} {
 start_server {tags {"fastpath maxmemory-clients external:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fpmm-control
+    r debug fastpath-exclude 1
     r select 0 ;# the same db as the raw fast-path clients
 
     test {maxmemory-clients evicts a stuck large-reply fast-path client and keeps a healthy one} {

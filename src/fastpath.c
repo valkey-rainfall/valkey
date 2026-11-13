@@ -491,7 +491,7 @@ static int fpSessionEligible(client *c) {
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
     if (c->flag.multi || (c->mstate && listLength(&c->mstate->watched_keys))) return 0; /* mstate outlives EXEC */
-    if (c->flag.pubsub || c->flag.tracking || c->name) return 0;
+    if (c->flag.pubsub || c->flag.tracking || c->flag.fp_excluded) return 0;
     if (c->capa) return 0; /* CLIENT CAPA changes replies main builds for this client, e.g. REDIRECT */
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;
@@ -1121,6 +1121,9 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->origin.peer = c->fp_peer;
     e->origin.local = c->fp_local;
     e->origin.conn_type = c->fp_conn_type;
+    e->origin.name = c->name;
+    e->origin.lib_name = c->lib_name;
+    e->origin.lib_ver = c->lib_ver;
     e->reply_off = e->reply_len = 0;
     e->reply_big = NULL;
     e->reply_big_len = 0;
@@ -1881,6 +1884,27 @@ int fastpathDetachConsumed(client *c) {
         if (ln) listDelNode(fp_staged_closing, ln);
     }
     return 1;
+}
+
+/* Objects main stopped referencing from a fast-path client while its entries may still borrow them in
+ * their origin (a client renamed by VM_SetClientNameById, for example from a module event during a
+ * barrier entry). Origins are read only until the end of the iteration's WRITE, which every later
+ * beforeSleep follows, so they are released there. Main only. */
+static robj **fp_deferred_decr = NULL;
+static size_t fp_deferred_decr_len = 0, fp_deferred_decr_cap = 0;
+
+void fastpathDeferDecrRefCount(robj *o) {
+    if (fp_deferred_decr_len == fp_deferred_decr_cap) {
+        fp_deferred_decr_cap = fp_deferred_decr_cap ? fp_deferred_decr_cap * 2 : 8;
+        fp_deferred_decr = zrealloc(fp_deferred_decr, sizeof(robj *) * fp_deferred_decr_cap);
+    }
+    fp_deferred_decr[fp_deferred_decr_len++] = o;
+}
+
+void fastpathReleaseDeferred(void) {
+    if (fp_deferred_decr_len == 0) return;
+    for (size_t i = 0; i < fp_deferred_decr_len; i++) decrRefCount(fp_deferred_decr[i]);
+    fp_deferred_decr_len = 0;
 }
 
 /* A client that left to authenticate returns once main has nothing further to do for it;

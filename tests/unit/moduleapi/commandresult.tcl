@@ -747,7 +747,8 @@ start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} 
     }
 
     test {Module commandresult - fast-path events carry the originating client id} {
-        r client setname fp-control ;# named clients stay on the main path
+        r client setname fp-control ;# excluded from the fast path below
+        r debug fastpath-exclude 1
         r cmdresult.reset
         r cmdresult.register all
         r acl setuser default resetkeys ~allowed:*

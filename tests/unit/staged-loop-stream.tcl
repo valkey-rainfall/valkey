@@ -78,6 +78,7 @@ proc sls_open {n} {
 
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname sls-control
+    r debug fastpath-exclude 1
     r select 0
 
     # Each mode drives the same workload: 32 connections, each INCR its own key depth-16 pipelined,
@@ -289,8 +290,9 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
 # requested. Streaming is disabled in that configuration (eligibility excludes it), so the base
 # reply-after-fsync ordering holds; this test asserts it directly with the config on.
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
-    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    # An excluded client (DEBUG FASTPATH-EXCLUDE) stays off the fast path, so INFO from it counts only the clients under test.
     r client setname sls-control
+    r debug fastpath-exclude 1
     r select 0
 
     foreach mode {exec} {
@@ -354,8 +356,9 @@ proc sls_drive_incr {port rounds depth n} {
 }
 
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes}} {
-    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    # An excluded client (DEBUG FASTPATH-EXCLUDE) stays off the fast path, so INFO from it counts only the clients under test.
     r client setname sls-control
+    r debug fastpath-exclude 1
     r select 0
     test {Lane recheck: streaming starts after main and IO threads move to distinct CPUs} {
         set ncpu [exec nproc]

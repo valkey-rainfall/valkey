@@ -656,3 +656,53 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_equal {OK} [r module unload misc]
     }
 }
+
+# A module renames a client while it is on the IO-thread fast path: its later commands carry the new
+# name, and the old name, which entries already harvested may still borrow, is released safely.
+start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 4 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
+    r module load $testmodule
+    r client setname misc-control
+    r debug fastpath-exclude 1
+    r select 0
+    r config set notify-keyspace-events ""
+
+    test {SetClientNameById renames a client on the fast path} {
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation binary -blocking 1 -buffering full
+        puts -nonewline $fd "*3\r\n\$6\r\nclient\r\n\$7\r\nsetname\r\n\$6\r\nfp-old\r\n*2\r\n\$6\r\nclient\r\n\$2\r\nid\r\n"
+        flush $fd
+        assert_equal {+OK} [string trim [gets $fd]]
+        set id [string range [string trim [gets $fd]] 1 end]
+        wait_for_condition 100 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] == 1
+        } else {
+            fail "the named client did not join the fast path: [r info fastpath]"
+        }
+        set max_len [lindex [r config get slowlog-max-len] 1]
+        r config set slowlog-max-len 1000
+        r config set slowlog-log-slower-than 0
+        # Rename it many times while it pipelines writes; every write logs one of the names.
+        set buf ""
+        for {set i 0} {$i < 50} {incr i} { append buf "*3\r\n\$3\r\nset\r\n\$7\r\nmisc:rn\r\n\$1\r\nv\r\n" }
+        for {set round 0} {$round < 20} {incr round} {
+            puts -nonewline $fd $buf
+            flush $fd
+            assert_equal OK [r test.setnamebyid $id fp-new$round]
+            for {set i 0} {$i < 50} {incr i} { assert_equal {+OK} [string trim [gets $fd]] }
+        }
+        assert_equal 1 [getInfoProperty [r info fastpath] fastpath_clients]
+        r slowlog reset
+        puts -nonewline $fd "*3\r\n\$3\r\nset\r\n\$7\r\nmisc:rn\r\n\$1\r\nw\r\n"
+        flush $fd
+        assert_equal {+OK} [string trim [gets $fd]]
+        r config set slowlog-log-slower-than 1000000
+        set names {}
+        foreach e [r slowlog get 1000] {
+            if {[lindex $e 3] eq {set misc:rn w}} { lappend names [lindex $e 5] }
+        }
+        assert_equal {fp-new19} $names
+        assert_match {*name=fp-new19 *} [r client list id $id]
+        r config set slowlog-max-len $max_len
+        close $fd
+    }
+}

@@ -95,6 +95,7 @@ proc ss_incr_round {fds prefix start rounds} {
 
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname ss-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged stress: interleaved writes and reads on shared keys keep per-client order and totals} {
@@ -417,9 +418,10 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
     test {Staged stress: clients handed back when staged mode stops rejoin when it resumes} {
         r client setname ss-control
+        r debug fastpath-exclude 1
         r select 0
         set fds [ss_open 12 ss:rj]
-        # Clients main must keep: one inside MULTI, one subscribed, one named.
+        # Clients main must keep: one inside MULTI, one subscribed, one excluded (and named).
         set multi [ss_fp_client ss:rjm]
         puts -nonewline $multi [ss_resp multi]
         flush $multi
@@ -429,9 +431,9 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
         flush $sub
         assert_equal {subscribe ss:rjch :1} [ss_read_reply $sub]
         set named [ss_fp_client ss:rjn]
-        puts -nonewline $named [ss_resp client setname ss-named]
+        puts -nonewline $named "[ss_resp client setname ss-named][ss_resp debug fastpath-exclude 1]"
         flush $named
-        assert_equal {+OK} [ss_read_reply $named]
+        assert_equal {+OK +OK} [ss_read_replies $named 2]
         ss_wait_fastpath_clients 12
         set seen 0
         foreach {off on} {{io-threads 1} {io-threads 4} {io-threads-fast-path no} {io-threads-fast-path yes}

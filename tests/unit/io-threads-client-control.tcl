@@ -94,8 +94,9 @@ proc cc_assert_healthy {} {
 
 start_server {tags {"io-threads-client-control external:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 4} [r config get io-threads]
-    # A named client stays off the fast path, so INFO from it counts only the clients under test.
+    # An excluded client (DEBUG FASTPATH-EXCLUDE) stays off the fast path, so INFO from it counts only the clients under test.
     r client setname cc-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Control: a client disconnecting in flight drops its work without asserting} {
@@ -165,6 +166,8 @@ start_server {tags {"io-threads-client-control external:skip logreqres:skip"} ov
         cc_wait_fastpath_clients 1
         set ctl [valkey_deferring_client]
         $ctl client setname cc-ctl
+        assert_equal OK [$ctl read]
+        $ctl debug fastpath-exclude 1
         assert_equal OK [$ctl read]
         set batches [cc_batches]
         # DEBUG SLEEP holds main, then the reconfigure lands in the same write phase.
@@ -244,6 +247,8 @@ start_server {tags {"io-threads-client-control external:skip logreqres:skip"} ov
         set ctl [valkey_deferring_client]
         $ctl client setname cc-ctl2
         assert_equal OK [$ctl read]
+        $ctl debug fastpath-exclude 1
+        assert_equal OK [$ctl read]
         # Begin a quiesce (io-threads down) while main sleeps, then close the client:
         # a CLOSE arriving after a HANDOFF started still frees the connection, and the
         # server must stay healthy with no leaked slot.
@@ -310,6 +315,8 @@ start_server {tags {"io-threads-client-control external:skip logreqres:skip"} ov
         # trips a protocol error while the lifecycle transition is pending.
         set ctl [valkey_deferring_client]
         $ctl client setname cc-ctl3
+        assert_equal OK [$ctl read]
+        $ctl debug fastpath-exclude 1
         assert_equal OK [$ctl read]
         set payload [cc_resp debug sleep 0.3]
         append payload [cc_resp config set io-threads 1]
@@ -389,6 +396,7 @@ start_server {tags {"io-threads-client-control external:skip logreqres:skip"} ov
 start_server {tags {"io-threads-client-control external:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-epoll-thread no}} {
     test {Control: shutdown while reconfiguring under load exits with no worker-destruction assert} {
         r client setname cc-control
+        r debug fastpath-exclude 1
         r select 0
         set clients {}
         for {set i 0} {$i < 8} {incr i} {

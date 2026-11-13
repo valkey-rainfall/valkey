@@ -121,6 +121,7 @@ proc slo_check_big_reply {reply size} {
 
 start_server {tags {"modules staged-loop external:skip tls:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname slo-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged overlap: MODULE LOAD and UNLOAD while clients pipeline its command and core commands} {

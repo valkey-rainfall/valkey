@@ -90,6 +90,8 @@ uint32_t testOnlyFastpathAdmitSeq(int tid);
 uint64_t testOnlyFastpathLeaveVisits(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
+void fastpathDeferDecrRefCount(robj *o);
+void fastpathReleaseDeferred(void);
 void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);

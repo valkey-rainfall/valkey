@@ -20,6 +20,7 @@ proc fpit_wait_fastpath_clients {n} {
 start_server {tags {"fastpath idle-timeout external:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0 ;# the same db as the raw fast-path clients
 
     test {Fast path idle timeout: an idle client closes} {

@@ -69,6 +69,7 @@ proc w6b_stat {c field} {
 
 proc w6b_control {c} {
     $c client setname w6-control
+    $c debug fastpath-exclude 1
     $c select 0
     $c config set notify-keyspace-events {}
 }

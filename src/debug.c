@@ -528,6 +528,8 @@ void debugCommand(client *c) {
             "    Make the next attempt to create IO thread <id> fail (for testing rollback).",
             "STAGED-EPOLL-THREAD-FAIL",
             "    Make the staged loop's epoll thread exit as on an epoll_wait error (for testing).",
+            "FASTPATH-EXCLUDE <0|1>",
+            "    Keep this connection off the IO-thread fast path (1) or let it join again (0), for testing.",
             "IO-WRITE-DONE-DELAY <microseconds>",
             "    IO threads wait this long after writing a reply before they report the write done (0 to stop).",
             "STRINGMATCH-TEST",
@@ -627,6 +629,10 @@ void debugCommand(client *c) {
             addReplyError(c, "no epoll thread is running");
             return;
         }
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "fastpath-exclude") && c->argc == 3) {
+        /* DEBUG is never a fast-path command, so the client runs this on the main path. */
+        c->flag.fp_excluded = atoi(objectGetVal(c->argv[2])) != 0;
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));

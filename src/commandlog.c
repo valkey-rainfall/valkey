@@ -73,7 +73,8 @@ static commandlogEntry *commandlogNewEntry(client *c, robj **argv, int argc, lon
      * client with no connection, so attribute the entry to the calling client. */
     client *caller = scriptIsRunning() ? scriptGetCaller() : c;
     ce->peerid = sdsnew(getClientPeerId(caller));
-    ce->cname = caller->name ? sdsnew(objectGetVal(caller->name)) : sdsempty();
+    robj *cname = getClientOriginName(caller);
+    ce->cname = cname ? sdsnew(objectGetVal(cname)) : sdsempty();
     return ce;
 }
 
@@ -117,7 +118,8 @@ void *commandlogNewEntryFromArgv(client *c, robj **argv, int argc, long long val
     ce->time = time(NULL);
     ce->value = value;
     ce->peerid = sdsnew(getClientPeerId(c));
-    ce->cname = c->name ? sdsnew(objectGetVal(c->name)) : sdsempty();
+    robj *cname = getClientOriginName(c);
+    ce->cname = cname ? sdsnew(objectGetVal(cname)) : sdsempty();
     return ce;
 }
 

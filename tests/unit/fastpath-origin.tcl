@@ -52,10 +52,12 @@ proc fp_allow_keys {} {
     r acl setuser default resetkeys allkeys
 }
 
-# A deferring control connection that stays on the main path (named clients are not admitted).
+# A deferring control connection that stays on the main path (DEBUG FASTPATH-EXCLUDE keeps it off the fast path).
 proc fp_ctl_client {} {
     set c [valkey_deferring_client]
     $c client setname fp-ctl
+    assert_equal OK [$c read]
+    $c debug fastpath-exclude 1
     assert_equal OK [$c read]
     return $c
 }
@@ -88,8 +90,9 @@ proc fp_monitor_line_matching {m pattern} {
 start_server {tags {"fastpath origin external:skip"} overrides {io-threads 2 enable-debug-command yes}} {
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
-    # Named clients stay on the main path, so the control connection is never counted.
+    # The control connection is excluded from the fast path, so it is never counted.
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0 ;# the same db as the raw fast-path clients
 
     test {Fast path: two clients in one batch keep distinct ids and peers} {
@@ -245,6 +248,102 @@ start_server {tags {"fastpath origin external:skip"} overrides {io-threads 2 ena
             }
         }
         assert_equal 1 $found
+        $a close
+    }
+
+    test {Fast path: a named client with library info joins the fast path, and SLOWLOG names it} {
+        r set slow:named:get v
+        set a [fp_client]
+        foreach cmd {{client setname fp-named} {client setinfo lib-name fp-lib} {client setinfo lib-ver 1.2.3}} {
+            $a {*}$cmd
+            assert_equal OK [$a read]
+        }
+        fp_wait_fastpath_clients 1
+        set peer_a [fp_peer_of $a]
+        assert_match {*name=fp-named *lib-name=fp-lib lib-ver=1.2.3*} [fp_client_list_entry $peer_a]
+        r slowlog reset
+        r config set slowlog-log-slower-than 0
+        set spec [getInfoProperty [r info fastpath] fastpath_speculated]
+        $a set slow:named:set v
+        assert_equal OK [$a read]
+        $a get slow:named:get
+        assert_equal v [$a read]
+        r config set slowlog-log-slower-than 1000000
+        # The GET was answered on the IO thread, the SET ran from a batch.
+        wait_for_condition 100 20 {
+            [getInfoProperty [r info fastpath] fastpath_speculated] > $spec
+        } else {
+            fail "the GET was not answered on the IO thread: [r info fastpath]"
+        }
+        set found 0
+        foreach e [r slowlog get 128] {
+            if {[lindex $e 3] in {{set slow:named:set v} {get slow:named:get}}} {
+                assert_equal $peer_a [lindex $e 4]
+                assert_equal fp-named [lindex $e 5]
+                incr found
+            }
+        }
+        assert_equal 2 $found
+        fp_wait_fastpath_clients 1
+        $a close
+    }
+
+    test {Fast path: ACL denial of a named client's command names it and its library} {
+        r acl log reset
+        fp_deny_keys
+        set a [fp_client]
+        foreach cmd {{client setname fp-acl} {client setinfo lib-name fp-lib} {client setinfo lib-ver 9.9}} {
+            $a {*}$cmd
+            assert_equal OK [$a read]
+        }
+        fp_wait_fastpath_clients 1
+        set peer_a [fp_peer_of $a]
+        set id_a [fp_client_id_of $peer_a]
+        $a get denied:named
+        assert_error {*NOPERM*} {$a read}
+        set e [lindex [fp_acl_log_entries_for_object denied:named] 0]
+        set info [dict get $e client-info]
+        assert_match "id=$id_a addr=$peer_a *" $info
+        assert_match {* name=fp-acl *} $info
+        assert_match {* lib-name=fp-lib lib-ver=9.9*} $info
+        $a close
+        fp_allow_keys
+    }
+
+    test {Fast path: a client named by HELLO SETNAME joins the fast path with RESP3 replies} {
+        set a [fp_client]
+        $a hello 3 setname fp-hello
+        assert_equal 3 [dict get [$a read] proto]
+        fp_wait_fastpath_clients 1
+        set batches [getInfoProperty [r info fastpath] fastpath_batches]
+        $a hset hello:h f v
+        assert_equal 1 [$a read]
+        $a hgetall hello:h
+        assert_equal {f v} [$a read]
+        assert_morethan [getInfoProperty [r info fastpath] fastpath_batches] $batches
+        assert_match {*name=fp-hello *resp=3*} [fp_client_list_entry [fp_peer_of $a]]
+        $a close
+    }
+
+    test {Fast path: a client renamed while on the fast path keeps working and shows the new name} {
+        set a [fp_client]
+        $a client setname fp-old
+        assert_equal OK [$a read]
+        fp_wait_fastpath_clients 1
+        $a client setname fp-new
+        assert_equal OK [$a read]
+        fp_wait_fastpath_clients 1
+        r slowlog reset
+        r config set slowlog-log-slower-than 0
+        $a set renamed:k v
+        assert_equal OK [$a read]
+        r config set slowlog-log-slower-than 1000000
+        set names {}
+        foreach e [r slowlog get 128] {
+            if {[lindex $e 3] eq {set renamed:k v}} { lappend names [lindex $e 5] }
+        }
+        assert_equal {fp-new} $names
+        assert_match {*name=fp-new *} [fp_client_list_entry [fp_peer_of $a]]
         $a close
     }
 
@@ -484,6 +583,7 @@ fp_write_acl $fp_acl_dir {~* &* +@all}
 
 start_server [list tags {"fastpath origin external:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2]] {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0 ;# the same db as the raw fast-path clients
 
     test {Fast path: ACL LOAD applies the reloaded rules to a queued command without disconnecting} {
@@ -562,6 +662,7 @@ start_server [list tags {"fastpath origin external:skip"} overrides [list dir $f
 start_server {tags {"fastpath origin external:skip"} overrides {requirepass fppw io-threads 2}} {
     r auth fppw
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
     r acl setuser bob on >pw ~* &* +@all
 
@@ -710,6 +811,7 @@ start_server {tags {"fastpath origin external:skip"} overrides {io-threads 2 ena
         # Fast-path raw clients live on db 0; align the master/replica control clients so their
         # reads and WAIT see the same keyspace and offset.
         $master client setname fp-control
+        $master debug fastpath-exclude 1
         $master select 0
         $replica select 0
 
@@ -776,5 +878,48 @@ start_server {tags {"fastpath origin external:skip"} overrides {io-threads 2 ena
                 fail "replica did not receive the offloaded write after release"
             }
         }
+    }
+}
+
+# Named clients on the write lanes: each lane builds the commandlog entry from the entry's origin.
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 4 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
+    r client setname fp-control
+    r debug fastpath-exclude 1
+    r select 0
+    r config set notify-keyspace-events "" ;# keyspace notifications keep writes off the lanes
+
+    test {Fast path: commands of a named client run on the write lanes, and SLOWLOG names it} {
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation binary -blocking 1 -buffering full
+        puts -nonewline $fd [fp_resp client setname fp-lanes]
+        flush $fd
+        assert_equal {+OK} [string trim [gets $fd]]
+        fp_wait_fastpath_clients 1
+        set sock [fconfigure $fd -sockname]
+        set peer "[lindex $sock 0]:[lindex $sock 2]"
+        set lane_entries [getInfoProperty [r info fastpath] fastpath_write_lane_entries]
+        set max_len [lindex [r config get slowlog-max-len] 1]
+        r config set slowlog-max-len 1000
+        r slowlog reset
+        r config set slowlog-log-slower-than 0
+        set buf ""
+        for {set i 0} {$i < 200} {incr i} { append buf [fp_resp set slow:lanes:$i v] }
+        puts -nonewline $fd $buf
+        flush $fd
+        for {set i 0} {$i < 200} {incr i} { assert_equal {+OK} [string trim [gets $fd]] }
+        r config set slowlog-log-slower-than 1000000
+        assert_morethan [getInfoProperty [r info fastpath] fastpath_write_lane_entries] $lane_entries
+        set found 0
+        foreach e [r slowlog get 1000] {
+            if {[string match {set slow:lanes:* v} [lindex $e 3]]} {
+                assert_equal $peer [lindex $e 4]
+                assert_equal fp-lanes [lindex $e 5]
+                incr found
+            }
+        }
+        assert_equal 200 $found
+        r config set slowlog-max-len $max_len
+        close $fd
+        fp_wait_fastpath_clients 0
     }
 }

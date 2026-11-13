@@ -47,6 +47,7 @@ proc sl_wait_fastpath_clients {n} {
 
 start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname sl-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {Staged loop: reads before the first write run in order with the writes behind them} {
@@ -350,6 +351,7 @@ tags {"valgrind:skip"} {
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes crash-memcheck-enabled yes io-threads-epoll-thread no}} {
     test {Staged loop: a crash with several workers at the barrier finishes the report and exits} {
         r client setname sl-control
+        r debug fastpath-exclude 1
         r select 0
         set fd [sl_socket]
         puts -nonewline $fd [sl_resp set sl:crash v]

@@ -67,6 +67,7 @@ set fao_sleep 400
 
 start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync always enable-debug-command yes save ""}} {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
     waitForBgrewriteaof r
 
@@ -90,6 +91,7 @@ start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overri
 
 start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync always enable-debug-command yes save "" forkless-infrastructure-enabled yes bgsave-default-method forkless}} {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
     waitForBgrewriteaof r
 
@@ -117,6 +119,7 @@ start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overri
 
 start_server {tags {"fastpath aof modules external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync always enable-debug-command yes save ""}} {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
     waitForBgrewriteaof r
     r module load [file normalize tests/modules/blockedclient.so]
@@ -153,6 +156,7 @@ start_server {tags {"fastpath aof modules external:skip tls:skip logreqres:skip"
 
 start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly no appendfsync always enable-debug-command yes save ""}} {
     r client setname fp-control
+    r debug fastpath-exclude 1
     r select 0
 
     test {AOF order: always, while AOF waits for its first rewrite a fast-path write acknowledges after the fsync (#38)} {
@@ -177,6 +181,7 @@ foreach policy {everysec no} {
     start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes enable-debug-command yes save ""}} {
         r config set appendfsync $policy
         r client setname fp-control
+        r debug fastpath-exclude 1
         r select 0
         waitForBgrewriteaof r
 

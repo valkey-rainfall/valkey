@@ -109,7 +109,9 @@ foreach sender {no yes} {
             set primary_port [srv 0 port]
             set replica [srv -1 client]
             $primary client setname w4-control
+            $primary debug fastpath-exclude 1
             $replica client setname w4-control
+            $replica debug fastpath-exclude 1
             $primary select 0
             $replica select 0
             # The harness default.conf turns keyspace notifications on, which keeps writes off the lanes.

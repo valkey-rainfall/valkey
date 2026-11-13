@@ -153,6 +153,7 @@ proc pwl_fast_socket {c host port} {
 
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
     r client setname pwl-control
+    r debug fastpath-exclude 1
     r select 0
     r config set notify-keyspace-events ""
     set host [srv 0 host]
@@ -663,6 +664,7 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
     $primary client setname pwl-control
+    $primary debug fastpath-exclude 1
     $primary select 0
     $primary config set notify-keyspace-events ""
     start_server {overrides {io-threads 3 keyspace-shard-bits 10 enable-debug-command yes}} {
@@ -943,6 +945,7 @@ start_cluster 1 1 {tags {"staged-loop cluster external:skip tls:skip"} overrides
     R 0 config set notify-keyspace-events ""
     R 1 config set notify-keyspace-events ""
     R 0 client setname pwl-control
+    R 0 debug fastpath-exclude 1
 
     test {Write lanes (cluster): a pipeline over many slots runs on slot lanes, replies in order} {
         set fd [pwl_fast_socket [srv 0 client] $host $port]

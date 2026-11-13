@@ -255,6 +255,8 @@ TEST_F(FastpathStagedTest, UnsupportedCommandHandsClientBackAfterReplyPhase) {
     readPhase();
     EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
     EXPECT_EQ(c->flag.fastpath, 1u); /* main takes it back only after the reply phase */
+    /* A named client may join again right after CLIENT SETNAME; keep it on main to check the hand-back. */
+    c->flag.fp_excluded = 1;
     writeAndReplyPhases();
     EXPECT_EQ(c->flag.fastpath, 0u);
     EXPECT_EQ(c->control->lifecycle, FP_DETACHED);

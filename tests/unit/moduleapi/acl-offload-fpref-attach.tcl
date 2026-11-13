@@ -22,6 +22,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
 
     proc fpa_fpc {} { getInfoProperty [r info fastpath] fastpath_clients }
     r client setname fpa-control
+    r debug fastpath-exclude 1
 
     test {password-authed restricted client attaches to the fast path (control)} {
         r acl setuser fpu on >pw ~h:* +@read +@write +@connection

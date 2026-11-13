@@ -79,6 +79,7 @@ set far_sleep 400
 # ---------------------------------------------------------------------------------------------------
 start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 appendonly yes appendfsync always enable-debug-command yes save ""}} {
     r client setname far-control
+    r debug fastpath-exclude 1
     r select 0
     r config set notify-keyspace-events "" ;# the test default (KEA) turns the write lanes off
     waitForBgrewriteaof r
@@ -141,6 +142,7 @@ foreach policy {everysec no} {
     start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes enable-debug-command yes save ""}} {
         r config set appendfsync $policy
         r client setname far-control
+        r debug fastpath-exclude 1
         r select 0
         waitForBgrewriteaof r
 
@@ -189,6 +191,7 @@ foreach {fastpath label} {yes "staged loop" no "IO threads without the staged lo
     start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync everysec enable-debug-command yes save ""}} {
         r config set io-threads-fast-path $fastpath
         r client setname far-control
+        r debug fastpath-exclude 1
         r select 0
         waitForBgrewriteaof r
 
@@ -240,6 +243,7 @@ foreach {fastpath label} {yes "staged loop" no "IO threads without the staged lo
 # ---------------------------------------------------------------------------------------------------
 start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync everysec no-appendfsync-on-rewrite yes enable-debug-command yes save "" hz 10}} {
     r client setname far-control
+    r debug fastpath-exclude 1
     r select 0
     waitForBgrewriteaof r
 

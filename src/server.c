@@ -2130,6 +2130,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Full IO queues leave terminal frees parked for the next beforeSleep pass. */
     drainPendingMainFrees();
+    /* Names of renamed fast-path clients that entries of the last iteration could still borrow. */
+    fastpathReleaseDeferred();
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();

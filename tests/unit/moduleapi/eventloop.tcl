@@ -28,7 +28,8 @@ start_server [list tags {"modules"} overrides [list loadmodule $testmodule]] {
 }
 
 start_server [list tags {"modules external:skip tls:skip"} overrides [list io-threads 2 loadmodule $testmodule]] {
-    r client setname control ;# named clients stay on the main path
+    r client setname control ;# excluded from the fast path below
+    r debug fastpath-exclude 1
 
     test "Module eventloop iteration for a client read by IO threads" {
         set rr [valkey [srv 0 host] [srv 0 port] 0 $::tls]
