@@ -29,8 +29,13 @@ foreach {mode lanes load} {A no disabled B yes disabled} {
                 $replica replicaof $ph $pp
                 set t0 [clock milliseconds]
                 set up_ms -1
-                for {set s 0} {$s < 90} {incr s} {
+                for {set s 0} {$s < 180} {incr s} {
                     after 1000
+                    if {$s % 5 == 4} {
+                        set omem 0
+                        regexp {omem=([0-9]+)} [$primary client list type replica] -> omem
+                        puts "  t=[expr {$s + 1}]s bgsave=[status $primary rdb_bgsave_in_progress] replica_omem=$omem gate_on=[fkg_fp $primary fastpath_forkless_gate_on] drops=[status $primary client_output_buffer_limit_disconnections] sync_full=[status $primary sync_full] replica_link=[status $replica master_link_status] ops=[status $primary instantaneous_ops_per_sec]"
+                    }
                     if {[status $replica master_link_status] eq {up}} {
                         set up_ms [expr {[clock milliseconds] - $t0}]
                         break
