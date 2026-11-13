@@ -11,9 +11,10 @@
  *
  * Main opens a phase for workers [0, n) and waits until each of them reports done. A worker
  * blocks until a phase that includes its index opens, runs it, and reports done. Waiters spin
- * briefly, unless the caller says not to, and then sleep on a condition variable, so a worker and
- * main sharing one CPU cannot livelock. Workers outside the participant count park until the count
- * grows or the barrier shuts down. */
+ * briefly, unless the caller says not to, and then sleep (on Linux a worker waiting for the next
+ * phase sleeps on a futex, elsewhere on a condition variable), so a worker and main sharing one CPU
+ * cannot livelock. Workers outside the participant count park until the count grows or the barrier
+ * shuts down. */
 
 #include <pthread.h>
 #ifndef __cplusplus
@@ -29,7 +30,14 @@ typedef struct phaseBarrier {
     _Atomic(uint64_t) state; /* seq << 32 | active_n << 16 | phase_id, one word so a reader never sees a torn phase */
     _Atomic(int) pending;    /* participants of the open phase not yet done */
     _Atomic(int) shutdown;
-    int nparticipants; /* applied at the next open; guarded by lock */
+    /* Futex wait (Linux): a worker sleeping for the next phase waits on open_word, which every open and
+     * the shutdown bump after the state store; main wakes the word only when open_waiters is non-zero.
+     * Nothing takes the lock on that path, so woken workers do not queue on it one after another.
+     * futex 0 (other systems, or a test) uses open_cv under the lock instead. */
+    int futex;
+    _Atomic(uint32_t) open_word;
+    _Atomic(int) open_waiters;
+    int nparticipants; /* applied at the next open; written by main under lock, read by main without it */
     int open_sleepers; /* guarded by lock */
     int park_sleepers; /* guarded by lock */
     int done_sleeper;  /* guarded by lock */

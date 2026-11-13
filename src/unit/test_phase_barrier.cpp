@@ -39,9 +39,11 @@ struct Harness {
     std::atomic<int> errors{0};
     std::vector<std::thread> threads;
 
-    explicit Harness(int nworkers, int nparticipants) :
+    /* futex 0 runs the condition-variable path that systems without a futex use. */
+    explicit Harness(int nworkers, int nparticipants, int futex = -1) :
         result(nworkers, -1), ran(nworkers, 0), spin(nworkers, 1) {
         EXPECT_EQ(phaseBarrierInit(&b, nparticipants), 0);
+        if (futex >= 0) b.futex = futex;
     }
 
     void start(int nworkers) {
@@ -221,4 +223,94 @@ TEST(PhaseBarrierTest, ShutdownWakesParkedAndWaitingWorkers) {
     EXPECT_EQ(h.errors.load(), 0);
     EXPECT_EQ(h.ran[0], 1);
     EXPECT_EQ(h.ran[5], 0);
+}
+
+/* Every worker sleeps at once in every phase, so each open wakes all of them; on Linux through the futex
+ * path, and the same run through the condition-variable path. */
+static void sleepersEveryPhase(int futex) {
+    const int nworkers = 32, phases = 3000;
+    Harness h(nworkers, nworkers, futex);
+    h.main_spin = 0;
+    for (int w = 0; w < nworkers; w++) h.spin[w] = 0;
+    h.start(nworkers);
+    for (int k = 1; k <= phases; k++) {
+        h.runPhase(k, nworkers, nworkers);
+        if (::testing::Test::HasFatalFailure()) break;
+    }
+    h.stop();
+    EXPECT_EQ(h.errors.load(), 0);
+    for (int w = 0; w < nworkers; w++) EXPECT_EQ(h.ran[w], phases);
+}
+
+TEST(PhaseBarrierTest, SleepersEveryPhase) {
+    sleepersEveryPhase(-1);
+}
+
+TEST(PhaseBarrierTest, SleepersEveryPhaseCondvar) {
+    sleepersEveryPhase(0);
+}
+
+TEST(PhaseBarrierTest, ParticipantCountChangesCondvar) {
+    const int nworkers = 8;
+    const int counts[] = {8, 3, 0, 5, 1, 8, 2};
+    Harness h(nworkers, nworkers, 0);
+    h.main_spin = 0;
+    for (int w = 0; w < nworkers; w += 2) h.spin[w] = 0;
+    h.start(nworkers);
+    int k = 0;
+    for (int rep = 0; rep < 200; rep++) {
+        for (int n : counts) {
+            ASSERT_EQ(phaseBarrierSetParticipants(&h.b, n), 0);
+            for (int i = 0; i < 5; i++) {
+                h.runPhase(++k, n, nworkers);
+                if (HasFatalFailure()) {
+                    h.stop();
+                    return;
+                }
+            }
+        }
+    }
+    h.stop();
+    EXPECT_EQ(h.errors.load(), 0);
+}
+
+TEST(PhaseBarrierTest, ShutdownWakesParkedAndWaitingWorkersCondvar) {
+    const int nworkers = 6;
+    Harness h(nworkers, 2, 0);
+    h.start(nworkers);
+    h.runPhase(1, 2, nworkers);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    h.stop();
+    EXPECT_EQ(h.errors.load(), 0);
+    EXPECT_EQ(h.ran[0], 1);
+    EXPECT_EQ(h.ran[5], 0);
+}
+
+/* The crash report's memory test cancels and joins IO threads that sleep in the barrier: a worker asleep
+ * waiting for the next phase must honor pthread_cancel. */
+static void *cancelWorker(void *arg) {
+    phaseBarrier *b = (phaseBarrier *)arg;
+    uint64_t seen = 0;
+    for (;;) {
+        int ph = phaseBarrierAwaitPhase(b, 0, &seen, 0);
+        if (ph == PHASE_BARRIER_EXIT) return NULL;
+        phaseBarrierDone(b);
+    }
+}
+
+TEST(PhaseBarrierTest, CancelWhileSleeping) {
+    phaseBarrier b;
+    ASSERT_EQ(phaseBarrierInit(&b, 1), 0);
+    pthread_t t;
+    ASSERT_EQ(pthread_create(&t, NULL, cancelWorker, &b), 0);
+    ASSERT_EQ(phaseBarrierOpen(&b, 1), 0);
+    phaseBarrierWaitAllDone(&b, 1);
+    /* The worker now sleeps waiting for phase 2. */
+    for (int i = 0; i < 200 && __atomic_load_n(&b.open_waiters, __ATOMIC_SEQ_CST) == 0 && b.open_sleepers == 0; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(pthread_cancel(t), 0);
+    auto t0 = std::chrono::steady_clock::now();
+    ASSERT_EQ(pthread_join(t, NULL), 0);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(5));
+    phaseBarrierDestroy(&b);
 }

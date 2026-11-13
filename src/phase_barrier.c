@@ -12,6 +12,16 @@
 
 #include <string.h>
 
+#if defined(__linux__)
+#include <limits.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#define PHASE_BARRIER_HAVE_FUTEX 1
+#else
+#define PHASE_BARRIER_HAVE_FUTEX 0
+#endif
+
 /* A waiter allowed to spin does so this long before it sleeps. Under load the next phase opens within a
  * few tens of microseconds, and waking a sleeper costs a syscall on both sides and delays the phase. The
  * clock is read every PHASE_BARRIER_SPIN_CHECK relaxes. */
@@ -42,12 +52,40 @@ static inline int statePhase(uint64_t st) {
     return (int)(st & 0xffff);
 }
 
+#if PHASE_BARRIER_HAVE_FUTEX
+/* Sleep while *w still holds expected. Returns at once when it does not, or on a wake or a signal; the
+ * caller rechecks. The raw syscall is no cancellation point, so the wait runs with asynchronous
+ * cancellation: the crash report's memory test cancels and joins every IO thread, and a worker waiting
+ * here holds no lock. */
+static void futexWait(_Atomic(uint32_t) *w, uint32_t expected) {
+    int old;
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old);
+    syscall(SYS_futex, (uint32_t *)w, FUTEX_WAIT_PRIVATE, expected, NULL, NULL, 0);
+    pthread_setcanceltype(old, NULL);
+}
+
+static void futexWakeAll(_Atomic(uint32_t) *w) {
+    syscall(SYS_futex, (uint32_t *)w, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+/* Main: publish an open or the shutdown to sleeping workers. The bump is ordered after the state store,
+ * and main reads the waiter count after the bump, while a waiter announces itself before it rechecks the
+ * word; so either main sees the waiter and wakes it or the waiter sees the bump and does not sleep. */
+static void openWordBump(phaseBarrier *b) {
+    atomic_fetch_add_explicit(&b->open_word, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&b->open_waiters, memory_order_seq_cst)) futexWakeAll(&b->open_word);
+}
+#endif
+
 int phaseBarrierInit(phaseBarrier *b, int nparticipants) {
     if (nparticipants < 0 || nparticipants > PHASE_BARRIER_MAX_PARTICIPANTS) return -1;
     memset(b, 0, sizeof(*b));
     atomic_init(&b->state, 0);
     atomic_init(&b->pending, 0);
     atomic_init(&b->shutdown, 0);
+    atomic_init(&b->open_word, 0);
+    atomic_init(&b->open_waiters, 0);
+    b->futex = PHASE_BARRIER_HAVE_FUTEX;
     b->nparticipants = nparticipants;
     if (pthread_mutex_init(&b->lock, NULL) != 0) return -1;
     if (pthread_cond_init(&b->open_cv, NULL) != 0) goto err_lock;
@@ -87,6 +125,18 @@ int phaseBarrierOpen(phaseBarrier *b, int phase_id) {
     if (phase_id < 0 || phase_id > PHASE_BARRIER_MAX_ID) return -1;
     if (atomic_load_explicit(&b->shutdown, memory_order_relaxed)) return -1;
     if (atomic_load_explicit(&b->pending, memory_order_acquire) != 0) return -1;
+#if PHASE_BARRIER_HAVE_FUTEX
+    if (b->futex) {
+        /* Only main writes nparticipants (under the lock, for the parked workers that read it), so main
+         * reads it here without the lock. */
+        int n = b->nparticipants;
+        uint64_t seq = (uint64_t)(stateSeq(atomic_load_explicit(&b->state, memory_order_relaxed)) + 1u);
+        atomic_store_explicit(&b->pending, n, memory_order_relaxed);
+        atomic_store_explicit(&b->state, seq << 32 | (uint64_t)n << 16 | (uint64_t)phase_id, memory_order_release);
+        openWordBump(b);
+        return 0;
+    }
+#endif
     pthread_mutex_lock(&b->lock);
     int n = b->nparticipants;
     uint64_t seq = (uint64_t)(stateSeq(atomic_load_explicit(&b->state, memory_order_relaxed)) + 1u);
@@ -121,6 +171,9 @@ void phaseBarrierShutdown(phaseBarrier *b) {
     pthread_cond_broadcast(&b->open_cv);
     pthread_cond_broadcast(&b->park_cv);
     pthread_mutex_unlock(&b->lock);
+#if PHASE_BARRIER_HAVE_FUTEX
+    if (b->futex) openWordBump(b);
+#endif
 }
 
 static void phaseBarrierUnlock(void *lock) {
@@ -136,6 +189,39 @@ static inline int takePhase(uint64_t st, int worker_id, uint64_t *last_seen, int
     return 1;
 }
 
+#if PHASE_BARRIER_HAVE_FUTEX
+/* Worker, after its spin: sleep on open_word until a phase that includes it opens. A worker the open
+ * phase leaves out parks under the lock, as on the condition-variable path, unless the participant
+ * count already includes it for the next phase. */
+static int awaitPhaseFutex(phaseBarrier *b, int worker_id, uint64_t *last_seen) {
+    int phase;
+    for (;;) {
+        if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) return PHASE_BARRIER_EXIT;
+        uint32_t w = atomic_load_explicit(&b->open_word, memory_order_seq_cst);
+        uint64_t st = atomic_load_explicit(&b->state, memory_order_acquire);
+        if (takePhase(st, worker_id, last_seen, &phase)) return phase;
+        if (worker_id >= stateN(st)) {
+            volatile int parked = 0; /* set between pthread_cleanup_push and pop, which may use setjmp */
+            pthread_mutex_lock(&b->lock);
+            pthread_cleanup_push(phaseBarrierUnlock, &b->lock);
+            if (worker_id >= b->nparticipants && !atomic_load_explicit(&b->shutdown, memory_order_acquire)) {
+                b->park_sleepers++;
+                pthread_cond_wait(&b->park_cv, &b->lock);
+                b->park_sleepers--;
+                parked = 1;
+            }
+            pthread_cleanup_pop(1);
+            if (parked) continue;
+        }
+        atomic_fetch_add_explicit(&b->open_waiters, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&b->open_word, memory_order_seq_cst) == w &&
+            !atomic_load_explicit(&b->shutdown, memory_order_acquire))
+            futexWait(&b->open_word, w);
+        atomic_fetch_sub_explicit(&b->open_waiters, 1, memory_order_relaxed);
+    }
+}
+#endif
+
 int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin) {
     int phase;
     if (spin) {
@@ -148,6 +234,9 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
             if (!phaseBarrierKeepSpinning(i, start)) break;
         }
     }
+#if PHASE_BARRIER_HAVE_FUTEX
+    if (b->futex) return awaitPhaseFutex(b, worker_id, last_seen);
+#endif
     pthread_mutex_lock(&b->lock);
     /* pthread_cond_wait is a cancellation point that returns holding the lock: a worker cancelled
      * there (the crash report's memory test joins every IO thread) must not exit holding it. */
