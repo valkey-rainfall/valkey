@@ -2077,6 +2077,32 @@ int fastpathReadmitAuthenticated(client *c) {
     return 0;
 }
 
+/* Main, handing a client back: its commands were looked up by an IO thread when they were read. A
+ * client handed back before it in the same pass may have changed the command table since: MODULE
+ * UNLOAD frees the module's commands, so a promoted or queued command could still point at a freed
+ * one, and MODULE LOAD can define a command that was unknown when read. Look each up again and
+ * prepare it again when the table no longer gives the same command, as main would resolve it now.
+ * Only pointers are compared; a stale one is never dereferenced. */
+static void fpRefreshParsedCommands(client *c) {
+    if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) &&
+        (c->parsed_cmd || (c->read_flags & READ_FLAGS_COMMAND_NOT_FOUND)) &&
+        lookupCommand(c->argv, c->argc) != c->parsed_cmd) {
+        unprepareCommand(c);
+        prepareCommand(c);
+    }
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        parsedCommand *p = &c->cmd_queue.cmds[i];
+        if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) || p->argc == 0) continue;
+        if (!p->cmd && !(p->read_flags & READ_FLAGS_COMMAND_NOT_FOUND)) continue;
+        if (lookupCommand(p->argv, p->argc) == p->cmd) continue;
+        p->cmd = NULL; /* as unprepareCommand does for the current command */
+        p->read_flags &= ~(READ_FLAGS_ACL_ALLOWED | READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY |
+                           READ_FLAGS_CROSSSLOT | READ_FLAGS_NO_KEYS);
+        p->slot = -1;
+        prepareParsedCommand(p);
+    }
+}
+
 void fastpathHandoffDone(client *c, int closing) {
     serverAssert(fastpath_clients > 0);
     c->flag.fastpath = 0;
@@ -2116,6 +2142,7 @@ void fastpathHandoffDone(client *c, int closing) {
         handleParseError(c); /* replies, sets close_after_reply; the write path closes it */
         return;
     }
+    fpRefreshParsedCommands(c);
     fp_handback_client = c;
     int processed = processPendingCommandAndInputBuffer(c);
     fp_handback_client = NULL;
