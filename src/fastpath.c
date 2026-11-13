@@ -550,6 +550,15 @@ static int fpCommandAllowed(struct serverCommand *cmd) {
     return 1;
 }
 
+/* A command whose arguments total PROTO_MBULK_BIG_ARG or more, while maxmemory-clients is set, runs on
+ * the main path: client eviction counts a command's arguments in its client's memory before it runs
+ * (processCommand -> evictClients), and a batch entry's arguments are not in its client's accounting.
+ * maxmemory-clients changes only on main, between phases. */
+static int fpEntryAllowed(struct serverCommand *cmd, size_t argv_len_sum) {
+    if (server.maxmemory_clients && argv_len_sum >= PROTO_MBULK_BIG_ARG) return 0;
+    return fpCommandAllowed(cmd);
+}
+
 static void fpSubmit(fpThread *t) {
     cmdBatch *b = t->cur;
     if (!b || b->count == 0) return;
@@ -1149,7 +1158,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     cmdQueue *q = &c->cmd_queue;
 
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
-        if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
+        if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpEntryAllowed(c->parsed_cmd, c->argv_len_sum)) {
             leave = 1;
         } else {
             if (!t->cur) t->cur = fpAllocBatch(t, tid);
@@ -1182,7 +1191,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         }
         int complete = p->read_flags & READ_FLAGS_PARSING_COMPLETED;
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
-        if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
+        if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpEntryAllowed(p->cmd, p->argv_len_sum)) {
             leave = 1;
             break;
         }
