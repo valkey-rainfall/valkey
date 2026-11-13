@@ -15,13 +15,16 @@ extern _Thread_local struct owner *own_self;
 #define OWNER_ON_MAIN (-1)
 #define OWNER_IN_TRANSIT (-2) /* handed to main, not yet taken: only inside the owner's window */
 
+/* With owner threads the standalone keyspace has 2^OWNER_SHARD_BITS tables, each a range of
+ * 16384 >> OWNER_SHARD_BITS slots; every owner owns whole tables. */
+#define OWNER_SHARD_BITS 10
+
 int ownerThreadsEnabled(void);
 int ownerValidateConfig(const char **err);
 void ownerThreadsInit(void);  /* initServer: listeners and state, before any client exists */
 void ownerThreadsStart(void); /* after loading: spawn the threads (they start stopped) */
 void ownerAfterSleep(void);   /* main: stop the world, fold stats, take handed-off clients */
 void ownerBeforeSleepEnd(void); /* main: return idle guests, resume the world */
-int ownerSlotOfKeyIndex(const char *key, size_t len);
 
 /* Hooks from networking.c / server.c. */
 int ownerAdoptAccepted(struct client *c); /* clientAcceptHandler: 1 when an owner took the client */

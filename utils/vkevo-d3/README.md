@@ -2,7 +2,8 @@
 
 Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c, config.c).
 
-- `owner-threads N`: owner i owns slots `[16384*i/N, 16384*(i+1)/N)` of every db and serves the
+- `owner-threads N`: owner i owns about 16384/N slots, `[16*floor(1024*i/N), 16*floor(1024*(i+1)/N))`,
+  of every db (the keyspace has 1024 tables of 16 slots; owners own whole tables) and serves the
   clients of port `owner-port + i` (default 6400) on its own epoll loop, pinned to the i-th CPU of
   `owner-cpulist`. Needs `io-threads 1` at startup (another io-threads, keyspace-shard-bits or
   cluster mode switches owners off). `CONFIG SET io-threads N>1` at runtime puts the owners to
@@ -17,7 +18,7 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
 - AOF, replicas, maxmemory, MONITOR, keyspace events, tracking, WATCH, keys with blocked clients,
   client pause, write-observing modules, latency monitor, hotkeys, forkless save: while any is on,
   owners hand every command to main (stock behavior, main-path speed).
-- `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT|COUNTKEYSINSLOT` on such a server announce the
+- `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
 - `INFO owners`: native commands, handoffs to main, returns, world stops and stop wait, per owner.

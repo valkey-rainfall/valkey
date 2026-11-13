@@ -164,7 +164,8 @@ def main():
     same = all(slots_of(p) == owner for p in ports + [a.port])
     check("topology.same_view_on_every_port", same)
     check("topology.full_coverage", None not in owner, "%d unmapped" % owner.count(None))
-    split = all(owner[s] == ports[i] for i in range(N) for s in (16384 * i // N, 16384 * (i + 1) // N - 1))
+    # owners own whole 16-slot tables: owner i covers tables [1024*i/N, 1024*(i+1)/N)
+    split = all(owner[s] == ports[i] for i in range(N) for s in ((1024 * i // N) * 16, (1024 * (i + 1) // N) * 16 - 1))
     check("topology.contiguous_split_N_ways", split and set(owner) == set(ports), {p: owner.count(p) for p in ports})
 
     key_cache = {}

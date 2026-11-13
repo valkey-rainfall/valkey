@@ -272,8 +272,9 @@ static int keyspaceShard(sds key) {
 }
 
 int getKVStoreIndexForKey(sds key) {
-    /* Owner threads (owner.c) own slot ranges, so their standalone keyspace is split by slot too. */
-    if (server.cluster_enabled || server.owner_threads) return (int)keyHashSlot(key, (int)sdslen(key));
+    if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
+    /* Owner threads (owner.c) own slot ranges: their standalone keyspace is split by slot range. */
+    if (server.owner_threads) return (int)(keyHashSlot(key, (int)sdslen(key)) >> (CLUSTER_SLOT_MASK_BITS - OWNER_SHARD_BITS));
     if (server.keyspace_shard_bits) return keyspaceShard(key);
     return 0;
 }

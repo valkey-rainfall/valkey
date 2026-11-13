@@ -3303,8 +3303,9 @@ bool dbsHaveNoKeys(void) {
 #define KEYSPACE_SHARD_BITS_AUTO_WIDE_MIN_IO_THREADS 16
 void resolveKeyspaceShardBits(void) {
     if (server.owner_threads && !server.cluster_enabled) {
-        /* Owner threads own slot ranges: one table per slot, as in cluster mode (owner.c). */
-        server.keyspace_shard_bits = CLUSTER_SLOT_MASK_BITS;
+        /* Owner threads own slot ranges: one table per 16 slots, owner ranges on table boundaries
+         * (owner.c). 1024 tables cost ~65 KB per kvstore; one per slot would cost ~300 KB. */
+        server.keyspace_shard_bits = OWNER_SHARD_BITS;
     } else if (server.keyspace_shard_bits_config >= 0) {
         server.keyspace_shard_bits = server.keyspace_shard_bits_config;
     } else if (server.cluster_enabled || server.io_threads_num < 2) {

@@ -1,11 +1,11 @@
 /* Owner threads: vkevo design D3 ("owner-steer"). One process, one port per worker core.
  *
- * owner-threads N starts N owner threads. Owner i owns the cluster slots
- * [16384*i/N, 16384*(i+1)/N) of every database and serves the clients that connect to port
- * owner-port + i. With owner threads the standalone keyspace has one table per slot, as in
- * cluster mode, so owners mutate disjoint tables. The kvstores run in concurrent mode (the lane
- * mode of kvstore.c) whenever owners may run, and main folds the per-table deltas back when it
- * stops them.
+ * owner-threads N starts N owner threads. Owner i owns a contiguous range of cluster slots (about
+ * 16384/N, on 16-slot boundaries) of every database and serves the clients that connect to port
+ * owner-port + i. With owner threads the standalone keyspace has one table per 16 slots
+ * (OWNER_SHARD_BITS), and every owner owns whole tables, so owners mutate disjoint tables. The
+ * kvstores run in concurrent mode (the lane mode of kvstore.c) whenever owners may run, and main
+ * folds the per-table deltas back when it stops them.
  *
  * CLUSTER SLOTS / SHARDS / NODES on such a server announce the N owners as cluster nodes, so a
  * cluster-aware client connects to the port of the owner of each key. NIC steering (one ntuple
@@ -170,7 +170,7 @@ int ownerValidateConfig(const char **err) {
         off = "owner-threads is a standalone mode; cluster-enabled turns it off";
     } else if (server.io_threads_num != 1) {
         off = "owner-threads needs io-threads 1 (the main path is the stock single-threaded loop); io-threads turns it off";
-    } else if (server.keyspace_shard_bits_config >= 0 && server.keyspace_shard_bits_config != CLUSTER_SLOT_MASK_BITS) {
+    } else if (server.keyspace_shard_bits_config >= 0 && server.keyspace_shard_bits_config != OWNER_SHARD_BITS) {
         off = "owner-threads splits the keyspace by slot; keyspace-shard-bits turns it off";
     }
     if (off) {
@@ -183,11 +183,6 @@ int ownerValidateConfig(const char **err) {
         return C_ERR;
     }
     return C_OK;
-}
-
-/* Slot of a key, as getKVStoreIndexForKey() uses it with owner threads. */
-int ownerSlotOfKeyIndex(const char *key, size_t len) {
-    return (int)keyHashSlot(key, (int)len);
 }
 
 /* The CPU of owner i: the i-th entry (wrapping) of owner-cpulist, "a-b,c,d-e" form. */
@@ -236,8 +231,10 @@ void ownerThreadsInit(void) {
         owner *o = &owners[i];
         o->id = i;
         o->cpu = ownerCpuOf(i);
-        o->slot_lo = (int)((long long)CLUSTER_SLOTS * i / own_n);
-        o->slot_hi = (int)((long long)CLUSTER_SLOTS * (i + 1) / own_n) - 1;
+        /* Whole tables: owner i owns tables [T*i/N, T*(i+1)/N), each 16384/T slots. */
+        const int tables = 1 << OWNER_SHARD_BITS, per = CLUSTER_SLOTS / tables;
+        o->slot_lo = (int)((long long)tables * i / own_n) * per;
+        o->slot_hi = (int)((long long)tables * (i + 1) / own_n) * per - 1;
         o->inbox = listCreate();
         pthread_mutex_init(&o->inbox_mu, NULL);
         o->fdmap_cap = 1024;
@@ -1158,16 +1155,6 @@ int ownerClusterCommand(client *c) {
     if (!strcasecmp(sub, "keyslot") && c->argc == 3) {
         sds key = objectGetVal(c->argv[2]);
         addReplyLongLong(c, keyHashSlot(key, (int)sdslen(key)));
-        return 1;
-    }
-    if (!strcasecmp(sub, "countkeysinslot") && c->argc == 3) {
-        long long slot;
-        if (getLongLongFromObjectOrReply(c, c->argv[2], &slot, NULL) != C_OK) return 1;
-        if (slot < 0 || slot >= CLUSTER_SLOTS) {
-            addReplyError(c, "Invalid slot");
-            return 1;
-        }
-        addReplyLongLong(c, (long long)kvstoreHashtableSize(c->db->keys, (int)slot));
         return 1;
     }
     return 0;
