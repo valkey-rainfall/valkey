@@ -2817,12 +2817,12 @@ void bgIteration_handleCommandReplication(int dbid,
                             !it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) {
                             /* If the current command is allowed to replicate, and there is a new
                              * key which we haven't yet reached in iteration, it needs to be added
-                             * to the set of early iterate entries.  It may be there already: this
-                             * loop runs for every op the command propagates, and the DEL of a
-                             * second lazily expired key comes after the first key was set again
-                             * (prototype fix, U-2 in the forkless spike notes). */
-                            bool wasAdded = earlySetAdd(it, de);
-                            UNUSED(wasAdded);
+                             * to the set of early iterate entries. One command can propagate more
+                             * than once (MSET that creates a key, then lazily expires a later key
+                             * and propagates its DEL), so the key may already be there from this
+                             * same command; the iterator takes early entries only at feed time,
+                             * never inside a command, so adding again is a no-op, not a resend. */
+                            earlySetAdd(it, de); /* keeps the lane mirror bits (prototype) */
                             if (BGITERATION_DEBUG) {
                                 sds entryString = createEntryString(dbid, de);
                                 debugBuffer = sdscatprintf(debugBuffer, "EARLY(NEW): %s\n", entryString);

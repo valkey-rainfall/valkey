@@ -42,6 +42,20 @@ proc la_mixed_writes {primary rounds} {
     $rd close
 }
 
+# As wait_for_ofs_sync, with a longer limit (a lanes-on primary can leave a long backlog after a
+# write load) and the offsets in the failure message.
+proc la_wait_ofs {primary replica} {
+    wait_for_condition 600 100 {
+        [status $primary master_repl_offset] eq [status $replica master_repl_offset]
+    } else {
+        puts "STALL replica stats: [regexp -all -inline {(?:repl_[a-z_]+|loading_inline[a-z_]+|total_commands_processed):[0-9]+} [$replica info stats]]"
+        puts "STALL replica primary client: [regexp -all -inline {[^\n]*flags=M[^\n]*} [$replica client list]]"
+        puts "STALL replica repl: [regexp -all -inline {(?:master_[a-z_]+|slave_repl_offset|master_link_status):[^\r\n]+} [$replica info replication]]"
+        puts "STALL primary replicas: [regexp -all -inline {slave[0-9]+:[^\r\n]+} [$primary info replication]]"
+        fail "replica offset [status $replica master_repl_offset] != primary [status $primary master_repl_offset]"
+    }
+}
+
 proc la_primary_overrides {} {
     return {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes
             repl-diskless-sync-delay 0 repl-ping-replica-period 60}
@@ -96,7 +110,7 @@ foreach replica_load {on-empty-db disabled} {
                 after 500
                 foreach l $loads { stop_write_load $l }
                 wait_load_handlers_disconnected -1
-                wait_for_ofs_sync $primary $replica
+                la_wait_ofs $primary $replica
                 assert_equal [$primary dbsize] [$replica dbsize]
                 assert_equal [$primary debug digest] [$replica debug digest]
                 assert_equal 0 [s -1 total_forks]
@@ -122,7 +136,7 @@ foreach replica_load {on-empty-db disabled} {
             $replica config set repl-diskless-load $replica_load
             test "Forkless load apply: mixed inline commands keep stream order (load=$replica_load)" {
                 la_sync_during $primary $replica $ph $pp { la_mixed_writes $primary 600 }
-                wait_for_ofs_sync $primary $replica
+                la_wait_ofs $primary $replica
                 assert_equal [$primary debug digest] [$replica debug digest]
                 assert_morethan [la_stat $replica loading_inline_parallel_applied] 0
                 assert_morethan [la_stat $replica loading_inline_serial_applied] 0
@@ -148,7 +162,7 @@ foreach {mutation name} {4 "no flush before another inline command" 16 "SETs hel
             $replica config set repl-diskless-load on-empty-db
             test "Forkless load apply: mutation '$name' makes the replica differ" {
                 la_sync_during $primary $replica $ph $pp { la_mixed_writes $primary 600 }
-                wait_for_ofs_sync $primary $replica
+                la_wait_ofs $primary $replica
                 assert_not_equal [$primary debug digest] [$replica debug digest]
             }
         }
@@ -178,7 +192,7 @@ foreach {debug name} {1 "the load applies the SETs it holds at its end" 8 "mutat
                     for {set i 0} {$i < 2001} {incr i} { $rd read }
                     $rd close
                 } 150
-                wait_for_ofs_sync $primary $replica
+                la_wait_ofs $primary $replica
                 set ok [expr {[$primary debug digest] eq [$replica debug digest] &&
                               [la_stat $replica repl_parallel_applied] == 0 &&
                               [la_stat $replica loading_inline_parallel_applied] > 0}]
@@ -244,8 +258,83 @@ start_server [list tags {"repl external:skip"} overrides [la_primary_overrides]]
             }
             foreach l $loads { stop_write_load $l }
             wait_load_handlers_disconnected -1
-            wait_for_ofs_sync $primary $replica
+            la_wait_ofs $primary $replica
             assert_equal [$primary debug digest] [$replica debug digest]
+        }
+    }
+}
+
+# The inline header reader (rdbRioReadLine) reads several bytes at a time but never past a line's
+# '\n': inline commands with 1- to 5-digit lengths, back to back and before EOF, load intact, and a
+# header the parser rejects still fails the load.
+proc la_inline_rdb {dir inline} {
+    set dump [file join $dir dump.rdb]
+    set fd [open $dump rb]
+    fconfigure $fd -translation binary
+    set data [read $fd]
+    close $fd
+    # Drop EOF + CRC; append the inline items, EOF and a zero checksum (no CRC check).
+    set fd [open $dump wb]
+    fconfigure $fd -translation binary
+    puts -nonewline $fd "[string range $data 0 end-9]$inline\xFF\x00\x00\x00\x00\x00\x00\x00\x00"
+    close $fd
+}
+
+# Start a server whose load is expected to fail, run code, then kill it (as rdb.tcl does).
+proc la_start_and_kill {overrides code} {
+    upvar srv srv
+    set srv [start_server [list overrides $overrides keep_persistence true]]
+    uplevel 1 $code
+    kill_server $srv
+}
+
+proc la_resp {args} {
+    set s "\xF2*[llength $args]\r\n"
+    foreach a $args { append s "\$[string length $a]\r\n$a\r\n" }
+    return $s
+}
+
+set la_rd_path [tmpdir "server.loadapply-reader"]
+start_server [list overrides [list dir $la_rd_path] keep_persistence true] {
+    r set base v
+    r save
+}
+set la_vals {}
+foreach n {0 1 9 10 99 100 12345} { lappend la_vals [string repeat x $n] }
+set la_inline ""
+for {set i 0} {$i < [llength $la_vals]} {incr i} {
+    append la_inline [la_resp SET k$i [lindex $la_vals $i]]
+    append la_inline [la_resp INCR c]
+}
+append la_inline [la_resp SET last done]
+la_inline_rdb $la_rd_path $la_inline
+
+start_server [list overrides [list dir $la_rd_path rdb-version-check relaxed]] {
+    test "Forkless load apply: inline headers of every length load intact" {
+        for {set i 0} {$i < [llength $la_vals]} {incr i} {
+            assert_equal [lindex $la_vals $i] [r get k$i]
+        }
+        assert_equal [llength $la_vals] [r get c]
+        assert_equal done [r get last]
+        assert_equal v [r get base]
+    }
+}
+
+foreach {name bad} [list "a header shorter than 4 bytes" "\xF2*\r\n" \
+                         "a header with a bare newline" "\xF2*3\n\$3\r\nSET\r\n\$1\r\na\r\n\$1\r\nb\r\n"] {
+    set la_bad_path [tmpdir "server.loadapply-reader-bad"]
+    start_server [list overrides [list dir $la_bad_path] keep_persistence true] {
+        r set base v
+        r save
+    }
+    la_inline_rdb $la_bad_path $bad
+    la_start_and_kill [list dir $la_bad_path rdb-version-check relaxed] {
+        test "Forkless load apply: $name fails the load" {
+            wait_for_condition 50 100 {
+                [string match {*Malformed inline replication command*} [exec tail -20 < [dict get $srv stdout]]]
+            } else {
+                fail "Server loaded an RDB with $name"
+            }
         }
     }
 }

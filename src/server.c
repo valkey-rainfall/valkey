@@ -7330,7 +7330,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_priority_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
                 "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
                 "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
-        /* Prototype (C step 1): kept out of FMTARGS above, which is at its argument limit. */
+        /* Prototype: load apply counters, outside FMTARGS, which takes at most 120 arguments. */
         info = sdscatprintf(info,
                             "loading_inline_parallel_applied:%lld\r\n"
                             "loading_inline_serial_applied:%lld\r\n"
