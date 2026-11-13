@@ -9,6 +9,9 @@
  *                     Counters are incremented each time these events are
  *                     fired. They should be equal and increment monotonically.
  * 4- test.oneshot   : Test for oneshot API
+ * 5- test.aftersleepincr <key> | off : INCR <key> in every AFTER_SLEEP event, a
+ *                     write made while no command runs (as a module thread
+ *                     holding the GIL or an after-sleep hook may do).
  */
 
 #include "valkeymodule.h"
@@ -17,6 +20,7 @@
 #include <fcntl.h>
 #include <memory.h>
 #include <errno.h>
+#include <strings.h>
 
 int fds[2];
 long long buf_size;
@@ -233,17 +237,32 @@ int oneshot(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     return VALKEYMODULE_OK;
 }
 
+ValkeyModuleString *aftersleep_key = NULL;
+
+int aftersleepincr(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+    if (aftersleep_key) ValkeyModule_FreeString(NULL, aftersleep_key);
+    aftersleep_key = NULL;
+    if (strcasecmp(ValkeyModule_StringPtrLen(argv[1], NULL), "off") != 0)
+        aftersleep_key = ValkeyModule_CreateStringFromString(NULL, argv[1]);
+    ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+    return VALKEYMODULE_OK;
+}
+
 void eventloopCallback(struct ValkeyModuleCtx *ctx, ValkeyModuleEvent eid, uint64_t subevent, void *data) {
-    VALKEYMODULE_NOT_USED(ctx);
     VALKEYMODULE_NOT_USED(eid);
-    VALKEYMODULE_NOT_USED(subevent);
     VALKEYMODULE_NOT_USED(data);
 
     ValkeyModule_Assert(eid.id == VALKEYMODULE_EVENT_EVENTLOOP);
-    if (subevent == VALKEYMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP)
+    if (subevent == VALKEYMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP) {
         beforeSleepCount++;
-    else if (subevent == VALKEYMODULE_SUBEVENT_EVENTLOOP_AFTER_SLEEP)
+    } else if (subevent == VALKEYMODULE_SUBEVENT_EVENTLOOP_AFTER_SLEEP) {
         afterSleepCount++;
+        if (aftersleep_key) {
+            ValkeyModuleCallReply *reply = ValkeyModule_Call(ctx, "INCR", "!s", aftersleep_key);
+            if (reply) ValkeyModule_FreeCallReply(reply);
+        }
+    }
 }
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
@@ -267,6 +286,9 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         == VALKEYMODULE_ERR) return VALKEYMODULE_ERR;
 
     if (ValkeyModule_CreateCommand(ctx, "test.oneshot", oneshot, "", 0, 0, 0)
+        == VALKEYMODULE_ERR) return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx, "test.aftersleepincr", aftersleepincr, "", 0, 0, 0)
         == VALKEYMODULE_ERR) return VALKEYMODULE_ERR;
 
     if (ValkeyModule_SubscribeToServerEvent(ctx, ValkeyModuleEvent_EventLoop,
