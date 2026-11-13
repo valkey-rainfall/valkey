@@ -498,6 +498,13 @@ static int fpSessionEligible(client *c) {
      * approximation all fast-path clients share). A named client stays on the main path while
      * maxmemory-clients is set, as it always did, so turning on client eviction changes nothing for it. */
     if (c->name && server.maxmemory_clients) return 0;
+    /* The main path applies the normal class's output buffer limits to a whole pipeline's replies before
+     * writing any (the client is closed and gets nothing); the fast path writes replies as it goes and
+     * limits only what stays unsent. A named client stays on the main path while such a limit is set,
+     * as it always did. */
+    if (c->name && (server.client_obuf_limits[CLIENT_TYPE_NORMAL].hard_limit_bytes ||
+                    server.client_obuf_limits[CLIENT_TYPE_NORMAL].soft_limit_bytes))
+        return 0;
     if (c->capa) return 0; /* CLIENT CAPA changes replies main builds for this client, e.g. REDIRECT */
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;
