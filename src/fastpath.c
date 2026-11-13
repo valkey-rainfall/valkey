@@ -710,6 +710,7 @@ static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc,
 #define FP_MM_ENTRY 1024        /* per entry: object headers, table entries and chained buckets, a new table */
 #define FP_MM_REPLY 128         /* a fixed-size reply: status, integer, null, error */
 #define FP_MM_LOG_ENTRY 8192    /* one commandlog entry: 32 arguments of at most 128 bytes, peer, name */
+#define FP_MM_HISTOGRAM (64 * 1024) /* a command's latency histogram (1 ns to 1 s, 2 digits: about 25 KB) */
 #define FP_MM_SLACK (1 << 20)   /* allocator and bookkeeping noise not modelled per entry */
 
 static int fp_mm_iter = 0; /* main writes before the read phase: lane entries carry growth bounds */
@@ -764,9 +765,9 @@ static size_t fpMmEntryBound(cmdEntry *e, int *reads, size_t *wlen) {
     void (*p)(client *) = cmd->proc;
     *reads = 0;
     *wlen = 0;
-    /* The first call of a command creates its latency histogram: let main make it. */
-    if (server.latency_tracking_enabled && !cmd->latency_histogram) return SIZE_MAX;
     size_t b = e->argv_len_sum + 64 * (size_t)argc + FP_MM_ENTRY + FP_MM_REPLY;
+    /* The first call of a command creates its latency histogram (main does, in the merge). */
+    if (server.latency_tracking_enabled && !cmd->latency_histogram) b += FP_MM_HISTOGRAM;
     if (fp_mm_prop) b += 2 * (e->argv_len_sum + 32 * (size_t)argc + 64); /* AOF buffer and backlog */
     int read_from = 0, read_step = 1; /* argv[read_from..] step read_step: keys whose string is returned */
     if (p == setCommand) {
