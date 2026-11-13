@@ -92,9 +92,16 @@ foreach gate {off 25 1} {
                 } else {
                     fail "load clients still connected"
                 }
-                # Let short TTLs fire on the primary and their deletes reach the replica.
+                # Let short TTLs fire on the primary and their deletes reach the replica. The replica
+                # catches up on what the primary wrote while it loaded, which takes seconds at lane rates.
                 after 1500
-                wait_for_ofs_sync $primary $replica
+                set t0 [clock milliseconds]
+                wait_for_condition 1200 100 {
+                    [status $primary master_repl_offset] eq [status $replica master_repl_offset]
+                } else {
+                    fail "replica offset didn't match in 120 s"
+                }
+                set catchup [expr {[clock milliseconds] - $t0}]
                 wait_for_condition 50 100 {
                     [$primary debug digest] eq [$replica debug digest]
                 } else {
@@ -105,7 +112,7 @@ foreach gate {off 25 1} {
                 set li [fkl_fp $primary fastpath_forkless_lane_inline]
                 set lr [fkl_fp $primary fastpath_forkless_routed]
                 set lg [fkl_fp $primary fastpath_forkless_gate_on]
-                puts "gate=$gate lane_writes=$lw lane_inline=$li routed=$lr gate_on=$lg"
+                puts "gate=$gate lane_writes=$lw lane_inline=$li routed=$lr gate_on=$lg catchup_ms=$catchup"
                 if {$gate ne "off"} {
                     assert_morethan $lw 0
                     assert_morethan $li 0
