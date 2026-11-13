@@ -1349,4 +1349,40 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_equal 22222 [r get nk2]
     } {}
 
+    test {SET values built by the parser match the stored encodings} {
+        r flushdb
+        set long [string repeat x 200]
+        foreach cmd {SET set Set} {
+            r $cmd ps:int 12345
+            assert_encoding int ps:int
+            assert_equal 12346 [r incr ps:int]
+            r $cmd ps:small hello
+            assert_encoding embstr ps:small
+            assert_equal hello [r get ps:small]
+            r $cmd ps:long $long
+            assert_encoding raw ps:long
+            assert_equal $long [r get ps:long]
+            # Overwrite with a value of another size, then append.
+            r $cmd ps:small hello-again
+            assert_equal 16 [r append ps:small !!!!!]
+            assert_equal hello-again!!!!! [r get ps:small]
+        }
+        # A pipeline mixes SETs that the parser prebuilds with other commands.
+        set rd [valkey_deferring_client]
+        for {set i 0} {$i < 100} {incr i} {
+            $rd set ps:p$i v$i
+            $rd get ps:p$i
+            $rd set ps:p$i $i
+            $rd incr ps:p$i
+        }
+        for {set i 0} {$i < 100} {incr i} {
+            assert_equal OK [$rd read]
+            assert_equal v$i [$rd read]
+            assert_equal OK [$rd read]
+            assert_equal [expr {$i + 1}] [$rd read]
+        }
+        $rd close
+        r ping
+    } {PONG}
+
 }

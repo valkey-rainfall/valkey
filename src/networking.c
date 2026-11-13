@@ -4315,6 +4315,8 @@ typedef struct sharedCommandName {
 } sharedCommandName;
 
 static sharedCommandName shared_cmdnames[CMDNAME_SLOTS];
+/* The shared "SET" and "set" objects, for the parser's SET value prebuild. */
+static robj *shared_cmdname_set[2];
 
 static inline unsigned int cmdNameSlot(const char *p, size_t len) {
     uint32_t h = (uint32_t)len;
@@ -4333,6 +4335,18 @@ static void addSharedCommandName(const char *name, size_t len) {
         return;
     }
     /* No free slot nearby: this spelling keeps the allocating path. */
+}
+
+/* Return the shared object whose bytes are exactly p[0..len), or NULL. */
+static inline robj *lookupSharedCommandName(const char *p, size_t len) {
+    if (len == 0 || len > CMDNAME_MAXLEN) return NULL;
+    unsigned int slot = cmdNameSlot(p, len);
+    for (int k = 0; k < CMDNAME_PROBES; k++) {
+        sharedCommandName *e = &shared_cmdnames[(slot + k) & (CMDNAME_SLOTS - 1)];
+        if (!e->obj) return NULL;
+        if (e->len == len && memcmp(e->name, p, len) == 0) return e->obj;
+    }
+    return NULL;
 }
 
 void createSharedCommandNames(void) {
@@ -4354,18 +4368,8 @@ void createSharedCommandNames(void) {
         addSharedCommandName(names[j], len);
         addSharedCommandName(lower, len);
     }
-}
-
-/* Return the shared object whose bytes are exactly p[0..len), or NULL. */
-static inline robj *lookupSharedCommandName(const char *p, size_t len) {
-    if (len == 0 || len > CMDNAME_MAXLEN) return NULL;
-    unsigned int slot = cmdNameSlot(p, len);
-    for (int k = 0; k < CMDNAME_PROBES; k++) {
-        sharedCommandName *e = &shared_cmdnames[(slot + k) & (CMDNAME_SLOTS - 1)];
-        if (!e->obj) return NULL;
-        if (e->len == len && memcmp(e->name, p, len) == 0) return e->obj;
-    }
-    return NULL;
+    shared_cmdname_set[0] = lookupSharedCommandName("SET", 3);
+    shared_cmdname_set[1] = lookupSharedCommandName("set", 3);
 }
 
 /* Incremental parsing of a command in the client's query buffer.
@@ -4574,8 +4578,18 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                robj *name = (*argc == 0) ? lookupSharedCommandName(c->querybuf + c->qb_pos, c->bulklen) : NULL;
-                (*argv)[(*argc)++] = name ? name : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+                const char *arg = c->querybuf + c->qb_pos;
+                robj *o = NULL;
+                if (*argc == 0) {
+                    o = lookupSharedCommandName(arg, c->bulklen);
+                } else if (*argc == 2 && c->multibulklen == 1 && shared_cmdname_set[0] &&
+                           ((*argv)[0] == shared_cmdname_set[0] || (*argv)[0] == shared_cmdname_set[1]) &&
+                           sdsEncodedObject((*argv)[1])) {
+                    /* SET key value: build the store-ready value (embedded key) now, as
+                     * prepareCommand() would, instead of a plain value it then replaces. */
+                    o = tryCreatePrebuiltStringEntry(arg, c->bulklen, objectGetVal((*argv)[1]));
+                }
+                (*argv)[(*argc)++] = o ? o : createStringObject(arg, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }

@@ -427,6 +427,18 @@ robj *tryPrebuildStringEntry(robj *valobj, const_sds key) {
     return NULL;
 }
 
+/* Parser variant of tryPrebuildStringEntry() for a SET value still in the
+ * query buffer: build the embedded key+value object directly, so the plain
+ * value object is never allocated. Returns NULL (the caller creates a plain
+ * string object) when the value would be INT-encoded or is too large to embed;
+ * prepareCommand() then prebuilds it as before, once the command is known. */
+robj *tryCreatePrebuiltStringEntry(const char *ptr, size_t len, const_sds key) {
+    long value;
+    if (len <= 20 && string2l(ptr, len, &value)) return NULL;
+    if (!shouldEmbedStringObject(len, key, EXPIRY_NONE)) return NULL;
+    return createEmbeddedStringObjectWithKeyAndExpire(ptr, len, key, EXPIRY_NONE);
+}
+
 void *objectGetVal(const robj *o) {
     if (o->hasembval) {
         unsigned char *data = objectEmbeddedData(o);
