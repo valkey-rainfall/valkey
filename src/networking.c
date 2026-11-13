@@ -552,7 +552,22 @@ void putClientInPendingWriteQueue(client *c) {
  * Typically gets called every time a reply is built, before adding more
  * data to the clients output buffers. If the function returns C_ERR no
  * data should be appended to the output buffers. */
+static int prepareClientToWriteSlow(client *c);
+
 int prepareClientToWrite(client *c) {
+    /* Common case, every reply after a command's first one: an ordinary client already queued for
+     * writing. The checks below would all pass and putClientInPendingWriteQueue() would do nothing,
+     * so only the buffered-reply mark is left. Kept small so that callers inline it. */
+    if (c->flag.pending_write && !c->flag.script && !c->flag.module && !c->flag.executor &&
+        !c->flag.close_asap && !c->flag.reply_off && !c->flag.reply_skip && !c->flag.primary && !c->flag.fake &&
+        c->io_write_state != CLIENT_COMPLETED_IO) {
+        if (!isDeferredReplyEnabled(c)) c->flag.buffered_reply = 1;
+        return C_OK;
+    }
+    return prepareClientToWriteSlow(c);
+}
+
+static __attribute__((noinline)) int prepareClientToWriteSlow(client *c) {
     /* If it's the Lua client we always return ok without installing any
      * handler since there is no socket at all. The fast-path executor client
      * has no socket either: its replies land in a batch arena. */
