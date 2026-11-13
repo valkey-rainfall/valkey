@@ -300,7 +300,7 @@ start_server [list overrides [list dir $la_rd_path] keep_persistence true] {
     r save
 }
 set la_vals {}
-foreach n {0 1 9 10 99 100 12345} { lappend la_vals [string repeat x $n] }
+foreach n {0 1 9 10 61 62 63 99 100 12345} { lappend la_vals [string repeat x $n] }
 set la_inline ""
 for {set i 0} {$i < [llength $la_vals]} {incr i} {
     append la_inline [la_resp SET k$i [lindex $la_vals $i]]
@@ -321,7 +321,9 @@ start_server [list overrides [list dir $la_rd_path rdb-version-check relaxed]] {
 }
 
 foreach {name bad} [list "a header shorter than 4 bytes" "\xF2*\r\n" \
-                         "a header with a bare newline" "\xF2*3\n\$3\r\nSET\r\n\$1\r\na\r\n\$1\r\nb\r\n"] {
+                         "a header with a bare newline" "\xF2*3\n\$3\r\nSET\r\n\$1\r\na\r\n\$1\r\nb\r\n" \
+                         "a small argument without its CRLF" "\xF2*3\r\n\$3\r\nSETxx\$1\r\na\r\n\$1\r\nb\r\n" \
+                         "a large argument without its CRLF" "\xF2*3\r\n\$3\r\nSET\r\n\$1\r\na\r\n\$70\r\n[string repeat y 70]xx"] {
     set la_bad_path [tmpdir "server.loadapply-reader-bad"]
     start_server [list overrides [list dir $la_bad_path] keep_persistence true] {
         r set base v
