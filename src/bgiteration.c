@@ -2802,10 +2802,12 @@ void bgIteration_handleCommandReplication(int dbid,
                             !it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) {
                             /* If the current command is allowed to replicate, and there is a new
                              * key which we haven't yet reached in iteration, it needs to be added
-                             * to the set of early iterate entries.  (We know that it's not already
-                             * in that set because it's a newly created key!) */
+                             * to the set of early iterate entries.  It may be there already: this
+                             * loop runs for every op the command propagates, and the DEL of a
+                             * second lazily expired key comes after the first key was set again
+                             * (prototype fix, U-2 in the forkless spike notes). */
                             bool wasAdded = earlySetAdd(it, de);
-                            serverAssert(wasAdded);
+                            UNUSED(wasAdded);
                             if (BGITERATION_DEBUG) {
                                 sds entryString = createEntryString(dbid, de);
                                 debugBuffer = sdscatprintf(debugBuffer, "EARLY(NEW): %s\n", entryString);
