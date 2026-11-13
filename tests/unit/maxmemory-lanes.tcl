@@ -110,6 +110,7 @@ proc mml_set_load {c host port prefix nsock n val} {
 
 start_server {tags {"staged-loop maxmemory external:skip tls:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 save "" enable-debug-command yes}} {
     r client setname mml-control
+    r debug fastpath-exclude 1
     r select 0
     r config set notify-keyspace-events ""
     set host [srv 0 host]
@@ -259,6 +260,7 @@ start_server {tags {"staged-loop maxmemory repl external:skip tls:skip"} overrid
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
     $primary client setname mml-control
+    $primary debug fastpath-exclude 1
     $primary select 0
     $primary config set notify-keyspace-events ""
     start_server {overrides {io-threads 3 keyspace-shard-bits 10 save ""}} {
