@@ -40,6 +40,7 @@ proc me_wait_empty {r} {
 
 set me_overrides {
     io-threads 4
+    io-threads-always-active yes
     io-threads-fast-path yes
     keyspace-shard-bits 6
     save ""

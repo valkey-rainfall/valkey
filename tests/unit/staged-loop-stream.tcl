@@ -76,7 +76,7 @@ proc sls_open {n} {
     return $fds
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 io-threads-always-active yes enable-debug-command yes}} {
     r client setname sls-control
     r select 0
 
@@ -288,7 +288,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
 # appendfsync always: a reply must not leave before its write reaches the AOF, even with streaming
 # requested. Streaming is disabled in that configuration (eligibility excludes it), so the base
 # reply-after-fsync ordering holds; this test asserts it directly with the config on.
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 io-threads-always-active yes appendonly yes appendfsync always enable-debug-command yes}} {
     # A named client stays off the fast path, so INFO from it counts only the clients under test.
     r client setname sls-control
     r select 0
@@ -353,7 +353,7 @@ proc sls_drive_incr {port rounds depth n} {
     foreach fd $fds { close $fd }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
     # A named client stays off the fast path, so INFO from it counts only the clients under test.
     r client setname sls-control
     r select 0
