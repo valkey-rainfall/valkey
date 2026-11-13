@@ -222,7 +222,8 @@ void ownerThreadsInit(void) {
     own_main_inbox = listCreate();
     own_guests = listCreate();
     for (int k = 0; k < OWN_NCMDS; k++) {
-        own_cmds[k] = lookupCommandByCString(own_cmd_names[k]);
+        /* By original name: rename-command moves the same command under another name. */
+        own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_cmd_names[k]);
         serverAssert(own_cmds[k] != NULL);
     }
     own_main_wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
