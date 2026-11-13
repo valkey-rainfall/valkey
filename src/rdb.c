@@ -3731,13 +3731,29 @@ static size_t rdbRioReader(void *ctx, void *buf, size_t len) {
     return rioRead((rio *)ctx, buf, len);
 }
 
-/* Adapts rioRead to the readline_fn signature used by parseRespCommandFromReader:
- * like fgets, reads up to and including '\n', one byte at a time. */
+/* Adapts rioRead to the readline_fn signature used by parseRespCommandFromReader: like fgets, reads
+ * up to and including '\n'. The line is an inline command's "*<n>\r\n" or "$<n>\r\n" header and
+ * the next byte belongs to the next RDB item, so a read must never pass the '\n' (rio cannot
+ * unread). Each read takes the fewest bytes the line can still need: 4 first (the shortest valid
+ * header is "*1\r\n"), then 2 while no '\r' was seen, then 1 after a '\r'. A "SET k v" header set
+ * takes 6 reads instead of about 18 one-byte reads.
+ * A '\n' before the end of a read can only come from a line the parser rejects (shorter than 4
+ * bytes, or a '\n' without '\r'); the bytes after it are consumed, so the line is returned
+ * empty, which the parser reports as a format error, as it does for such a line read byte by
+ * byte. */
 static char *rdbRioReadLine(void *ctx, char *buf, int size) {
-    int pos = 0;
+    int pos = 0, want = 4;
     while (pos < size - 1) {
-        if (rioRead((rio *)ctx, buf + pos, 1) == 0) break;
-        if (buf[pos++] == '\n') break;
+        if (want > size - 1 - pos) want = size - 1 - pos;
+        if (rioRead((rio *)ctx, buf + pos, want) == 0) break;
+        char *nl = memchr(buf + pos, '\n', want);
+        pos += want;
+        if (nl == buf + pos - 1) break;
+        if (nl) {
+            buf[0] = '\0';
+            return buf;
+        }
+        want = buf[pos - 1] == '\r' ? 1 : 2;
     }
     if (pos == 0) return NULL;
     buf[pos] = '\0';

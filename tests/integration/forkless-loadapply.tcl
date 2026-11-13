@@ -249,3 +249,70 @@ start_server [list tags {"repl external:skip"} overrides [la_primary_overrides]]
         }
     }
 }
+
+# The inline header reader (rdbRioReadLine) reads several bytes at a time but never past a line's
+# '\n': inline commands with 1- to 5-digit lengths, back to back and before EOF, load intact, and a
+# header the parser rejects still fails the load.
+proc la_inline_rdb {dir inline} {
+    set dump [file join $dir dump.rdb]
+    set fd [open $dump rb]
+    fconfigure $fd -translation binary
+    set data [read $fd]
+    close $fd
+    # Drop EOF + CRC; append the inline items, EOF and a zero checksum (no CRC check).
+    set fd [open $dump wb]
+    fconfigure $fd -translation binary
+    puts -nonewline $fd "[string range $data 0 end-9]$inline\xFF\x00\x00\x00\x00\x00\x00\x00\x00"
+    close $fd
+}
+
+proc la_resp {args} {
+    set s "\xF2*[llength $args]\r\n"
+    foreach a $args { append s "\$[string length $a]\r\n$a\r\n" }
+    return $s
+}
+
+set la_rd_path [tmpdir "server.loadapply-reader"]
+start_server [list overrides [list dir $la_rd_path] keep_persistence true] {
+    r set base v
+    r save
+}
+set la_vals {}
+foreach n {0 1 9 10 99 100 12345} { lappend la_vals [string repeat x $n] }
+set la_inline ""
+for {set i 0} {$i < [llength $la_vals]} {incr i} {
+    append la_inline [la_resp SET k$i [lindex $la_vals $i]]
+    append la_inline [la_resp INCR c]
+}
+append la_inline [la_resp SET last done]
+la_inline_rdb $la_rd_path $la_inline
+
+start_server [list overrides [list dir $la_rd_path rdb-version-check relaxed]] {
+    test "Forkless load apply: inline headers of every length load intact" {
+        for {set i 0} {$i < [llength $la_vals]} {incr i} {
+            assert_equal [lindex $la_vals $i] [r get k$i]
+        }
+        assert_equal [llength $la_vals] [r get c]
+        assert_equal done [r get last]
+        assert_equal v [r get base]
+    }
+}
+
+foreach {name bad} [list "a header shorter than 4 bytes" "\xF2*\r\n" \
+                         "a header with a bare newline" "\xF2*3\n\$3\r\nSET\r\n\$1\r\na\r\n\$1\r\nb\r\n"] {
+    set la_bad_path [tmpdir "server.loadapply-reader-bad"]
+    start_server [list overrides [list dir $la_bad_path] keep_persistence true] {
+        r set base v
+        r save
+    }
+    la_inline_rdb $la_bad_path $bad
+    start_server_and_kill_it [list dir $la_bad_path rdb-version-check relaxed] {
+        test "Forkless load apply: $name fails the load" {
+            wait_for_condition 50 100 {
+                [string match {*Malformed inline replication command*} [exec tail -20 < [dict get $srv stdout]]]
+            } else {
+                fail "Server loaded an RDB with $name"
+            }
+        }
+    }
+}
