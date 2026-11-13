@@ -3038,11 +3038,9 @@ static int applyIOThreadsEpollThreadCpu(const char **err) {
 }
 
 static int applyIOThreads(const char **err) {
-    if (ownerThreadsEnabled() && server.io_threads_num != 1) {
-        *err = "io-threads must stay 1 while owner-threads runs";
-        return 0;
-    }
     if (!stagedEpollThreadConfigValid(server.io_threads_epoll_thread, server.io_threads_num, err)) return 0;
+    /* Owner threads sleep while the main path is the staged loop (owner.c). */
+    ownerIOThreadsChanged();
     return updateIOThreads(err);
 }
 

@@ -136,6 +136,7 @@ static list *own_guests = NULL; /* clients with a home owner, served by main now
 static long long own_stops = 0, own_stop_wait_us = 0, own_stop_wait_max_us = 0;
 static long long own_takes = 0, own_returns = 0;
 static int own_last_veto = OWN_VETO_ALL;
+static int own_dormant = 0; /* io-threads > 1: owners sleep, main serves everything */
 
 int ownerThreadsEnabled(void) {
     return own_n > 0;
@@ -355,14 +356,41 @@ static int ownerComputeVeto(void) {
     return 0;
 }
 
+/* Owners look commands up concurrently, so no command table may be mid-rehash while they run: a
+ * lookup would take a rehash step (a paused rehash takes none). Tables change only at startup and
+ * when a module registers commands. */
+static size_t own_settled_modules = (size_t)-1;
+
+static void ownerSettleTable(hashtable *ht) {
+    while (ht && hashtableIsRehashing(ht) && !hashtableIsRehashingPaused(ht)) hashtableRehashMicroseconds(ht, 1000);
+}
+
+static void ownerSettleCommandTables(void) {
+    size_t loaded = moduleCountLoaded();
+    if (loaded == own_settled_modules) return;
+    own_settled_modules = loaded;
+    hashtable *tables[2] = {server.commands, server.orig_commands};
+    for (int t = 0; t < 2; t++) {
+        ownerSettleTable(tables[t]);
+        hashtableIterator iter;
+        void *next;
+        hashtableInitIterator(&iter, tables[t], 0);
+        while (hashtableNext(&iter, &next)) {
+            struct serverCommand *cmd = next;
+            if (cmd->subcommands_ht) ownerSettleTable(cmd->subcommands_ht);
+        }
+        hashtableCleanupIterator(&iter);
+    }
+}
+
 /* Main, last thing before it sleeps: let the owners run. */
 static void ownerResumeWorld(void) {
     if (!own_held) return;
     own_last_veto = ownerComputeVeto();
     atomic_store_explicit(&own_veto, own_last_veto, memory_order_relaxed);
-    /* Owners look commands up concurrently: a lookup must never take a rehash step. */
-    while (hashtableIsRehashing(server.commands)) hashtableRehashMicroseconds(server.commands, 1000);
-    while (hashtableIsRehashing(server.orig_commands)) hashtableRehashMicroseconds(server.orig_commands, 1000);
+    ownerSettleCommandTables();
+    ownerSettleTable(server.commands);
+    ownerSettleTable(server.orig_commands);
     dbLanePhaseBegin();
     own_held = 0;
     atomic_store_explicit(&own_stop, 0, memory_order_seq_cst);
@@ -516,14 +544,17 @@ static void ownerSendToOwner(client *c) {
     }
 }
 
-void ownerAdoptAccepted(client *c) {
+/* Returns 1 when an owner took the client, 0 when it stays on main as a guest (it goes home later). */
+int ownerAdoptAccepted(client *c) {
     /* Main is inside a long command (busy script, loading): owners stay stopped until it ends, so
-     * the new client stays on main, where it can get BUSY or send SCRIPT KILL. It goes home when idle. */
-    if (ProcessingEventsWhileBlocked) {
+     * the new client stays on main, where it can get BUSY or send SCRIPT KILL. Same while the
+     * owners sleep under io-threads > 1. */
+    if (ProcessingEventsWhileBlocked || own_dormant) {
         ownerGuestAdd(c);
-        return;
+        return 0;
     }
     ownerSendToOwner(c);
+    return 1;
 }
 
 /* Main, world held: take a client back from its owner (freeClient). */
@@ -583,6 +614,18 @@ static void ownerReturnGuests(void) {
     }
 }
 
+/* Main, world held: client c of owner o becomes a guest on main. */
+static void ownerTakeToMain(client *c) {
+    ownerReclaim(c);
+    own_takes++;
+    if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+        freeClientAsync(c);
+        return;
+    }
+    ownerGuestAdd(c);
+    if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+}
+
 /* Main inside a long command (processEventsWhileBlocked: busy script, loading, module yield): the
  * owners stay stopped until it ends, so main takes every owner client with input waiting and serves
  * it itself (BUSY replies, SCRIPT KILL, SHUTDOWN). Level-triggered epoll reports the input to main
@@ -598,15 +641,30 @@ static void ownerTakeReadable(void) {
             int fd = (int)(uint32_t)d;
             client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
             if (!c || (uint32_t)c->id != (uint32_t)(d >> 32) || !c->owner_onloop) continue;
-            ownerReclaim(c);
-            own_takes++;
-            if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
-                freeClientAsync(c);
-                continue;
-            }
-            ownerGuestAdd(c);
-            if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+            ownerTakeToMain(c);
         }
+    }
+}
+
+/* Main, world held: CONFIG SET io-threads. With more than one IO thread the main path is CF's staged
+ * loop, which owner windows must not overlap: the owners sleep (main keeps the world) and main takes
+ * all their clients. Back at io-threads 1 they wake, and idle guests go home. */
+void ownerIOThreadsChanged(void) {
+    if (!own_n) return;
+    if (server.io_threads_num > 1 && !own_dormant) {
+        own_dormant = 1;
+        for (int i = 0; i < own_n; i++) {
+            owner *o = &owners[i];
+            for (int fd = 0; fd < o->fdmap_cap; fd++)
+                if (o->fdmap[fd]) ownerTakeToMain(o->fdmap[fd]);
+            listNode *ln;
+            while ((ln = listFirst(o->inbox))) ownerTakeToMain(listNodeValue(ln));
+        }
+        serverLog(LL_NOTICE, "owner threads: asleep while io-threads is %d; main serves their clients",
+                  server.io_threads_num);
+    } else if (server.io_threads_num == 1 && own_dormant) {
+        own_dormant = 0;
+        serverLog(LL_NOTICE, "owner threads: awake (io-threads 1)");
     }
 }
 
@@ -622,7 +680,7 @@ void ownerAfterSleep(void) {
 }
 
 void ownerBeforeSleepEnd(void) {
-    if (!own_n || ProcessingEventsWhileBlocked) return;
+    if (!own_n || ProcessingEventsWhileBlocked || own_dormant) return;
     ownerReturnGuests();
     ownerResumeWorld();
 }

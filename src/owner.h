@@ -24,7 +24,8 @@ void ownerBeforeSleepEnd(void); /* main: return idle guests, resume the world */
 int ownerSlotOfKeyIndex(const char *key, size_t len);
 
 /* Hooks from networking.c / server.c. */
-void ownerAdoptAccepted(struct client *c); /* clientAcceptHandler: a client accepted on an owner port */
+int ownerAdoptAccepted(struct client *c); /* clientAcceptHandler: 1 when an owner took the client */
+void ownerIOThreadsChanged(void);         /* CONFIG SET io-threads: owners sleep while it is > 1 */
 void ownerReclaim(struct client *c);       /* freeClient on main: take the client back from its owner */
 void ownerClientFreed(struct client *c);   /* freeClient on main: drop it from the guest list */
 void ownerErrorReply(struct client *c, const char *s, size_t len, int flags);

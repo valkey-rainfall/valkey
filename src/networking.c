@@ -348,8 +348,9 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
         if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
     }
     if (c->flag.fake || c->flag.executor || isDeferredReplyEnabled(c)) return 0;
-    /* Owner threads write plain buffers: no reply references a value across threads. */
-    if (c->owner_home >= 0) return 0;
+    /* Owner threads write plain buffers: no reply references a value across threads. A client
+     * goes back to its owner only with nothing left to write (owner.c). */
+    if (c->owner_tid != OWNER_ON_MAIN) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 
@@ -2024,10 +2025,7 @@ void clientAcceptHandler(connection *conn) {
     if (!c->flag.close_asap && ownerThreadsEnabled()) {
         if (c->owner_home < 0 && server.owner_adopt_all && connGetType(conn) == CONN_TYPE_SOCKET)
             c->owner_home = (int)(c->id % (uint64_t)server.owner_threads);
-        if (c->owner_home >= 0) {
-            ownerAdoptAccepted(c);
-            return;
-        }
+        if (c->owner_home >= 0 && ownerAdoptAccepted(c)) return;
     }
 
     if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {

@@ -4,7 +4,9 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
 
 - `owner-threads N`: owner i owns slots `[16384*i/N, 16384*(i+1)/N)` of every db and serves the
   clients of port `owner-port + i` (default 6400) on its own epoll loop, pinned to the i-th CPU of
-  `owner-cpulist`. Needs `io-threads 1`; turns itself off in cluster mode.
+  `owner-cpulist`. Needs `io-threads 1` at startup (another io-threads, keyspace-shard-bits or
+  cluster mode switches owners off). `CONFIG SET io-threads N>1` at runtime puts the owners to
+  sleep (main takes their clients, CF's staged loop serves them); back at 1 they wake.
 - Native on the owner, no barrier, no cross-core hop: GET, SET (all options), DEL with one key,
   INCR, PING, when the key's slot is the owner's own.
 - Everything else falls back to the main path: the client (socket, parsed input, unsent replies)
