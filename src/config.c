@@ -641,6 +641,7 @@ void loadServerConfigFromString(sds config) {
                     goto loaderr;
                 }
             }
+            commandTableChanged();
         } else if (!strcasecmp(argv[0], "user") && argc >= 2) {
             int argc_err;
             if (ACLAppendUserForLoading(argv, argc, &argc_err) == C_ERR) {

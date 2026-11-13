@@ -2032,6 +2032,22 @@ test {CONFIG REWRITE handles rename-command properly} {
     }
 } {} {external:skip}
 
+test {Command lookup is case-insensitive and honours rename-command} {
+    start_server {tags {"introspection"} overrides {rename-command {get myget}}} {
+        r set k v
+        assert_equal v [r myget k]
+        assert_equal v [r MYGET k]
+        assert_equal v [r MyGeT k]
+        assert_error {ERR unknown command*} {r get k}
+        assert_error {ERR unknown command*} {r GET k}
+        # A container command resolves its subcommand on every call.
+        assert_equal {maxmemory-policy noeviction} [r config get maxmemory-policy]
+        assert_equal OK [r CONFIG set maxmemory-policy allkeys-lru]
+        assert_equal {maxmemory-policy allkeys-lru} [r Config Get maxmemory-policy]
+        r config set maxmemory-policy noeviction
+    }
+} {} {external:skip}
+
 test {CONFIG REWRITE handles alias config properly} {
     start_server {tags {"introspection"} overrides {hash-max-listpack-entries 20 hash-max-ziplist-entries 21}} {
         assert_equal [r config get hash-max-listpack-entries] {hash-max-listpack-entries 21}

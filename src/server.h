@@ -4591,6 +4591,7 @@ void commandCountCommand(client *c);
 void commandListCommand(client *c);
 void commandInfoCommand(client *c);
 void invalidateCommandCache(void);
+void commandTableChanged(void);
 void commandGetKeysCommand(client *c);
 void commandGetKeysAndFlagsCommand(client *c);
 void commandHelpCommand(client *c);

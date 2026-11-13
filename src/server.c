@@ -3786,6 +3786,7 @@ void commandAddSubcommand(struct serverCommand *parent, struct serverCommand *su
     subcommand->id = ACLGetCommandID(subcommand->fullname); /* Assign the ID used for ACL. */
 
     serverAssert(hashtableAdd(parent->subcommands_ht, subcommand));
+    commandTableChanged();
 }
 
 /* Automatically set CMD_WRITE_FIRSTKEY_ONLY for write commands where the first
@@ -3876,6 +3877,7 @@ void populateCommandTable(void) {
         retval2 = hashtableAdd(server.orig_commands, c);
         serverAssert(retval1 && retval2);
     }
+    commandTableChanged();
 }
 
 void resetCommandTableStats(hashtable *commands) {
@@ -3980,8 +3982,56 @@ struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int a
     }
 }
 
+/* Per-thread cache of top-level command lookups in server.commands.
+ *
+ * IO threads look up every parsed command, so the case-insensitive hash and
+ * compare of the command table show up on every GET/SET. The cache maps the
+ * exact bytes of argv[0] to the command found for them. Only commands without
+ * subcommands are cached, so the result never depends on argv[1]. An entry is
+ * valid only while command_table_epoch is unchanged; every change to the
+ * command table (rename-command, module commands and subcommands added or
+ * removed) bumps the epoch, so a stale or freed command is never returned. */
+#define CMD_LOOKUP_CACHE_SLOTS 8 /* power of two */
+#define CMD_LOOKUP_CACHE_MAXLEN 15
+
+typedef struct cmdLookupCacheEntry {
+    unsigned long long epoch; /* command_table_epoch when filled; 0 = empty */
+    struct serverCommand *cmd;
+    unsigned char len;
+    char name[CMD_LOOKUP_CACHE_MAXLEN];
+} cmdLookupCacheEntry;
+
+static _Atomic unsigned long long command_table_epoch = 1;
+static __thread cmdLookupCacheEntry cmd_lookup_cache[CMD_LOOKUP_CACHE_SLOTS];
+
+/* Called whenever server.commands or a command's subcommand table changes. */
+void commandTableChanged(void) {
+    atomic_fetch_add_explicit(&command_table_epoch, 1, memory_order_relaxed);
+}
+
+static inline unsigned int cmdLookupCacheSlot(const char *name, size_t len) {
+    return (unsigned int)(len + (unsigned char)name[0] * 3 + (unsigned char)name[len - 1]) &
+           (CMD_LOOKUP_CACHE_SLOTS - 1);
+}
+
 struct serverCommand *lookupCommand(robj **argv, int argc) {
-    return lookupCommandLogic(server.commands, argv, argc, 0);
+    if (!sdsEncodedObject(argv[0])) return lookupCommandLogic(server.commands, argv, argc, 0);
+    sds name = objectGetVal(argv[0]);
+    size_t len = sdslen(name);
+    if (len == 0 || len > CMD_LOOKUP_CACHE_MAXLEN) return lookupCommandLogic(server.commands, argv, argc, 0);
+
+    unsigned long long epoch = atomic_load_explicit(&command_table_epoch, memory_order_relaxed);
+    cmdLookupCacheEntry *e = &cmd_lookup_cache[cmdLookupCacheSlot(name, len)];
+    if (e->epoch == epoch && e->len == len && memcmp(e->name, name, len) == 0) return e->cmd;
+
+    struct serverCommand *cmd = lookupCommandLogic(server.commands, argv, argc, 0);
+    if (cmd && !cmd->subcommands_ht && !cmd->parent) {
+        e->epoch = epoch;
+        e->cmd = cmd;
+        e->len = (unsigned char)len;
+        memcpy(e->name, name, len);
+    }
+    return cmd;
 }
 
 struct serverCommand *lookupCommandBySdsLogic(hashtable *commands, sds s) {
@@ -6339,6 +6389,7 @@ void getKeysSubcommand(client *c) {
 
 /* Invalidate the cached COMMAND response when command table changes */
 void invalidateCommandCache(void) {
+    commandTableChanged();
     for (int i = 0; i < RESP_CACHE_INDEX_MAX; i++) {
         if (server.command_response_cache[i]) {
             sdsfree(server.command_response_cache[i]);
