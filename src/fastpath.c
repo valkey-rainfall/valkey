@@ -2840,7 +2840,10 @@ int fastpathStreamParallelAllowed(void) {
     if (!trackingIsIdle()) return 0;
     if (server.notify_keyspace_events || moduleObservesWrites()) return 0;
     if (bgIteration_iterationActive() || throttle_anyThrottlers()) return 0;
-    if (server.maxmemory || server.maxmemory_clients) return 0;
+    /* A replica that ignores maxmemory never evicts and never refuses its primary (isSafeToPerformEvictions),
+     * so the limit changes nothing it applies. One that evicts on its own runs the stream on main. */
+    if (server.maxmemory && !server.repl_replica_ignore_maxmemory) return 0;
+    if (server.maxmemory_clients) return 0;
     if (server.blocked_clients_by_type[BLOCKED_MODULE]) return 0;
     int blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
                   server.blocked_clients_by_type[BLOCKED_STREAM];

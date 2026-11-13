@@ -246,3 +246,62 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
         }
     }
 }
+
+# A replica that ignores maxmemory (the default) never evicts and never refuses its primary, so it
+# applies in parallel with maxmemory set, even below its dataset. One that evicts on its own does not.
+start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fast-path yes}} {
+    start_server {overrides {io-threads 4 io-threads-fast-path yes keyspace-shard-bits 8}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+        $replica config set notify-keyspace-events ""
+        $replica replicaof $primary_host $primary_port
+        wait_for_sync $replica
+        wait_for_ofs_sync $primary $replica
+
+        test {Parallel apply: maxmemory below the dataset with replica-ignore-maxmemory yes} {
+            $replica config set maxmemory-policy allkeys-lru
+            $replica config set replica-ignore-maxmemory yes
+            set rd [valkey_deferring_client -1]
+            set val [string repeat x 500]
+            for {set i 0} {$i < 20000} {incr i} {
+                $rd set big:$i $val
+            }
+            for {set i 0} {$i < 20000} {incr i} { $rd read }
+            $rd close
+            wait_for_ofs_sync $primary $replica
+            # Set the limit once the dataset is there, then write more on top of it.
+            set used [getInfoProperty [$replica info memory] used_memory]
+            $replica config set maxmemory [expr {$used / 2}]
+            set before [parallel_applied $replica]
+            set rd [valkey_deferring_client -1]
+            for {set i 0} {$i < 20000} {incr i} {
+                $rd set big:[expr {$i % 25000}] $val$i
+            }
+            for {set i 0} {$i < 20000} {incr i} { $rd read }
+            $rd close
+            assert_in_sync $primary $replica
+            assert_morethan [expr {[parallel_applied $replica] - $before}] 0
+            assert_equal 0 [getInfoProperty [$replica info stats] evicted_keys]
+            assert_morethan [getInfoProperty [$replica info memory] used_memory] [lindex [$replica config get maxmemory] 1]
+        }
+
+        test {Parallel apply: off with maxmemory and replica-ignore-maxmemory no} {
+            $replica config set maxmemory 0
+            $replica config set replica-ignore-maxmemory no
+            $replica config set maxmemory 1gb
+            set before [parallel_applied $replica]
+            set rd [valkey_deferring_client -1]
+            for {set i 0} {$i < 20000} {incr i} {
+                $rd set key:[expr {$i % 3000}] v$i
+            }
+            for {set i 0} {$i < 20000} {incr i} { $rd read }
+            $rd close
+            assert_in_sync $primary $replica
+            assert_equal $before [parallel_applied $replica]
+            $replica config set maxmemory 0
+            $replica config set replica-ignore-maxmemory yes
+        }
+    }
+}
