@@ -65,7 +65,7 @@ enum { OWN_GET, OWN_SET, OWN_DEL, OWN_INCR, OWN_PING, OWN_NCMDS };
 static const char *const own_cmd_names[OWN_NCMDS] = {"get", "set", "del", "incr", "ping"};
 
 /* Why an owner handed a client to main (client->owner_why). */
-enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT };
+enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
 
 /* Native-path vetoes (own_veto). */
 #define OWN_VETO_ALL 1
@@ -498,25 +498,22 @@ static void ownerTakeOne(client *c) {
         handleQbLimitReached(c);
         return;
     }
+    if (why == OWN_WHY_IDLE) return; /* nothing read: main's own read handler takes the input */
     ownerResumeOnMain(c);
 }
 
+/* One client at a time: a client's command can run a long script, and main then serves the other
+ * clients from inside it (processEventsWhileBlocked), including the ones still queued here. */
 static void ownerTakeHandoffs(void) {
-    pthread_mutex_lock(&own_main_mu);
-    if (listLength(own_main_inbox) == 0) {
+    for (;;) {
+        pthread_mutex_lock(&own_main_mu);
+        listNode *ln = listFirst(own_main_inbox);
+        client *c = ln ? listNodeValue(ln) : NULL;
+        if (ln) listDelNode(own_main_inbox, ln);
         pthread_mutex_unlock(&own_main_mu);
-        return;
-    }
-    list *l = own_main_inbox;
-    own_main_inbox = listCreate();
-    pthread_mutex_unlock(&own_main_mu);
-    listNode *ln;
-    while ((ln = listFirst(l))) {
-        client *c = listNodeValue(ln);
-        listDelNode(l, ln);
+        if (!c) return;
         ownerTakeOne(c);
     }
-    listRelease(l);
 }
 
 static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -550,7 +547,7 @@ int ownerAdoptAccepted(client *c) {
     /* Main is inside a long command (busy script, loading): owners stay stopped until it ends, so
      * the new client stays on main, where it can get BUSY or send SCRIPT KILL. Same while the
      * owners sleep under io-threads > 1. */
-    if (ProcessingEventsWhileBlocked || own_dormant) {
+    if (ProcessingEventsWhileBlocked || own_dormant || (ownerComputeVeto() & OWN_VETO_ALL)) {
         ownerGuestAdd(c);
         return 0;
     }
@@ -558,8 +555,20 @@ int ownerAdoptAccepted(client *c) {
     return 1;
 }
 
-/* Main, world held: take a client back from its owner (freeClient). */
+/* Main, world held: take a client back from its owner (freeClient), or out of main's own queue of
+ * handed-off clients when a nested command (behind a busy script) frees it before its turn. */
 void ownerReclaim(client *c) {
+    if (c->owner_tid == OWNER_IN_TRANSIT) {
+        pthread_mutex_lock(&own_main_mu);
+        listNode *ln = listSearchKey(own_main_inbox, c);
+        serverAssert(ln != NULL);
+        listDelNode(own_main_inbox, ln);
+        pthread_mutex_unlock(&own_main_mu);
+        c->owner_tid = OWNER_ON_MAIN;
+        c->owner_why = 0;
+        if (c->flag.close_asap) c->flag.close_asap = 0; /* the owner's request; freeClient follows */
+        return;
+    }
     serverAssert(own_held && c->owner_tid >= 0 && c->owner_tid < own_n);
     owner *o = &owners[c->owner_tid];
     if (c->owner_onloop) {
@@ -676,7 +685,10 @@ void ownerIOThreadsChanged(void) {
 void ownerAfterSleep(void) {
     if (!own_n) return;
     if (ProcessingEventsWhileBlocked) {
-        if (own_held) ownerTakeReadable();
+        if (own_held) {
+            ownerTakeHandoffs(); /* queued behind the command that is running now */
+            ownerTakeReadable();
+        }
         return;
     }
     ownerStopWorld();
@@ -686,7 +698,8 @@ void ownerAfterSleep(void) {
 
 void ownerBeforeSleepEnd(void) {
     if (!own_n || ProcessingEventsWhileBlocked || own_dormant) return;
-    ownerReturnGuests();
+    /* While the native path is vetoed, guests stay on main: owners would only hand them back. */
+    if (!(ownerComputeVeto() & OWN_VETO_ALL)) ownerReturnGuests();
     ownerResumeWorld();
 }
 
@@ -939,6 +952,10 @@ void ownerCountNetOut(long long n) {
 /* Returns 1 when the client left the owner. */
 static int ownerRead(owner *o, client *c) {
     if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
+    /* Vetoed: main serves the client exactly as the stock server, reads included (query buffer
+     * accounting, client eviction, pause), so leave the input unread. */
+    if (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL)
+        return ownerHandOff(o, c, OWN_WHY_IDLE);
     if (!canParseCommand(c)) return ownerHandOff(o, c, OWN_WHY_RUN);
     c->read_flags = authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     readToQueryBuf(c);

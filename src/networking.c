@@ -2496,8 +2496,7 @@ int freeClient(client *c) {
     listNode *ln;
 
     /* An owner thread's client comes back to main first; owners are stopped while main runs. */
-    serverAssert(c->owner_tid != OWNER_IN_TRANSIT);
-    if (c->owner_tid >= 0) ownerReclaim(c);
+    if (c->owner_tid != OWNER_ON_MAIN) ownerReclaim(c);
     if (c->owner_guest_node) ownerClientFreed(c);
 
     /* repl-stream-sender: ensure the sender thread holds no reference to this client
