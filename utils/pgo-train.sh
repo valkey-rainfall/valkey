@@ -40,9 +40,11 @@ b() { "$BENCH" -p "$PORT" -q "$@" > /dev/null 2>&1 || true; }
 run() { timeout "$T" "$BENCH" -p "$PORT" -q -n 2000000000 "$@" > /dev/null 2>&1 || true; }
 half() { timeout $((T / 2)) "$BENCH" -p "$PORT" -q -n 2000000000 "$@" > /dev/null 2>&1 || true; }
 K=(-r 3000000 --threads 16)
+# Server settings for the headline shapes: the scorecard's CFG1 (results/config.md).
+FAST=${PGO_FAST_ARGS:---io-threads-epoll-thread yes --io-threads-epoll-threads 2 --keyspace-shard-bits 10 --staged-reply-merge yes --io-batch-commands 64}
 
 echo "GET shapes (scorecard K1, K3, K5, K7)"
-srv --io-threads 8 --io-threads-epoll-thread yes
+srv --io-threads 8 $FAST
 b -t set "${K[@]}" -n 3000000 -d 16 -P 64 -c 200
 run -t get "${K[@]}" -d 16 -P 64 -c 400
 run -t get "${K[@]}" -d 16 -P 10 -c 400
@@ -52,7 +54,7 @@ half -t get -r 100000 -d 4096 -P 10 -c 400
 stop
 
 echo "SET and mixed shapes with write lanes forced (K2, K3, K4, K6)"
-srv --io-threads 8 --io-threads-epoll-thread yes --io-threads-parallel-writes-min 1
+srv --io-threads 8 $FAST --io-threads-parallel-writes-min 1
 run -t set "${K[@]}" -d 16 -P 64 -c 400
 run -t set "${K[@]}" -d 16 -P 1 -c 2000
 b -t set "${K[@]}" -n 3000000 -d 64 -P 64 -c 200
