@@ -7239,9 +7239,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_lane_classify_usec:%lld\r\n", server.stat_repl_lane_classify_usec,
                 "repl_lane_parse_usec:%lld\r\n", server.stat_repl_lane_parse_usec,
                 "repl_lane_plan_usec:%lld\r\n", server.stat_repl_lane_plan_usec,
-                "loading_inline_parallel_applied:%lld\r\n", server.stat_loading_inline_parallel_applied,
-                "loading_inline_serial_applied:%lld\r\n", server.stat_loading_inline_serial_applied,
-                "loading_inline_apply_phases:%lld\r\n", server.stat_loading_inline_apply_phases,
                 "repl_lane_apply_usec:%lld\r\n", server.stat_repl_lane_apply_usec,
                 "repl_lane_barriers:%lld\r\n", server.stat_repl_lane_barriers,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
@@ -7333,6 +7330,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_priority_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].cnt,
                 "eventloop_priority_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].sum,
                 "eventloop_priority_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_CMD].sum));
+        /* Prototype (C step 1): kept out of FMTARGS above, which is at its argument limit. */
+        info = sdscatprintf(info,
+                            "loading_inline_parallel_applied:%lld\r\n"
+                            "loading_inline_serial_applied:%lld\r\n"
+                            "loading_inline_apply_phases:%lld\r\n",
+                            server.stat_loading_inline_parallel_applied, server.stat_loading_inline_serial_applied,
+                            server.stat_loading_inline_apply_phases);
         info = genValkeyInfoStringACLStats(info);
     }
 
