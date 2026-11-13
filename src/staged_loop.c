@@ -733,7 +733,9 @@ static void collectFDs(aeEventLoop *el) {
     long long fsync_cap = timeout != 0 ? aofFsyncWaitSleepCapUs() : -1;
     if (fsync_cap >= 0 && (timeout < 0 || fsync_cap < timeout)) timeout = fsync_cap;
     monotime pl = getMonotonicUs();
+    if (timeout != 0) phaseBarrierSetOpenerIdle(&sl_barrier, 1); /* workers stop spinning */
     int n = pollerGetNextBatch(sl_poller, timeout);
+    if (timeout != 0) phaseBarrierSetOpenerIdle(&sl_barrier, 0);
     cronStatsRecord(CRON_JOB_SL_POLL, getMonotonicUs() - pl); /* includes sleep when idle */
     if (n < 0) {
         serverLog(LL_WARNING, "Staged event loop: poll failed: %s", strerror(errno));
@@ -951,11 +953,12 @@ int stagedLaneCount(void) {
 }
 
 /* The spin argument of phaseBarrierAwaitPhase for worker tid: none when it shares main's CPU, else
- * adaptive unless the hidden io-threads-barrier-spin-us fixes it (0 sleeps at once). */
+ * spin until main blocks for new work, unless the hidden io-threads-barrier-spin-us fixes the spin
+ * (100 was the old behaviour, 0 sleeps at once). */
 int stagedWorkerSpins(int tid) {
     if (atomic_load_explicit(&sl_on_main_cpu[tid], memory_order_relaxed)) return 0;
     int us = server.io_threads_barrier_spin_us;
-    return us < 0 ? PHASE_BARRIER_SPIN_ADAPTIVE : us;
+    return us < 0 ? PHASE_BARRIER_SPIN_UNTIL_IDLE : us;
 }
 
 /* Lane body per phase, bound once at startup; indexed by phase id. */
