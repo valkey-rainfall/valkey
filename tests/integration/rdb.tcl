@@ -716,7 +716,7 @@ start_server {tags {"external:skip tls:skip"} overrides {forkless-infrastructure
             fail "client never joined the fast path"
         }
         r config set rdb-key-save-delay 10000
-        r config set bgsave-default-method forkless
+        r config set forkless-policy prefer-forkless
         r bgsave
         wait_for_condition 50 100 {
             [s rdb_bgsave_in_progress] == 1
@@ -1060,7 +1060,7 @@ start_server {overrides {forkless-infrastructure-enabled yes save "" keyspace-sh
         # The keys spread over 64 tables; the save must keep each one it had not reached when it was deleted.
         populate 2000
         r config set rdb-key-save-delay 1000
-        r config set bgsave-default-method forkless
+        r config set forkless-policy prefer-forkless
         r bgsave
         wait_for_condition 50 100 {
             [s rdb_bgsave_in_progress] == 1
@@ -2187,7 +2187,7 @@ start_server {tags {"external:skip"} overrides {forkless-infrastructure-enabled 
             for {set i 0} {$i < 10} {incr i} {r set k$i v$i}
             r config resetstat
             r config set rdb-key-save-delay 1000000
-            r config set bgsave-default-method forkless
+            r config set forkless-policy prefer-forkless
             r bgsave
             wait_for_condition 50 100 {
                 [s rdb_bgsave_in_progress] == 1
