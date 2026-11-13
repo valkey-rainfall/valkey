@@ -1825,6 +1825,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     /* Clear the paused actions state if needed. */
     updatePausedActions();
+    replicationForklessLoadHoldCron();
 
     /* Replication cron function -- used to reconnect to primary,
      * detect transfer failures, start background RDB transfers and so forth.

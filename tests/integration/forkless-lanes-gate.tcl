@@ -34,7 +34,7 @@ foreach {mode lanes load} {A no disabled B yes disabled A no on-empty-db B yes o
                     if {$s % 5 == 4} {
                         set omem 0
                         regexp {omem=([0-9]+)} [$primary client list type replica] -> omem
-                        puts "  t=[expr {$s + 1}]s bgsave=[status $primary rdb_bgsave_in_progress] replica_omem=$omem gate_on=[fkg_fp $primary fastpath_forkless_gate_on] drops=[status $primary client_output_buffer_limit_disconnections] sync_full=[status $primary sync_full] replica_link=[status $replica master_link_status] ops=[status $primary instantaneous_ops_per_sec]"
+                        puts "  t=[expr {$s + 1}]s bgsave=[status $primary rdb_bgsave_in_progress] replica_omem=$omem gate_on=[fkg_fp $primary fastpath_forkless_gate_on] drops=[status $primary client_output_buffer_limit_disconnections] sync_full=[status $primary sync_full] replica_link=[status $replica master_link_status] holds=[fkg_fp $primary forkless_load_holds] ops=[status $primary instantaneous_ops_per_sec]"
                     }
                     if {[status $replica master_link_status] eq {up}} {
                         set up_ms [expr {[clock milliseconds] - $t0}]
@@ -45,9 +45,11 @@ foreach {mode lanes load} {A no disabled B yes disabled A no on-empty-db B yes o
                 set fulls [status $primary sync_full]
                 set gate [fkg_fp $primary fastpath_forkless_gate_on]
                 set lw [fkg_fp $primary fastpath_forkless_lane_writes]
+                set holds [fkg_fp $primary forkless_load_holds]
+                set hold_ms [fkg_fp $primary forkless_load_hold_ms]
                 foreach pid $pids { catch {exec /bin/kill -9 $pid} }
                 $primary config set rdb-key-save-delay 0
-                puts "mode=$mode load=$load presync_set_per_s=$rate link_up_under_load_ms=$up_ms drops=$drops sync_full=$fulls gate_on=$gate lane_writes=$lw"
+                puts "mode=$mode load=$load presync_set_per_s=$rate link_up_under_load_ms=$up_ms drops=$drops sync_full=$fulls gate_on=$gate lane_writes=$lw load_holds=$holds load_hold_ms=$hold_ms"
                 wait_for_condition 1200 100 {
                     [status $replica master_link_status] eq {up} &&
                     [status $primary master_repl_offset] eq [status $replica master_repl_offset]

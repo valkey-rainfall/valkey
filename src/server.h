@@ -671,6 +671,7 @@ typedef enum {
     PAUSE_DURING_SHUTDOWN,
     PAUSE_DURING_FAILOVER,
     PAUSE_DURING_SLOT_MIGRATION,
+    PAUSE_DURING_FORKLESS_LOAD, /* prototype: a replica loads a forkless sync and its buffer is filling */
     NUM_PAUSE_PURPOSES /* This value is the number of purposes above. */
 } pause_purpose;
 
@@ -2137,6 +2138,9 @@ struct valkeyServer {
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
     int forkless_lanes;                       /* Prototype: write lanes run beside a forkless full sync */
+    int forkless_load_hold;                   /* Prototype: hold writes while a replica loads after a forkless cut and its buffer fills */
+    long long stat_forkless_load_holds;       /* Prototype: times the load hold turned on */
+    long long stat_forkless_load_hold_ms;     /* Prototype: total ms writes were held */
     int forkless_lanes_gate_pct;              /* Prototype: lanes stop while the sync's inline queue is above this percent of the replica hard limit */
     int io_threads_lane_prefetch;             /* A write lane prefetches its commands' keys before running them */
     int io_threads_free_on_bio;               /* Main's offloaded frees go to bio instead of the IO threads */
@@ -3489,6 +3493,7 @@ void evictClients(void);
 size_t getClientEvictionLimit(void);
 int listenToPort(connListener *fds);
 void pauseActions(pause_purpose purpose, mstime_t end, uint32_t actions);
+void replicationForklessLoadHoldCron(void);
 void unpauseActions(pause_purpose purpose);
 uint32_t isPausedActions(uint32_t action_bitmask);
 uint32_t isPausedActionsWithUpdate(uint32_t action_bitmask);

@@ -7352,6 +7352,8 @@ char *getPausedReason(pause_purpose purpose) {
         return "failover_in_progress";
     case PAUSE_DURING_SLOT_MIGRATION:
         return "slot_migration_in_progress";
+    case PAUSE_DURING_FORKLESS_LOAD:
+        return "forkless_replica_loading";
     case NUM_PAUSE_PURPOSES:
         return "none";
     default:

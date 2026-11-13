@@ -6016,6 +6016,46 @@ void handleBioThreadFinishedRDBDownload(void) {
 /* --------------------------- REPLICATION CRON  ---------------------------- */
 
 /* Replication cron function, called 1 time per second. */
+/* Prototype (forkless lanes): after a forkless cut a replica loads the RDB and reads nothing until its
+ * first REPLCONF ACK, while every write lands in its output buffer; at a high write rate the hard limit
+ * drops it and the sync starts again, for ever under a steady load. The iterator is gone, so the
+ * inline-queue gate cannot act. Hold writes (PAUSE_ACTION_CLIENT_WRITE) while such a replica's buffer
+ * is above forkless-lanes-gate-pct of the replica hard limit; release once every waiting replica is
+ * below half of that mark, online for the stream, or gone. Cost: writes stall for the rest of the
+ * replica's load. Main, from serverCron (every 1000/hz ms). */
+void replicationForklessLoadHoldCron(void) {
+    static int on = 0;
+    static mstime_t since = 0;
+    long long hard = (long long)server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes;
+    if (hard <= 0) hard = 256LL << 20; /* shortcut: no hard limit configured; use the default's size */
+    long long high = hard / 100 * server.forkless_lanes_gate_pct;
+    int over = 0, above_low = 0;
+    if (server.forkless_load_hold) {
+        listIter li;
+        listNode *ln;
+        listRewind(server.replicas, &li);
+        while ((ln = listNext(&li))) {
+            client *r = listNodeValue(ln);
+            if (!r->repl_data || !r->repl_data->repl_start_cmd_stream_on_ack || r->flag.close_asap) continue;
+            long long used = (long long)getClientOutputBufferMemoryUsage(r);
+            if (used > high) over = 1;
+            if (used > high / 2) above_low = 1;
+        }
+    }
+    if (!on && over) {
+        on = 1;
+        since = server.mstime;
+        server.stat_forkless_load_holds++;
+        pauseActions(PAUSE_DURING_FORKLESS_LOAD, LLONG_MAX, PAUSE_ACTION_CLIENT_WRITE);
+        serverLog(LL_NOTICE, "Forkless load hold on: a loading replica's output buffer passed %lld bytes", high);
+    } else if (on && !above_low) {
+        on = 0;
+        server.stat_forkless_load_hold_ms += server.mstime - since;
+        unpauseActions(PAUSE_DURING_FORKLESS_LOAD);
+        serverLog(LL_NOTICE, "Forkless load hold off after %lld ms", (long long)(server.mstime - since));
+    }
+}
+
 void replicationCron(void) {
     static long long replication_cron_loops = 0;
 

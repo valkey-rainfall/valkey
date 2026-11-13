@@ -1834,11 +1834,14 @@ void fastpathInfo(sds *info) {
                          "fastpath_forkless_lane_writes:%lld\r\n"
                          "fastpath_forkless_lane_inline:%lld\r\n"
                          "fastpath_forkless_routed:%lld\r\n"
-                         "fastpath_forkless_gate_on:%lld\r\n",
+                         "fastpath_forkless_gate_on:%lld\r\n"
+                         "forkless_load_holds:%lld\r\n"
+                         "forkless_load_hold_ms:%lld\r\n",
                          fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
                          fp_stat_serial_segments, fp_stat_lane_prefetches, fp_stat_fk_lane, fp_stat_fk_inline,
-                         __atomic_load_n(&fp_stat_fk_routed, __ATOMIC_RELAXED), fp_stat_fk_gate_on);
+                         __atomic_load_n(&fp_stat_fk_routed, __ATOMIC_RELAXED), fp_stat_fk_gate_on,
+                         server.stat_forkless_load_holds, server.stat_forkless_load_hold_ms);
 }
 
 /* ---------------------------------------------------------------------------------------------
