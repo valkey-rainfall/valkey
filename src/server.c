@@ -3139,6 +3139,9 @@ void resetServerStats(void) {
     server.stat_repl_lane_classify_usec = 0;
     server.stat_repl_lane_parse_usec = 0;
     server.stat_repl_lane_plan_usec = 0;
+    server.stat_loading_inline_parallel_applied = 0;
+    server.stat_loading_inline_serial_applied = 0;
+    server.stat_loading_inline_apply_phases = 0;
     server.stat_repl_lane_apply_usec = 0;
     server.stat_repl_lane_barriers = 0;
     server.stat_numconnections = 0;
@@ -7228,6 +7231,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_lane_classify_usec:%lld\r\n", server.stat_repl_lane_classify_usec,
                 "repl_lane_parse_usec:%lld\r\n", server.stat_repl_lane_parse_usec,
                 "repl_lane_plan_usec:%lld\r\n", server.stat_repl_lane_plan_usec,
+                "loading_inline_parallel_applied:%lld\r\n", server.stat_loading_inline_parallel_applied,
+                "loading_inline_serial_applied:%lld\r\n", server.stat_loading_inline_serial_applied,
+                "loading_inline_apply_phases:%lld\r\n", server.stat_loading_inline_apply_phases,
                 "repl_lane_apply_usec:%lld\r\n", server.stat_repl_lane_apply_usec,
                 "repl_lane_barriers:%lld\r\n", server.stat_repl_lane_barriers,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),

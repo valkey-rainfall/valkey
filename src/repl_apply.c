@@ -615,9 +615,8 @@ static int replApplyEligible(client *c, long long *pxat) {
     return 1;
 }
 
-int replApplyDefer(client *c) {
-    long long pxat;
-    if (!replApplyAllowed(c) || !replApplyEligible(c, &pxat)) return 0;
+/* Hold c's eligible SET on its lane. The lane owns the arguments now. */
+static void replApplyHold(client *c, long long pxat) {
     if (ra_pending == 0) {
         ra_main_lane = stagedMainTakesLane();
         ra_nlanes = stagedWorkerCount() + ra_main_lane;
@@ -637,17 +636,92 @@ int replApplyDefer(client *c) {
                                      .pxat = pxat,
                                      .in_bytes = c->net_input_bytes_curr_cmd};
     ra_pending++;
-    hotkeysRecordLookup(c->argv[1], c->db->id, LOOKUP_WRITE);
 
-    /* The lane owns the arguments now. */
     c->argv = NULL;
     c->argc = 0;
     c->argv_len = 0;
     c->argv_len_sum = 0;
+}
+
+int replApplyDefer(client *c) {
+    long long pxat;
+    if (!replApplyAllowed(c) || !replApplyEligible(c, &pxat)) return 0;
+    hotkeysRecordLookup(c->argv[1], c->db->id, LOOKUP_WRITE);
+    replApplyHold(c, pxat);
     c->commands_processed++;
 
     if (ra_pending >= 16384) replApplyFlush(c);
     return 1;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * The inline commands of an RDB load (opcode 242 of a forkless full sync), prototype only.
+ *
+ * The loader runs inline commands at their stream position. A held SET runs later: past other held SETs
+ * of other tables (disjoint keys) and past records, which never carry a key an inline command touched
+ * (the sender sends a command inline only once its keys are passed, sent early or new). The loader
+ * flushes before any other inline command, before it processes events, and before it returns.
+ * --------------------------------------------------------------------------------------------- */
+
+static client *ra_load_client = NULL; /* the loader's client of the held batch; NULL: a stream batch */
+static int ra_load_phase = 0;         /* lanes: the phase applies a load batch */
+
+/* As replApplyAllowed, for the loader's client. The S-4 code read (loadapply-status.md) found no
+ * loading-only branch on the held path that a lane cannot take. */
+static int replApplyLoadAllowed(client *c) {
+    if (!server.replica_parallel_apply || !replApplySharded() || !inMainThread()) return 0;
+    if (!server.loading || server.async_loading || ProcessingEventsWhileBlocked || c->flag.multi) return 0;
+    /* A writable replica remembers keys a non-primary client gave a TTL, and the loader's client is not
+     * the primary: the serial path does that on main (setExpire); the held path does not. */
+    if (server.primary_host && !server.repl_replica_ro) return 0;
+    if (!stagedApplyReady() || !fastpathLoadParallelAllowed()) return 0;
+    if (server.tracking_clients) return 0;
+    if (dictSize(c->db->watched_keys) || dictSize(c->db->blocking_keys)) return 0;
+    return 1;
+}
+
+int replApplyLoadDefer(client *c) {
+    long long pxat;
+    if (!replApplyLoadAllowed(c) || !replApplyEligible(c, &pxat)) return 0;
+    if (ra_pending && ra_load_client != c) replApplyFlush(ra_load_client ? ra_load_client : c);
+    ra_load_client = c;
+    replApplyHold(c, pxat);
+    if (ra_pending >= 16384) replApplyFlush(c);
+    return 1;
+}
+
+void replApplyLoadFlush(void) {
+    if (ra_pending && ra_load_client) replApplyFlush(ra_load_client);
+}
+
+void replApplyLoadEnd(int ok) {
+    if (!ra_load_client) return;
+    if (ok) {
+        /* Only a test mutation leaves held ops past the end: they go with the stream's next flush. */
+        ra_load_client = NULL;
+        return;
+    }
+    /* The load failed and the keyspace is dropped: free the held ops unapplied. */
+    serverLog(LL_NOTICE, "Dropped %d held inline SETs of a failed load", ra_pending);
+    for (int i = 0; i < ra_nlanes; i++) {
+        replApplyLane *l = &ra_lanes[i];
+        for (int j = 0; j < l->len; j++) {
+            for (int k = 0; k < l->ops[j].argc; k++) decrRefCount(l->ops[j].argv[k]);
+            zfree(l->ops[j].argv);
+        }
+        l->len = 0;
+        l->nlogs = 0;
+    }
+    ra_pending = 0;
+    ra_load_client = NULL;
+}
+
+int replApplyLoadHeld(serverDb *db, sds key) {
+    if (!ra_pending || !ra_load_client) return 0;
+    replApplyLane *l = &ra_lanes[getKVStoreIndexForKey(key) % ra_nlanes];
+    for (int j = 0; j < l->len; j++)
+        if (l->ops[j].db == db && !sdscmp(objectGetVal(l->ops[j].argv[1]), key)) return 1;
+    return 0;
 }
 
 /* setGenericCommand for the eligible forms, without the reply, the dirty count and the events. */
@@ -713,7 +787,7 @@ void replApplyRunLane(int tid) {
     int histogram = server.latency_tracking_enabled;
     int slowlog = server.commandlog[COMMANDLOG_TYPE_SLOW].threshold >= 0 &&
                   server.commandlog[COMMANDLOG_TYPE_SLOW].max_len != 0;
-    if (slot_stats || histogram || slowlog || server.latency_monitor_threshold) {
+    if (!ra_load_phase && (slot_stats || histogram || slowlog || server.latency_monitor_threshold)) {
         /* Per-op time, as call() measures it on the main path, for the per-slot CPU, the latency
          * histogram, the latency monitor and the commandlog. In cluster mode op->shard is the slot and
          * one slot maps to one lane, so no two threads touch the same slot counter. A lane op is
@@ -748,7 +822,7 @@ void replApplyRunLane(int tid) {
         for (int i = 0; i < l->len; i++) {
             replApplyOp *op = &l->ops[i];
             replApplyOne(op);
-            if (replApplyLogged(op, 0))
+            if (!ra_load_phase && replApplyLogged(op, 0))
                 replApplyKeepForLog(l, i, 0);
             else
                 replApplyFreeArgs(op);
@@ -788,6 +862,31 @@ static void replApplyLogOp(client *c, replApplyOp *op) {
 
 void replApplyFlush(client *c) {
     if (!ra_pending) return;
+    if (ra_load_client) {
+        /* A load batch: the loader's client, as the serial path runs it. It counts only dirty
+         * (setGenericCommand): the loader calls the command directly, not through call(). */
+        debugServerAssert(server.loading && stagedApplyReady());
+        client *old = ectx->current_client;
+        ectx->current_client = ra_load_client;
+        ra_load_phase = 1;
+        dbLanePhaseBegin();
+        stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
+        dbLanePhaseEnd();
+        ra_load_phase = 0;
+        ectx->current_client = old;
+        for (int i = 0; i < ra_nlanes; i++) {
+            ra_lanes[i].usec = 0;
+            ra_lanes[i].max_us = 0;
+            ra_lanes[i].len = 0;
+            ra_lanes[i].nlogs = 0;
+        }
+        ectx->dirty += ra_pending;
+        server.stat_loading_inline_parallel_applied += ra_pending;
+        server.stat_loading_inline_apply_phases++;
+        ra_pending = 0;
+        ra_load_client = NULL;
+        return;
+    }
     client *old = ectx->current_client;
     ectx->current_client = c; /* replicated writes never see a key as expired */
     dbLanePhaseBegin();

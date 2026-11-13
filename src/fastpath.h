@@ -174,6 +174,8 @@ void fastpathStagedWriteLane(int tid);
 /* Main: nothing outside a lane's own hashtables would observe or order the stream's writes, held or
  * planned. */
 int fastpathStreamParallelAllowed(void);
+/* Main: the same, without the replica and loading tests, for the inline commands of an RDB load. */
+int fastpathLoadParallelAllowed(void);
 /* Main: as fastpathStreamParallelAllowed, and the stream may be planned onto the write lanes. */
 int fastpathStreamLanesAllowed(void);
 /* IO thread, read phase: the keyspace hashtable of every key the command declares, or -1 when it has

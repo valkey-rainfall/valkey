@@ -43,6 +43,23 @@ int replApplyPending(void);
 /* Staged thread tid (0 = main): apply its lane during an APPLY phase. */
 void replApplyRunLane(int tid);
 
+/* RDB load, prototype only: the loader's client c carries a parsed inline command. Returns 1 when it
+ * is a plain SET taken into a lane (the lane owns c's argv). */
+int replApplyLoadDefer(struct client *c);
+/* RDB load: apply the held SETs now (before another inline command, before events, at the end). */
+void replApplyLoadFlush(void);
+/* RDB load ends: ok = 0 drops the held SETs unapplied (the load failed). */
+void replApplyLoadEnd(int ok);
+/* RDB load, debug check: a held SET is for key in db. */
+struct serverDb;
+int replApplyLoadHeld(struct serverDb *db, char *key);
+/* Bits of the hidden loading-inline-apply-debug setting (prototype only). */
+#define LOAD_APPLY_CHECK_RECORDS 1 /* assert that no held SET is for a record's key */
+#define LOAD_APPLY_FLUSH_RECORDS 2 /* flush before every record, for bisecting */
+#define LOAD_APPLY_MUT_NO_CMD_FLUSH 4 /* test mutation: no flush before another inline command */
+#define LOAD_APPLY_MUT_NO_EOF_FLUSH 8 /* test mutation: no flush at the end of the load */
+#define LOAD_APPLY_MUT_PAST_SWAPDB 16 /* test mutation: no flush before an inline SWAPDB */
+
 /* Set on a thread while it applies a lane. Paths gated off by replApplyDefer must not run. */
 extern _Thread_local int repl_apply_in_lane;
 /* Set on a thread while it runs a planned read's lane commands. Their keys are not watched, so the
