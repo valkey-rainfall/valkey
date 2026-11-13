@@ -116,3 +116,44 @@ foreach gate {off 25 1} {
         }
     }
 }
+
+# A gate that never vetoes and a small replica limit: the inline queue passes the limit, the replica is
+# dropped and the sync starts again; with the load stopped the next sync completes.
+start_server {tags {"repl external:skip tls:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 io-threads 4 io-threads-parallel-writes-min 1 notify-keyspace-events {""}}} {
+    set primary [srv 0 client]
+    set ph [srv 0 host]
+    set pp [srv 0 port]
+    $primary config set forkless-lanes-gate-pct 10000
+    $primary config set client-output-buffer-limit "replica 16mb 0 0"
+    fkl_populate $ph $pp
+    start_server {overrides {save {} repl-diskless-load disabled io-threads 4 io-threads-parallel-writes-min 1 notify-keyspace-events {""}}} {
+        set replica [srv 0 client]
+        test "Forkless sync with write lanes: a replica dropped for the inline queue syncs again" {
+            set pids {}
+            foreach cmd $::fkl_loads { lappend pids [fkl_start_load $ph $pp $cmd] }
+            wait_for_condition 50 100 {
+                [fkl_fp $primary fastpath_clients] >= 20
+            } else {
+                fail "load clients did not join the fast path"
+            }
+            $primary config set rdb-key-save-delay 1
+            $replica replicaof $ph $pp
+            wait_for_condition 300 100 {
+                [status $primary client_output_buffer_limit_disconnections] > 0
+            } else {
+                fail "replica was not dropped"
+            }
+            fkl_stop_load $pids
+            $primary config set rdb-key-save-delay 0
+            wait_for_condition 600 100 {
+                [status $replica master_link_status] eq {up}
+            } else {
+                fail "Replica didn't sync"
+            }
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            assert_equal 0 [status $primary total_forks]
+            assert_morethan [status $primary sync_full] 1
+        }
+    }
+}
