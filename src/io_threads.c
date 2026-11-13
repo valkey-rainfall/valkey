@@ -2388,9 +2388,12 @@ void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
         if (val) decrRefCount(val);
         return;
     }
-    if (exec_lane && !inMainThread()) {
-        /* A write lane is already off main and the free slab is main's. As main does, streams and module
-         * values go to bio; the rest is freed here, unless large enough to hold the lane up. */
+    if (exec_lane) {
+        /* A write lane frees what it overwrites itself, main included when it runs a lane: during a
+         * lane phase main is one lane among peers, and handing its frees to the IO threads only gives
+         * them more work in the next phase. Off main the free slab is not the lane's anyway. As main
+         * does, streams and module values go to bio; the rest is freed here, unless large enough to
+         * hold the lane up. */
         if (!val) return;
         if (val->refcount == 1 && (val->type == OBJ_STREAM || val->type == OBJ_MODULE ||
                                    (val->type != OBJ_STRING && lazyfreeGetFreeEffort(key, val, dbid) > 64)))
