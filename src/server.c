@@ -2485,6 +2485,7 @@ void createSharedObjects(void) {
     shared.sameobjecterr = createSharedString("-ERR source and destination objects are the same\r\n");
     shared.outofrangeerr = createSharedString("-ERR index out of range\r\n");
     shared.noscripterr = createSharedString("-NOSCRIPT No matching script.\r\n");
+    createSharedCommandNames();
     createSharedObjectsForCompat(0);
     createSharedObjectsForCompat(1);
     updateSharedObjectsWithCompat();

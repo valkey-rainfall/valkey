@@ -4297,6 +4297,77 @@ void parseMultibulkBuffer(client *c) {
     }
 }
 
+/* Shared argv[0] objects for the most common command names, in the two
+ * spellings clients send (all upper case and all lower case). The multibulk
+ * parser uses them instead of allocating an object for argv[0], which saves one
+ * allocation and one free per command. Like shared.del or shared.zadd placed in
+ * rewritten argv, these objects are never modified or freed. Any other name or
+ * spelling gets its own object as before. The table is read-only after
+ * startup, so IO threads read it without synchronization. */
+#define CMDNAME_SLOTS 512 /* power of two */
+#define CMDNAME_PROBES 4
+#define CMDNAME_MAXLEN 15
+
+typedef struct sharedCommandName {
+    robj *obj;
+    unsigned char len;
+    char name[CMDNAME_MAXLEN];
+} sharedCommandName;
+
+static sharedCommandName shared_cmdnames[CMDNAME_SLOTS];
+
+static inline unsigned int cmdNameSlot(const char *p, size_t len) {
+    uint32_t h = (uint32_t)len;
+    for (size_t j = 0; j < len; j++) h = h * 31 + (unsigned char)p[j];
+    return (h ^ (h >> 11)) & (CMDNAME_SLOTS - 1);
+}
+
+static void addSharedCommandName(const char *name, size_t len) {
+    unsigned int slot = cmdNameSlot(name, len);
+    for (int k = 0; k < CMDNAME_PROBES; k++) {
+        sharedCommandName *e = &shared_cmdnames[(slot + k) & (CMDNAME_SLOTS - 1)];
+        if (e->obj) continue;
+        e->obj = makeObjectShared(createStringObject(name, len));
+        e->len = (unsigned char)len;
+        memcpy(e->name, name, len);
+        return;
+    }
+    /* No free slot nearby: this spelling keeps the allocating path. */
+}
+
+void createSharedCommandNames(void) {
+    static const char *names[] = {
+        "GET", "SET", "MGET", "MSET", "DEL", "UNLINK", "EXISTS", "EXPIRE", "PEXPIRE", "TTL", "INCR", "DECR",
+        "INCRBY", "SETEX", "PSETEX", "SETNX", "GETSET", "GETEX", "GETDEL", "APPEND", "STRLEN", "PING",
+        "HGET", "HSET", "HMGET", "HMSET", "HDEL", "HGETALL", "HINCRBY", "HEXISTS", "SADD", "SREM",
+        "SISMEMBER", "SMEMBERS", "SPOP", "SCARD", "ZADD", "ZREM", "ZINCRBY", "ZRANK", "ZRANGE",
+        "ZRANGEBYSCORE", "ZSCORE", "ZPOPMIN", "ZPOPMAX", "ZCARD", "LPUSH", "RPUSH", "LPOP", "RPOP",
+        "LRANGE", "LLEN", "XADD", "PUBLISH", "EVALSHA"};
+    static int created = 0;
+    if (created) return;
+    created = 1;
+    for (size_t j = 0; j < sizeof(names) / sizeof(names[0]); j++) {
+        size_t len = strlen(names[j]);
+        char lower[CMDNAME_MAXLEN];
+        serverAssert(len <= CMDNAME_MAXLEN);
+        for (size_t k = 0; k < len; k++) lower[k] = tolower((unsigned char)names[j][k]);
+        addSharedCommandName(names[j], len);
+        addSharedCommandName(lower, len);
+    }
+}
+
+/* Return the shared object whose bytes are exactly p[0..len), or NULL. */
+static inline robj *lookupSharedCommandName(const char *p, size_t len) {
+    if (len == 0 || len > CMDNAME_MAXLEN) return NULL;
+    unsigned int slot = cmdNameSlot(p, len);
+    for (int k = 0; k < CMDNAME_PROBES; k++) {
+        sharedCommandName *e = &shared_cmdnames[(slot + k) & (CMDNAME_SLOTS - 1)];
+        if (!e->obj) return NULL;
+        if (e->len == len && memcmp(e->name, p, len) == 0) return e->obj;
+    }
+    return NULL;
+}
+
 /* Incremental parsing of a command in the client's query buffer.
  *
  * Parser state related to the input buffer are per client and stored in the
@@ -4503,7 +4574,8 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+                robj *name = (*argc == 0) ? lookupSharedCommandName(c->querybuf + c->qb_pos, c->bulklen) : NULL;
+                (*argv)[(*argc)++] = name ? name : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }
