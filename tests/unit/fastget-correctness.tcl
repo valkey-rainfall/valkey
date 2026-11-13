@@ -106,6 +106,81 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
     }
 }
 
+# GETs of values past the 1 KB copy limit, or past what the client's 16 KB reply buffer holds, are
+# answered on the reading thread with the values sent from their objects. Each reply is the whole value
+# the read saw, in order, also when the socket takes only part of the reply while main overwrites the key.
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    proc lv_val {n} { string repeat [format %c [expr {65 + $n % 26}]] $n }
+
+    test {Large GET values are answered on the reading thread, complete and in order} {
+        set sizes {16 500 1000 1024 1025 4096 16384}
+        foreach n $sizes { r set lv:$n [lv_val $n] }
+        r set lv:int 123456
+        foreach proto {2 3} {
+            set rd [fastget_client]
+            $rd hello $proto
+            $rd read
+            ensure_engaged r $rd lv:16
+            set before [fastget_speculated r]
+            for {set round 0} {$round < 10} {incr round} {
+                set want {}
+                for {set i 0} {$i < 64} {incr i} {
+                    if {$i % 9 == 4} {
+                        $rd get lv:int
+                        lappend want 123456
+                    } else {
+                        set n [lindex $sizes [expr {($i + $round) % [llength $sizes]}]]
+                        $rd get lv:$n
+                        lappend want [lv_val $n]
+                    }
+                }
+                foreach w $want { assert_equal $w [$rd read] }
+            }
+            assert_equal 640 [expr {[fastget_speculated r] - $before}]
+            $rd close
+        }
+    }
+
+    test {GETs past the reference limit go to main and keep their order} {
+        r set lv:16385 [lv_val 16385]
+        r set lv:40000 [lv_val 40000]
+        set rd [fastget_client]
+        ensure_engaged r $rd lv:16
+        set before [fastget_speculated r]
+        set keys {lv:4096 lv:500 lv:16385 lv:4096 lv:40000 lv:16 lv:16384}
+        for {set round 0} {$round < 10} {incr round} {
+            foreach k $keys { $rd get $k }
+            foreach k $keys { assert_equal [lv_val [string range $k 3 end]] [$rd read] }
+        }
+        set answered [expr {[fastget_speculated r] - $before}]
+        assert_range $answered 20 50
+        $rd close
+    }
+
+    test {Large GET replies the socket cannot take stay complete while main overwrites the key} {
+        set a [string repeat A 4096]
+        set b [string repeat B 9000]
+        r set lv:race $a
+        set rd [fastget_client]
+        ensure_engaged r $rd lv:16
+        set before [fastget_speculated r]
+        # About 25 MB of replies while the client reads nothing.
+        for {set round 0} {$round < 60} {incr round} {
+            for {set i 0} {$i < 64} {incr i} { $rd get lv:race }
+            if {$round % 2} { r set lv:race $a } else { r set lv:race $b }
+        }
+        for {set i 0} {$i < 60 * 64} {incr i} {
+            set got [$rd read]
+            assert {$got eq $a || $got eq $b}
+        }
+        assert_morethan [fastget_speculated r] $before
+        $rd close
+        assert_equal "PONG" [r ping]
+    }
+}
+
 # SISMEMBER and HGET answered on the reading thread match main's replies in both protocols, and engage only
 # with io-threads-speculate-reads.
 start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {

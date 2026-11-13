@@ -30,6 +30,7 @@
 #include <stdbool.h>
 
 struct client;
+struct iovec;
 
 #define FASTGET_CACHELINE 64
 #define FASTGET_MAX_IO_THREADS 256
@@ -102,6 +103,19 @@ void fastGetAggregateStats(void);
 /* Maximum embedded value size for speculative copy. Larger values punt.
  * The value-size sweep showed a smooth gradient with no cliff up to 1KB. */
 #define FASTGET_MAX_SPECULATIVE_VALUE_LEN 1024
+
+/* A GET of a string value up to this size is answered here even when the value is larger than the copy
+ * limit or no longer fits the client's buffer: the reply is sent from the object (fastGetReplyVector). */
+#define FASTGET_MAX_REF_VALUE_LEN (16 * 1024)
+
+/* Entries of the reply vector of one read: two per value sent from its object, one for the tail. */
+#define FASTGET_REPLY_IOV_MAX 256
+
+/* IO thread, after fastGetSpeculateBatch answered commands: when some values are sent from their
+ * objects, points *iov at the reply (c->buf segments and those values, in order) and returns the
+ * entry count; returns 0 when the whole reply is c->buf[0, bufpos). The vector must be written, and
+ * whatever the write leaves copied, before the read phase ends. */
+int fastGetReplyVector(struct client *c, struct iovec **iov);
 
 /* INFO fastget: speculated command count; detailed counters need
  * -DIO_LOOKUP_OFFLOAD_STATS. */

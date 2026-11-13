@@ -125,9 +125,29 @@ void fastGetRefreshMainGate(void) {
         atomic_store_explicit(&fastget_main_gate.on, gate, memory_order_relaxed);
 }
 
-/* Format a RESP2/3 bulk string reply directly into the client's output buffer.
+/* The reply of one read's fast reads: c->buf, cut into segments around the values that are sent from
+ * where they are instead of being copied (fastGetWriteBulkReply). Those values stay valid until the
+ * reply is written, since the reading thread writes it within the same read phase, and main changes
+ * no value while IO threads read; the bytes a write leaves are copied out before the phase ends
+ * (fpSend). */
+static _Thread_local struct {
+    struct iovec iov[FASTGET_REPLY_IOV_MAX];
+    int n;       /* entries used */
+    size_t mark; /* the bytes of c->buf before it are in iov */
+} fastget_out;
+
+int fastGetReplyVector(client *c, struct iovec **iov) {
+    if (fastget_out.n == 0) return 0;
+    fastget_out.iov[fastget_out.n].iov_base = c->buf + fastget_out.mark;
+    fastget_out.iov[fastget_out.n].iov_len = c->bufpos - fastget_out.mark;
+    *iov = fastget_out.iov;
+    return fastget_out.n + 1;
+}
+
+/* Format a RESP2/3 bulk string reply directly into the client's output buffer. A value of a string
+ * object (can_ref) that is larger than the copy limit or no longer fits is sent from the object.
  * Returns bytes written, or 0 if insufficient space (punt to main). */
-static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
+static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen, int can_ref) {
     /* "$<len>\r\n" with ll2string: snprintf is measurably slower here. */
     char hdr[32];
     hdr[0] = '$';
@@ -137,7 +157,22 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
     int hdrlen = numlen + 3;
     size_t total = hdrlen + vallen + 2; /* trailing \r\n */
     size_t available = c->buf_usable_size - c->bufpos;
-    if (total > available) return 0; /* does not fit: main replies */
+    if (total > available || vallen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) {
+        /* Two entries for the bytes before the value and the value, one kept for the tail. */
+        if (!can_ref || (size_t)hdrlen + 2 > available || fastget_out.n + 3 > FASTGET_REPLY_IOV_MAX) return 0;
+        memcpy(c->buf + c->bufpos, hdr, hdrlen);
+        c->bufpos += hdrlen;
+        fastget_out.iov[fastget_out.n].iov_base = c->buf + fastget_out.mark;
+        fastget_out.iov[fastget_out.n].iov_len = c->bufpos - fastget_out.mark;
+        fastget_out.iov[fastget_out.n + 1].iov_base = (void *)val;
+        fastget_out.iov[fastget_out.n + 1].iov_len = vallen;
+        fastget_out.n += 2;
+        fastget_out.mark = c->bufpos;
+        memcpy(c->buf + c->bufpos, "\r\n", 2);
+        c->bufpos += 2;
+        if (c->buf_peak < c->bufpos) c->buf_peak = c->bufpos;
+        return (int)total;
+    }
 
     memcpy(c->buf + c->bufpos, hdr, hdrlen);
     c->bufpos += hdrlen;
@@ -430,7 +465,7 @@ static int fastGetReplyHget(client *c, robj *o, robj *arg) {
     if (vlen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) return 0;
     long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
     if (reply_threshold >= 0 && (long long)(1 + digits10(vlen) + 2 + vlen + 2) >= reply_threshold) return 0;
-    if (fastGetWriteBulkReply(c, (const char *)vstr, vlen) <= 0) return 0;
+    if (fastGetWriteBulkReply(c, (const char *)vstr, vlen, 0) <= 0) return 0;
     fastGetTouch(o);
     return 1;
 }
@@ -481,7 +516,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e, int kind) {
     } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
         val = objectGetVal(o);
         vallen = sdslen((sds)val);
-        if (vallen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) {
+        if (vallen > FASTGET_MAX_REF_VALUE_LEN) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             FASTGET_STAT_ADD(large_value_punts, 1);
 #endif
@@ -495,7 +530,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e, int kind) {
     long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
     if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
-    if (fastGetWriteBulkReply(c, val, vallen) <= 0) return 0;
+    if (fastGetWriteBulkReply(c, val, vallen, val != intbuf) <= 0) return 0;
     fastGetTouch(o);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     FASTGET_STAT_ADD(speculative_hits, 1);
@@ -562,7 +597,7 @@ static int fastGetAnswerMget(client *c, robj **argv, int argc, size_t input_byte
     hdr[len + 1] = '\r';
     hdr[len + 2] = '\n';
     fastGetWriteRaw(c, hdr, len + 3);
-    for (int i = 0; i < n; i++) fastGetWriteBulkReply(c, val[i], vallen[i]);
+    for (int i = 0; i < n; i++) fastGetWriteBulkReply(c, val[i], vallen[i], 0);
     for (int i = 0; i < n; i++) fastGetTouch(obj[i]);
     return 1;
 }
@@ -603,6 +638,9 @@ static int fastGetSpeculateMget(client *c, int tid, monotime spec_start) {
  * Returns the number of commands speculatively completed. */
 int fastGetSpeculateBatch(client *c, int tid) {
     int speculated = 0;
+
+    fastget_out.n = 0;
+    fastget_out.mark = 0;
 
     if (server.io_threads_num <= 1) return 0;
 

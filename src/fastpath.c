@@ -991,9 +991,10 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
     fastGetConsumeSpeculated(c, n, tid);
     if (c->argc == 0) c->net_input_bytes_curr_cmd = 0; /* resetClient never runs for this client */
     t->speculated += n;
-    struct iovec iov = {.iov_base = c->buf, .iov_len = c->bufpos};
+    struct iovec one = {.iov_base = c->buf, .iov_len = c->bufpos}, *iov = &one;
+    int iovcnt = fastGetReplyVector(c, &iov);
     c->bufpos = 0;
-    fpSend(t, c, &iov, 1);
+    fpSend(t, c, iov, iovcnt ? iovcnt : 1);
 }
 
 static void fpEnableWriteInterest(client *c, int on);
