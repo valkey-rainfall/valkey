@@ -29,7 +29,6 @@ typedef struct phaseBarrier {
     _Atomic(uint64_t) state; /* seq << 32 | active_n << 16 | phase_id, one word so a reader never sees a torn phase */
     _Atomic(int) pending;    /* participants of the open phase not yet done */
     _Atomic(int) shutdown;
-    _Atomic(int) opener_idle; /* main is blocked waiting for new work; see phaseBarrierSetOpenerIdle */
     int nparticipants; /* applied at the next open; guarded by lock */
     int open_sleepers; /* guarded by lock */
     int park_sleepers; /* guarded by lock */
@@ -64,16 +63,8 @@ void phaseBarrierShutdown(phaseBarrier *b);
 
 /* Worker. Block until a phase newer than *last_seen opens with worker_id among its participants
  * and return its id, or return PHASE_BARRIER_EXIT after shutdown. *last_seen starts at 0. spin 0
- * sleeps at once, for a worker that shares its CPU with main; spin > 0 spins that many microseconds
- * before sleeping; PHASE_BARRIER_SPIN_UNTIL_IDLE spins up to the default time, but stops as soon as
- * the opener marks itself idle. */
-#define PHASE_BARRIER_SPIN_UNTIL_IDLE (-1)
+ * sleeps at once, for a worker that shares its CPU with main. */
 int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin);
-
-/* Main. idle 1 before main blocks waiting for new work (the next phase is then far away, so
- * PHASE_BARRIER_SPIN_UNTIL_IDLE waiters sleep), 0 once it runs again. A hint only: a phase opened
- * while it is set still wakes every waiter. */
-void phaseBarrierSetOpenerIdle(phaseBarrier *b, int idle);
 
 /* Worker. Report the phase returned by phaseBarrierAwaitPhase complete. Not called on exit. */
 void phaseBarrierDone(phaseBarrier *b);
