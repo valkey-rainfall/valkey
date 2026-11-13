@@ -2571,6 +2571,12 @@ struct valkeyServer {
                                                         * before a mid-batch recheck is forced. Effective bound is
                                                         * capped at 1% of maxmemory. */
     size_t evict_check_used_memory;                    /* zmalloc_used_memory() at the last eviction check. */
+    /* Write lanes with maxmemory set (prototype only): a segment runs on the lanes when it fits under the
+     * limit with a margin, after main pre-evicts if needed; otherwise it runs on main. */
+    int maxmemory_lanes;                            /* 0: maxmemory turns the lanes off (as before) */
+    unsigned long long maxmemory_lanes_margin;      /* headroom kept free, capped at 1% of maxmemory */
+    int maxmemory_lanes_entry_allowance;            /* bytes allowed per lane entry beyond its arguments */
+    int maxmemory_lanes_preevict;                   /* evict on main before a lane phase to make room */
     long long proto_max_bulk_len;                      /* Protocol bulk length maximum size. */
     int oom_score_adj_values[CONFIG_OOM_COUNT];        /* Linux oom_score_adj configuration */
     int oom_score_adj;                                 /* If true, oom_score_adj is managed */
@@ -3979,6 +3985,7 @@ int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec);
 
 /* Core functions */
 int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level);
+size_t maxmemoryCountedUsedMemory(void);
 size_t freeMemoryGetNotCountedMemory(void);
 int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
@@ -4527,6 +4534,7 @@ void evictionPoolAlloc(void);
 #define EVICT_RUNNING 1
 #define EVICT_FAIL 2
 int performEvictions(void);
+int performEvictionsWithReserve(size_t reserve);
 void startEvictionTimeProc(void);
 
 /* Keys hashing/comparison functions for dict.c and hashtable.c hash tables. */

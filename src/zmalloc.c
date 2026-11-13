@@ -523,6 +523,16 @@ char *zstrdup(const char *s) {
     return p;
 }
 
+/* The calling thread's own counter: its allocations minus its frees, modulo 2^64. The change between two
+ * reads is the thread's net growth. A thread past the private slots shares one counter, so for it the
+ * change also holds other threads' growth. */
+size_t zmalloc_thread_used_memory(void) {
+    if (unlikely(thread_index == -1)) zmalloc_register_thread_index();
+    if (unlikely(thread_index >= MAX_THREADS_NUM))
+        return atomic_load_explicit(&used_memory_for_additional_threads, memory_order_relaxed);
+    return atomic_load_explicit(&used_memory_thread[thread_index].used, memory_order_relaxed);
+}
+
 size_t zmalloc_used_memory(void) {
     size_t um = 0;
     int threads_num = total_active_threads;

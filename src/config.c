@@ -3667,6 +3667,10 @@ standardConfig static_configs[] = {
     createIntConfig("maxmemory-eviction-tenacity", NULL, MODIFIABLE_CONFIG, 0, 100, server.maxmemory_eviction_tenacity, 10, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("maxmemory-eviction-batch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.maxmemory_eviction_batch, 0, NULL, NULL),
     createULongLongConfig("maxmemory-eviction-batch-slack", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, LLONG_MAX, server.maxmemory_eviction_batch_slack, 16 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
+    createBoolConfig("maxmemory-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.maxmemory_lanes, 0, NULL, NULL),
+    createULongLongConfig("maxmemory-lanes-margin", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, LLONG_MAX, server.maxmemory_lanes_margin, 16 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
+    createIntConfig("maxmemory-lanes-entry-allowance", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.maxmemory_lanes_entry_allowance, 128, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("maxmemory-lanes-preevict", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.maxmemory_lanes_preevict, 1, NULL, NULL),
     createIntConfig("timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.maxidletime, 0, INTEGER_CONFIG, NULL, NULL), /* Default client timeout: infinite */
     createIntConfig("replica-announce-port", "slave-announce-port", MODIFIABLE_CONFIG, 0, 65535, server.replica_announce_port, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("tcp-backlog", NULL, IMMUTABLE_CONFIG, 0, INT_MAX, server.tcp_backlog, 511, INTEGER_CONFIG, NULL, NULL), /* TCP listen backlog. */

@@ -70,6 +70,7 @@ typedef struct fpThread {
     int nbarriers, barriers_cap;
     int *seg_count;
     int seg_cap;
+    size_t *seg_bytes; /* with maxmemory: argument bytes of each segment's lane entries (same cap) */
     /* Main, write phase: where serial execution of this thread's batches resumes. */
     int scur_b, scur_e;
     /* Main, write phase: the first barrier whose keys are not prefetched yet. */
@@ -198,6 +199,9 @@ typedef struct __attribute__((aligned(64))) fpLane {
     struct hdr_histogram **hist;
     struct serverCommand **hist_cmd;
     int hist_cap;
+    /* Write phase with maxmemory: the largest net growth of this lane's thread counter after any of its
+     * entries in the phase. Written by the lane, read by main after the phase. */
+    long long mm_peak;
 } fpLane;
 
 static fpLane fp_lanes[FP_MAX_LANES];
@@ -249,6 +253,13 @@ static void fpPhaseClockStart(void) {
 static int fp_prop_mode = FP_PROP_OPS;
 /* INFO, main only. */
 static long long fp_stat_lane_phases = 0, fp_stat_lane_entries = 0, fp_stat_barriers = 0, fp_stat_serial_segments = 0;
+/* Write lanes with maxmemory (prototype). fp_mm_track is written by main before a lane phase and read by
+ * the lanes in it. */
+static int fp_mm_track = 0;
+static int fp_mm_cooldown = 0;     /* after an overrun: serial until well below the limit */
+static size_t fp_mm_reply_allow = 0; /* measured growth per entry beyond its arguments, decaying */
+static long long fp_stat_mm_admitted = 0, fp_stat_mm_preevict = 0, fp_stat_mm_preevict_admitted = 0,
+                 fp_stat_mm_fallback = 0, fp_stat_mm_overrun = 0, fp_stat_mm_overrun_oom = 0;
 static long long fp_stat_lane_prefetches = 0;
 
 #define FP_GROW(arr, n, cap, init)                                   \
@@ -401,6 +412,7 @@ void fastpathFreeThread(int tid) {
     for (int l = 0; l < FP_MAX_LANES; l++) zfree(t->lane_ents[l]);
     zfree(t->barriers);
     zfree(t->seg_count);
+    zfree(t->seg_bytes);
     while (t->nfree > 0) {
         cmdBatch *b = t->freelist[--t->nfree];
         zfree(b->arena);
@@ -564,6 +576,12 @@ static const char *fp_lane_commands[] = {
     "lpush", "rpush", "lpushx", "rpushx", "linsert", "lset", "lrem", "ltrim", "lpop", "rpop", "lmpop",
     "lindex", "llen", "lrange", "lpos", "lmove", "rpoplpush", NULL};
 
+/* Lane commands that can grow memory far beyond their arguments: an offset, a preallocation, or a
+ * result built from stored data. With maxmemory set they are barrier entries. */
+#define FP_LANE_GROWS 2
+static const char *fp_lane_grows[] = {"append", "setrange", "sinterstore", "sunionstore", "sdiffstore",
+                                      "zrangestore", "zunionstore", "zinterstore", "zdiffstore", NULL};
+
 /* Command names of the parts: shared, so lanes running parts of one command at once never touch a
  * common refcount. Created by main with the lane commands. */
 static robj *fp_part_name_mget = NULL, *fp_part_name_mset = NULL;
@@ -575,6 +593,10 @@ static void fpMarkLaneCommands(void) {
     for (int i = 0; fp_lane_commands[i]; i++) {
         struct serverCommand *cmd = lookupCommandByCString(fp_lane_commands[i]);
         if (cmd) cmd->write_lane = 1;
+    }
+    for (int i = 0; fp_lane_grows[i]; i++) {
+        struct serverCommand *cmd = lookupCommandByCString(fp_lane_grows[i]);
+        if (cmd && cmd->write_lane) cmd->write_lane = FP_LANE_GROWS;
     }
     fp_part_name_mget = makeObjectShared(createStringObject("MGET", 4));
     fp_part_name_mset = makeObjectShared(createStringObject("MSET", 4));
@@ -641,6 +663,7 @@ static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc,
         return (int)(c->id % (uint64_t)fp_nlanes);
     }
     if (!cmd->write_lane) return -1;
+    if (cmd->write_lane == FP_LANE_GROWS && server.maxmemory) return -1; /* main runs it, with the OOM test */
     *shard = fpKeysShard(c->db, cmd, argv, argc, slot);
     if (*shard < 0) return -1;
     if (server.cluster_enabled && !clusterServesSlotStably(*shard)) return -1; /* main produces the redirect */
@@ -708,6 +731,7 @@ static int fpTrySplit(fpThread *t, cmdEntry *e, client *c) {
         FP_GROW(t->lane_ents[e->lane], t->lane_n[e->lane], t->lane_cap[e->lane], 64);
         t->lane_ents[e->lane][t->lane_n[e->lane]++] = e;
         t->seg_count[t->nbarriers]++;
+        t->seg_bytes[t->nbarriers] += e->argv_len_sum;
         return 1;
     }
     fpSplit *s = fpSplitAlloc(t, sizeof(*s));
@@ -754,6 +778,7 @@ static int fpTrySplit(fpThread *t, cmdEntry *e, client *c) {
             pt->e.argv[pt->e.argc++] = e->argv[src];
         }
     }
+    t->seg_bytes[t->nbarriers] += e->argv_len_sum;
     for (int p = 0; p < nparts; p++) {
         int lane = lanes[p];
         FP_GROW(t->lane_ents[lane], t->lane_n[lane], t->lane_cap[lane], 64);
@@ -782,11 +807,15 @@ static void fpClassify(fpThread *t, int tid, cmdBatch *b, cmdEntry *e, client *c
         FP_GROW(t->lane_ents[lane], t->lane_n[lane], t->lane_cap[lane], 64);
         t->lane_ents[lane][t->lane_n[lane]++] = e;
         t->seg_count[t->nbarriers]++;
+        t->seg_bytes[t->nbarriers] += e->argv_len_sum;
     } else if (!fpTrySplit(t, e, c)) {
         FP_GROW(t->barriers, t->nbarriers, t->barriers_cap, 16);
         t->barriers[t->nbarriers++] = (struct fpBarrier){.e = e, .b = b};
+        int cap = t->seg_cap;
         FP_GROW(t->seg_count, t->nbarriers, t->seg_cap, 16);
+        if (t->seg_cap != cap) t->seg_bytes = zrealloc(t->seg_bytes, sizeof(size_t) * t->seg_cap);
         t->seg_count[t->nbarriers] = 0;
+        t->seg_bytes[t->nbarriers] = 0;
     }
 }
 
@@ -814,8 +843,10 @@ static void fpResetLaneVectors(fpThread *t) {
     if (!t->seg_cap) {
         t->seg_cap = 16;
         t->seg_count = zmalloc(sizeof(int) * t->seg_cap);
+        t->seg_bytes = zmalloc(sizeof(size_t) * t->seg_cap);
     }
     t->seg_count[0] = 0;
+    t->seg_bytes[0] = 0;
     t->scur_b = t->scur_e = 0;
     t->mcur_b = t->mcur_e = 0;
     t->pf_barrier = 0;
@@ -1769,10 +1800,19 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_lane_entries:%lld\r\n"
                          "fastpath_write_barriers:%lld\r\n"
                          "fastpath_write_serial_segments:%lld\r\n"
-                         "fastpath_write_lane_prefetches:%lld\r\n",
+                         "fastpath_write_lane_prefetches:%lld\r\n"
+                         "fastpath_maxmemory_admitted:%lld\r\n"
+                         "fastpath_maxmemory_preevict:%lld\r\n"
+                         "fastpath_maxmemory_preevict_admitted:%lld\r\n"
+                         "fastpath_maxmemory_fallback:%lld\r\n"
+                         "fastpath_maxmemory_overrun:%lld\r\n"
+                         "fastpath_maxmemory_overrun_oom:%lld\r\n"
+                         "fastpath_maxmemory_reply_allowance:%zu\r\n",
                          fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments, fp_stat_lane_prefetches);
+                         fp_stat_serial_segments, fp_stat_lane_prefetches, fp_stat_mm_admitted, fp_stat_mm_preevict,
+                         fp_stat_mm_preevict_admitted, fp_stat_mm_fallback, fp_stat_mm_overrun, fp_stat_mm_overrun_oom,
+                         fp_mm_reply_allow);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1988,7 +2028,7 @@ static int fpParallelVeto(int role) {
         return FP_VETO_MODULE;
     if (bgIteration_iterationActive()) return FP_VETO_FORKLESS_SAVE;
     if (throttle_anyThrottlers()) return FP_VETO_THROTTLE;
-    if (server.maxmemory || server.maxmemory_clients) return FP_VETO_MAXMEMORY;
+    if (server.maxmemory_clients || (server.maxmemory && !server.maxmemory_lanes)) return FP_VETO_MAXMEMORY;
     if (hotkeysEnabled()) return FP_VETO_HOTKEYS;
     if ((fpBlockedOnKeys() || server.watching_clients) && !fpKeyDictsSettled()) return FP_VETO_KEY_DICTS;
     if (writeCommandsDeniedByDiskError() != DISK_ERROR_TYPE_NONE) return FP_VETO_DISK_ERROR;
@@ -2440,6 +2480,8 @@ void fastpathStagedWriteLane(int tid) {
     ectx->cmd_time_snapshot = fp_phase_time;
     fp_cur_lane = L;
     exec_lane = 1;
+    size_t mm_base = fp_mm_track ? zmalloc_thread_used_memory() : 0;
+    long long mm_peak = 0;
     if (L->frames) sdsclear(L->frames); /* main fed the previous phase's frames in its merge */
     L->largs_used = 0;                  /* and logged the previous phase's split commands */
     /* The lane's entries of this phase, in T order, so their keys can be prefetched ahead of them. */
@@ -2494,8 +2536,17 @@ void fastpathStagedWriteLane(int tid) {
             prefetchBatchReset();
             L->prefetches++;
         }
-        for (; i < end; i++) fpLaneExecute(L, L->run[i]);
+        if (!fp_mm_track) {
+            for (; i < end; i++) fpLaneExecute(L, L->run[i]);
+        } else {
+            for (; i < end; i++) {
+                fpLaneExecute(L, L->run[i]);
+                long long d = (long long)(zmalloc_thread_used_memory() - mm_base);
+                if (d > mm_peak) mm_peak = d;
+            }
+        }
     }
+    L->mm_peak = mm_peak;
     if (use_prefetch) prefetchLaneBatchUse(NULL);
     exec_lane = 0;
     fp_cur_lane = NULL;
@@ -2946,13 +2997,68 @@ done:
     return n;
 }
 
+/* Main, before a lane phase with maxmemory set: may the segment run on the lanes. It may when the
+ * serial run of its entries stays under the limit: used + G + margin <= maxmemory, G the estimate of
+ * the segment's growth. Near the limit with an evicting policy main first evicts G + margin with the
+ * stock loop. Otherwise the segment runs serially, where stock code evicts and answers OOM per entry.
+ * *used_out is the counted used memory the phase starts from. */
+static int fpMaxmemoryAdmit(int pending, size_t *used_out, size_t *args_out) {
+    size_t limit = server.maxmemory;
+    size_t margin = server.maxmemory_lanes_margin;
+    if (margin > limit / 100) margin = limit / 100;
+    size_t args = 0;
+    for (int p = 0; p < fp_nparts; p++) args += fp_threads[fp_parts[p].tid].seg_bytes[fp_parts[p].seg];
+    size_t g = args + (size_t)pending * ((size_t)server.maxmemory_lanes_entry_allowance + fp_mm_reply_allow);
+    *args_out = args;
+    size_t used = maxmemoryCountedUsedMemory();
+    if (fp_mm_cooldown) {
+        if (used + 2 * margin >= limit) return 0;
+        fp_mm_cooldown = 0;
+    }
+    if (used + g + margin <= limit) {
+        *used_out = used;
+        fp_stat_mm_admitted++;
+        return 1;
+    }
+    if (!server.maxmemory_lanes_preevict || server.maxmemory_policy == MAXMEMORY_NO_EVICTION ||
+        (iAmPrimary() && server.import_mode) || g + margin >= limit)
+        return 0;
+    fp_stat_mm_preevict++;
+    int r = performEvictionsWithReserve(g + margin);
+    used = maxmemoryCountedUsedMemory();
+    if (r != EVICT_OK || used + g + margin > limit) return 0;
+    *used_out = used;
+    fp_stat_mm_preevict_admitted++;
+    return 1;
+}
+
+/* Main, after a lane phase with maxmemory set: the lanes' peaks bound the growth of every prefix of the
+ * segment in T order. Over the limit is an overrun: the serial run could have evicted or, under a policy
+ * that cannot evict, refused a write the lanes ran. */
+static void fpMaxmemoryAfterPhase(int pending, size_t used_start, size_t args) {
+    size_t peaks = 0;
+    for (int l = 0; l < fp_nlanes; l++)
+        if (fp_lanes[l].mm_peak > 0) peaks += (size_t)fp_lanes[l].mm_peak;
+    if (used_start + peaks > server.maxmemory) {
+        fp_stat_mm_overrun++;
+        if (server.maxmemory_policy == MAXMEMORY_NO_EVICTION || (iAmPrimary() && server.import_mode))
+            fp_stat_mm_overrun_oom++;
+        fp_mm_cooldown = 1;
+    }
+    size_t per = peaks > args ? (peaks - args) / (size_t)pending : 0;
+    fp_mm_reply_allow -= fp_mm_reply_allow / 8;
+    if (per > fp_mm_reply_allow) fp_mm_reply_allow = per;
+}
+
 /* Main: run the pending segment parts on the lanes, or on main when too small to pay for a phase. */
 static int fpRunSegment(int pending, int serial, int use_prefetch) {
     if (!fp_nparts) return 0;
     int n = 0;
+    size_t mm_used = 0, mm_args = 0;
     if (pending == 0) {
         /* nothing to run */
-    } else if (serial || pending < server.io_threads_parallel_writes_min) {
+    } else if (serial || pending < server.io_threads_parallel_writes_min ||
+               (server.maxmemory && !fpMaxmemoryAdmit(pending, &mm_used, &mm_args) && ++fp_stat_mm_fallback)) {
         for (int p = 0; p < fp_nparts; p++) n += fpSerialSegment(fp_parts[p].tid, fp_parts[p].seg, use_prefetch);
         fp_stat_serial_segments++;
     } else {
@@ -2963,13 +3069,17 @@ static int fpRunSegment(int pending, int serial, int use_prefetch) {
                 L->ec->flag.executor = 1;
                 L->ec->cur_tid = fp_lane_main ? l : l + 1;
             }
+            L->mm_peak = 0;
         }
         fpPhaseClockStart();
         fp_prop_mode = fpPropMode();
+        fp_mm_track = server.maxmemory != 0;
         dbLanePhaseBegin();
         stagedRunWritePhase();
         dbLanePhaseEnd();
+        fp_mm_track = 0;
         fpMergeLanes();
+        if (server.maxmemory) fpMaxmemoryAfterPhase(pending, mm_used, mm_args);
         fp_stat_lane_phases++;
         n = pending;
     }

@@ -265,7 +265,9 @@ size_t freeMemoryGetNotCountedMemory(void) {
  *              limit.
  *              (Populated both for C_ERR and C_OK)
  */
-int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level) {
+static size_t evict_reserve = 0; /* see performEvictionsWithReserve */
+
+static int maxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level, size_t *counted) {
     size_t mem_reported, mem_used, mem_tofree;
 
     /* Check if we are over the memory usage limit. If we are not, no need
@@ -278,7 +280,9 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
         if (level) *level = 0;
         return C_OK;
     }
-    if (mem_reported <= server.maxmemory && !level) return C_OK;
+    /* A pre-eviction for the write lanes aims below the limit by its reserve (fastpath.c). */
+    size_t limit = server.maxmemory - evict_reserve;
+    if (mem_reported <= limit && !level) return C_OK;
 
     /* Remove the size of replicas output buffers and AOF buffer from the
      * count of used memory. */
@@ -305,19 +309,34 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
 
     /* Compute the ratio of memory usage. */
     if (level) *level = (float)mem_used / (float)server.maxmemory;
+    if (counted) *counted = mem_used;
 
-    if (mem_reported <= server.maxmemory) return C_OK;
+    if (mem_reported <= limit) return C_OK;
 
     /* Check if we are still over the memory limit. */
-    if (mem_used <= server.maxmemory) return C_OK;
+    if (mem_used <= limit) return C_OK;
 
     /* Compute how much memory we need to free. */
-    mem_tofree = mem_used - server.maxmemory;
+    mem_tofree = mem_used - limit;
 
     if (logical) *logical = mem_used;
     if (tofree) *tofree = mem_tofree;
 
     return C_ERR;
+}
+
+int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level) {
+    return maxmemoryState(total, logical, tofree, level, NULL);
+}
+
+/* Used memory as the limit counts it: without the buffers freeMemoryGetNotCountedMemory leaves out, the
+ * clients scheduled to close and the pending off-main frees. */
+size_t maxmemoryCountedUsedMemory(void) {
+    float level;
+    size_t counted = 0;
+    if (!server.maxmemory) return zmalloc_used_memory();
+    maxmemoryState(NULL, NULL, NULL, &level, &counted);
+    return counted;
 }
 
 /* Return 1 if used memory is more than maxmemory after allocating more memory,
@@ -693,5 +712,15 @@ update_metrics:
             server.stat_last_eviction_exceeded_time = 0;
         }
     }
+    return result;
+}
+
+/* Main, between write-lane phases: performEvictions with the target lowered by reserve bytes, so the
+ * lanes that follow have room. Same policy, pool, time limit and propagation. Prototype only. */
+int performEvictionsWithReserve(size_t reserve) {
+    if (reserve >= server.maxmemory) return EVICT_FAIL;
+    evict_reserve = reserve;
+    int result = performEvictions();
+    evict_reserve = 0;
     return result;
 }
