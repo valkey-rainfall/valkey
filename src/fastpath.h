@@ -28,6 +28,13 @@ typedef struct ClientControl {
 
 /* Produced by an IO thread in the read phase, executed by main in the write phase, replied by the same IO thread. */
 typedef struct cmdEntry {
+    /* Pre-answered GET (parallel-reads prototype): the IO thread wrote the reply in the read phase;
+     * main keeps it only if nothing before the entry in T wrote the key (fpPreanswerValid). These and
+     * control share the entry's first cache line, so main keeps a reply touching only that line. */
+    uint8_t pre;
+    uint64_t pre_hash;       /* fpOccHash of the db and key */
+    long long pre_expire;    /* the key's expire time when answered, or -1 */
+    struct user *pre_user;   /* origin.principal, for the retired-user test */
     client *c;              /* Owning client: valid until the reply phase of the iteration that produced the entry. Main never dereferences it. */
     ClientControl *control; /* c->control, which main reads instead of the client. */
     robj **argv;
@@ -59,11 +66,6 @@ typedef struct cmdEntry {
     uint8_t part;          /* One lane's share of a split entry, not an entry of a batch. */
     uint8_t part_extra;    /* A part after the first: the command is counted once, by the first. */
     struct fpSplit *split; /* Keys on several lanes: the parts the lanes run, assembled at delivery. */
-    /* Pre-answered GET (parallel-reads prototype): the IO thread wrote the reply in the read phase;
-     * main keeps it only if nothing before the entry in T wrote the key (fpPreanswerValid). */
-    uint8_t pre;
-    uint64_t pre_hash;       /* fpOccHash of the db and key */
-    long long pre_expire;    /* the key's expire time when answered, or -1 */
 } cmdEntry;
 
 typedef struct cmdBatch {

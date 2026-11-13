@@ -950,6 +950,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
             e->pre = 1;
             e->pre_hash = fpOccHash(c->db->id, k, sdslen(k));
             e->pre_expire = exp;
+            e->pre_user = c->user;
             e->reply_off = (uint32_t)b->arena_used;
             e->reply_len = (uint32_t)n;
             b->arena_used += (size_t)n;
@@ -1562,6 +1563,18 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
+    /* A pre-answered GET whose key nothing before it in T wrote: keep the reply, touching only the
+     * entry's first line (its argv are the parser's sole references, freed by the IO thread). */
+    if (e->pre && !fpControlDetaching(e->control) && !fpMustRunOnMain() &&
+        !(e->pre_user->flags & USER_FLAG_RETIRED) && fpPreanswerValid(e)) {
+        e->pre = 0;
+        fp_stat_pre_kept++;
+        e->cmd->calls++;
+        ectx->stat_numcommands++;
+        ectx->stat_keyspace_hits++;
+        return;
+    }
+
     /* Main runs the command whole; its parts do not run. */
     e->split = NULL;
     if (fpControlDetaching(e->control)) goto release_argv; /* no reply: the IO thread is closing it */
@@ -1579,15 +1592,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     serverAssert(principal); /* a deleted user's clients are detaching */
     if (e->pre) {
         e->pre = 0;
-        if (fpPreanswerValid(e)) {
-            /* The GET's place in T sees the key as the read phase did: keep the IO thread's reply. */
-            fp_stat_pre_kept++;
-            e->cmd->calls++;
-            ectx->stat_numcommands++;
-            ectx->stat_keyspace_hits++;
-            goto release_argv;
-        }
-        fp_stat_pre_run++; /* written or expired since: run it, its reply replaces the IO thread's */
+        fp_stat_pre_run++; /* written, expired or retired since: run it, its reply replaces the IO thread's */
     }
     ec->user = principal;
     ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;
