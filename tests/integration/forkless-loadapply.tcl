@@ -266,6 +266,14 @@ proc la_inline_rdb {dir inline} {
     close $fd
 }
 
+# Start a server whose load is expected to fail, run code, then kill it (as rdb.tcl does).
+proc la_start_and_kill {overrides code} {
+    upvar srv srv
+    set srv [start_server [list overrides $overrides keep_persistence true]]
+    uplevel 1 $code
+    kill_server $srv
+}
+
 proc la_resp {args} {
     set s "\xF2*[llength $args]\r\n"
     foreach a $args { append s "\$[string length $a]\r\n$a\r\n" }
@@ -306,7 +314,7 @@ foreach {name bad} [list "a header shorter than 4 bytes" "\xF2*\r\n" \
         r save
     }
     la_inline_rdb $la_bad_path $bad
-    start_server_and_kill_it [list dir $la_bad_path rdb-version-check relaxed] {
+    la_start_and_kill [list dir $la_bad_path rdb-version-check relaxed] {
         test "Forkless load apply: $name fails the load" {
             wait_for_condition 50 100 {
                 [string match {*Malformed inline replication command*} [exec tail -20 < [dict get $srv stdout]]]
