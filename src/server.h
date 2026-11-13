@@ -3664,6 +3664,7 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 /* Objects with val and/or key embedded */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
 robj *tryPrebuildStringEntry(robj *valobj, const_sds key);
+robj *tryBuildStringEntry(const char *s, size_t len, const_sds key);
 robj *objectSetExpire(robj *o, long long expire);
 void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);

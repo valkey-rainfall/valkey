@@ -4529,7 +4529,17 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+                robj *o = NULL;
+                /* The value of SET key value: build the entry the keyspace stores (key and value in
+                 * one allocation) straight from the buffer, instead of a value object that the
+                 * command preparation would copy into the entry and free. */
+                if (*argc == 2 && c->multibulklen == 1) {
+                    sds name = objectGetVal((*argv)[0]);
+                    if (sdslen(name) == 3 && (name[0] | 0x20) == 's' && (name[1] | 0x20) == 'e' &&
+                        (name[2] | 0x20) == 't')
+                        o = tryBuildStringEntry(c->querybuf + c->qb_pos, c->bulklen, objectGetVal((*argv)[1]));
+                }
+                (*argv)[(*argc)++] = o ? o : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }

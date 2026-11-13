@@ -396,15 +396,9 @@ robj *createStringObjectWithKeyAndExpire(const char *ptr, size_t len, const_sds 
     }
 }
 
-/* Build the string representation dbAdd would create, or leave it to the main path. */
-robj *tryPrebuildStringEntry(robj *valobj, const_sds key) {
-    if (objectGetType(valobj) != OBJ_STRING) return NULL;
-    if (!sdsEncodedObject(valobj)) return NULL; /* already INT-encoded: rare for parsed argv */
-    if (objectGetRefcount(valobj) > 1) return NULL;
-
-    sds s = objectGetVal(valobj);
-    size_t len = sdslen(s);
-
+/* Build the string representation dbAdd would create for the value bytes s[0..len), or return NULL to
+ * leave it to the main path. */
+robj *tryBuildStringEntry(const char *s, size_t len, const_sds key) {
     long value;
     if (len <= 20 && string2l(s, len, &value)) {
         robj *o = createUnembeddedObjectWithKeyAndExpire(OBJ_STRING, (void *)value, key, EXPIRY_NONE);
@@ -417,6 +411,17 @@ robj *tryPrebuildStringEntry(robj *valobj, const_sds key) {
     }
 
     return NULL;
+}
+
+/* Build the string representation dbAdd would create from a parsed value object, or leave it to the
+ * main path. */
+robj *tryPrebuildStringEntry(robj *valobj, const_sds key) {
+    if (objectGetType(valobj) != OBJ_STRING) return NULL;
+    if (!sdsEncodedObject(valobj)) return NULL; /* already INT-encoded: rare for parsed argv */
+    if (objectGetRefcount(valobj) > 1) return NULL;
+
+    sds s = objectGetVal(valobj);
+    return tryBuildStringEntry(s, sdslen(s), key);
 }
 
 void *objectGetVal(const robj *o) {
