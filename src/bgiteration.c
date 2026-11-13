@@ -2564,11 +2564,16 @@ void bgIteration_handleCommandReplication(int dbid,
                  *       handle it as a "missing key" below.  If we were to try to handle it as a
                  *       standard "missing key", we would get the DBID incorrect. */
 
-            } else if (listLength(curCmdMissingKeys) > 0 &&
+            } else if (listLength(curCmdMissingKeys) > 0 && ectx->in_call > 0 && iteratorReplicationFlagsWereUpdated &&
                        cmd->proc != multiCommand && cmd->proc != execCommand) {
                 /* MULTI/EXEC are ignored because they are injected around a transaction by
                  * propagateToBgIteration without passing through bgIteration_blockClientIfRequired.
-                 * curCmdMissingKeys holds the keys of a command inside the transaction. */
+                 * curCmdMissingKeys holds the keys of a command inside the transaction.
+                 *
+                 * curCmdMissingKeys belongs to the last WRITE command that passed
+                 * bgIteration_blockClientIfRequired (a read returns before it is emptied). Use it only
+                 * while that command runs: a DEL propagated by a read's lazy expiry, or by active
+                 * expiry between commands, must not re-run the list of an earlier command. */
                 listIter missingIt;
                 listNode *missingNode;
                 listRewind(curCmdMissingKeys, &missingIt);
@@ -2582,10 +2587,12 @@ void bgIteration_handleCommandReplication(int dbid,
                             !it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) {
                             /* If the current command is allowed to replicate, and there is a new
                              * key which we haven't yet reached in iteration, it needs to be added
-                             * to the set of early iterate entries.  (We know that it's not already
-                             * in that set because it's a newly created key!) */
-                            bool wasAdded = hashtableAdd(it->early_iterate_entries, de);
-                            serverAssert(wasAdded);
+                             * to the set of early iterate entries. One command can propagate more
+                             * than once (MSET that creates a key, then lazily expires a later key
+                             * and propagates its DEL), so the key may already be there from this
+                             * same command; the iterator takes early entries only at feed time,
+                             * never inside a command, so adding again is a no-op, not a resend. */
+                            hashtableAdd(it->early_iterate_entries, de);
                             if (BGITERATION_DEBUG) {
                                 sds entryString = createEntryString(dbid, de);
                                 debugBuffer = sdscatprintf(debugBuffer, "EARLY(NEW): %s\n", entryString);
