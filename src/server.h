@@ -2135,6 +2135,8 @@ struct valkeyServer {
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
+    int forkless_lanes;                       /* Prototype: write lanes run beside a forkless full sync */
+    int forkless_lanes_gate_pct;              /* Prototype: lanes stop while the sync's inline queue is above this percent of the replica hard limit */
     int io_threads_lane_prefetch;             /* A write lane prefetches its commands' keys before running them */
     int io_threads_free_on_bio;               /* Main's offloaded frees go to bio instead of the IO threads */
     int main_read_batch;                      /* io-threads 1: main runs ready clients' commands through one prefetch batch */

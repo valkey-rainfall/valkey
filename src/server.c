@@ -4130,6 +4130,9 @@ static void propagateNow(int dbid, robj **argv, int argc, int target, int slot) 
  * Called from alsoPropagate with regular params.
  * Called from propagatePendingCommands with dbid = -1 (to close multi/exec). */
 static void propagateToBgIteration(int dbid, int argc, robj **argv, int target) {
+    /* A write lane decides its entry's inline replication itself; main queues it after the phase
+     * (bgIteration_laneKeyStatus). */
+    if (exec_lane) return;
     /* STATIC indicates that we have sent the MULTI, and need to match it with
      *  an EXEC during propagatePendingCommands. */
     static bool sentMultiToBgIterator = false;

@@ -58,6 +58,9 @@ typedef struct cmdEntry {
     uint8_t frames_wrap;   /* The frames go out inside MULTI/EXEC. */
     uint8_t part;          /* One lane's share of a split entry, not an entry of a batch. */
     uint8_t part_extra;    /* A part after the first: the command is counted once, by the first. */
+    uint8_t fk_ok;         /* Forkless sync with lanes: READ found a single unpinned key; lanes or main may run it. */
+    uint8_t fk_inline;     /* Forkless sync with lanes: the lane decided the entry's ops go inline to the sync. */
+    int16_t fk_keypos;     /* Forkless sync with lanes: argv index of the entry's only key, 0 for none. */
     struct fpSplit *split; /* Keys on several lanes: the parts the lanes run, assembled at delivery. */
 } cmdEntry;
 
@@ -153,6 +156,7 @@ enum {
     FP_VETO_KEY_DICTS,
     FP_VETO_DISK_ERROR,
     FP_VETO_MIN_REPLICAS,
+    FP_VETO_FORKLESS_INLINE,
     FP_VETO_COUNT
 };
 /* Main: FP_VETO_NONE when role's work may run on lanes now, else the reason it may not. */

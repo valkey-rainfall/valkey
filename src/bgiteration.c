@@ -204,9 +204,21 @@ enum {
 
 // dbEntry metadata
 typedef struct {
-    uint32_t iterator_epoch; // iterator epoch of last modification
+    uint32_t iterator_epoch; // iterator epoch of last modification, plus the lane bits below
 } bgIterationEntryMetadata;
 static_assert(sizeof(bgIterationEntryMetadata) == BGITERATION_ENTRY_METADATA_SIZE, "");
+
+/* Write lanes during a forkless full sync (prototype). The two top bits of the metadata word
+ * mirror membership in the lanes iterator's early_iterate_entries, so a lane can read it on its own
+ * object: EARLY is valid only while the epoch bits equal bgIteration_epoch, so marks left by an
+ * earlier iterator are ignored without a clearing pass. PENDING marks an add that a lane logged and
+ * main has not applied to the set yet. */
+#define BGIT_MD_EARLY (1u << 31)
+#define BGIT_MD_PENDING (1u << 30)
+#define BGIT_MD_EPOCH_MASK (BGIT_MD_PENDING - 1)
+static inline uint32_t mdEpoch(dbEntry *de) {
+    return ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch & BGIT_MD_EPOCH_MASK;
+}
 
 
 // These can be tweaked by unit tests
@@ -396,6 +408,10 @@ struct bgIterator {
 
     bool cur_cmd_may_replicate; // Used only in main thread during command processing
 
+    /* Write lanes may run beside this iterator (prototype): a full-scan EVENTUAL iterator that has
+     * been the only iterator for its whole life. Cleared for good when another iterator starts. */
+    bool lanes_ok;
+
     /* When a key is deleted (expire/evict):
      *   1. bgIteration_keyDelete() is called
      *   2. the key is physically deleted
@@ -483,6 +499,44 @@ static bool iteratorReplicationFlagsWereUpdated;
  * syntax. */
 static const bool BGITERATION_DEBUG = false; // DO NOT SUBMIT WITH THIS SYMBOL SET TO TRUE!
 static sds debugBuffer;
+
+
+/* Early set of an iterator, with the lane mirror bits for the lanes iterator (see BGIT_MD_EARLY).
+ * Main only. A delete may name a freed object (lane log): it only compares the pointer then, and
+ * alive says whether the object may be written. */
+static bool earlyBitValid(dbEntry *de) {
+    bgIterationEntryMetadata *m = (bgIterationEntryMetadata *)objectGetMetadata(de);
+    if (!m) return false;
+    uint32_t md = m->iterator_epoch;
+    return (md & BGIT_MD_EARLY) && (md & BGIT_MD_EPOCH_MASK) == (bgIteration_epoch & BGIT_MD_EPOCH_MASK);
+}
+
+static void earlyBitSet(dbEntry *de, uint32_t extra) {
+    bgIterationEntryMetadata *m = (bgIterationEntryMetadata *)objectGetMetadata(de);
+    if (m) m->iterator_epoch = BGIT_MD_EARLY | extra | (bgIteration_epoch & BGIT_MD_EPOCH_MASK);
+}
+
+static void earlyBitClear(dbEntry *de) {
+    bgIterationEntryMetadata *m = (bgIterationEntryMetadata *)objectGetMetadata(de);
+    if (m) m->iterator_epoch &= BGIT_MD_EPOCH_MASK;
+}
+
+static bool earlySetAdd(bgIterator *it, dbEntry *de) {
+    bool added = hashtableAdd(it->early_iterate_entries, de);
+    if (added && it->lanes_ok) earlyBitSet(de, 0);
+    return added;
+}
+
+static bool earlySetDelete(bgIterator *it, dbEntry *de, bool alive) {
+    bool deleted = hashtableDelete(it->early_iterate_entries, de);
+    if (deleted && alive && it->lanes_ok) earlyBitClear(de);
+    return deleted;
+}
+
+/* The write lane this thread runs, or -1 (see bgIteration_laneEnter). */
+static _Thread_local int bgit_lane = -1;
+static void laneKeyDelete(int dbid, const_sds key);
+static void laneReplaceEntry(dbEntry *old, dbEntry *new);
 
 
 /* =============================================================================================
@@ -1039,12 +1093,12 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
 
             // Remove new/modified items during consistent iteration.
             if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT &&
-                ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch > it->consistent_modification_id) {
+                mdEpoch(de) > it->consistent_modification_id) {
                 continue;
             }
 
             // Remove any items which have been processed early
-            if (hashtableDelete(it->early_iterate_entries, de)) {
+            if (earlySetDelete(it, de, true)) {
                 if (BGITERATION_DEBUG) {
                     sds entryString = createEntryString(dbid, de);
                     debugBuffer = sdscatprintf(debugBuffer, "SKIPPING ITEM(early iterate): %s\n", entryString);
@@ -1085,7 +1139,7 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
 
 
 static bool addEarlyIterationKey(bgIterator *it, dbEntry *earlyEntry, int cur_dbid) {
-    bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
+    bool wasAdded = earlySetAdd(it, earlyEntry);
     serverAssert(wasAdded);
 
     int dbid = (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT)
@@ -1284,7 +1338,7 @@ static bool expediteKeysForWrite(bgIterator *it,
             dbEntry *de = (server.db[dbid]) ? dbFind(server.db[dbid], key) : NULL;
             if (de == NULL) continue; // New key, no need to expedite
             if (!iteratorHasPassedKey(it, dbid, key, de) &&
-                ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
+                mdEpoch(de) <= it->consistent_modification_id) {
                 if (addEarlyIterationKey(it, de, dbid)) {
                     mustBlock = true;
                     hashtableAdd(waitingOnKeys, oKey);
@@ -2047,6 +2101,16 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->completed = false;
     it->terminated = false;
     it->cur_cmd_may_replicate = false;
+    /* The early bits are valid for the newest epoch only, and lanes read the scan position of one
+     * iterator, so lanes run only beside a single full-scan EVENTUAL iterator. */
+    it->lanes_ok = (flags == BGITERATOR_FLAG_REPLICATION && iter_type == BGITERATION_TYPE_FULLSCAN &&
+                    listLength(allIterators) == 0);
+    if (listLength(allIterators) > 0) {
+        listIter li;
+        listNode *ln;
+        listRewind(allIterators, &li);
+        while ((ln = listNext(&li)) != NULL) ((bgIterator *)listNodeValue(ln))->lanes_ok = false;
+    }
     it->last_key_delete_was_early = false;
     it->added_since_feed = 0;
 
@@ -2278,6 +2342,10 @@ void bgIteration_beforeSleep(void) {
 // PUBLIC API
 void bgIteration_keyDelete(int dbid, const_sds key) {
     if (!bgIteration_iterationActive()) return;
+    if (bgit_lane >= 0) {
+        laneKeyDelete(dbid, key);
+        return;
+    }
     serverAssert(hasMainThreadExclusivity());
 
     if (BGITERATION_DEBUG) {
@@ -2296,7 +2364,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
         if (it->completed || it->terminated || !it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
 
         if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT &&
-            ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
+            mdEpoch(de) <= it->consistent_modification_id) {
             if (!iteratorHasPassedKey(it, dbid, key, de)) {
                 addEarlyIterationKey(it, de, dbid); // (may also add to inUseEntries)
             }
@@ -2305,7 +2373,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
         /* Since the key is being removed from the main dictionary, also remove it from the
          * early_iterate_entries (if it was there) and save the early iterate status for use during
          * the replication of the DEL. */
-        it->last_key_delete_was_early = hashtableDelete(it->early_iterate_entries, de);
+        it->last_key_delete_was_early = earlySetDelete(it, de, true);
     }
 
     /* We might be within the context of a command execution.  This happens if the key is found to
@@ -2460,6 +2528,168 @@ bool bgIteration_blockClientIfRequired(client *c) {
 }
 
 
+static void queueReplicationItem(bgIterator *it, int dbid, struct serverCommand *cmd, int argc, robj **argv) {
+    bgIteratorItem *item = itemFreeList_getElementOrAllocate();
+    item->type = BGITERATOR_ITEM_REPLICATION;
+    item->dbid = dbid;
+    item->u.repl.cmd = cmd;
+    item->u.repl.argv = cloneRobjArray(argc, argv);
+    item->u.repl.argc = argc;
+    item->u.repl.replication_size = replicationItemSize(item);
+    bufferedReplicationBytes += item->u.repl.replication_size;
+    it->replication_queued++;
+    it->added_since_feed++;
+    mutexQueueAdd(it->items_for_iterator, item);
+}
+
+
+/* =============================================================================================
+ *                        Write lanes beside a forkless full sync (prototype)
+ * =============================================================================================
+ * A lane applies upstream's EVENTUAL rule to its own single-key commands. Main does not move the
+ * scan, pin entries or change the early set inside a lane phase, so a lane reads the iterator's
+ * position directly. The lane's changes to the early set go to a per-lane log that main applies
+ * after the phase: every removal first (a removed object may be freed, and its address reused by
+ * another lane's add), then every add (an add names an object that is still in the keyspace: a
+ * lane cancels its own add when it deletes or replaces that object). */
+
+#define BGIT_MAX_LANES 64
+
+typedef struct laneEarlyLog {
+    dbEntry **add;
+    int nadd, add_cap;
+    dbEntry **del;
+    int ndel, del_cap;
+} laneEarlyLog;
+
+static laneEarlyLog lane_logs[BGIT_MAX_LANES];
+
+/* The iterator lanes may run beside, or NULL. Main, or a lane during a phase. */
+static bgIterator *lanesIterator(void) {
+    if (allIterators == NULL || listLength(allIterators) != 1) return NULL;
+    bgIterator *it = listNodeValue(listFirst(allIterators));
+    return it->lanes_ok ? it : NULL;
+}
+
+// PUBLIC API
+bool bgIteration_lanesCapable(void) {
+    bgIterator *it = lanesIterator();
+    return it != NULL && !it->terminated;
+}
+
+// PUBLIC API
+void bgIteration_laneEnter(int lane) {
+    serverAssert(lane >= 0 && lane < BGIT_MAX_LANES);
+    bgit_lane = lane;
+}
+
+// PUBLIC API
+void bgIteration_laneLeave(void) {
+    bgit_lane = -1;
+}
+
+static void laneLogPush(dbEntry ***v, int *n, int *cap, dbEntry *de) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *v = zrealloc(*v, sizeof(dbEntry *) * (size_t)*cap);
+    }
+    (*v)[(*n)++] = de;
+}
+
+static void laneLogAdd(dbEntry *de) {
+    laneEarlyLog *l = &lane_logs[bgit_lane];
+    earlyBitSet(de, BGIT_MD_PENDING);
+    laneLogPush(&l->add, &l->nadd, &l->add_cap, de);
+}
+
+/* Lane: de leaves the keyspace or is replaced by another object. */
+static void laneForget(dbEntry *de) {
+    if (!earlyBitValid(de)) return;
+    laneEarlyLog *l = &lane_logs[bgit_lane];
+    uint32_t md = ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch;
+    if (md & BGIT_MD_PENDING) {
+        /* shortcut: linear scan of this phase's adds; fine while a lane deletes few of its own new keys */
+        for (int i = l->nadd - 1; i >= 0; i--) {
+            if (l->add[i] != de) continue;
+            l->add[i] = l->add[--l->nadd];
+            break;
+        }
+    } else {
+        laneLogPush(&l->del, &l->ndel, &l->del_cap, de);
+    }
+    earlyBitClear(de);
+}
+
+static void laneKeyDelete(int dbid, const_sds key) {
+    dbEntry *de = dbFind(server.db[dbid], (sds)key);
+    if (de) laneForget(de);
+}
+
+static void laneReplaceEntry(dbEntry *old, dbEntry *new) {
+    if (!earlyBitValid(old)) {
+        if (earlyBitValid(new)) earlyBitClear(new); /* copied metadata of a not-early object */
+        return;
+    }
+    laneForget(old);
+    laneLogAdd(new);
+}
+
+// PUBLIC API
+int bgIteration_laneKeyStatus(int dbid, const_sds key, dbEntry *de) {
+    bgIterator *it = lanesIterator();
+    if (it == NULL || it->completed || it->terminated) return BGIT_LANE_NONE;
+    if (it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) return BGIT_LANE_PASSED;
+    if (de == NULL) return BGIT_LANE_MISSING;
+    if (earlyBitValid(de)) return BGIT_LANE_PASSED;
+    return BGIT_LANE_UNREACHED;
+}
+
+// PUBLIC API
+void bgIteration_laneAfterInline(int dbid, const_sds key) {
+    bgIterator *it = lanesIterator();
+    if (it == NULL) return;
+    dbEntry *de = dbFind(server.db[dbid], (sds)key);
+    if (de == NULL || earlyBitValid(de)) return;
+    if (it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid)) return;
+    laneLogAdd(de);
+}
+
+// PUBLIC API
+void bgIteration_laneMergeLogs(int nlanes) {
+    serverAssert(hasMainThreadExclusivity());
+    serverAssert(nlanes <= BGIT_MAX_LANES);
+    bgIterator *it = lanesIterator();
+    for (int l = 0; l < nlanes; l++) {
+        laneEarlyLog *g = &lane_logs[l];
+        for (int i = 0; i < g->ndel; i++)
+            if (it) hashtableDelete(it->early_iterate_entries, g->del[i]);
+        g->ndel = 0;
+    }
+    for (int l = 0; l < nlanes; l++) {
+        laneEarlyLog *g = &lane_logs[l];
+        for (int i = 0; i < g->nadd; i++) {
+            dbEntry *de = g->add[i];
+            earlyBitClear(de);
+            if (it) {
+                bool added = earlySetAdd(it, de);
+                serverAssert(added);
+            }
+        }
+        g->nadd = 0;
+    }
+}
+
+// PUBLIC API
+void bgIteration_queueLaneReplication(int dbid, robj **argv, int argc) {
+    serverAssert(hasMainThreadExclusivity());
+    bgIterator *it = lanesIterator();
+    if (it == NULL || it->completed || it->terminated) return;
+    struct serverCommand *cmd = lookupCommandOrOriginal(argv, argc);
+    if (!cmd || !isWriteCmd(cmd)) return;
+    queueReplicationItem(it, dbid, cmd, argc, argv);
+}
+
+
 // PUBLIC API
 void bgIteration_handleCommandReplication(int dbid,
                                           struct serverCommand *cmd,
@@ -2540,7 +2770,7 @@ void bgIteration_handleCommandReplication(int dbid,
             if (special_dbEntry != NULL) {
                 if (it->cur_cmd_may_replicate &&
                     !it->keyset_iter->hasPassedItem(it->keyset_iter, special_key, special_dbid)) {
-                    hashtableAdd(it->early_iterate_entries, special_dbEntry);
+                    earlySetAdd(it, special_dbEntry);
                     if (BGITERATION_DEBUG) {
                         sds entryString = createEntryString(special_dbid, special_dbEntry);
                         debugBuffer = sdscatprintf(debugBuffer, "EARLY(special): %s\n", entryString);
@@ -2574,7 +2804,7 @@ void bgIteration_handleCommandReplication(int dbid,
                              * key which we haven't yet reached in iteration, it needs to be added
                              * to the set of early iterate entries.  (We know that it's not already
                              * in that set because it's a newly created key!) */
-                            bool wasAdded = hashtableAdd(it->early_iterate_entries, de);
+                            bool wasAdded = earlySetAdd(it, de);
                             serverAssert(wasAdded);
                             if (BGITERATION_DEBUG) {
                                 sds entryString = createEntryString(dbid, de);
@@ -2664,18 +2894,7 @@ void bgIteration_handleCommandReplication(int dbid,
             if (BGITERATION_DEBUG) {
                 debugBuffer = sdscat(debugBuffer, " (queued)\n");
             }
-
-            bgIteratorItem *item = itemFreeList_getElementOrAllocate();
-            item->type = BGITERATOR_ITEM_REPLICATION;
-            item->dbid = dbid;
-            item->u.repl.cmd = cmd;
-            item->u.repl.argv = cloneRobjArray(argc, argv);
-            item->u.repl.argc = argc;
-            item->u.repl.replication_size = replicationItemSize(item);
-            bufferedReplicationBytes += item->u.repl.replication_size;
-            it->replication_queued++;
-            it->added_since_feed++;
-            mutexQueueAdd(it->items_for_iterator, item);
+            queueReplicationItem(it, dbid, cmd, argc, argv);
         }
     } // allIterators loop
 }
@@ -2699,7 +2918,10 @@ bool bgIteration_isEntryInuse(dbEntry *de) {
 void bgIteration_dbEntryModified(dbEntry *de) {
     if (bgIteration_iterationActive()) {
         bgIterationEntryMetadata *md = (bgIterationEntryMetadata *)objectGetMetadata(de);
-        if (md) md->iterator_epoch = bgIteration_epoch;
+        if (!md) return;
+        /* A valid early mark stays (the stamp is the same epoch); a stale one is dropped. */
+        uint32_t keep = earlyBitValid(de) ? (md->iterator_epoch & (BGIT_MD_EARLY | BGIT_MD_PENDING)) : 0;
+        md->iterator_epoch = keep | (bgIteration_epoch & BGIT_MD_EPOCH_MASK);
     }
 }
 
@@ -2716,6 +2938,10 @@ void bgIteration_keyModified(int dbid, const_sds key) {
 // PUBLIC API
 void bgIteration_updateDbEntryPtr(dbEntry *old, dbEntry *new) {
     if (!bgIteration_iterationActive() || old == new) return;
+    if (bgit_lane >= 0) {
+        laneReplaceEntry(old, new);
+        return;
+    }
     serverAssert(hasMainThreadExclusivity());
     serverAssert(!isEntryInuseByAnyIterator(old));
 
@@ -2724,11 +2950,11 @@ void bgIteration_updateDbEntryPtr(dbEntry *old, dbEntry *new) {
     listRewind(allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
-        if (hashtableDelete(it->early_iterate_entries, old)) {
+        if (earlySetDelete(it, old, true)) {
             if (BGITERATION_DEBUG) {
                 debugBuffer = sdscatprintf(debugBuffer, "EARLY LIST UPDATE %p -> %p\n", (void *)old, (void *)new);
             }
-            bool wasAdded = hashtableAdd(it->early_iterate_entries, new);
+            bool wasAdded = earlySetAdd(it, new);
             serverAssert(wasAdded);
         }
     }

@@ -373,4 +373,20 @@ bool bgIteration_isEntryInuse(dbEntry *de);
 void bgIteration_dbEntryModified(dbEntry *de);
 void bgIteration_keyModified(int dbid, const_sds key);
 
+/* Write lanes beside a forkless full sync (prototype). Main checks bgIteration_lanesCapable before
+ * a read phase: true while the only iterator is a full-scan EVENTUAL one that never had company. A
+ * lane thread brackets its phase with laneEnter/laneLeave; inside, keyDelete and updateDbEntryPtr
+ * keep the lane's early marks. Before a single-key command the lane takes the key's status; when
+ * the command propagated and the status was PASSED or MISSING the entry is inline: the lane calls
+ * laneAfterInline, and main, after the phase, laneMergeLogs and then queueLaneReplication for each
+ * op of every inline entry in command order. */
+enum { BGIT_LANE_NONE = 0, BGIT_LANE_UNREACHED, BGIT_LANE_PASSED, BGIT_LANE_MISSING };
+bool bgIteration_lanesCapable(void);
+void bgIteration_laneEnter(int lane);
+void bgIteration_laneLeave(void);
+int bgIteration_laneKeyStatus(int dbid, const_sds key, dbEntry *de);
+void bgIteration_laneAfterInline(int dbid, const_sds key);
+void bgIteration_laneMergeLogs(int nlanes);
+void bgIteration_queueLaneReplication(int dbid, robj **argv, int argc);
+
 #endif

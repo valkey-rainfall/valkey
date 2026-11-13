@@ -209,6 +209,13 @@ static int fp_lanes_iter = 0; /* this iteration's entries are sorted into lanes 
 static int fp_nlanes = 0;     /* lanes of this iteration */
 static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
 static int fp_replies_deferred = 0; /* the last iteration's replies go out in this read phase */
+/* Forkless full sync with lanes (prototype, candidate B): READ marks the entries that may run
+ * beside the sync (cmdEntry.fk_ok), lanes apply the sync's per-key rule. Set before the read phase. */
+static int fp_fk_mode = 0;
+static _Thread_local int fp_fk_routed = 0; /* IO thread: an earlier entry of the client being harvested was not fk_ok */
+static long long fp_stat_fk_routed = 0;    /* atomic: entries READ sent to the main path during a sync */
+static long long fp_stat_fk_inline = 0, fp_stat_fk_lane = 0, fp_stat_fk_gate_on = 0; /* main */
+static int fp_fk_gate_on = 0;              /* main: the inline-queue gate holds the lanes off */
 
 /* Main, between phases, once no reply points into the lane arenas. */
 static void fpResetLaneArenas(void) {
@@ -444,7 +451,8 @@ static int fpSessionEligible(client *c) {
     if (authRequired(c)) return 0;                                                      /* main enforces a later default-user password change per entry */
     if (c->flag.asking) return 0;                                                       /* ASKING applies to the next command only, which main runs */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
-    if (bgIteration_iterationActive()) return 0;                                        /* a forkless save may block commands on keys in use */
+    if (bgIteration_iterationActive() && !(server.forkless_lanes && bgIteration_lanesCapable()))
+        return 0; /* a forkless save may block commands on keys in use */
     if (throttle_anyThrottlers()) return 0;                                             /* a throttler may hold a command; main runs the check */
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.repl_rdb_channel || c->repl_data) return 0; /* a connection on its way to becoming a replica */
@@ -775,14 +783,14 @@ static void fpClassify(fpThread *t, int tid, cmdBatch *b, cmdEntry *e, client *c
     UNUSED(tid);
     e->seg = (uint32_t)t->nbarriers;
     int shard = -1;
-    int lane = fpLaneOf(c, e->cmd, e->argv, e->argc, e->slot, e->read_flags, &shard);
+    int lane = (fp_fk_mode && !e->fk_ok) ? -1 : fpLaneOf(c, e->cmd, e->argv, e->argc, e->slot, e->read_flags, &shard);
     if (lane >= 0) {
         e->lane = lane;
         e->shard = shard;
         FP_GROW(t->lane_ents[lane], t->lane_n[lane], t->lane_cap[lane], 64);
         t->lane_ents[lane][t->lane_n[lane]++] = e;
         t->seg_count[t->nbarriers]++;
-    } else if (!fpTrySplit(t, e, c)) {
+    } else if (fp_fk_mode || !fpTrySplit(t, e, c)) { /* no split beside a forkless sync (one key per entry) */
         FP_GROW(t->barriers, t->nbarriers, t->barriers_cap, 16);
         t->barriers[t->nbarriers++] = (struct fpBarrier){.e = e, .b = b};
         FP_GROW(t->seg_count, t->nbarriers, t->seg_cap, 16);
@@ -820,6 +828,54 @@ static void fpResetLaneVectors(fpThread *t) {
     t->mcur_b = t->mcur_e = 0;
     t->pf_barrier = 0;
     fpReleaseSplits(t);
+}
+
+/* IO thread, read phase: the object of key in db, or NULL. Only reads: nothing changes the keyspace
+ * in a read phase. */
+static robj *fpFkFind(serverDb *db, sds key) {
+    hashtable *ht = kvstoreGetHashtable(db->keys, getKVStoreIndexForKey(key));
+    if (!ht) return NULL;
+    hashtableIncrementalFindState st;
+    hashtableIncrementalFindInit(&st, ht, key);
+    while (hashtableIncrementalFindStep(&st));
+    void *found = NULL;
+    return hashtableIncrementalFindGetResult(&st, &found) ? found : NULL;
+}
+
+/* IO thread, read phase, during a forkless full sync with lanes: may this entry run beside the
+ * sync, on a lane or serially on main? Only a lane command with one key whose object the save does
+ * not hold (refcount 1; a pinned entry has one more reference), or PING. Any other entry, and every
+ * later entry of the same client in this read, goes back to the main path, so the held entries stay
+ * the client's last ones (fpRequeue). */
+static void fpFkCheck(cmdEntry *e) {
+    e->fk_ok = 0;
+    e->fk_keypos = 0;
+    if (fp_fk_routed) goto routed;
+    struct serverCommand *cmd = e->cmd;
+    if (!cmd || (e->read_flags & (READ_FLAGS_ERROR_MASK | READ_FLAGS_BAD_ARITY))) goto routed;
+    if (cmd->proc == pingCommand) {
+        e->fk_ok = 1;
+        return;
+    }
+    if (!cmd->write_lane) goto routed;
+    int pos = -1;
+    if (cmd->proc == setCommand || cmd->proc == getCommand) {
+        if (e->argc >= 2) pos = 1;
+    } else {
+        getKeysResult result;
+        initGetKeysResult(&result);
+        if (getKeysFromCommand(cmd, e->argv, e->argc, &result) == 1) pos = result.keys[0].pos;
+        getKeysFreeResult(&result);
+    }
+    if (pos < 1 || pos > INT16_MAX) goto routed;
+    robj *de = fpFkFind(e->db, objectGetVal(e->argv[pos]));
+    if (de && objectGetRefcount(de) > 1) goto routed;
+    e->fk_ok = 1;
+    e->fk_keypos = (int16_t)pos;
+    return;
+routed:
+    fp_fk_routed = 1;
+    __atomic_fetch_add(&fp_stat_fk_routed, 1, __ATOMIC_RELAXED);
 }
 
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
@@ -861,6 +917,9 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->frames_wrap = 0;
     e->part = e->part_extra = 0;
     e->split = NULL;
+    e->fk_ok = e->fk_inline = 0;
+    e->fk_keypos = 0;
+    if (fp_fk_mode && fpDepth() == 0) fpFkCheck(e);
     if (fp_lanes_iter && fpDepth() == 0) fpClassify(&fp_threads[fp_cur_tid], fp_cur_tid, b, e, c);
     c->fp_inflight++;
 }
@@ -870,6 +929,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     int leave = 0;
     int max = server.io_batch_commands;
     cmdQueue *q = &c->cmd_queue;
+    fp_fk_routed = 0;
 
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
         if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
@@ -1448,11 +1508,12 @@ int fastpathExecutorOutputLimitReached(client *ec) {
 
 /* Conditions under which a fast-path command must run as a real client on main. Each can change only
  * on main, so checking them as each entry executes is exact. */
-static int fpMustRunOnMain(void) {
+static int fpMustRunOnMain(cmdEntry *e) {
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 1; /* main postpones it */
     if (server.failover_state != NO_FAILOVER) return 1;                                 /* coordinated failover owns writes */
     if (moduleHasCommandFilters()) return 1;                                            /* a filter may rewrite argv, which the executor borrows */
-    if (bgIteration_iterationActive()) return 1;                                        /* a forkless save may block it on a key in use */
+    /* A forkless save may block it on a key in use; READ cleared the entries that cannot block. */
+    if (bgIteration_iterationActive() && !(e->fk_ok && bgIteration_lanesCapable())) return 1;
     if (throttle_anyThrottlers()) return 1;                                             /* a throttler may hold the command */
     if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
         !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS))
@@ -1469,7 +1530,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     /* Main runs the command whole; its parts do not run. */
     e->split = NULL;
     if (fpControlDetaching(e->control)) goto release_argv; /* no reply: the IO thread is closing it */
-    if (fpMustRunOnMain()) {
+    if (fpMustRunOnMain(e)) {
         e->requeued = 1; /* handed back for the main path */
         return;
     }
@@ -1769,10 +1830,15 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_lane_entries:%lld\r\n"
                          "fastpath_write_barriers:%lld\r\n"
                          "fastpath_write_serial_segments:%lld\r\n"
-                         "fastpath_write_lane_prefetches:%lld\r\n",
+                         "fastpath_write_lane_prefetches:%lld\r\n"
+                         "fastpath_forkless_lane_writes:%lld\r\n"
+                         "fastpath_forkless_lane_inline:%lld\r\n"
+                         "fastpath_forkless_routed:%lld\r\n"
+                         "fastpath_forkless_gate_on:%lld\r\n",
                          fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments, fp_stat_lane_prefetches);
+                         fp_stat_serial_segments, fp_stat_lane_prefetches, fp_stat_fk_lane, fp_stat_fk_inline,
+                         __atomic_load_n(&fp_stat_fk_routed, __ATOMIC_RELAXED), fp_stat_fk_gate_on);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1945,7 +2011,7 @@ static int fpKeyDictsSettled(void) {
 static const char *const fp_veto_names[FP_VETO_COUNT] = {
     "none", "off", "not-staged", "unsplit", "slot-migrating", "role", "loading",
     "paused", "monitor", "tracking", "keyspace-events", "module", "forkless-save",
-    "throttle", "maxmemory", "hotkeys", "key-dicts", "disk-error", "min-replicas"};
+    "throttle", "maxmemory", "hotkeys", "key-dicts", "disk-error", "min-replicas", "forkless-inline"};
 static int fp_last_veto[FP_PAR_COUNT] = {FP_VETO_NOT_STAGED, FP_VETO_NOT_STAGED};
 
 const char *fastpathParallelVetoName(int veto) {
@@ -1969,6 +2035,24 @@ static int fpBlockedOnKeys(void) {
  * each one. */
 static int fp_test_nlanes; /* unit tests: lane count without a lane executor */
 
+/* Main: flow control for a forkless full sync with lanes. The sync's inline queue is charged to
+ * every syncing replica's output buffer limit, and the receiver applies it serially, so above the
+ * high mark the lanes stay off (writes run serially on main) until the queue drains below half of
+ * it. Prototype default: 25 percent of the replica hard limit. */
+static int fpForklessGate(void) {
+    long long hard = (long long)server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes;
+    if (hard <= 0) hard = 256LL << 20; /* shortcut: no hard limit configured; use the default's size */
+    long long high = hard / 100 * server.forkless_lanes_gate_pct;
+    long long q = (long long)bgIteration_memoryInuseForReplication();
+    if (!fp_fk_gate_on && q > high) {
+        fp_fk_gate_on = 1;
+        fp_stat_fk_gate_on++;
+    } else if (fp_fk_gate_on && q < high / 2) {
+        fp_fk_gate_on = 0;
+    }
+    return fp_fk_gate_on;
+}
+
 static int fpParallelVeto(int role) {
     if (!(role == FP_PAR_CLIENTS ? server.io_threads_parallel_writes : server.cron_lanes)) return FP_VETO_OFF;
     int lanes = fp_test_nlanes ? fp_test_nlanes : (stagedApplyReady() ? stagedLaneCount() : 0);
@@ -1986,7 +2070,12 @@ static int fpParallelVeto(int role) {
     /* A module can block a client on any key and wake it by its own rules. */
     if (moduleObservesWrites() || server.blocked_clients_by_type[BLOCKED_MODULE] || server.busy_module_yield_flags)
         return FP_VETO_MODULE;
-    if (bgIteration_iterationActive()) return FP_VETO_FORKLESS_SAVE;
+    if (bgIteration_iterationActive()) {
+        if (!server.forkless_lanes || !bgIteration_lanesCapable()) return FP_VETO_FORKLESS_SAVE;
+        if (fpForklessGate()) return FP_VETO_FORKLESS_INLINE;
+    } else {
+        fp_fk_gate_on = 0;
+    }
     if (throttle_anyThrottlers()) return FP_VETO_THROTTLE;
     if (server.maxmemory || server.maxmemory_clients) return FP_VETO_MAXMEMORY;
     if (hotkeysEnabled()) return FP_VETO_HOTKEYS;
@@ -2006,6 +2095,7 @@ static int fpLanesAllowed(void) {
 
 void fastpathStagedPrepareLanes(void) {
     fpMarkLaneCommands();
+    fp_fk_mode = server.forkless_lanes && bgIteration_iterationActive() && bgIteration_lanesCapable();
     int allowed = fpLanesAllowed();
     fp_lane_main = stagedMainTakesLane();
     fp_nlanes = allowed ? stagedLaneCount() : 0;
@@ -2251,6 +2341,7 @@ static void fpLaneCall(fpLane *L, client *c) {
 
 
 static int fpPropMode(void) {
+    if (fp_fk_mode) return FP_PROP_OPS; /* main queues an inline entry's ops to the forkless sync */
     if (server.aof_state != AOF_OFF || clusterIsAnySlotExporting()) return FP_PROP_OPS;
     if (server.primary_host || (!server.repl_backlog && !listLength(server.replicas))) return FP_PROP_NONE;
     return server.repl_backlog ? FP_PROP_FRAMES : FP_PROP_OPS;
@@ -2367,9 +2458,25 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
     ec->woff = 0;
 
     if (e->part && fpCommandlogOn()) fpLaneCopyPartArgs(L, (fpPart *)e);
+    /* Beside a forkless full sync: the key's status before the command decides whether its
+     * propagation goes inline to the sync (bgIteration_laneKeyStatus). The key is copied, since the
+     * command may replace the argument object. */
+    sds fk_key = NULL;
+    int fk_status = BGIT_LANE_NONE;
+    if (fp_fk_mode && e->fk_keypos > 0) {
+        fk_key = sdsdup(objectGetVal(e->argv[e->fk_keypos])); /* shortcut: one allocation per lane write during a sync */
+        fk_status = bgIteration_laneKeyStatus(e->db->id, fk_key, dbFind(e->db, fk_key));
+    }
     fp_exec_entry = e;
     ectx->current_client = ec;
     fpLaneCall(L, ec);
+    if (fk_key) {
+        if (ectx->also_propagate.numops && (fk_status == BGIT_LANE_PASSED || fk_status == BGIT_LANE_MISSING)) {
+            e->fk_inline = 1;
+            bgIteration_laneAfterInline(e->db->id, fk_key);
+        }
+        sdsfree(fk_key);
+    }
     if (ectx->also_propagate.numops) fpLaneTakeProp(L, e, ec);
     commandProcessed(ec);
     ectx->current_client = NULL;
@@ -2440,6 +2547,7 @@ void fastpathStagedWriteLane(int tid) {
     ectx->cmd_time_snapshot = fp_phase_time;
     fp_cur_lane = L;
     exec_lane = 1;
+    if (fp_fk_mode) bgIteration_laneEnter(lane);
     if (L->frames) sdsclear(L->frames); /* main fed the previous phase's frames in its merge */
     L->largs_used = 0;                  /* and logged the previous phase's split commands */
     /* The lane's entries of this phase, in T order, so their keys can be prefetched ahead of them. */
@@ -2497,6 +2605,7 @@ void fastpathStagedWriteLane(int tid) {
         for (; i < end; i++) fpLaneExecute(L, L->run[i]);
     }
     if (use_prefetch) prefetchLaneBatchUse(NULL);
+    if (fp_fk_mode) bgIteration_laneLeave();
     exec_lane = 0;
     fp_cur_lane = NULL;
     ectx = saved;
@@ -2797,6 +2906,14 @@ static void fpMergeLanes(void) {
                         replicationFeedFrames(e->db->id, fp_lanes[e->lane].frames + e->frames_off, e->frames_len,
                                               e->frames_wrap);
                     } else {
+                        if (fp_fk_mode) fp_stat_fk_lane++;
+                        if (e->fk_inline) {
+                            /* Into the forkless sync, in T order, before the ops go to the backlog. */
+                            for (int j = 0; j < e->prop->numops; j++)
+                                bgIteration_queueLaneReplication(e->prop->ops[j].dbid, e->prop->ops[j].argv,
+                                                                 e->prop->ops[j].argc);
+                            fp_stat_fk_inline++;
+                        }
                         replayLanePropagation(e->prop->ops, e->prop->numops, e->prop->wrap);
                         zfree(e->prop->ops);
                         zfree(e->prop);
@@ -2966,6 +3083,7 @@ static int fpRunSegment(int pending, int serial, int use_prefetch) {
         dbLanePhaseBegin();
         stagedRunWritePhase();
         dbLanePhaseEnd();
+        if (fp_fk_mode) bgIteration_laneMergeLogs(fp_nlanes);
         fpMergeLanes();
         fp_stat_lane_phases++;
         n = pending;
