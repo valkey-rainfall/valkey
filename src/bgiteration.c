@@ -2794,11 +2794,16 @@ void bgIteration_handleCommandReplication(int dbid,
                  *       handle it as a "missing key" below.  If we were to try to handle it as a
                  *       standard "missing key", we would get the DBID incorrect. */
 
-            } else if (listLength(curCmdMissingKeys) > 0 &&
+            } else if (listLength(curCmdMissingKeys) > 0 && ectx->in_call > 0 && iteratorReplicationFlagsWereUpdated &&
                        cmd->proc != multiCommand && cmd->proc != execCommand) {
                 /* MULTI/EXEC are ignored because they are injected around a transaction by
                  * propagateToBgIteration without passing through bgIteration_blockClientIfRequired.
-                 * curCmdMissingKeys holds the keys of a command inside the transaction. */
+                 * curCmdMissingKeys holds the keys of a command inside the transaction.
+                 *
+                 * curCmdMissingKeys belongs to the last WRITE command that passed
+                 * bgIteration_blockClientIfRequired (a read returns before it is emptied). Use it only
+                 * while that command runs: a DEL propagated by a read's lazy expiry, or by active
+                 * expiry between commands, must not re-run the list of an earlier command. */
                 listIter missingIt;
                 listNode *missingNode;
                 listRewind(curCmdMissingKeys, &missingIt);
