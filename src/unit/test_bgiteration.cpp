@@ -2833,7 +2833,7 @@ TEST_F(BgIterationTest, multiCreatesNewKey_eventual) {
     EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
     bool blocked = bgIteration_blockClientIfRequired(c);
     EXPECT_FALSE(blocked);
-    server.in_call++;
+    ectx->in_call++;
     robj *value = dupStringObject(c->argv[2]);
     setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
 
@@ -2841,13 +2841,13 @@ TEST_F(BgIterationTest, multiCreatesNewKey_eventual) {
     struct serverCommand *cmd_multi = lookupCommandByCString("multi");
     bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
     bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
-    server.in_call--;
+    ectx->in_call--;
     server.in_exec = 0;
 
     // propagatePendingCommands() closes the transaction with EXEC
     struct serverCommand *cmd_exec = lookupCommandByCString("exec");
     bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
-    server.in_call--;
+    ectx->in_call--;
 
     expectReadKeySequence(it, 1, 2); // already queued (same bucket as key 0)
     expectReadMultiReplication(it);

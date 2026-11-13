@@ -2332,7 +2332,7 @@ void disconnectReplicas(void) {
         /* If we are going to disconnect all replicas, there is no need to protect the rdb channel. */
         replica->flag.protected_rdb_channel = 0;
         /* The replica may be the client running this command. */
-        if (replica == server.current_client)
+        if (replica == ectx->current_client)
             freeClientAsync(replica);
         else
             freeClient(replica);

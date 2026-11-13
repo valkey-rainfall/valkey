@@ -5201,7 +5201,7 @@ void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disc
         server.primary->flag.dont_cache_primary = full_sync_required;
         /* The primary may be the client running this command, which is still
          * in use until the command returns. */
-        if (server.primary == server.current_client)
+        if (server.primary == ectx->current_client)
             freeClientAsync(server.primary);
         else
             freeClient(server.primary);
@@ -5264,7 +5264,7 @@ void replicationUnsetPrimary(void) {
      * replicationHandlePrimaryDisconnection which can attempt to re-connect. */
     sdsfree(server.primary_host);
     server.primary_host = NULL;
-    if (server.primary && server.primary == server.current_client) {
+    if (server.primary && server.primary == ectx->current_client) {
         /* The primary is running this command, so it is still in use until the
          * command returns. Free it then instead of caching it. */
         server.primary->flag.dont_cache_primary = 1;
