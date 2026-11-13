@@ -1312,6 +1312,10 @@ again:
      * inline parser stops after one command and a queue run stops at the first non-RESP byte.
      * The main path drains the leftover bytes by looping in processInputBuffer; do the same
      * here, or the rest of the packet waits for the connection's next read event. */
+    /* Values of SETs that run on the lanes are built on the lane (setCommand -> dbAdd embeds the key),
+     * not here: the lane that later frees a value when its key is overwritten then also allocated
+     * it, so the free stays in that lane's jemalloc arena instead of locking another thread's bins. */
+    parse_defer_value_prebuild = fp_lanes_iter && fpDepth() == 0;
     for (;;) {
         size_t pos = c->qb_pos;
         parseInputBuffer(c);
@@ -1326,6 +1330,7 @@ again:
         if (c->querybuf == NULL || c->qb_pos >= sdslen(c->querybuf) || c->qb_pos == pos) break;
         c->read_flags = 0;
     }
+    parse_defer_value_prebuild = 0;
     trimClientQueryBuffer(c);
     /* TLS: input OpenSSL took off the socket, or that reached the socket since its last read, raises
      * no event. It is read now, up to a bound, then in the next batch. */

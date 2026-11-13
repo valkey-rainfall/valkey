@@ -4005,6 +4005,10 @@ typedef struct cmdLookupCacheEntry {
 static _Atomic unsigned long long command_table_epoch = 1;
 static __thread cmdLookupCacheEntry cmd_lookup_cache[CMD_LOOKUP_CACHE_SLOTS];
 
+/* Set by the fast path while it parses a read whose write commands run on the lanes: their
+ * values are then built on the lane that stores them (see fpRead). */
+__thread int parse_defer_value_prebuild = 0;
+
 /* Called whenever server.commands or a command's subcommand table changes. */
 void commandTableChanged(void) {
     atomic_fetch_add_explicit(&command_table_epoch, 1, memory_order_relaxed);
@@ -4969,7 +4973,7 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
     }
 
     /* Prebuild only request-determined values whose keys cannot change. */
-    if (*cmd && !(*read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
+    if (*cmd && !parse_defer_value_prebuild && !(*read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
         serverCommandProc *p = (*cmd)->proc;
         if (argc == 3 && (p == setCommand || p == setnxCommand || p == getsetCommand)) {
             prebuildArgvEntry(argv, 1, 2);

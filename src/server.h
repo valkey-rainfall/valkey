@@ -4594,6 +4594,7 @@ void commandInfoCommand(client *c);
 void invalidateCommandCache(void);
 void commandTableChanged(void);
 void createSharedCommandNames(void);
+extern __thread int parse_defer_value_prebuild;
 void commandGetKeysCommand(client *c);
 void commandGetKeysAndFlagsCommand(client *c);
 void commandHelpCommand(client *c);

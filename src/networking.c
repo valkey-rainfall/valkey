@@ -4617,7 +4617,7 @@ static int parseMultibulk(client *c,
                 robj *o = NULL;
                 if (*argc == 0) {
                     o = lookupSharedCommandName(arg, c->bulklen);
-                } else if (*argc == 2 && c->multibulklen == 1 && shared_cmdname_set[0] &&
+                } else if (*argc == 2 && c->multibulklen == 1 && shared_cmdname_set[0] && !parse_defer_value_prebuild &&
                            ((*argv)[0] == shared_cmdname_set[0] || (*argv)[0] == shared_cmdname_set[1]) &&
                            sdsEncodedObject((*argv)[1])) {
                     /* SET key value: build the store-ready value (embedded key) now, as
