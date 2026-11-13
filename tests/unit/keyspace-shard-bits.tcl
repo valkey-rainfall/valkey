@@ -1,5 +1,6 @@
-# keyspace-shard-bits resolves to an effective value at startup: auto (the default) gives 8 on every
-# standalone server whatever io-threads is, cluster mode gives 0, and an explicit value is used as given.
+# keyspace-shard-bits resolves to an effective value at startup: auto (the default) gives 8 on a
+# standalone server started with io-threads 2 or more and 0 on one started with a single io-thread,
+# cluster mode gives 0, and an explicit value is used as given.
 # CONFIG GET reports the configured value and CONFIG REWRITE keeps auto as auto; INFO reports the
 # effective value.
 
@@ -12,14 +13,41 @@ proc configured_shard_bits {} {
 }
 
 start_server {tags {"keyspace-shard-bits" "external:skip"} overrides {io-threads 1}} {
-    test {auto with one io-thread resolves to 8} {
+    test {auto with one io-thread resolves to 0} {
         assert_equal {-1} [configured_shard_bits]
-        assert_equal {8} [effective_shard_bits]
+        assert_equal {0} [effective_shard_bits]
     }
 }
 
 start_server {tags {"keyspace-shard-bits" "external:skip" "tls:skip"} overrides {io-threads 1 io-threads-parallel-writes-min 1}} {
-    test {a server started with one io-thread runs writes on the lanes after io-threads is raised} {
+    test {auto with one io-thread: writes stay correct on main after io-threads is raised} {
+        r config set notify-keyspace-events ""
+        r config set io-threads 4
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation {crlf binary} -blocking 1 -buffering full
+        set buf ""
+        for {set i 0} {$i < 400} {incr i} {
+            append buf "*3\r\n\$3\r\nset\r\n\$[string length ksb:$i]\r\nksb:$i\r\n\$1\r\nv\r\n"
+        }
+        puts -nonewline $fd $buf
+        flush $fd
+        for {set i 0} {$i < 400} {incr i} { assert_equal {+OK} [gets $fd] }
+        close $fd
+        assert_equal {0} [effective_shard_bits]
+        assert_equal 0 [getInfoProperty [r info fastpath] fastpath_write_lane_entries]
+        r select 0
+        assert_equal 400 [r dbsize]
+        assert_equal {v} [r get ksb:399]
+    }
+}
+
+start_server {tags {"keyspace-shard-bits" "external:skip" "tls:skip"} overrides {io-threads 1 keyspace-shard-bits 8 io-threads-parallel-writes-min 1}} {
+    test {explicit 8 with one io-thread is honored} {
+        assert_equal {8} [configured_shard_bits]
+        assert_equal {8} [effective_shard_bits]
+    }
+
+    test {a server started with one io-thread and explicit shards runs writes on the lanes after io-threads is raised} {
         r config set notify-keyspace-events ""
         r config set io-threads 4
         set fd [socket [srv 0 host] [srv 0 port]]
@@ -89,6 +117,7 @@ test {the shipped valkey.conf shows a keyspace-shard-bits value that parses} {
 start_server [list tags {"keyspace-shard-bits" "external:skip"} overrides [list keyspace-shard-bits $shipped]] {
     test {the shipped valkey.conf keyspace-shard-bits example is the default} {
         assert_equal {-1} [configured_shard_bits]
-        assert_equal {8} [effective_shard_bits]
+        set expected [expr {[lindex [r config get io-threads] 1] >= 2 ? 8 : 0}]
+        assert_equal $expected [effective_shard_bits]
     }
 }

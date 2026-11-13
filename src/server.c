@@ -3265,14 +3265,17 @@ bool dbsHaveNoKeys(void) {
 }
 
 /* Resolve the configured keyspace-shard-bits into the effective value every caller reads.
- * -1 means auto: 8 bits for every standalone server, whatever io-threads is at startup, so a server
- * started with one IO thread still has write lanes when io-threads is raised at runtime. Cluster
- * mode shards by slot regardless, so the standalone value is 0 there. An explicit value, including
- * 0, is used as given. Resolved once at startup before any database is created. */
+ * -1 means auto: 8 bits for a standalone server started with io-threads 2 or more, the shards its
+ * write lanes, parallel replica apply and MAINT lanes split the keyspace by. A server started with
+ * one io-thread has no lanes, and the shards would only cost it a second key hash and per-shard
+ * bookkeeping on every key access, so auto gives it 0, one hashtable per database as without the
+ * fast path; if io-threads is raised at runtime its writes run on main (lanes report unsplit).
+ * Cluster mode shards by slot regardless, so the standalone value is 0 there. An explicit value,
+ * including 0, is used as given. Resolved once at startup before any database is created. */
 void resolveKeyspaceShardBits(void) {
     if (server.keyspace_shard_bits_config >= 0) {
         server.keyspace_shard_bits = server.keyspace_shard_bits_config;
-    } else if (server.cluster_enabled) {
+    } else if (server.cluster_enabled || server.io_threads_num < 2) {
         server.keyspace_shard_bits = 0;
     } else {
         server.keyspace_shard_bits = 8;
