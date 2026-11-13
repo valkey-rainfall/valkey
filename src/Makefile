@@ -50,6 +50,23 @@ endif
 WARN=-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -Wstrict-prototypes -Werror=undef
 OPT=$(OPTIMIZATION)
 
+# Profile-guided optimization (GCC only). When ../pgo/gcc holds a profile the
+# build uses it; functions the training never ran are built as without PGO.
+# utils/pgo-train.sh trains a new profile (it builds with PGO=gen). PGO=no
+# ignores the profile. A profile from older sources only warns
+# (coverage-mismatch) and leaves the changed functions without PGO.
+PGO_TREE:=$(abspath ..)
+PGO_DIR?=$(PGO_TREE)/pgo/gcc
+ifneq (clang,$(CLANG))
+ifeq ($(PGO),gen)
+	OPT+=-fprofile-generate=$(PGO_TREE)/pgo/gen -fprofile-update=atomic -fprofile-prefix-path=$(PGO_TREE)
+else ifneq ($(PGO),no)
+ifneq (,$(wildcard $(PGO_DIR)/*.gcda))
+	OPT+=-fprofile-use=$(PGO_DIR) -fprofile-prefix-path=$(PGO_TREE) -fprofile-partial-training -Wno-missing-profile -Wno-error=coverage-mismatch
+endif
+endif
+endif
+
 # Detect if the compiler supports C11 _Atomic.
 # NUMBER_SIGN_CHAR is a workaround to support both GNU Make 4.3 and older versions.
 NUMBER_SIGN_CHAR := \#
