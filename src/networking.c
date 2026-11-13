@@ -4372,6 +4372,23 @@ void createSharedCommandNames(void) {
     shared_cmdname_set[1] = lookupSharedCommandName("set", 3);
 }
 
+/* Fast path for a RESP length header ("*<n>\r\n" or "$<n>\r\n") at p, with
+ * avail bytes in the buffer: 1 to 9 digits without sign or leading zero,
+ * followed by CRLF. Returns the number of digits and sets *ll, or 0 when the
+ * header is anything else (incomplete, zero, too long, malformed): the caller
+ * then takes the generic memchr + string2ll path, which handles those cases
+ * and reports every error. For the headers accepted here string2ll() returns
+ * the same value. */
+static inline size_t parseShortRespLength(const char *p, size_t avail, long long *ll) {
+    if (avail < 4 || p[1] < '1' || p[1] > '9') return 0;
+    long long v = p[1] - '0';
+    size_t i = 2;
+    while (i < avail && i <= 9 && p[i] >= '0' && p[i] <= '9') v = v * 10 + (p[i++] - '0');
+    if (i + 1 >= avail || p[i] != '\r' || p[i + 1] != '\n') return 0;
+    *ll = v;
+    return i - 1;
+}
+
 /* Incremental parsing of a command in the client's query buffer.
  *
  * Parser state related to the input buffer are per client and stored in the
@@ -4402,35 +4419,42 @@ static int parseMultibulk(client *c,
         /* The client (argc) should have been reset */
         serverAssertWithInfo(c, NULL, *argc == 0);
 
-        /* Multi bulk length cannot be read without a \r\n */
-        newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
-        if (newline == NULL) {
-            if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
-                return READ_FLAGS_ERROR_BIG_MULTIBULK;
+        size_t multibulklen_slen = parseShortRespLength(c->querybuf + c->qb_pos, sdslen(c->querybuf) - c->qb_pos, &ll);
+        if (multibulklen_slen) {
+            /* Common case: a complete, well-formed header. Same checks as below. */
+            if (ll > 10 && auth_required) return READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
+            c->qb_pos += multibulklen_slen + 3;
+        } else {
+            /* Multi bulk length cannot be read without a \r\n */
+            newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
+            if (newline == NULL) {
+                if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+                    return READ_FLAGS_ERROR_BIG_MULTIBULK;
+                }
+                return 0;
             }
-            return 0;
+
+            /* Buffer should also contain \n */
+            if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return 0;
+
+            /* Check that what follows \r is a real \n */
+            if (unlikely(newline[1] != '\n')) {
+                return READ_FLAGS_ERROR_INVALID_CRLF;
+            }
+
+            /* We know for sure there is a whole line since newline != NULL,
+             * so go ahead and find out the multi bulk length. */
+            serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
+            multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
+            ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
+            if (!ok || ll > INT_MAX) {
+                return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
+            } else if (ll > 10 && auth_required) {
+                return READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
+            }
+
+            c->qb_pos = (newline - c->querybuf) + 2;
         }
-
-        /* Buffer should also contain \n */
-        if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return 0;
-
-        /* Check that what follows \r is a real \n */
-        if (unlikely(newline[1] != '\n')) {
-            return READ_FLAGS_ERROR_INVALID_CRLF;
-        }
-
-        /* We know for sure there is a whole line since newline != NULL,
-         * so go ahead and find out the multi bulk length. */
-        serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
-        size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
-        ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
-        if (!ok || ll > INT_MAX) {
-            return READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
-        } else if (ll > 10 && auth_required) {
-            return READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
-        }
-
-        c->qb_pos = (newline - c->querybuf) + 2;
 
         if (ll <= 0) {
             return READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
@@ -4483,35 +4507,46 @@ static int parseMultibulk(client *c,
     while (c->multibulklen) {
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
-            newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
-            if (newline == NULL) {
-                if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
-                    return READ_FLAGS_ERROR_BIG_BULK_COUNT;
+            size_t bulklen_slen = parseShortRespLength(c->querybuf + c->qb_pos, sdslen(c->querybuf) - c->qb_pos, &ll);
+            if (bulklen_slen && c->querybuf[c->qb_pos] == '$') {
+                /* Common case: a complete, well-formed header. Same checks as below. */
+                if (!(is_replicated) && ll > server.proto_max_bulk_len) {
+                    return READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN;
+                } else if (ll > 16384 && auth_required) {
+                    return READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN;
                 }
-                break;
+                c->qb_pos += bulklen_slen + 3;
+            } else {
+                newline = memchr(c->querybuf + c->qb_pos, '\r', sdslen(c->querybuf) - c->qb_pos);
+                if (newline == NULL) {
+                    if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+                        return READ_FLAGS_ERROR_BIG_BULK_COUNT;
+                    }
+                    break;
+                }
+
+                /* Buffer should also contain \n */
+                if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return 0;
+
+                if (c->querybuf[c->qb_pos] != '$') {
+                    return READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER;
+                }
+
+                /* Check that what follows \r is a real \n */
+                if (unlikely(newline[1] != '\n')) {
+                    return READ_FLAGS_ERROR_INVALID_CRLF;
+                }
+
+                bulklen_slen = newline - (c->querybuf + c->qb_pos + 1);
+                ok = string2ll(c->querybuf + c->qb_pos + 1, bulklen_slen, &ll);
+                if (!ok || ll < 0 || (!(is_replicated) && ll > server.proto_max_bulk_len)) {
+                    return READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN;
+                } else if (ll > 16384 && auth_required) {
+                    return READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN;
+                }
+
+                c->qb_pos = newline - c->querybuf + 2;
             }
-
-            /* Buffer should also contain \n */
-            if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return 0;
-
-            if (c->querybuf[c->qb_pos] != '$') {
-                return READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER;
-            }
-
-            /* Check that what follows \r is a real \n */
-            if (unlikely(newline[1] != '\n')) {
-                return READ_FLAGS_ERROR_INVALID_CRLF;
-            }
-
-            size_t bulklen_slen = newline - (c->querybuf + c->qb_pos + 1);
-            ok = string2ll(c->querybuf + c->qb_pos + 1, bulklen_slen, &ll);
-            if (!ok || ll < 0 || (!(is_replicated) && ll > server.proto_max_bulk_len)) {
-                return READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN;
-            } else if (ll > 16384 && auth_required) {
-                return READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN;
-            }
-
-            c->qb_pos = newline - c->querybuf + 2;
             if (!(is_replicated) && ll >= PROTO_MBULK_BIG_ARG) {
                 /* When the client is not a replicated client (because replicated
                  * client's querybuf can only be trimmed after data applied

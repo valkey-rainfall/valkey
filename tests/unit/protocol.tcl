@@ -27,6 +27,49 @@ start_server {tags {"protocol network"}} {
         assert_equal PONG [r read]
     }
 
+    test "Length headers outside the short-header path and split reads" {
+        # Headers the parser's short-header fast path does not take go the generic path.
+        foreach {payload reply} {
+            "*2\r\n\$4\r\necho\r\n\$0\r\n\r\n" {}
+            "*2\r\n\$4\r\necho\r\n\$10\r\n0123456789\r\n" 0123456789
+            "*0\r\n*1\r\n\$4\r\nping\r\n" PONG
+        } {
+            reconnect
+            r write $payload
+            r flush
+            assert_equal $reply [r read]
+        }
+        # The same command delivered one byte at a time.
+        reconnect
+        set payload "*3\r\n\$3\r\nSET\r\n\$12\r\nsplit:header\r\n\$5\r\nvalue\r\n"
+        foreach ch [split $payload {}] {
+            r write $ch
+            r flush
+            after 1
+        }
+        assert_equal OK [r read]
+        assert_equal value [r get split:header]
+    }
+
+    test "Malformed length headers are protocol errors" {
+        foreach {payload err} {
+            "*1\r\n\$+4\r\nping\r\n" "*invalid bulk length*"
+            "*1\r\n\$4x\r\nping\r\n" "*invalid bulk length*"
+            "*1\r\n\$-4\r\nping\r\n" "*invalid bulk length*"
+            "*1\r\n\$04\r\nping\r\n" "*invalid bulk length*"
+            "*1\r\n\$0000000004\r\nping\r\n" "*invalid bulk length*"
+            "*+1\r\n\$4\r\nping\r\n" "*invalid multibulk length*"
+            "*1x\r\n\$4\r\nping\r\n" "*invalid multibulk length*"
+            "*01\r\n\$4\r\nping\r\n" "*invalid multibulk length*"
+            "*1\r\n%4\r\nping\r\n" "*expected '\$', got '%'*"
+        } {
+            reconnect
+            r write $payload
+            r flush
+            assert_error $err {r read}
+        }
+    }
+
     test "Out of range multibulk length" {
         reconnect
         r write "*3000000000\r\n"
