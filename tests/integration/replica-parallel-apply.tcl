@@ -12,8 +12,8 @@ proc assert_in_sync {primary replica} {
     assert_equal [$primary dbsize] [$replica dbsize]
 }
 
-start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fast-path yes}} {
-    start_server {overrides {io-threads 4 io-threads-fast-path yes keyspace-shard-bits 8}} {
+start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-fast-path yes}} {
+    start_server {overrides {io-threads 4 io-threads-always-active yes io-threads-fast-path yes keyspace-shard-bits 8}} {
         set primary [srv -1 client]
         set primary_host [srv -1 host]
         set primary_port [srv -1 port]
@@ -191,8 +191,8 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
 # With every local client in a priority subnet, replies to many subscribers queue ahead of the
 # primary's planned read, which then completes after main-path commands of the same iteration ran.
 # A WATCH among them was not seen when the read was classified.
-start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fast-path yes}} {
-    start_server {overrides {io-threads 4 io-threads-fast-path yes keyspace-shard-bits 8 priority-subnets 127.0.0.0/8 enable-debug-assert yes}} {
+start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-fast-path yes}} {
+    start_server {overrides {io-threads 4 io-threads-always-active yes io-threads-fast-path yes keyspace-shard-bits 8 priority-subnets 127.0.0.0/8 enable-debug-assert yes}} {
         set primary [srv -1 client]
         set replica [srv 0 client]
         $replica config set notify-keyspace-events ""

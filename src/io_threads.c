@@ -958,7 +958,9 @@ int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize) {
 /* Staged workers are never parked on their mutex; every ready thread counts as active. */
 void ioThreadsStagedUnpark(void) {
     for (int i = 1; i < io_ready_num; i++) ioWorkerUnpark(i);
-    server.active_io_threads_num = io_ready_num;
+    /* Workers the staged loop parked on its barrier take no jobs. */
+    int cap = stagedActiveIOThreads();
+    server.active_io_threads_num = cap > 0 && cap < io_ready_num ? cap : io_ready_num;
     ioThreadsWakeAll(); /* a sleeping thread enrolls only once it wakes */
 }
 

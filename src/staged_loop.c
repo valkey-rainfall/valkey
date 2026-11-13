@@ -55,6 +55,14 @@ void stagedWorkerPhaseTime(int tid, int phase, uint64_t ns) {
     sl_worker_last_ns[tid] = ns;
 }
 
+/* Worker phase time summed over workers 1..n and phases: the work the workers did so far. */
+static uint64_t stagedWorkerWorkNs(int n) {
+    uint64_t sum = 0;
+    for (int tid = 1; tid <= n && tid < IO_THREADS_MAX_NUM; tid++)
+        for (int p = 1; p < STAGED_PHASE_KINDS; p++) sum += atomic_load_explicit(&sl_worker_ns[tid][p], memory_order_relaxed);
+    return sum;
+}
+
 /* Main, after the barrier of a phase that workers 1..nworkers ran. */
 static void stagedAccountPhase(int phase, int nworkers) {
     if (phase <= 0 || phase >= STAGED_PHASE_KINDS) return;
@@ -70,6 +78,7 @@ static void stagedAccountPhase(int phase, int nworkers) {
 #define STAGED_EPOLL_THREAD_MIN_IO_THREADS 3
 
 static int stagedEpollThreadRunning(void);
+uint64_t stagedLastIterationWorkNs(void);
 static int stagedMainSharesCpu(void);
 
 int stagedEpollThreadConfigValid(int on, int io_threads, const char **err) {
@@ -113,6 +122,8 @@ int stagedEpollThreadWanted(void) {
 void stagedInfo(char **info) {
     sds s = *info;
     s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
+    s = sdscatprintf(s, "staged_active_workers:%d\r\n", stagedWorkerCount());
+    s = sdscatprintf(s, "staged_last_iteration_work_ns:%llu\r\n", (unsigned long long)stagedLastIterationWorkNs());
     s = sdscatprintf(s, "staged_epoll_thread:%d\r\n", stagedEpollThreadRunning());
     s = sdscatprintf(s, "staged_main_lane:%d\r\nstaged_main_shares_cpu:%d\r\n", stagedMainTakesLane(),
                      stagedMainSharesCpu());
@@ -161,7 +172,8 @@ static phaseBarrier sl_barrier;
 static int sl_barrier_ready = 0;
 static int sl_on = 0;         /* staged mode is on for this iteration */
 static int sl_want = 0;       /* staged mode is wanted: stock IO offload stops so it can start */
-static int sl_workers = 0;    /* IO threads 1..sl_workers are enrolled; the barrier's participant count */
+static int sl_workers = 0;    /* IO threads 1..sl_workers are enrolled */
+static int sl_active = 0;     /* IO threads 1..sl_active work the phases; the barrier's participant count */
 static int sl_depth = 0;      /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
 static int sl_ae_fd = -1;     /* ae's own epoll fd, the single main-affinity entry */
@@ -177,6 +189,9 @@ static int sl_stream_open = 0;      /* a STREAM phase is open: workers deliver w
 static int sl_main_shares = 0; /* main shares a CPU with an enrolled worker, as last read */
 static int sl_main_spins = 1;  /* main spins at the barrier: it shares no CPU */
 static monotime sl_pinning_read = 0;
+
+static uint64_t sl_main_work_ns = 0;  /* main's time in phase work: its lanes and the execution */
+static uint64_t sl_lane_wall_ns = 0;  /* wall time of the lane phases, waits included */
 
 static int stagedMainSharesCpu(void) {
     return sl_main_shares;
@@ -199,7 +214,7 @@ int stagedLoopActive(void) {
 }
 
 int stagedWorkerCount(void) {
-    return sl_workers;
+    return sl_active;
 }
 
 poller *stagedPoller(void) {
@@ -241,7 +256,7 @@ static void stagedStreamClose(int abort) {
     uint64_t t0 = stagedNowNs();
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
     sl_main_ns[SL_T_STREAMWAIT] += stagedNowNs() - t0;
-    stagedAccountPhase(STAGED_PHASE_STREAM, sl_workers);
+    stagedAccountPhase(STAGED_PHASE_STREAM, sl_active);
     sl_stream_open = 0;
 }
 
@@ -251,7 +266,7 @@ static void stagedOpenAndWait(int phase);
  * because something other than that read phase comes first. */
 static void stagedFlushDeferredReplies(void) {
     if (!fastpathStagedRepliesDeferred()) return;
-    serverAssert(sl_depth == 0 && sl_workers > 0);
+    serverAssert(sl_depth == 0 && sl_active > 0);
     stagedOpenAndWait(STAGED_PHASE_REPLY);
     fastpathStagedDeferredDelivered();
     fastpathStagedFinish();
@@ -273,12 +288,14 @@ static void stagedOpenAndWait(int phase) {
     serverAssert(rc == 0);
     sl_opens++;
     /* Main works its own share of the phase instead of waiting idle for the IO threads. */
+    uint64_t w0 = stagedNowNs();
     if (sl_main_lane && phase == STAGED_PHASE_READ)
         fastpathStagedReadPhase(0);
     else if (sl_main_lane && phase == STAGED_PHASE_REPLY)
         fastpathStagedReplyPhase(0);
+    sl_main_work_ns += stagedNowNs() - w0;
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
-    stagedAccountPhase(phase, sl_workers);
+    stagedAccountPhase(phase, sl_active);
 }
 
 /* Main-affinity handler. Never called: main checks whether ae's fd fired and runs ae itself. */
@@ -548,15 +565,25 @@ static void stagedFollowMainLane(void) {
     sl_main_lane = lane;
 }
 
+static int sl_scale_window_max = 0; /* most workers an iteration needed since the window started */
+static monotime sl_scale_window_start = 0;
+
 /* Main, between phases: enroll IO threads 1..want. Leavers pass one SYNC phase so none is left
  * waiting on the barrier; newcomers wait from the current sequence. */
 static void stagedSetWorkers(int want) {
     if (want == sl_workers) return;
     stagedFlushDeferredReplies(); /* the leavers own some of them */
+    if (sl_active < sl_workers) { /* parked workers take part in SYNC too */
+        int rc = phaseBarrierSetParticipants(&sl_barrier, sl_workers);
+        serverAssert(rc == 0);
+    }
     if (want < sl_workers) {
         for (int tid = want + 1; tid <= sl_workers; tid++) atomic_store_explicit(&sl_enrolled[tid], 0, memory_order_release);
         stagedRunPhase(STAGED_PHASE_SYNC);
     }
+    sl_active = want;
+    sl_scale_window_max = 0;
+    sl_scale_window_start = getMonotonicUs();
     int rc = phaseBarrierSetParticipants(&sl_barrier, want);
     serverAssert(rc == 0);
     for (int tid = sl_workers + 1; tid <= want; tid++) {
@@ -571,6 +598,64 @@ static void stagedSetWorkers(int want) {
     }
     stagedReadCpuPinning();
     stagedFollowMainLane();
+}
+
+/* Workers that take part in the phases, scaled to the work: an IO thread outside the participant count
+ * parks on the barrier and takes no jobs, as stock parks IO threads it does not need. Work is main's
+ * time in phase work (its lane share and the execution, not barrier waits or wakes) plus the workers'
+ * phase time. Every STAGED_SCALE_SAMPLE_US main compares the work with the time passed: enough
+ * threads to keep each below STAGED_SCALE_TARGET_PCT busy take part from the next iteration, so a load
+ * that saturates the current threads doubles them within a sample or two. Fewer take part only after
+ * STAGED_SCALE_DOWN_US in which no sample needed more. The hidden io-threads-always-active keeps every
+ * enrolled worker in. */
+#define STAGED_SCALE_SAMPLE_US 1000
+#define STAGED_SCALE_TARGET_PCT 40
+#define STAGED_SCALE_DOWN_US 100000
+static uint64_t sl_iter_work_ns = 0;   /* last iteration's work */
+static uint64_t sl_scale_work_ns = 0;  /* work since the sample started */
+static monotime sl_scale_sample_start = 0;
+uint64_t stagedLastIterationWorkNs(void) {
+    return sl_iter_work_ns;
+}
+
+/* Main, at an iteration boundary: workers 1..n take part from the next phase on. */
+static void stagedSetActive(int n) {
+    if (n == sl_active) return;
+    stagedFlushDeferredReplies(); /* they belong to the current participants */
+    if (n < sl_active) {
+        /* Jobs from here on go to the remaining workers; the leaving ones drain what they hold first. */
+        flushWriteSlab();
+        commitIOJobs();
+        server.active_io_threads_num = n + 1;
+        stagedOpenAndWait(STAGED_PHASE_DRAIN);
+    }
+    int rc = phaseBarrierSetParticipants(&sl_barrier, n);
+    serverAssert(rc == 0);
+    sl_active = n;
+    server.active_io_threads_num = n + 1;
+}
+
+static void stagedScaleWorkers(void) {
+    monotime now = getMonotonicUs();
+    int need = sl_workers;
+    if (!server.io_threads_always_active && sl_main_lane) {
+        monotime span = now - sl_scale_sample_start;
+        if (span < STAGED_SCALE_SAMPLE_US) return;
+        /* threads = work / (span * target), main being one of them */
+        need = (int)(sl_scale_work_ns * 100 / ((uint64_t)span * 1000 * STAGED_SCALE_TARGET_PCT)) - 1;
+        if (need < 0) need = 0;
+        if (need > sl_workers) need = sl_workers;
+    }
+    sl_scale_work_ns = 0;
+    sl_scale_sample_start = now;
+    if (need > sl_scale_window_max) sl_scale_window_max = need;
+    if (need > sl_active) {
+        stagedSetActive(need);
+    } else if (now - sl_scale_window_start >= STAGED_SCALE_DOWN_US) {
+        if (sl_scale_window_max < sl_active) stagedSetActive(sl_scale_window_max);
+        sl_scale_window_max = 0;
+        sl_scale_window_start = now;
+    }
 }
 
 /* Main, at the iteration boundary: follow the configuration and the live IO thread count. */
@@ -625,6 +710,8 @@ static void stagedReconcile(aeEventLoop *el) {
         if (pollerThreadRunning(sl_poller)) stagedPlaceEpollThread();
     }
     stagedFollowMainLane();
+    /* Last, once main's lane is known: without it every enrolled worker takes part. */
+    if (sl_depth == 0) stagedScaleWorkers();
 }
 
 /* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
@@ -686,7 +773,7 @@ static void readPhase(void) {
 extern rax *PrefixTable; /* tracking.c */
 static int stagedStreamEligible(void) {
     if (server.staged_reply_overlap == STAGED_REPLY_OVERLAP_NONE) return 0;
-    if (sl_depth != 0 || sl_workers <= 0) return 0;
+    if (sl_depth != 0 || sl_active <= 0) return 0;
     if (fastpathStagedStreamBatchCount() == 0) return 0;
     if (server.aof_state != AOF_OFF) return 0; /* replies follow the AOF write of their commands */
     if (!sl_main_spins || !sl_main_lane) return 0; /* main would only take turns with a worker */
@@ -699,7 +786,7 @@ static int stagedStreamEligible(void) {
  * In exec/loop overlap, a STREAM phase delivers completed runs while main executes. */
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
-    uint64_t t0 = stagedNowNs();
+    uint64_t t0 = stagedNowNs(), lane0 = sl_lane_wall_ns;
     if (sl_read_queued) {
         sl_read_queued = 0;
         processIOThreadsResponses(); /* runs the primary's commands parsed in the read phase */
@@ -713,6 +800,7 @@ static void writePhase(aeEventLoop *el) {
     }
     uint64_t t1 = stagedNowNs();
     sl_main_ns[SL_T_EXEC] += t1 - t0;
+    sl_main_work_ns += (t1 - t0) - (sl_lane_wall_ns - lane0); /* lane phases count main's share themselves */
     /* Close the stream (wait for the workers to finish delivering) before main does anything that
      * reads worker-owned client state or opens another phase. A nested iteration inside exec already
      * aborted and closed it through stagedRunPhase. */
@@ -732,7 +820,7 @@ static void writePhase(aeEventLoop *el) {
  * out before the deferred replies). Anything else that opens a phase first delivers them. */
 static int stagedMayDeferReplies(aeEventLoop *el) {
     if (!server.staged_reply_merge) return 0;
-    if (sl_depth != 0 || sl_workers <= 0 || !sl_main_lane) return 0;
+    if (sl_depth != 0 || sl_active <= 0 || !sl_main_lane) return 0;
     if (!fastpathStagedRepliesPending()) return 0;
     if (fastpathStagedHandoffsPending()) return 0;
     if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
@@ -764,6 +852,8 @@ static void stagedLoopIteration(aeEventLoop *el) {
     sl_iterations++;
     collectFDs(el);
     uint64_t t0 = stagedNowNs();
+    uint64_t mwork0 = sl_main_work_ns, work0 = stagedWorkerWorkNs(sl_active);
+    int active0 = sl_active;
     t = getMonotonicUs();
     readPhase();
     cronStatsRecord(CRON_JOB_SL_READ, getMonotonicUs() - t);
@@ -786,6 +876,8 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     replyPhase(el);
     cronStatsRecord(CRON_JOB_SL_REPLY, getMonotonicUs() - t);
+    sl_iter_work_ns = (sl_main_work_ns - mwork0) + (stagedWorkerWorkNs(active0) - work0);
+    sl_scale_work_ns += sl_iter_work_ns;
     /* Publish the next stable offset now, so this iteration's writes need not wait for the next collect. */
     replStreamSenderTick();
     t = getMonotonicUs();
@@ -821,16 +913,22 @@ void stagedNestedIteration(void) {
     fastpathStagedFinish();
 }
 
+/* Every enrolled worker drains, the parked ones too: a job may still wait in a parked worker's inbox. */
 void stagedDrainWorkers(void) {
-    if (sl_on) stagedRunPhase(STAGED_PHASE_DRAIN);
+    if (!sl_on) return;
+    stagedStreamClose(1);
+    stagedFlushDeferredReplies();
+    if (sl_active < sl_workers) serverAssert(phaseBarrierSetParticipants(&sl_barrier, sl_workers) == 0);
+    stagedOpenAndWait(STAGED_PHASE_DRAIN);
+    if (sl_active < sl_workers) serverAssert(phaseBarrierSetParticipants(&sl_barrier, sl_active) == 0);
 }
 
 int stagedApplyReady(void) {
-    return sl_on && !sl_depth && sl_workers > 0;
+    return sl_on && !sl_depth && sl_active > 0;
 }
 
 int stagedDeferRead(client *c) {
-    if (!sl_on || sl_depth || !sl_workers || ProcessingEventsWhileBlocked) return 0;
+    if (!sl_on || sl_depth || !sl_active || ProcessingEventsWhileBlocked) return 0;
     if (!c->flag.primary || !c->conn || server.repl_stream_reader) return 0;
     if (c->flag.blocked || c->flag.unblocked || c->flag.close_asap || c->flag.lua_debug) return 0;
     if (c->io_read_state != CLIENT_IDLE || c->io_write_state == CLIENT_PENDING_IO) return 0;
@@ -843,8 +941,12 @@ int stagedMainTakesLane(void) {
     return sl_main_lane;
 }
 
+int stagedActiveIOThreads(void) {
+    return sl_on && sl_active < sl_workers ? sl_active + 1 : -1;
+}
+
 int stagedLaneCount(void) {
-    int n = sl_workers + sl_main_lane;
+    int n = sl_active + sl_main_lane;
     return n > FP_MAX_LANES ? FP_MAX_LANES : n;
 }
 
@@ -872,18 +974,24 @@ void stagedRunLane(int phase, int tid) {
 /* Open phase for the enrolled workers, run main's lane when it takes one, and wait. with_workers 0,
  * or no enrolled worker, runs lane 0 on main alone with no barrier. */
 void stagedRunLanePhase(int phase, int with_workers) {
+    uint64_t wall0 = stagedNowNs();
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     stagedFlushDeferredReplies();
     if (!with_workers) {
         stagedRunLane(phase, 0);
+        sl_main_work_ns += stagedNowNs() - wall0;
+        sl_lane_wall_ns += stagedNowNs() - wall0;
         return;
     }
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
+    uint64_t w0 = stagedNowNs();
     if (sl_main_lane) stagedRunLane(phase, 0);
+    sl_main_work_ns += stagedNowNs() - w0;
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
-    stagedAccountPhase(phase, sl_workers);
+    stagedAccountPhase(phase, sl_active);
+    sl_lane_wall_ns += stagedNowNs() - wall0;
 }
 
 void stagedRunApplyPhase(int with_workers) {
@@ -891,14 +999,18 @@ void stagedRunApplyPhase(int with_workers) {
 }
 
 void stagedRunWritePhase(void) {
+    uint64_t wall0 = stagedNowNs();
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     stagedFlushDeferredReplies();
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
     serverAssert(rc == 0);
     sl_opens++;
+    uint64_t w0 = stagedNowNs();
     if (sl_main_lane) fastpathStagedWriteLane(0);
+    sl_main_work_ns += stagedNowNs() - w0;
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
-    stagedAccountPhase(STAGED_PHASE_WRITE, sl_workers);
+    stagedAccountPhase(STAGED_PHASE_WRITE, sl_active);
+    sl_lane_wall_ns += stagedNowNs() - wall0;
 }
 
 void stagedStopWorkers(void) {
@@ -983,6 +1095,9 @@ int stagedMainTakesLane(void) {
 }
 int stagedLaneCount(void) {
     return 1;
+}
+int stagedActiveIOThreads(void) {
+    return -1;
 }
 int stagedWorkerSpins(int tid) {
     UNUSED(tid);

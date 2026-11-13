@@ -52,6 +52,8 @@ void stagedMain(struct aeEventLoop *el);
 int stagedLoopActive(void);
 /* Main thread: IO threads enrolled in the staged loop. */
 int stagedWorkerCount(void);
+/* IO threads (main included) the staged loop gives jobs to while it parks the rest, or -1 for all. */
+int stagedActiveIOThreads(void);
 /* io-threads-epoll-thread on needs io-threads 3 or more. 1 when the pair is valid, else 0 with *err set. */
 int stagedEpollThreadConfigValid(int on, int io_threads, const char **err);
 /* io-threads-epoll-thread-cpu: -1, or a CPU the server may run on that neither main nor an IO thread

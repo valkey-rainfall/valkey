@@ -1,6 +1,7 @@
 # Parallel write lanes: the staged write phase runs lane-eligible fast-path commands on main and the
 # IO threads at once, by keyspace shard. Fast-path clients here are raw db-0 sockets;
 # io-threads-parallel-writes-min 1 sends every segment to the lanes.
+# io-threads-always-active yes keeps every IO thread in the phases, whatever the load.
 
 # Every raw socket a test opens, with its local port, so a failed test's sockets are closed before the
 # next test waits for the server to have no fast-path clients. Tcl reuses channel names, so a channel is
@@ -151,7 +152,7 @@ proc pwl_fast_socket {c host port} {
     return $fd
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 5 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
     r client setname pwl-control
     r select 0
     r config set notify-keyspace-events ""
@@ -658,14 +659,14 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 }
 
-start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
+start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-threads 5 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
     $primary client setname pwl-control
     $primary select 0
     $primary config set notify-keyspace-events ""
-    start_server {overrides {io-threads 3 keyspace-shard-bits 10 enable-debug-command yes}} {
+    start_server {overrides {io-threads 3 io-threads-always-active yes keyspace-shard-bits 10 enable-debug-command yes}} {
         set replica [srv 0 client]
         $replica config set notify-keyspace-events ""
         $replica replicaof $primary_host $primary_port
@@ -909,7 +910,7 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
         test {Replica lanes: a sub-replica gets the stream the replica applied} {
             set replica_host [srv 0 host]
             set replica_port [srv 0 port]
-            start_server {overrides {io-threads 3 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
+            start_server {overrides {io-threads 3 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1 enable-debug-command yes}} {
                 set sub [srv 0 client]
                 $sub config set notify-keyspace-events ""
                 $sub replicaof $replica_host $replica_port
@@ -929,7 +930,7 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
     }
 }
 
-start_cluster 1 1 {tags {"staged-loop cluster external:skip tls:skip"} overrides {io-threads 5 io-threads-parallel-writes-min 1}} {
+start_cluster 1 1 {tags {"staged-loop cluster external:skip tls:skip"} overrides {io-threads 5 io-threads-always-active yes io-threads-parallel-writes-min 1}} {
     set host [srv 0 host]
     set port [srv 0 port]
     R 0 config set notify-keyspace-events ""
