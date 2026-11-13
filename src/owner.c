@@ -162,8 +162,10 @@ int ownerValidateConfig(const char **err) {
     return C_ERR;
 #endif
     if (server.cluster_enabled) {
-        *err = "owner-threads is a standalone mode; it announces its own owners as cluster nodes";
-        return C_ERR;
+        /* Cluster nodes already own slots and route by them: nothing for owner threads to add. */
+        serverLog(LL_WARNING, "owner-threads is a standalone mode; cluster-enabled turns it off");
+        server.owner_threads = 0;
+        return C_OK;
     }
     if (server.io_threads_num != 1) {
         *err = "owner-threads needs io-threads 1 (the main path is the stock single-threaded loop)";
