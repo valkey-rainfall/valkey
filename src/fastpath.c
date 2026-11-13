@@ -2948,10 +2948,16 @@ static _Thread_local execContext *fp_stream_saved_ectx = NULL;
  * the stream to the backlog and the sub-replicas itself, so of the sinks only the AOF, which execution
  * feeds, needs stream order. */
 int fastpathStreamParallelAllowed(void) {
+    if (!server.primary_host || server.loading || server.async_loading) return 0;
+    return fastpathLoadParallelAllowed();
+}
+
+/* The same server-wide conditions, without the replica and loading tests: the inline commands of an RDB
+ * load (repl_apply.c, replApplyLoadDefer). */
+int fastpathLoadParallelAllowed(void) {
     if (server.cluster_enabled ? (clusterIsAnySlotExporting() || clusterIsAnySlotImporting())
                                : !server.keyspace_shard_bits)
         return 0;
-    if (!server.primary_host || server.loading || server.async_loading) return 0;
     if (server.aof_state != AOF_OFF) return 0;
     if (server.paused_actions || listLength(server.monitors)) return 0;
     if (!trackingIsIdle()) return 0;

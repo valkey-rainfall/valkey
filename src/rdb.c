@@ -50,6 +50,7 @@
 #include "compression.h"
 #include "compression_stream.h"
 #include "forkless.h"
+#include "repl_apply.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -3506,6 +3507,9 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
         off_t report_pos = r->stream_reader ? rioTell(r) : decoded_pos;
         if (server.primary_host && server.repl_state == REPL_STATE_TRANSFER) replicationSendNewlineToPrimary();
         loadingAbsProgress(report_pos);
+        /* Held inline SETs land before events run: a command there can change the lanes or turn on an
+         * observer. */
+        replApplyLoadFlush();
         processEventsWhileBlocked();
         processModuleLoadingProgressEvent(0);
     }
@@ -3840,8 +3844,22 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             client *fakeClient = rdb_loading_ctx->update_client;
 
             fakeClient->db = db;
+            /* Prototype: a plain SET is held for a parallel APPLY phase; anything else runs here, after
+             * the held SETs (repl_apply.c, replApplyLoadDefer). */
+            fakeClient->argc = argc;
+            fakeClient->argv = argv;
+            fakeClient->argv_len = argc;
+            if (replApplyLoadDefer(fakeClient)) continue;
+            fakeClient->argv = NULL;
+            fakeClient->argc = 0;
+            fakeClient->argv_len = 0;
+            int dbg = server.loading_inline_apply_debug;
+            int past_swapdb = (dbg & LOAD_APPLY_MUT_PAST_SWAPDB) && argc > 0 &&
+                              !strcasecmp(objectGetVal(argv[0]), "swapdb");
+            if (!(dbg & LOAD_APPLY_MUT_NO_CMD_FLUSH) && !past_swapdb) replApplyLoadFlush();
             sds err = NULL;
             int load_cmd_ret = loadCommandFromArgv(fakeClient, argv, argc, LOAD_CMD_SOURCE_INLINE_REPL, &err);
+            server.stat_loading_inline_serial_applied++;
             /* FUNCTION FLUSH and FUNCTION RESTORE FLUSH replace the current ctx. */
             rdb_loading_ctx->functions_lib_ctx = functionsLibCtxGetCurrent();
             /* On an unknown or invalid command, stop the load. Skipping it
@@ -4115,6 +4133,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         }
 
         /* Read key */
+        if (server.loading_inline_apply_debug & LOAD_APPLY_FLUSH_RECORDS) replApplyLoadFlush();
         if ((key = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) goto eoferr;
         /* Read value */
         val = rdbLoadObject(type, rdb, key, db->id, &error, rdbflags, now);
@@ -4176,6 +4195,8 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             initStaticStringObject(keyobj, key);
 
             /* Add the new object in the hash table */
+            if (server.loading_inline_apply_debug & LOAD_APPLY_CHECK_RECORDS)
+                serverAssertWithInfo(NULL, &keyobj, !replApplyLoadHeld(db, key));
             int added = dbAddRDBLoad(db, key, &val);
             server.rdb_last_load_keys_loaded++;
             if (!added) {
@@ -4221,6 +4242,8 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         lfu_freq = -1;
         lru_idle = -1;
     }
+    /* The held inline SETs land before the load ends. */
+    if (!(server.loading_inline_apply_debug & LOAD_APPLY_MUT_NO_EOF_FLUSH)) replApplyLoadFlush();
     /* Verify the checksum if RDB version is >= 5 */
     if (rdbver >= 5) {
         uint64_t cksum, expected = rdb->cksum;
@@ -4290,6 +4313,8 @@ eoferr:
     /* fall through */
 
 cleanup:
+    /* A failed load drops the inline SETs it still holds. */
+    replApplyLoadEnd(ret == RDB_OK);
     /* Single exit: free the inline-command fake client (if one was created) and
      * return the result code set by the path that jumped here. */
     if (rdb_loading_ctx->update_client) {

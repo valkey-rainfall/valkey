@@ -3561,6 +3561,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
     createIntConfig("keyspace-shard-bits", NULL, IMMUTABLE_CONFIG, -1, CLUSTER_SLOT_MASK_BITS, server.keyspace_shard_bits_config, -1, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
+    createIntConfig("loading-inline-apply-debug", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 31, server.loading_inline_apply_debug, 0, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes", NULL, MODIFIABLE_CONFIG, server.io_threads_parallel_writes, 1, NULL, NULL),
     createBoolConfig("io-threads-lane-prefetch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_lane_prefetch, 1, NULL, NULL),
