@@ -1,3 +1,6 @@
+# These clients exercise the main path's buffer management (resize in clientsCron, output buffer limit on
+# buffered replies). A named client may join the IO-thread fast path, which reads into a thread-shared
+# buffer and writes replies as it goes (unnamed clients there already did on CF), so keep it on main.
 proc client_idle_sec {name} {
     set clients [split [r client list] "\r\n"]
     set c [lsearch -inline $clients *name=$name*]
@@ -28,6 +31,8 @@ start_server {tags {"querybuf slow"}} {
         set rd [valkey_deferring_client]
 
         $rd client setname test_client
+        $rd read
+        $rd debug fastpath-exclude 1 ;# a main-path buffer test, see the top of this file
         $rd read
 
         # Make sure query buff has size of 0 bytes at start as the client uses the shared qb.
@@ -76,6 +81,7 @@ start_server {tags {"querybuf slow"}} {
         # Memory will increase by more than 32k due to client query buffer.
         set rd [valkey_client]
         $rd client setname test_client
+        $rd debug fastpath-exclude 1 ;# a main-path buffer test, see the top of this file
 
         # Create a large query buffer (more than PROTO_RESIZE_THRESHOLD - 32k)
         $rd set x [string repeat A 400000]
@@ -104,6 +110,7 @@ start_server {tags {"querybuf slow"}} {
     test "query buffer resized correctly with fat argv" {
         set rd [valkey_client]
         $rd client setname test_client
+        $rd debug fastpath-exclude 1 ;# a main-path buffer test, see the top of this file
         $rd write "*3\r\n\$3\r\nset\r\n\$1\r\na\r\n\$1000000\r\n"
         $rd flush
         

@@ -21,6 +21,7 @@ start_server {tags {"replybufsize"}} {
         # Create a simple idle test client
         variable tc [valkey_client]
         $tc client setname test_client
+        $tc debug fastpath-exclude 1 ;# a main-path buffer test: the fast path sizes replies itself
          
         # make sure the client is idle for 1 seconds to make it shrink the reply buffer
         wait_for_condition 10 100 {

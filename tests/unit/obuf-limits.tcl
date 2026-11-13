@@ -161,6 +161,10 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         set rd2 [valkey_deferring_client]
         $rd2 client setname multicommands
         assert_equal "OK" [$rd2 read]
+        # The main path buffers the whole pipeline's replies before writing; the IO-thread fast path
+        # writes them as it goes (as for unnamed clients on CF), so this limit test keeps it on main.
+        $rd2 debug fastpath-exclude 1
+        assert_equal "OK" [$rd2 read]
 
         # Let the server sleep 1s firstly
         $rd1 debug sleep 1
