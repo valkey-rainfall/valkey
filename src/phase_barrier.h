@@ -63,7 +63,10 @@ void phaseBarrierShutdown(phaseBarrier *b);
 
 /* Worker. Block until a phase newer than *last_seen opens with worker_id among its participants
  * and return its id, or return PHASE_BARRIER_EXIT after shutdown. *last_seen starts at 0. spin 0
- * sleeps at once, for a worker that shares its CPU with main. */
+ * sleeps at once, for a worker that shares its CPU with main; spin > 0 spins that many microseconds
+ * before sleeping; PHASE_BARRIER_SPIN_ADAPTIVE spins as long as recent waits on this thread showed
+ * to be worth it (see phase_barrier.c). */
+#define PHASE_BARRIER_SPIN_ADAPTIVE (-1)
 int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin);
 
 /* Worker. Report the phase returned by phaseBarrierAwaitPhase complete. Not called on exit. */

@@ -848,8 +848,12 @@ int stagedLaneCount(void) {
     return n > FP_MAX_LANES ? FP_MAX_LANES : n;
 }
 
+/* The spin argument of phaseBarrierAwaitPhase for worker tid: none when it shares main's CPU, else
+ * adaptive unless the hidden io-threads-barrier-spin-us fixes it (0 sleeps at once). */
 int stagedWorkerSpins(int tid) {
-    return !atomic_load_explicit(&sl_on_main_cpu[tid], memory_order_relaxed);
+    if (atomic_load_explicit(&sl_on_main_cpu[tid], memory_order_relaxed)) return 0;
+    int us = server.io_threads_barrier_spin_us;
+    return us < 0 ? PHASE_BARRIER_SPIN_ADAPTIVE : us;
 }
 
 /* Lane body per phase, bound once at startup; indexed by phase id. */
