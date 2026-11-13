@@ -14,6 +14,7 @@
 #include "maint.h"
 #include "repl_apply.h"
 #include "phase_barrier.h"
+#include "phase_trace.h"
 
 
 /* One spin-wait step; a hint to the core on x86 and arm64, a no-op elsewhere. */
@@ -1362,13 +1363,19 @@ static int ioThreadDrainInboxes(long id, void **batch_jobs) {
 static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
     phaseBarrier *b = stagedBarrier();
     for (;;) {
+        PT((int)id, PT_AWAIT, PT_BEGIN, 0, *seen, 0, 0, 0, 0);
         int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
         if (phase == PHASE_BARRIER_EXIT) return;
+        PT((int)id, PT_AWAIT, PT_END, phase, *seen, 0, 0, 0, 0);
         monotime start = getMonotonicUs();
         uint64_t start_ns = stagedNowNs();
         if (phase == STAGED_PHASE_READ || phase == STAGED_PHASE_REPLY || phase == STAGED_PHASE_DRAIN ||
-            phase == STAGED_PHASE_SYNC)
+            phase == STAGED_PHASE_SYNC) {
+            PT((int)id, PT_DRAIN, PT_BEGIN, phase, *seen, 0, 0, 0, 0);
             ioThreadDrainInboxes(id, batch_jobs);
+            PT((int)id, PT_DRAIN, PT_END, phase, *seen, 0, 0, 0, 0);
+        }
+        PTLANE((int)id, phase, PT_BEGIN, *seen);
         if (phase == STAGED_PHASE_READ)
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
@@ -1383,8 +1390,10 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
             fastpathStagedWriteLane((int)id);
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
+        PTLANE((int)id, phase, PT_END, *seen);
         atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
         stagedWorkerPhaseTime((int)id, phase, stagedNowNs() - start_ns);
+        PT((int)id, PT_DONE, PT_POINT, phase, *seen, 0, 0, 0, 0);
         phaseBarrierDone(b);
         if (phase == STAGED_PHASE_SYNC) return;
     }

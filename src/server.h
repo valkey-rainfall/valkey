@@ -2317,6 +2317,7 @@ struct valkeyServer {
     clientBufferLimitsConfig client_obuf_limits[CLIENT_TYPE_OBUF_COUNT];
     int extended_redis_compat;                 /* True if extended Redis OSS compatibility is enabled */
     int pause_cron;                            /* Don't run cron tasks (debug) */
+    int debug_phase_trace_events;              /* Phase trace ring size per thread; 0 disables DEBUG PHASETRACE (debug) */
     int debug_io_write_done_delay_us;          /* IO threads sleep this long between writing a reply and reporting it (debug) */
     int dict_resizing;                         /* Whether to allow main dict and expired dict to be resized (debug) */
     int latency_tracking_enabled;              /* 1 if extended latency tracking is enabled, 0 otherwise. */

@@ -188,4 +188,6 @@ void fastpathStreamLaneLeave(void);
 /* Main, after an APPLY phase of the stream: fold what lanes [0, nlanes) accumulated. */
 void fastpathStreamLanesMerge(int nlanes);
 
+void fastpathTraceLane(int tid, int phase, int edge, uint32_t seq);
+
 #endif

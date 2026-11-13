@@ -567,6 +567,7 @@ ENGINE_SERVER_OBJ = \
     poller.o \
     phase_barrier.o \
     staged_loop.o \
+    phase_trace.o \
     repl_apply.o \
     maint.o \
     kvstore.o \

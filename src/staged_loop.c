@@ -12,6 +12,7 @@
 #include "io_threads.h"
 #include "repl_apply.h"
 #include "cronstats.h"
+#include "phase_trace.h"
 #include "maint.h"
 #include <time.h>
 
@@ -228,6 +229,7 @@ static void stagedStreamOpen(void) {
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_STREAM);
     serverAssert(rc == 0);
     sl_opens++;
+    PT(0, PT_OPEN, PT_POINT, STAGED_PHASE_STREAM, sl_opens, 0, 0, 0, 0);
     sl_stream_open = 1;
 }
 
@@ -239,7 +241,9 @@ static void stagedStreamClose(int abort) {
     if (!sl_stream_open) return;
     if (abort) fastpathStagedStreamAbort();
     uint64_t t0 = stagedNowNs();
+    PT(0, PT_WAIT, PT_BEGIN, STAGED_PHASE_STREAM, sl_opens, 0, 0, 0, 0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    PT(0, PT_WAIT, PT_END, STAGED_PHASE_STREAM, sl_opens, 0, 0, 0, 0);
     sl_main_ns[SL_T_STREAMWAIT] += stagedNowNs() - t0;
     stagedAccountPhase(STAGED_PHASE_STREAM, sl_workers);
     sl_stream_open = 0;
@@ -272,12 +276,20 @@ static void stagedOpenAndWait(int phase) {
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
+    PT(0, PT_OPEN, PT_POINT, phase, sl_opens, 0, 0, 0, 0);
     /* Main works its own share of the phase instead of waiting idle for the IO threads. */
-    if (sl_main_lane && phase == STAGED_PHASE_READ)
+    if (sl_main_lane && phase == STAGED_PHASE_READ) {
+        PTLANE(0, phase, PT_BEGIN, sl_opens);
         fastpathStagedReadPhase(0);
-    else if (sl_main_lane && phase == STAGED_PHASE_REPLY)
+        PTLANE(0, phase, PT_END, sl_opens);
+    } else if (sl_main_lane && phase == STAGED_PHASE_REPLY) {
+        PTLANE(0, phase, PT_BEGIN, sl_opens);
         fastpathStagedReplyPhase(0);
+        PTLANE(0, phase, PT_END, sl_opens);
+    }
+    PT(0, PT_WAIT, PT_BEGIN, phase, sl_opens, 0, 0, 0, 0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    PT(0, PT_WAIT, PT_END, phase, sl_opens, 0, 0, 0, 0);
     stagedAccountPhase(phase, sl_workers);
 }
 
@@ -631,12 +643,15 @@ static void stagedReconcile(aeEventLoop *el) {
  * accumulated, bounded like aeProcessEvents), the post-sleep hook. */
 static void collectFDs(aeEventLoop *el) {
     uint64_t t0 = stagedNowNs();
+    PTB(0, PT_BEFORESLEEP);
     if (el->beforesleep) {
         monotime bs = getMonotonicUs();
         el->beforesleep(el);
         cronStatsRecord(CRON_JOB_SL_BEFORE_SLEEP, getMonotonicUs() - bs);
     }
     uint64_t t1 = stagedNowNs();
+    PTE(0, PT_BEFORESLEEP);
+    PTB(0, PT_POLL);
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
     /* Deferred replies go out in the next read phase: do not sleep on them either. */
     long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client ||
@@ -653,7 +668,11 @@ static void collectFDs(aeEventLoop *el) {
         n = 0;
     }
     uint64_t t2 = stagedNowNs();
+    /* c1 fds in the batch, c2 client fds among them, c3 1 when main may have slept */
+    PT(0, PT_POLL, PT_END, 0, 0, (uint32_t)n, (uint32_t)pollerIOCount(sl_poller), timeout != 0, 0);
+    PTB(0, PT_AFTERSLEEP);
     if (el->aftersleep) el->aftersleep(el, n);
+    PTE(0, PT_AFTERSLEEP);
     sl_main_ns[SL_T_BEFORESLEEP] += (t1 - t0) + (stagedNowNs() - t2);
     sl_main_ns[SL_T_POLL] += t2 - t1;
 }
@@ -700,6 +719,7 @@ static int stagedStreamEligible(void) {
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
     uint64_t t0 = stagedNowNs();
+    PTB(0, PT_EXEC);
     if (sl_read_queued) {
         sl_read_queued = 0;
         processIOThreadsResponses(); /* runs the primary's commands parsed in the read phase */
@@ -712,6 +732,7 @@ static void writePhase(aeEventLoop *el) {
         fastpathStagedExecute();
     }
     uint64_t t1 = stagedNowNs();
+    PTE(0, PT_EXEC);
     sl_main_ns[SL_T_EXEC] += t1 - t0;
     /* Close the stream (wait for the workers to finish delivering) before main does anything that
      * reads worker-owned client state or opens another phase. A nested iteration inside exec already
@@ -719,7 +740,9 @@ static void writePhase(aeEventLoop *el) {
     stagedStreamClose(0);
     uint64_t t2 = stagedNowNs();
     if (ae_ready) {
+        PTB(0, PT_EVENTS);
         aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
+        PTE(0, PT_EVENTS);
         sl_main_ns[SL_T_EVENTS] += stagedNowNs() - t2;
     }
 }
@@ -742,12 +765,16 @@ static int stagedMayDeferReplies(aeEventLoop *el) {
 
 static void replyPhase(aeEventLoop *el) {
     uint64_t t0 = stagedNowNs();
+    PTB(0, PT_REPLYSTAGE);
     if (stagedMayDeferReplies(el))
         fastpathStagedDeferReplies();
     else if (fastpathStagedRepliesPending() || ioThreadsInboxPending())
         stagedRunPhase(STAGED_PHASE_REPLY);
     uint64_t t1 = stagedNowNs();
+    PTE(0, PT_REPLYSTAGE);
+    PTB(0, PT_FINISH);
     fastpathStagedFinish();
+    PTE(0, PT_FINISH);
     sl_main_ns[SL_T_REPLY] += t1 - t0;
     sl_main_ns[SL_T_FINISH] += stagedNowNs() - t1;
 }
@@ -755,17 +782,22 @@ static void replyPhase(aeEventLoop *el) {
 /* Crons: timers, main only. beforeSleep runs at the head of the next collect, as in ae. */
 static void crons(aeEventLoop *el) {
     uint64_t t0 = stagedNowNs();
+    PTB(0, PT_CRONS);
     aeProcessTimeEvents(el);
+    PTE(0, PT_CRONS);
     sl_main_ns[SL_T_CRONS] += stagedNowNs() - t0;
 }
 
 static void stagedLoopIteration(aeEventLoop *el) {
     monotime t;
     sl_iterations++;
+    PT(0, PT_ITER, PT_BEGIN, 0, sl_iterations, 0, 0, 0, 0);
     collectFDs(el);
     uint64_t t0 = stagedNowNs();
     t = getMonotonicUs();
+    PTB(0, PT_READSTAGE);
     readPhase();
+    PTE(0, PT_READSTAGE);
     cronStatsRecord(CRON_JOB_SL_READ, getMonotonicUs() - t);
     sl_main_ns[SL_T_READ] += stagedNowNs() - t0;
     t = getMonotonicUs();
@@ -777,9 +809,11 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     if (aofHoldsReplies()) {
         uint64_t t1 = stagedNowNs();
+        PTB(0, PT_AOF);
         flushAppendOnlyFile(0);
         fastpathRetryAofReadmits();
         if (listLength(server.clients_pending_write)) handleClientsWithPendingWrites();
+        PTE(0, PT_AOF);
         sl_main_ns[SL_T_AOF] += stagedNowNs() - t1;
     }
     cronStatsRecord(CRON_JOB_SL_AOF_ALWAYS, getMonotonicUs() - t);
@@ -791,7 +825,10 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     crons(el);
     cronStatsRecord(CRON_JOB_SL_CRONS, getMonotonicUs() - t);
+    PTB(0, PT_MAINT);
     maintRun();
+    PTE(0, PT_MAINT);
+    PT(0, PT_ITER, PT_END, 0, sl_iterations, 0, 0, 0, 0);
 }
 
 void stagedMain(aeEventLoop *el) {
@@ -877,8 +914,15 @@ void stagedRunLanePhase(int phase, int with_workers) {
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
-    if (sl_main_lane) stagedRunLane(phase, 0);
+    PT(0, PT_OPEN, PT_POINT, phase, sl_opens, 0, 0, 0, 0);
+    if (sl_main_lane) {
+        PTLANE(0, phase, PT_BEGIN, sl_opens);
+        stagedRunLane(phase, 0);
+        PTLANE(0, phase, PT_END, sl_opens);
+    }
+    PT(0, PT_WAIT, PT_BEGIN, phase, sl_opens, 0, 0, 0, 0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    PT(0, PT_WAIT, PT_END, phase, sl_opens, 0, 0, 0, 0);
     stagedAccountPhase(phase, sl_workers);
 }
 
@@ -892,8 +936,15 @@ void stagedRunWritePhase(void) {
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
     serverAssert(rc == 0);
     sl_opens++;
-    if (sl_main_lane) fastpathStagedWriteLane(0);
+    PT(0, PT_OPEN, PT_POINT, STAGED_PHASE_WRITE, sl_opens, 0, 0, 0, 0);
+    if (sl_main_lane) {
+        PTLANE(0, STAGED_PHASE_WRITE, PT_BEGIN, sl_opens);
+        fastpathStagedWriteLane(0);
+        PTLANE(0, STAGED_PHASE_WRITE, PT_END, sl_opens);
+    }
+    PT(0, PT_WAIT, PT_BEGIN, STAGED_PHASE_WRITE, sl_opens, 0, 0, 0, 0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    PT(0, PT_WAIT, PT_END, STAGED_PHASE_WRITE, sl_opens, 0, 0, 0, 0);
     stagedAccountPhase(STAGED_PHASE_WRITE, sl_workers);
 }
 

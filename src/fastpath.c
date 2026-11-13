@@ -14,6 +14,7 @@
 #include "fastpath_no_epoll.h"
 #include "poller.h"
 #include "staged_loop.h"
+#include "phase_trace.h"
 #include "module.h"
 #include "bgiteration.h"
 #include "hotkeys.h"
@@ -3325,6 +3326,38 @@ void fastpathStagedReplyPhase(int tid) {
     for (int i = 0; i < t->sb_streamed[d]; i++) fpRecycleBatch(t, t->sb[d][i]); /* fully delivered in STREAM */
     t->sbn[d] = 0;
     t->sb_streamed[d] = 0;
+}
+
+/* Phase trace (only called while it runs): record a lane edge of phase on thread tid with its counts.
+ * READ end: c1 commands batched for main, c2 GETs answered in the read phase, c3 socket reads, c4 socket
+ * writes. REPLY/STREAM begin: c1 replies still to write; end: c3/c4 socket reads/writes. WRITE end: c1
+ * lane entries run. Socket counts are deltas from the lane's begin. */
+static struct {
+    long long reads, writes, spec;
+} __attribute__((aligned(64))) fp_trace_snap[IO_THREADS_MAX_NUM];
+
+void fastpathTraceLane(int tid, int phase, int edge, uint32_t seq) {
+    fpThread *t = &fp_threads[tid];
+    int d = fpDepth();
+    uint32_t c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+    if (edge == PT_BEGIN) {
+        fp_trace_snap[tid].reads = t->reads;
+        fp_trace_snap[tid].writes = t->writes;
+        fp_trace_snap[tid].spec = t->speculated;
+        if (phase == STAGED_PHASE_REPLY || phase == STAGED_PHASE_STREAM)
+            for (int i = t->sb_streamed[d]; i < t->sbn[d]; i++) c1 += (uint32_t)(t->sb[d][i]->count - t->sb[d][i]->delivered);
+    } else {
+        c3 = (uint32_t)(t->reads - fp_trace_snap[tid].reads);
+        c4 = (uint32_t)(t->writes - fp_trace_snap[tid].writes);
+        if (phase == STAGED_PHASE_READ) {
+            for (int i = 0; i < t->sbn[d]; i++) c1 += (uint32_t)t->sb[d][i]->count;
+            c2 = (uint32_t)(t->speculated - fp_trace_snap[tid].spec);
+        } else if (phase == STAGED_PHASE_WRITE) {
+            int lane = fp_lane_main ? tid : tid - 1;
+            if (lane >= 0 && lane < fp_nlanes) c1 = (uint32_t)fp_lanes[lane].nrun;
+        }
+    }
+    ptRecord(tid, PT_LANE, edge, phase, seq, c1, c2, c3, c4);
 }
 
 static void fpStagedHandoff(client *c) {

@@ -39,6 +39,7 @@
 #include "threads_mngr.h"
 #include "io_threads.h"
 #include "staged_loop.h"
+#include "phase_trace.h"
 #include "fastget.h"
 #include "sds.h"
 #include "module.h"
@@ -628,6 +629,8 @@ void debugCommand(client *c) {
             return;
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "phasetrace") && c->argc >= 3) {
+        phaseTraceCommand(c);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
