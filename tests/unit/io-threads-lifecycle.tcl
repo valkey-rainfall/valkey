@@ -611,7 +611,7 @@ proc lc_thread_tid {pid name} {
 }
 
 proc lc_thread_cpus {tid} {
-    return [lindex [split [exec taskset -pc $tid] :] end]
+    return [string trim [lindex [split [exec taskset -pc $tid] :] end]]
 }
 
 proc lc_cpu_list {spec} {
