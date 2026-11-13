@@ -59,6 +59,11 @@ typedef struct cmdEntry {
     uint8_t part;          /* One lane's share of a split entry, not an entry of a batch. */
     uint8_t part_extra;    /* A part after the first: the command is counted once, by the first. */
     struct fpSplit *split; /* Keys on several lanes: the parts the lanes run, assembled at delivery. */
+    /* Pre-answered GET (parallel-reads prototype): the IO thread wrote the reply in the read phase;
+     * main keeps it only if nothing before the entry in T wrote the key (fpPreanswerValid). */
+    uint8_t pre;
+    uint64_t pre_hash;       /* fpOccHash of the db and key */
+    long long pre_expire;    /* the key's expire time when answered, or -1 */
 } cmdEntry;
 
 typedef struct cmdBatch {
@@ -77,6 +82,13 @@ typedef struct cmdBatch {
 } cmdBatch;
 
 int fastpathEligible(client *c);
+/* Parallel-reads prototype: main marks every key written while pre-answered GETs wait in this
+ * iteration's batches (db.c signalModifiedKey), or the whole keyspace (flush, swapdb). */
+extern int fp_occ_track;
+void fastpathOccKeyWritten(int dbid, sds key);
+void fastpathOccAllWritten(void);
+void fastpathOccBegin(void);
+void fastpathOccEnd(void);
 int fastpathMayJoinLater(client *c);
 int fastpathAttach(client *c);
 int fastpathReadmitAuthenticated(client *c);

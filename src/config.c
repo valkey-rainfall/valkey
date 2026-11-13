@@ -3558,6 +3558,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-free-on-bio", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_free_on_bio, 0, NULL, NULL),
     createBoolConfig("main-read-batch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.main_read_batch, 0, NULL, NULL),
     createBoolConfig("io-threads-speculate-reads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculate_reads, 1, NULL, NULL),
+    createBoolConfig("io-threads-preanswer-reads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_preanswer_reads, 1, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-epoll-thread", NULL, MODIFIABLE_CONFIG, server.io_threads_epoll_thread, 0, NULL, applyIOThreadsEpollThread),

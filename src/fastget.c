@@ -601,9 +601,9 @@ static int fastGetSpeculateMget(client *c, int tid, monotime spec_start) {
  * main thread processes any punted command, whose replies append after.
  *
  * Returns the number of commands speculatively completed. */
-int fastGetSpeculateBatch(client *c, int tid) {
-    int speculated = 0;
-
+/* IO thread, read phase: the client and server state let this thread answer a read of client c
+ * (the checks every answered read shares; fastGetSpeculateBatch and fastGetPreanswerGet). */
+static int fastGetClientGate(client *c) {
     if (server.io_threads_num <= 1) return 0;
 
     /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
@@ -650,6 +650,13 @@ int fastGetSpeculateBatch(client *c, int tid) {
 
     /* A replica whose link is down and that may not serve stale data replies MASTERDOWN from main. */
     if (server.primary_host && server.repl_state != REPL_STATE_CONNECTED && server.repl_serve_stale_data == 0) return 0;
+    return 1;
+}
+
+int fastGetSpeculateBatch(client *c, int tid) {
+    int speculated = 0;
+
+    if (!fastGetClientGate(c)) return 0;
 
     fastGetTouchBegin(c);
 
@@ -778,6 +785,56 @@ int fastGetSpeculateBatch(client *c, int tid) {
         fastGetSlowlogRead(c, tid, kind, speculated, usec);
     }
     return speculated;
+}
+
+/* --- Pre-answered GETs (parallel-reads prototype) --- */
+
+/* IO thread, read phase: answer a GET that is not at the head of its socket read (a read that mixes
+ * GETs and other commands) from the keyspace as it is now, writing the reply into out. Main keeps the
+ * entry in its place in the order T and uses this reply only if no command before it in T wrote the
+ * key and the key has not expired since (fastpath.c, fpPreanswerValid); otherwise it runs the GET.
+ * Returns the reply length, or 0 when main must run the GET (the same cases as a fast read: a miss,
+ * an expired key, not a string, a large value or request or reply, a client or server gate). */
+int fastGetPreanswerGet(client *c, struct serverCommand *cmd, robj **argv, int argc, size_t input_bytes,
+                        int slot, int read_flags, char *out, size_t room, long long *expire_at) {
+    if (cmd != fastGetKindCmd(FASTGET_KIND_GET) || argc != 2) return 0;
+    if (!fastGetClientGate(c)) return 0;
+    if (!(atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire) & (1 << FASTGET_KIND_GET))) return 0;
+    if (server.cluster_enabled && (server.cluster_slot_stats_enabled || !fastGetClusterServes(c, cmd, slot, read_flags)))
+        return 0;
+    long long request_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    if (request_threshold >= 0 && (long long)input_bytes >= request_threshold) return 0;
+    sds key = fastGetArgSds(argv[1]);
+    if (!key) return 0;
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, fastGetTableIndex(key, slot));
+    if (!ht) return 0;
+    void *entry = NULL;
+    /* The incremental find never rehashes (hashtableFind may take a rehash step, a write). */
+    hashtableIncrementalFindState fs;
+    hashtableIncrementalFindInit(&fs, ht, key);
+    while (hashtableIncrementalFindStep(&fs));
+    if (!hashtableIncrementalFindGetResult(&fs, &entry)) return 0;
+    robj *o = (robj *)entry;
+    char intbuf[LONG_STR_SIZE];
+    const char *val;
+    size_t vallen;
+    if (!fastGetStringValue(o, intbuf, &val, &vallen)) return 0;
+    long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
+    char hdr[32];
+    hdr[0] = '$';
+    int numlen = ll2string(hdr + 1, sizeof(hdr) - 3, (long long)vallen);
+    hdr[numlen + 1] = '\r';
+    hdr[numlen + 2] = '\n';
+    size_t hdrlen = (size_t)numlen + 3, total = hdrlen + vallen + 2;
+    if (total > room) return 0;
+    memcpy(out, hdr, hdrlen);
+    memcpy(out + hdrlen, val, vallen);
+    memcpy(out + hdrlen + vallen, "\r\n", 2);
+    *expire_at = o->hasexpire ? objectGetExpire(o) : -1;
+    fastGetTouchBegin(c);
+    fastGetTouch(o);
+    return (int)total;
 }
 
 /* --- Phase-1 no-enqueue: IO-thread command consumption --- */

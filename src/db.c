@@ -33,6 +33,7 @@
 #include "hotkeys.h"
 #include "ordered_index.h"
 #include "fastget.h"
+#include "fastpath.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -908,6 +909,7 @@ void signalModifiedKey(client *c, serverDb *db, robj *key) {
         touchWatchedKey(db, key);
     trackingInvalidateKey(c, key, 1);
     bgIteration_keyModified(db->id, objectGetVal(key));
+    if (fp_occ_track) fastpathOccKeyWritten(db->id, objectGetVal(key));
 }
 
 void signalFlushedDb(int dbid, int async) {
@@ -923,6 +925,7 @@ void signalFlushedDb(int dbid, int async) {
         if (server.db[j] == NULL) continue;
         scanDatabaseForDeletedKeys(server.db[j], NULL);
         touchAllWatchedKeysInDb(server.db[j], NULL);
+        fastpathOccAllWritten();
     }
 
     trackingInvalidateKeysOnFlush(async);
@@ -1949,6 +1952,7 @@ int dbSwapDatabases(int id1, int id2) {
 
     /* Swapdb should make transaction fail if there is any
      * client watching keys */
+    fastpathOccAllWritten();
     touchAllWatchedKeysInDb(db1, db2);
     touchAllWatchedKeysInDb(db2, db1);
 
@@ -1997,6 +2001,7 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         /* Swapping databases should make transaction fail if there is any
          * client watching keys. */
         touchAllWatchedKeysInDb(activedb, newdb);
+        fastpathOccAllWritten();
 
         /* Try to unblock any XREADGROUP clients if the key no longer exists. */
         scanDatabaseForDeletedKeys(activedb, newdb);

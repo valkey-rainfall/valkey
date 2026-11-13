@@ -760,8 +760,12 @@ static void readPhase(void) {
     fastpathStagedPrepareLanes();
     stagedQueueDeferredRead();
     int deferred = fastpathStagedRepliesDeferred();
-    if (!deferred && pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) return;
+    if (!deferred && pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) {
+        fastpathOccBegin(); /* no read phase: nothing pre-answered */
+        return;
+    }
     stagedRunPhase(STAGED_PHASE_READ);
+    fastpathOccBegin();
     if (deferred) fastpathStagedDeferredDelivered();
 }
 
@@ -798,6 +802,7 @@ static void writePhase(aeEventLoop *el) {
     } else {
         fastpathStagedExecute();
     }
+    fastpathOccEnd();
     uint64_t t1 = stagedNowNs();
     sl_main_ns[SL_T_EXEC] += t1 - t0;
     sl_main_work_ns += (t1 - t0) - (sl_lane_wall_ns - lane0); /* lane phases count main's share themselves */

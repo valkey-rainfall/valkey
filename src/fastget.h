@@ -90,6 +90,9 @@ void fastGetRefreshMainGate(void);
 /* IO thread: reply to a GET prefix of the parsed commands; returns how many.
  * tid = IO thread index (1..N-1). */
 int fastGetSpeculateBatch(struct client *c, int tid);
+/* IO thread, read phase: pre-answer a GET inside a mixed read; main validates it (fastpath.c). */
+int fastGetPreanswerGet(struct client *c, struct serverCommand *cmd, robj **argv, int argc, size_t input_bytes,
+                        int slot, int read_flags, char *out, size_t room, long long *expire_at);
 
 /* IO thread, after fastGetSpeculateBatch: free the argv of the speculated
  * commands, advance the command queue and count them per thread. */

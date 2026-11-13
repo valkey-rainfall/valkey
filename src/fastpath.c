@@ -50,6 +50,7 @@ typedef struct fpThread {
     cmdBatch *freelist[FP_FREELIST_MAX];
     int nfree;
     long long reads, net_input_bytes, net_output_bytes, writes, batches, speculated;
+    long long preanswered; /* GETs this thread pre-answered inside mixed reads (main may still run some) */
     long long reads_synced, writes_synced; /* main only: reads/writes already folded into server stats */
     /* Staged loop. Batches this thread published in the read phase, per nesting depth: written by the
      * thread in the read phase, executed by main in the write phase, delivered and recycled by the same
@@ -210,6 +211,59 @@ static int fp_nlanes = 0;     /* lanes of this iteration */
 static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
 static int fp_replies_deferred = 0; /* the last iteration's replies go out in this read phase */
 
+/* Parallel-reads prototype: pre-answered GETs and the written-key check.
+ * Main sets fp_preanswer_iter before the read phase; IO threads read it in the phase (ordered by the
+ * barrier). After the read phase main turns fp_occ_track on when any thread pre-answered a GET; from
+ * then until the batches are executed every key write main makes is stamped with the iteration's
+ * generation in fp_occ_stamp (one slot per hash value; a collision only makes main run a GET it
+ * could have kept). A pre-answered GET is kept when its slot does not carry this generation, nothing
+ * flushed or swapped a whole database, and the key has not expired since it was read.
+ * shortcut: 2^18 slots (1 MiB) and one hash per key; enough for tens of thousands of writes per
+ * iteration at a few percent false positives. Size it from the writes per iteration if kept. */
+#define FP_OCC_BITS 18
+static int fp_preanswer_iter = 0;
+int fp_occ_track = 0;
+static uint32_t *fp_occ_stamp = NULL;
+static uint32_t fp_occ_gen = 0;
+static int fp_occ_all = 0;
+static long long fp_stat_pre_kept = 0, fp_stat_pre_run = 0;
+
+static inline uint64_t fpOccHash(int dbid, const char *s, size_t len) {
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ len ^ ((uint64_t)dbid << 48);
+    while (len >= 8) {
+        uint64_t w;
+        memcpy(&w, s, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+        s += 8;
+        len -= 8;
+    }
+    uint64_t w = 0;
+    for (size_t i = 0; i < len; i++) w |= (uint64_t)(unsigned char)s[i] << (8 * i);
+    h ^= w;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return h;
+}
+
+void fastpathOccKeyWritten(int dbid, sds key) {
+    if (!fp_occ_track) return;
+    fp_occ_stamp[fpOccHash(dbid, key, sdslen(key)) & ((1u << FP_OCC_BITS) - 1)] = fp_occ_gen;
+}
+
+void fastpathOccAllWritten(void) {
+    if (fp_occ_track) fp_occ_all = 1;
+}
+
+/* Main, at the entry's place in T: the reply the IO thread wrote is what the GET would reply now. */
+static int fpPreanswerValid(cmdEntry *e) {
+    if (!fp_occ_track || fp_occ_all) return 0;
+    if (fp_occ_stamp[e->pre_hash & ((1u << FP_OCC_BITS) - 1)] == fp_occ_gen) return 0;
+    if (e->pre_expire >= 0 && mstime() >= e->pre_expire) return 0;
+    return 1;
+}
+
 /* Main, between phases, once no reply points into the lane arenas. */
 static void fpResetLaneArenas(void) {
     for (int l = 0; l < FP_MAX_LANES; l++) {
@@ -330,6 +384,31 @@ static int fp_staged_admit = 0; /* main only: new staged clients are admitted */
 static inline int fpDepth(void) {
     return atomic_load_explicit(&fp_depth, memory_order_relaxed);
 }
+
+/* Main, right after the read phase: track writes while pre-answered GETs wait for their turn. */
+void fastpathOccBegin(void) {
+    if (!fp_preanswer_iter) return;
+    fp_preanswer_iter = 0; /* pre-answers happen only inside the read phase */
+    long long n = 0;
+    for (int tid = 0; tid < fp_slots; tid++) n += fp_threads[tid].preanswered;
+    static long long seen = 0;
+    if (n == seen) return; /* nothing pre-answered in this read phase */
+    seen = n;
+    if (!fp_occ_stamp) fp_occ_stamp = zcalloc(sizeof(uint32_t) << FP_OCC_BITS);
+    if (++fp_occ_gen == 0) { /* wrapped: no slot may carry the new generation */
+        memset(fp_occ_stamp, 0, sizeof(uint32_t) << FP_OCC_BITS);
+        fp_occ_gen = 1;
+    }
+    fp_occ_all = 0;
+    fp_occ_track = 1;
+}
+
+/* Main, once the iteration's batches are executed. */
+void fastpathOccEnd(void) {
+    if (fpDepth() != 0) return; /* a nested iteration: the outer batches still wait */
+    fp_occ_track = 0;
+}
+
 
 static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     cmdBatch *b;
@@ -861,6 +940,22 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->frames_wrap = 0;
     e->part = e->part_extra = 0;
     e->split = NULL;
+    e->pre = 0;
+    if (fp_preanswer_iter && fpDepth() == 0 && !(read_flags & READ_FLAGS_ERROR_MASK)) {
+        long long exp = -1;
+        int n = fastGetPreanswerGet(c, cmd, argv, argc, input_bytes, slot, read_flags, b->arena + b->arena_used,
+                                    b->arena_cap - b->arena_used, &exp);
+        if (n > 0) {
+            sds k = objectGetVal(argv[1]);
+            e->pre = 1;
+            e->pre_hash = fpOccHash(c->db->id, k, sdslen(k));
+            e->pre_expire = exp;
+            e->reply_off = (uint32_t)b->arena_used;
+            e->reply_len = (uint32_t)n;
+            b->arena_used += (size_t)n;
+            fp_threads[fp_cur_tid].preanswered++;
+        }
+    }
     if (fp_lanes_iter && fpDepth() == 0) fpClassify(&fp_threads[fp_cur_tid], fp_cur_tid, b, e, c);
     c->fp_inflight++;
 }
@@ -1479,8 +1574,21 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         /* An ALLOW checked under the retired rule set does not describe its live successor. */
         e->read_flags &= ~READ_FLAGS_ACL_ALLOWED;
         principal = ACLResolveUser(principal);
+        e->pre = 0; /* the IO thread answered it under the retired rules */
     }
     serverAssert(principal); /* a deleted user's clients are detaching */
+    if (e->pre) {
+        e->pre = 0;
+        if (fpPreanswerValid(e)) {
+            /* The GET's place in T sees the key as the read phase did: keep the IO thread's reply. */
+            fp_stat_pre_kept++;
+            e->cmd->calls++;
+            ectx->stat_numcommands++;
+            ectx->stat_keyspace_hits++;
+            goto release_argv;
+        }
+        fp_stat_pre_run++; /* written or expired since: run it, its reply replaces the IO thread's */
+    }
     ec->user = principal;
     ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;
 
@@ -1747,6 +1855,7 @@ void fastpathHandoffDone(client *c, int closing) {
 void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
               batches = fp_retired[4], speculated = fp_retired[5];
+    long long preanswered = 0;
     for (int i = 0; i < fp_slots; i++) {
         if (!fp_threads[i].ready) continue;
         reads += fp_threads[i].reads;
@@ -1755,6 +1864,7 @@ void fastpathInfo(sds *info) {
         writes += fp_threads[i].writes;
         batches += fp_threads[i].batches;
         speculated += fp_threads[i].speculated;
+        preanswered += fp_threads[i].preanswered;
     }
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
@@ -1770,10 +1880,13 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_lane_entries:%lld\r\n"
                          "fastpath_write_barriers:%lld\r\n"
                          "fastpath_write_serial_segments:%lld\r\n"
-                         "fastpath_write_lane_prefetches:%lld\r\n",
+                         "fastpath_write_lane_prefetches:%lld\r\n"
+                         "fastpath_preanswered:%lld\r\n"
+                         "fastpath_preanswer_kept:%lld\r\n"
+                         "fastpath_preanswer_run:%lld\r\n",
                          fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments, fp_stat_lane_prefetches);
+                         fp_stat_serial_segments, fp_stat_lane_prefetches, preanswered, fp_stat_pre_kept, fp_stat_pre_run);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -2011,6 +2124,10 @@ void fastpathStagedPrepareLanes(void) {
     fp_lane_main = stagedMainTakesLane();
     fp_nlanes = allowed ? stagedLaneCount() : 0;
     fp_lanes_iter = allowed;
+    /* Pre-answered GETs need every key write on main (lanes and parallel replica apply write
+     * elsewhere). */
+    fp_preanswer_iter = server.io_threads_preanswer_reads && !allowed && fpDepth() == 0 &&
+                        !(server.primary_host && server.replica_parallel_apply);
     fp_check_blocked = fpBlockedOnKeys();
     fp_check_watched = server.watching_clients > 0;
     /* The previous iteration's replies were delivered in its reply phase, or are delivered from the

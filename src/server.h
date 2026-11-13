@@ -2133,6 +2133,7 @@ struct valkeyServer {
     int io_threads_free_on_bio;               /* Main's offloaded frees go to bio instead of the IO threads */
     int main_read_batch;                      /* io-threads 1: main runs ready clients' commands through one prefetch batch */
     int io_threads_speculate_reads;           /* The reading thread also answers SISMEMBER and HGET, as it does GET */
+    int io_threads_preanswer_reads;           /* Prototype: GETs inside mixed reads are answered in the read phase and validated by main */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
