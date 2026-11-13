@@ -869,9 +869,14 @@ void replApplyFlush(client *c) {
         client *old = ectx->current_client;
         ectx->current_client = ra_load_client;
         ra_load_phase = 1;
+        monotime phase_start = getMonotonicUs();
         dbLanePhaseBegin();
         stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
         dbLanePhaseEnd();
+        /* Prototype counters of the port (rdb_inline_cmds*): a held SET counts as applied with the
+         * phase's wall time shared by the batch. */
+        server.stat_rdb_inline_cmds_usec += getMonotonicUs() - phase_start;
+        server.stat_rdb_inline_cmds += ra_pending;
         ra_load_phase = 0;
         ectx->current_client = old;
         for (int i = 0; i < ra_nlanes; i++) {
