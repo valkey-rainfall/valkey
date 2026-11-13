@@ -123,6 +123,12 @@ configEnum staged_reply_overlap_enum[] = {
     {"exec", STAGED_REPLY_OVERLAP_EXEC},
     {NULL, 0}};
 
+configEnum io_threads_epoll_thread_enum[] = {
+    {"no", IO_THREADS_EPOLL_THREAD_NO},
+    {"yes", IO_THREADS_EPOLL_THREAD_YES},
+    {"auto", IO_THREADS_EPOLL_THREAD_AUTO},
+    {NULL, 0}};
+
 configEnum repl_stream_sender_enum[] = {
     {"no", REPL_STREAM_SENDER_NO},
     {"iteration", REPL_STREAM_SENDER_ITERATION},
@@ -3561,7 +3567,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-speculate-reads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculate_reads, 1, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
-    createBoolConfig("io-threads-epoll-thread", NULL, MODIFIABLE_CONFIG, server.io_threads_epoll_thread, 0, NULL, applyIOThreadsEpollThread),
+    createEnumConfig("io-threads-epoll-thread", NULL, MODIFIABLE_CONFIG, io_threads_epoll_thread_enum, server.io_threads_epoll_thread, IO_THREADS_EPOLL_THREAD_AUTO, NULL, applyIOThreadsEpollThread),
     createEnumConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, repl_stream_sender_enum, server.repl_stream_sender, REPL_STREAM_SENDER_NO, NULL, NULL),
     createIntConfig("repl-stream-sender-wake-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.repl_stream_sender_wake_bytes, 16384, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
@@ -3641,13 +3647,13 @@ standardConfig static_configs[] = {
     createEnumConfig("avoid-copy-reply-mode", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, copy_avoid_mode_enum, server.copy_avoid_mode, COPY_AVOID_MODE_STATIC, NULL, NULL),
     createEnumConfig("staged-main-lane", NULL, MODIFIABLE_CONFIG, staged_main_lane_enum, server.staged_main_lane, STAGED_MAIN_LANE_AUTO, NULL, NULL),
     createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
-    createBoolConfig("staged-reply-merge", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.staged_reply_merge, 0, NULL, NULL),
+    createBoolConfig("staged-reply-merge", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.staged_reply_merge, 1, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-threads-epoll-threads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 4, server.io_threads_epoll_threads, 1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThread),
+    createIntConfig("io-threads-epoll-threads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 4, server.io_threads_epoll_threads, 0, INTEGER_CONFIG, NULL, applyIOThreadsEpollThread),
     createIntConfig("io-threads-epoll-thread-cpu", NULL, MODIFIABLE_CONFIG, -1, 1023, server.io_threads_epoll_thread_cpu, -1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThreadCpu),
     createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 64, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-parallel-writes-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_parallel_writes_min, 32, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* replica max data age factor. */

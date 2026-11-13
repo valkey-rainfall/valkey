@@ -69,12 +69,30 @@ static void stagedAccountPhase(int phase, int nworkers) {
  * the epoll thread. */
 #define STAGED_EPOLL_THREAD_MIN_IO_THREADS 3
 
+/* io-threads-epoll-thread auto (the default) runs the epoll thread from this io-threads up. Below it
+ * an IO thread is worth more than the collector: pipelined traffic loses the thread it takes, and
+ * main's own epoll wait limits request/response traffic only from about io-threads 7. */
+#define STAGED_EPOLL_THREAD_AUTO_MIN_IO_THREADS 8
+
+/* io-threads-epoll-threads 0 (auto, the default) runs a second collector from this io-threads up. One
+ * epoll set saturates on socket wakeups at pipeline 1 over many connections (two collectors: GET P1
+ * +58% at io-threads 63), and from here the IO thread it takes is under 5% of them. */
+#define STAGED_EPOLL_THREADS_AUTO_TWO_MIN_IO_THREADS 24
+
 static int stagedEpollThreadRunning(void);
 static int stagedMainSharesCpu(void);
 
+/* The number of epoll collector threads the configuration asks for at this io-threads. */
+static int stagedEpollThreadsFor(int io_threads) {
+    if (server.io_threads_epoll_threads > 0) return server.io_threads_epoll_threads;
+    return io_threads >= STAGED_EPOLL_THREADS_AUTO_TWO_MIN_IO_THREADS ? 2 : 1;
+}
+
+/* Only an explicit yes is refused at too few io-threads; auto just leaves the epoll thread off there. */
 int stagedEpollThreadConfigValid(int on, int io_threads, const char **err) {
-    if (on && io_threads < STAGED_EPOLL_THREAD_MIN_IO_THREADS + server.io_threads_epoll_threads - 1) {
-        if (server.io_threads_epoll_threads > 1) {
+    int n = stagedEpollThreadsFor(io_threads);
+    if (on == IO_THREADS_EPOLL_THREAD_YES && io_threads < STAGED_EPOLL_THREAD_MIN_IO_THREADS + n - 1) {
+        if (n > 1) {
             *err = "io-threads-epoll-threads N needs io-threads N+2 or more (the main thread, one I/O thread and the "
                    "epoll threads)";
             return 0;
@@ -101,9 +119,12 @@ static int stagedEpollThreadFailed(void) {
 
 int stagedEpollThreadWanted(void) {
 #ifdef HAVE_FASTPATH_EPOLL
-    if (!server.io_threads_epoll_thread || stagedEpollThreadFailed()) return 0;
+    if (server.io_threads_epoll_thread == IO_THREADS_EPOLL_THREAD_NO || stagedEpollThreadFailed()) return 0;
+    if (server.io_threads_epoll_thread == IO_THREADS_EPOLL_THREAD_AUTO &&
+        server.io_threads_num < STAGED_EPOLL_THREAD_AUTO_MIN_IO_THREADS)
+        return 0;
     if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.sentinel_mode) return 0;
-    int n = server.io_threads_epoll_threads;
+    int n = stagedEpollThreadsFor(server.io_threads_num);
     return server.io_threads_num >= STAGED_EPOLL_THREAD_MIN_IO_THREADS + n - 1 ? n : 0;
 #else
     return 0;

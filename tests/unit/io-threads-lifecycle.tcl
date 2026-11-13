@@ -539,9 +539,25 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
     r select 0
 
     if {[lsearch -exact $::global_overrides io-threads-epoll-thread] < 0} {
-        test {Thread budget: the epoll thread is off by default} {
-            assert_equal {io-threads-epoll-thread no} [r config get io-threads-epoll-thread]
+        test {Thread budget: the epoll thread is auto by default, off below io-threads 8} {
+            assert_equal {io-threads-epoll-thread auto} [r config get io-threads-epoll-thread]
             assert_equal {io-threads-epoll-thread-cpu -1} [r config get io-threads-epoll-thread-cpu]
+            lc_wait_budget 3 0
+        }
+
+        test {Thread budget: auto runs the epoll thread from io-threads 8 and an explicit no stops it} {
+            assert_equal OK [r config set io-threads 7]
+            lc_wait_budget 6 0
+            assert_equal OK [r config set io-threads 8]
+            lc_wait_budget 6 1
+            assert_equal OK [r config set io-threads-epoll-thread no]
+            lc_wait_budget 7 0
+            assert_equal OK [r config set io-threads-epoll-thread auto]
+            lc_wait_budget 6 1
+            # Auto never refuses a smaller io-threads: the epoll thread just stops.
+            assert_equal OK [r config set io-threads 2]
+            lc_wait_budget 1 0
+            assert_equal OK [r config set io-threads 4 io-threads-epoll-thread no]
             lc_wait_budget 3 0
         }
     }

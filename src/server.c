@@ -3267,18 +3267,24 @@ bool dbsHaveNoKeys(void) {
 }
 
 /* Resolve the configured keyspace-shard-bits into the effective value every caller reads.
- * -1 means auto: 8 bits for a standalone server started with io-threads 2 or more, the shards its
- * write lanes, parallel replica apply and MAINT lanes split the keyspace by. A server started with
- * one io-thread has no lanes, and the shards would only cost it a second key hash and per-shard
- * bookkeeping on every key access, so auto gives it 0, one hashtable per database as without the
- * fast path; if io-threads is raised at runtime its writes run on main (lanes report unsplit).
- * Cluster mode shards by slot regardless, so the standalone value is 0 there. An explicit value,
- * including 0, is used as given. Resolved once at startup before any database is created. */
+ * -1 means auto: for a standalone server started with io-threads 2 or more, the shards its write
+ * lanes, parallel replica apply and MAINT lanes split the keyspace by: 8 bits (256 shards) up to
+ * io-threads 15, and 10 bits (1024 shards) from io-threads 16, where 256 shards over that many lanes
+ * leave the slowest lane well above the mean (61 lanes: +23% work; SET P64 at io-threads 62 is +7%
+ * with 10 bits). A server started with one io-thread has no lanes, and the shards would only cost it
+ * a second key hash and per-shard bookkeeping on every key access, so auto gives it 0, one hashtable
+ * per database as without the fast path; if io-threads is raised at runtime its writes run on main
+ * (lanes report unsplit). Cluster mode shards by slot regardless, so the standalone value is 0 there.
+ * An explicit value, including 0, is used as given. Resolved once at startup before any database is
+ * created. */
+#define KEYSPACE_SHARD_BITS_AUTO_WIDE_MIN_IO_THREADS 16
 void resolveKeyspaceShardBits(void) {
     if (server.keyspace_shard_bits_config >= 0) {
         server.keyspace_shard_bits = server.keyspace_shard_bits_config;
     } else if (server.cluster_enabled || server.io_threads_num < 2) {
         server.keyspace_shard_bits = 0;
+    } else if (server.io_threads_num >= KEYSPACE_SHARD_BITS_AUTO_WIDE_MIN_IO_THREADS) {
+        server.keyspace_shard_bits = 10;
     } else {
         server.keyspace_shard_bits = 8;
     }

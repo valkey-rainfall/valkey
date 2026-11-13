@@ -1,6 +1,6 @@
 # keyspace-shard-bits resolves to an effective value at startup: auto (the default) gives 8 on a
-# standalone server started with io-threads 2 or more and 0 on one started with a single io-thread,
-# cluster mode gives 0, and an explicit value is used as given.
+# standalone server started with io-threads 2 to 15, 10 from io-threads 16, and 0 on one started with
+# a single io-thread, cluster mode gives 0, and an explicit value is used as given.
 # CONFIG GET reports the configured value and CONFIG REWRITE keeps auto as auto; INFO reports the
 # effective value.
 
@@ -85,6 +85,30 @@ start_server {tags {"keyspace-shard-bits" "external:skip"} overrides {io-threads
         r config rewrite
         restart_server 0 true false
         assert_equal {-1} [configured_shard_bits]
+        assert_equal {8} [effective_shard_bits]
+    }
+}
+
+start_server {tags {"keyspace-shard-bits" "external:skip"} overrides {io-threads 15}} {
+    test {auto with io-threads 15 resolves to 8} {
+        assert_equal {-1} [configured_shard_bits]
+        assert_equal {8} [effective_shard_bits]
+    }
+}
+
+start_server {tags {"keyspace-shard-bits" "external:skip"} overrides {io-threads 16}} {
+    test {auto with io-threads 16 or more resolves to 10} {
+        assert_equal {-1} [configured_shard_bits]
+        assert_equal {10} [effective_shard_bits]
+        r set k v
+        assert_equal {v} [r get k]
+        assert_equal 1 [r dbsize]
+    }
+}
+
+start_server {tags {"keyspace-shard-bits" "external:skip"} overrides {io-threads 16 keyspace-shard-bits 8}} {
+    test {explicit 8 is honored with io-threads 16} {
+        assert_equal {8} [configured_shard_bits]
         assert_equal {8} [effective_shard_bits]
     }
 }
