@@ -2160,6 +2160,7 @@ struct valkeyServer {
     int staged_main_lane;                     /* Staged loop: main works a share of each phase, see STAGED_MAIN_LANE_* */
     int staged_reply_overlap;                 /* Staged loop: overlap reply delivery with exec, see STAGED_REPLY_OVERLAP_* */
     int staged_reply_merge;                   /* Staged loop: deliver an iteration's replies in the next read phase */
+    int staged_eviction_yield;                /* Staged loop: serve on the stock loop under sustained eviction when little runs in parallel */
     int repl_stream_sender;                   /* Hidden: stream the backlog to ONLINE plaintext replicas from a
                                                * dedicated sender thread, off the staged loop. One of
                                                * REPL_STREAM_SENDER_* (no/iteration/append). Default no. */

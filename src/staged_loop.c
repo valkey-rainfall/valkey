@@ -13,7 +13,63 @@
 #include "repl_apply.h"
 #include "cronstats.h"
 #include "maint.h"
+#include "fastget.h"
 #include <time.h>
+
+/* Eviction yield. Under sustained eviction the lanes cannot run (no segment fits under the limit),
+ * so the staged loop runs almost every command serially on main, and main also spends its share of
+ * every read and reply phase; the stock loop serves the same serial load faster, because its IO
+ * threads read and reply while main executes. Every 100 ms (serverCron) main looks at the last
+ * second: when keys were evicted and fewer than a quarter of the commands ran in parallel (fast
+ * reads, lane entries), it serves on the stock loop; it comes back once a second passes without an
+ * eviction, or after STAGED_YIELD_RETRY_MS to look again. Both loops run every command through the
+ * same stock code paths; the choice changes only which threads read, parse and reply. */
+#define STAGED_YIELD_WINDOW_MS 1000
+#define STAGED_YIELD_RETRY_MS 30000
+#define STAGED_YIELD_MIN_CMDS 10000 /* per window: an idle server never switches */
+static int sl_eviction_yield = 0;
+static long long sl_eviction_yields = 0; /* INFO: times the staged loop yielded to the stock loop */
+
+void stagedEvictionCron(void) {
+    static mstime_t win_start = 0, yield_since = 0;
+    static long long ev0 = 0, cmd0 = 0, par0 = 0;
+    mstime_t now = server.mstime;
+    long long ev = server.stat_evictedkeys, cmd = ectx->stat_numcommands;
+    long long par = fastGetCommandsTotal() + fastpathLaneEntriesTotal();
+    if (!server.staged_eviction_yield || !server.maxmemory) {
+        if (sl_eviction_yield) {
+            sl_eviction_yield = 0;
+            serverLog(LL_NOTICE, "Staged event loop: maxmemory eviction yield off, back to the staged loop");
+        }
+        win_start = 0;
+        return;
+    }
+    if (win_start == 0 || ev < ev0 || cmd < cmd0 || par < par0) { /* first sample, or a stats reset */
+        win_start = now;
+        ev0 = ev, cmd0 = cmd, par0 = par;
+        return;
+    }
+    if (now - win_start < STAGED_YIELD_WINDOW_MS) return;
+    long long evicted = ev - ev0, cmds = cmd - cmd0, parallel = par - par0;
+    win_start = now;
+    ev0 = ev, cmd0 = cmd, par0 = par;
+    if (!sl_eviction_yield) {
+        if (stagedLoopActive() && evicted > 0 && cmds >= STAGED_YIELD_MIN_CMDS &&
+            parallel * 4 < cmds) {
+            sl_eviction_yield = 1;
+            sl_eviction_yields++;
+            yield_since = now;
+            serverLog(LL_NOTICE,
+                      "Staged event loop: %lld of %lld commands ran serially while %lld keys were evicted in "
+                      "the last second; serving on the stock loop under eviction",
+                      cmds - parallel, cmds, evicted);
+        }
+    } else if (evicted == 0 || now - yield_since >= STAGED_YIELD_RETRY_MS) {
+        sl_eviction_yield = 0;
+        serverLog(LL_NOTICE, "Staged event loop: %s, back to the staged loop",
+                  evicted == 0 ? "no evictions in the last second" : "looking again under eviction");
+    }
+}
 
 /* Phase timing. Main's wall time per part of a staged iteration; per phase id, every worker's busy
  * time and, summed over phases, the slowest worker's busy time (the phase's critical path; the rest
@@ -142,6 +198,8 @@ void stagedInfo(char **info) {
                      fastpathParallelVetoName(fastpathLastParallelVeto(FP_PAR_MAINT)));
     s = sdscatprintf(s, "staged_stream_arena_guard_bytes:%lld\r\n",
                      (long long)server.stat_staged_stream_arena_guard_bytes);
+    s = sdscatprintf(s, "staged_eviction_yield:%d\r\nstaged_eviction_yields:%lld\r\n", sl_eviction_yield,
+                     sl_eviction_yields);
     for (int i = 0; i < SL_T_COUNT; i++)
         s = sdscatprintf(s, "staged_main_%s_us:%llu\r\n", sl_t_names[i], (unsigned long long)(sl_main_ns[i] / 1000));
     for (int p = 1; p < STAGED_PHASE_KINDS; p++) {
@@ -336,6 +394,7 @@ static int stagedInit(void) {
  * a thread the configuration did not ask for. */
 static int stagedWanted(void) {
     if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.sentinel_mode) return 0;
+    if (sl_eviction_yield) return 0;
     if (server.io_threads_num < 2 || ioThreadsReadyNum() < 2) {
         if (server.io_threads_num < 2 && !sl_warned) {
             serverLog(LL_NOTICE, "io-threads-fast-path needs io-threads >= 2; the staged event loop stays off");

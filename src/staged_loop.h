@@ -50,6 +50,8 @@ struct client;
 void stagedMain(struct aeEventLoop *el);
 /* Main thread: staged mode is on for the current iteration. */
 int stagedLoopActive(void);
+/* Main, every 100 ms from serverCron: decide whether to serve on the stock loop under eviction. */
+void stagedEvictionCron(void);
 /* Main thread: IO threads enrolled in the staged loop. */
 int stagedWorkerCount(void);
 /* io-threads-epoll-thread on needs io-threads 3 or more. 1 when the pair is valid, else 0 with *err set. */

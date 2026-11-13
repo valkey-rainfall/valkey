@@ -3649,6 +3649,7 @@ standardConfig static_configs[] = {
     createEnumConfig("staged-main-lane", NULL, MODIFIABLE_CONFIG, staged_main_lane_enum, server.staged_main_lane, STAGED_MAIN_LANE_AUTO, NULL, NULL),
     createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
     createBoolConfig("staged-reply-merge", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.staged_reply_merge, 1, NULL, NULL),
+    createBoolConfig("staged-eviction-yield", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.staged_eviction_yield, 1, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-epoll-threads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 4, server.io_threads_epoll_threads, 0, INTEGER_CONFIG, NULL, applyIOThreadsEpollThread),

@@ -1694,6 +1694,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
+        stagedEvictionCron();
         trackInstantaneousMetric(STATS_METRIC_COMMAND, ectx->stat_numcommands, current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);

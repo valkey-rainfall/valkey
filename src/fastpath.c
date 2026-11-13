@@ -745,6 +745,10 @@ int fastpathMaxmemoryPhase(void) {
     return fp_mm_phase;
 }
 
+long long fastpathLaneEntriesTotal(void) {
+    return fp_stat_lane_entries;
+}
+
 int fastpathMaxmemoryTakeBudget(size_t bytes) {
     long long b = (long long)bytes;
     if (atomic_fetch_sub_explicit(&fp_mm_budget, b, memory_order_relaxed) >= b) return 1;

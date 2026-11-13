@@ -322,6 +322,44 @@ start_server {tags {"staged-loop maxmemory external:skip tls:skip"} overrides {i
         r config set maxmemory 0
         r flushall
     }
+
+    test {Eviction yield: sustained eviction with serial writes moves to the stock loop and back} {
+        r flushall
+        r config set maxmemory-policy allkeys-lru
+        set limit [expr {[s used_memory] + 4 * 1024 * 1024}]
+        r config set maxmemory $limit
+        set yields [mml_fp r staged_eviction_yields]
+        set val [string repeat x 1000]
+        set start [clock milliseconds]
+        set round 0
+        # Raw pipelines that do not wait for the fast path: the loop changes under them.
+        while {[clock milliseconds] - $start < 6000 && [mml_fp r staged_eviction_yield] == 0} {
+            set fds {}
+            for {set s 0} {$s < 4} {incr s} { lappend fds [mml_socket $host $port] }
+            set bufs {}
+            set counts {}
+            foreach fd $fds {
+                set buf ""
+                for {set i 0} {$i < 200} {incr i} { append buf [mml_resp set mml:y:$round:$i $val] }
+                lappend bufs $buf
+                lappend counts 200
+                incr round
+            }
+            foreach rs [mml_pipelines $fds $bufs $counts] { foreach reply $rs { assert_equal {+OK} $reply } }
+            mml_close_all
+        }
+        assert_equal 1 [mml_fp r staged_eviction_yield]
+        assert_equal [expr {$yields + 1}] [mml_fp r staged_eviction_yields]
+        # The stock loop keeps evicting under the limit.
+        for {set i 0} {$i < 2000} {incr i} { r set mml:z:$i $val }
+        assert {[s used_memory] < $limit + 1024 * 1024}
+        # No more evictions: back to the staged loop, and fast-path clients are admitted again.
+        r config set maxmemory 0
+        wait_for_condition 50 100 {[mml_fp r staged_eviction_yield] == 0} else { fail "the staged loop did not come back" }
+        set fds [mml_open_fast r $host $port 1]
+        mml_close_all
+        r flushall
+    }
 }
 
 start_server {tags {"staged-loop maxmemory repl external:skip tls:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 save ""}} {

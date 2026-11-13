@@ -177,6 +177,8 @@ void fastpathStagedWriteLane(int tid);
  * phase's budget (hashtableResizeAllowed). Take reports whether `bytes` fit the rest of it. */
 int fastpathMaxmemoryPhase(void);
 int fastpathMaxmemoryTakeBudget(size_t bytes);
+/* Main: write-lane entries run since start (INFO fastpath_write_lane_entries, before RESETSTAT). */
+long long fastpathLaneEntriesTotal(void);
 
 /* Replica: the primary's stream on the write lanes (repl_apply.c). */
 /* Main: nothing outside a lane's own hashtables would observe or order the stream's writes, held or

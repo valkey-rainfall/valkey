@@ -99,6 +99,8 @@ void fastGetConsumeSpeculated(struct client *c, int count, int tid);
 /* Aggregate per-IO-thread command counters into ectx->stat_numcommands.
  * Called once per event-loop iteration from beforeSleep. O(num_io_threads). */
 void fastGetAggregateStats(void);
+/* Main: GETs answered on IO threads since start, summed over threads (reads every thread's line). */
+long long fastGetCommandsTotal(void);
 
 /* Maximum embedded value size for speculative copy. Larger values punt.
  * The value-size sweep showed a smooth gradient with no cliff up to 1KB. */

@@ -887,6 +887,13 @@ void fastGetConsumeSpeculated(client *c, int count, int tid) {
  * stat_keyspace_hits and GET's commandstats, and add their slow commandlog entries. Runs in beforeSleep,
  * and also before CONFIG RESETSTAT zeroes the stats and before INFO renders commandstats, so a reset
  * clears pending counts and commandstats include them. */
+long long fastGetCommandsTotal(void) {
+    long long n = 0;
+    int threads = server.io_threads_num < FASTGET_MAX_IO_THREADS ? server.io_threads_num : FASTGET_MAX_IO_THREADS;
+    for (int i = 0; i < threads; i++) n += fastget_thread_stats[i].commands_processed;
+    return n;
+}
+
 void fastGetAggregateStats(void) {
     /* IO threads only ever increase their counters; main folds the growth since its last snapshot.
      * Zeroing a counter from main would race an IO thread's increment and lose counts, while a stale
