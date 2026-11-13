@@ -430,6 +430,7 @@ static void rpConsume(client *c, int from, int to) {
     if (from == 0) {
         /* The lane freed the arguments of the client's current command. */
         c->argv = NULL;
+        clientDropShardHint(c);
         c->argc = 0;
         c->argv_len = 0;
         c->argv_len_sum = 0;
@@ -641,6 +642,7 @@ int replApplyDefer(client *c) {
 
     /* The lane owns the arguments now. */
     c->argv = NULL;
+    clientDropShardHint(c);
     c->argc = 0;
     c->argv_len = 0;
     c->argv_len_sum = 0;
