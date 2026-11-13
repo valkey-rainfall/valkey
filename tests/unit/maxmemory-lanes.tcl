@@ -263,6 +263,7 @@ start_server {tags {"staged-loop maxmemory repl external:skip tls:skip"} overrid
     $primary config set notify-keyspace-events ""
     start_server {overrides {io-threads 3 keyspace-shard-bits 10 save ""}} {
         set replica [srv 0 client]
+        $replica select 0
         $replica config set notify-keyspace-events ""
         $replica config set maxmemory 1gb
         $replica replicaof $primary_host $primary_port
