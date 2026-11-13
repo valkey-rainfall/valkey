@@ -2189,6 +2189,8 @@ struct valkeyServer {
     /* Fields used only for stats */
     time_t stat_starttime;                         /* Server start time */
     long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
+    long long stat_rdb_inline_cmds;                /* Inline (RDB_OPCODE_UPDATE) commands applied on load */
+    long long stat_rdb_inline_cmds_usec;           /* Time spent applying them */
     long long stat_repl_apply_phases;              /* APPLY phases run */
     long long stat_repl_lane_reads;                /* Primary reads whose plan main ran on the write lanes */
     long long stat_repl_lane_read_usec;            /* IO-thread time of those reads: read, parse and plan */

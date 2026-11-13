@@ -3841,7 +3841,11 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
 
             fakeClient->db = db;
             sds err = NULL;
+            /* Prototype only: count and time inline commands to measure the replica's apply rate. */
+            ustime_t inline_start = ustime();
             int load_cmd_ret = loadCommandFromArgv(fakeClient, argv, argc, LOAD_CMD_SOURCE_INLINE_REPL, &err);
+            server.stat_rdb_inline_cmds_usec += ustime() - inline_start;
+            server.stat_rdb_inline_cmds++;
             /* FUNCTION FLUSH and FUNCTION RESTORE FLUSH replace the current ctx. */
             rdb_loading_ctx->functions_lib_ctx = functionsLibCtxGetCurrent();
             /* On an unknown or invalid command, stop the load. Skipping it
