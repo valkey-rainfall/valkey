@@ -3258,8 +3258,8 @@ bool dbsHaveNoKeys(void) {
 }
 
 /* Resolve the configured keyspace-shard-bits into the effective value every caller reads.
- * -1 means auto: 8 bits for every standalone server, whatever io-threads is at startup, so a server
- * started with one IO thread still has write lanes when io-threads is raised at runtime. Cluster
+ * -1 means auto: 0 in the parallel-reads prototype, which runs every write on main (C used 8 bits
+ * for every standalone server, for the write lanes). Cluster
  * mode shards by slot regardless, so the standalone value is 0 there. An explicit value, including
  * 0, is used as given. Resolved once at startup before any database is created. */
 void resolveKeyspaceShardBits(void) {
@@ -3268,7 +3268,7 @@ void resolveKeyspaceShardBits(void) {
     } else if (server.cluster_enabled) {
         server.keyspace_shard_bits = 0;
     } else {
-        server.keyspace_shard_bits = 8;
+        server.keyspace_shard_bits = 0; /* parallel-reads prototype: no write lanes, one table per db */
     }
 }
 
