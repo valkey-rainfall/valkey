@@ -26,10 +26,10 @@ static inline void phaseBarrierRelax(void) {
 #endif
 }
 
-/* Spin step i (from 1) of a wait that started at start: 0 once budget_us is spent. */
-static inline int phaseBarrierKeepSpinning(unsigned i, monotime start, int budget_us) {
+/* Spin step i (from 1) of a wait that started at start: 0 once the spin budget is spent. */
+static inline int phaseBarrierKeepSpinning(unsigned i, monotime start) {
     phaseBarrierRelax();
-    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 || getMonotonicUs() - start < (monotime)budget_us;
+    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 || getMonotonicUs() - start < PHASE_BARRIER_SPIN_US;
 }
 
 static inline uint32_t stateSeq(uint64_t st) {
@@ -48,7 +48,6 @@ int phaseBarrierInit(phaseBarrier *b, int nparticipants) {
     atomic_init(&b->state, 0);
     atomic_init(&b->pending, 0);
     atomic_init(&b->shutdown, 0);
-    atomic_init(&b->opener_idle, 0);
     b->nparticipants = nparticipants;
     if (pthread_mutex_init(&b->lock, NULL) != 0) return -1;
     if (pthread_cond_init(&b->open_cv, NULL) != 0) goto err_lock;
@@ -104,7 +103,7 @@ void phaseBarrierWaitAllDone(phaseBarrier *b, int spin) {
         monotime start = getMonotonicUs();
         for (unsigned i = 1;; i++) {
             if (atomic_load_explicit(&b->pending, memory_order_acquire) == 0) return;
-            if (!phaseBarrierKeepSpinning(i, start, PHASE_BARRIER_SPIN_US)) break;
+            if (!phaseBarrierKeepSpinning(i, start)) break;
         }
     }
     pthread_mutex_lock(&b->lock);
@@ -139,18 +138,14 @@ static inline int takePhase(uint64_t st, int worker_id, uint64_t *last_seen, int
 
 int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin) {
     int phase;
-    int until_idle = spin == PHASE_BARRIER_SPIN_UNTIL_IDLE;
-    int budget = until_idle ? PHASE_BARRIER_SPIN_US : (spin > 0 ? spin : 0);
-    if (budget) {
+    if (spin) {
         monotime start = getMonotonicUs();
         for (unsigned i = 1;; i++) {
             if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) return PHASE_BARRIER_EXIT;
             uint64_t st = atomic_load_explicit(&b->state, memory_order_acquire);
             if (takePhase(st, worker_id, last_seen, &phase)) return phase;
             if (worker_id >= stateN(st)) break; /* not a participant now: park instead of spinning */
-            /* Main waits for new requests: the next phase is not microseconds away. */
-            if (until_idle && atomic_load_explicit(&b->opener_idle, memory_order_relaxed)) break;
-            if (!phaseBarrierKeepSpinning(i, start, budget)) break;
+            if (!phaseBarrierKeepSpinning(i, start)) break;
         }
     }
     pthread_mutex_lock(&b->lock);
@@ -176,10 +171,6 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
     }
     pthread_cleanup_pop(1);
     return phase;
-}
-
-void phaseBarrierSetOpenerIdle(phaseBarrier *b, int idle) {
-    atomic_store_explicit(&b->opener_idle, idle, memory_order_relaxed);
 }
 
 void phaseBarrierDone(phaseBarrier *b) {

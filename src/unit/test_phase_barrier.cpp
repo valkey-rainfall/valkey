@@ -222,26 +222,3 @@ TEST(PhaseBarrierTest, ShutdownWakesParkedAndWaitingWorkers) {
     EXPECT_EQ(h.ran[0], 1);
     EXPECT_EQ(h.ran[5], 0);
 }
-
-/* Spin-until-idle waiters run every phase whether main stays busy between phases (they spin) or marks
- * itself idle while they wait (they sleep, and a phase opened while the mark is still set wakes them). */
-TEST(PhaseBarrierTest, SpinUntilIdleRunsEveryPhase) {
-    const int nworkers = 4;
-    Harness h(nworkers, nworkers);
-    for (int w = 0; w < nworkers; w++) h.spin[w] = PHASE_BARRIER_SPIN_UNTIL_IDLE;
-    h.start(nworkers);
-    int k = 0;
-    for (int round = 0; round < 3 && !HasFatalFailure(); round++) {
-        for (int j = 0; j < 2000 && !HasFatalFailure(); j++) h.runPhase(++k, nworkers, nworkers);
-        for (int j = 0; j < 20 && !HasFatalFailure(); j++) {
-            phaseBarrierSetOpenerIdle(&h.b, 1);
-            std::this_thread::sleep_for(std::chrono::microseconds(300));
-            if (j % 2) phaseBarrierSetOpenerIdle(&h.b, 0);
-            h.runPhase(++k, nworkers, nworkers);
-        }
-        phaseBarrierSetOpenerIdle(&h.b, 0);
-    }
-    h.stop();
-    EXPECT_EQ(h.errors.load(), 0);
-    for (int w = 0; w < nworkers; w++) EXPECT_EQ(h.ran[w], k);
-}
