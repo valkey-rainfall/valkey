@@ -1683,7 +1683,7 @@ static int fpPrefetchRange(cmdBatch *b, int from, int to) {
             __builtin_prefetch(cc);
             last_control = cc;
         }
-        if (!e->cmd || (e->read_flags & READ_FLAGS_BAD_ARITY)) continue;
+        if (!e->cmd || e->pre || (e->read_flags & READ_FLAGS_BAD_ARITY)) continue; /* a pre-answered GET needs no key */
         room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
     }
     getKeysFreeResult(&result);
@@ -3266,7 +3266,7 @@ static int fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, int
                     __builtin_prefetch(e->control);
                     last_control = e->control;
                 }
-                if (e->cmd && !(e->read_flags & READ_FLAGS_BAD_ARITY))
+                if (e->cmd && !e->pre && !(e->read_flags & READ_FLAGS_BAD_ARITY))
                     room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
                 j++;
                 added++;
