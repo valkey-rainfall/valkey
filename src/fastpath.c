@@ -492,6 +492,10 @@ static int fpSessionEligible(client *c) {
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
     if (c->flag.multi || (c->mstate && listLength(&c->mstate->watched_keys))) return 0; /* mstate outlives EXEC */
     if (c->flag.pubsub || c->flag.tracking || c->flag.fp_excluded) return 0;
+    /* Client eviction sees a fast-path client's memory late and frees it only after a reply phase (an
+     * approximation all fast-path clients share). A named client stays on the main path while
+     * maxmemory-clients is set, as it always did, so turning on client eviction changes nothing for it. */
+    if (c->name && server.maxmemory_clients) return 0;
     if (c->capa) return 0; /* CLIENT CAPA changes replies main builds for this client, e.g. REDIRECT */
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;
