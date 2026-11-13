@@ -53,8 +53,8 @@ proc la_replica_overrides {debug} {
 }
 
 # Start a forkless sync with a slow scan; run body while the scan runs; end the scan.
-proc la_sync_during {primary replica ph pp body} {
-    $primary config set rdb-key-save-delay 30
+proc la_sync_during {primary replica ph pp body {delay 30}} {
+    $primary config set rdb-key-save-delay $delay
     $replica replicaof $ph $pp
     wait_for_condition 100 50 {
         [s -1 rdb_bgsave_in_progress] == 1
@@ -79,7 +79,6 @@ foreach replica_load {on-empty-db disabled} {
         set pp [srv 0 port]
         $primary select 9
         $primary debug populate 100000
-        $primary select 0
         start_server [list overrides [la_replica_overrides 1]] {
             set replica [srv 0 client]
             # The test default turns on keyspace events, which keep every write serial.
@@ -134,8 +133,7 @@ foreach replica_load {on-empty-db disabled} {
 
 # L-4: each mutation breaks one flush point, and the replica must then differ from the primary.
 # A test that passes with a mutation on would not catch that bug.
-foreach {mutation name} {4 "no flush before another inline command" 16 "SETs held past a SWAPDB"
-                         8 "no flush at the end of the load"} {
+foreach {mutation name} {4 "no flush before another inline command" 16 "SETs held past a SWAPDB"} {
     start_server [list tags {"repl external:skip"} overrides [la_primary_overrides]] {
         set primary [srv 0 client]
         set ph [srv 0 host]
@@ -144,26 +142,47 @@ foreach {mutation name} {4 "no flush before another inline command" 16 "SETs hel
         for {set i 0} {$i < 300} {incr i} { $primary set db8:$i $i }
         $primary select 9
         $primary debug populate 100000
-        $primary select 0
-        start_server [list overrides [la_replica_overrides [expr {$mutation}]]] {
+        start_server [list overrides [la_replica_overrides $mutation]] {
             set replica [srv 0 client]
             $replica config set notify-keyspace-events ""
             $replica config set repl-diskless-load on-empty-db
             test "Forkless load apply: mutation '$name' makes the replica differ" {
-                if {$mutation == 8} {
-                    # Writes stop before the scan ends, so nothing after the load flushes the held SETs.
-                    la_sync_during $primary $replica $ph $pp {
-                        set rd [valkey_deferring_client -1]
-                        $rd select 9
-                        for {set i 0} {$i < 2000} {incr i} { $rd set last:$i v$i }
-                        for {set i 0} {$i < 2001} {incr i} { $rd read }
-                        $rd close
-                    }
-                } else {
-                    la_sync_during $primary $replica $ph $pp { la_mixed_writes $primary 600 }
-                }
+                la_sync_during $primary $replica $ph $pp { la_mixed_writes $primary 600 }
                 wait_for_ofs_sync $primary $replica
                 assert_not_equal [$primary debug digest] [$replica debug digest]
+            }
+        }
+    }
+}
+
+# The end of the load: SETs held at the end are applied by the load itself, not left for the
+# stream's next command. The RDB is below loading-process-events-interval-bytes (2 MB), so no
+# progress callback flushes, and no write follows the cut, so the stream applies nothing in
+# parallel. Mutation 8 (no flush at the end) must fail this check.
+foreach {debug name} {1 "the load applies the SETs it holds at its end" 8 "mutation 'no flush at the end of the load' is caught"} {
+    start_server [list tags {"repl external:skip"} overrides [la_primary_overrides]] {
+        set primary [srv 0 client]
+        set ph [srv 0 host]
+        set pp [srv 0 port]
+        $primary select 9
+        $primary debug populate 20000
+        start_server [list overrides [la_replica_overrides $debug]] {
+            set replica [srv 0 client]
+            $replica config set notify-keyspace-events ""
+            $replica config set repl-diskless-load on-empty-db
+            test "Forkless load apply: $name" {
+                la_sync_during $primary $replica $ph $pp {
+                    set rd [valkey_deferring_client -1]
+                    $rd select 9
+                    for {set i 0} {$i < 2000} {incr i} { $rd set last:$i v$i }
+                    for {set i 0} {$i < 2001} {incr i} { $rd read }
+                    $rd close
+                } 150
+                wait_for_ofs_sync $primary $replica
+                set ok [expr {[$primary debug digest] eq [$replica debug digest] &&
+                              [la_stat $replica repl_parallel_applied] == 0 &&
+                              [la_stat $replica loading_inline_parallel_applied] > 0}]
+                assert_equal [expr {$debug == 8 ? 0 : 1}] $ok
             }
         }
     }
