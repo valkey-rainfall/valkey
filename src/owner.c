@@ -517,6 +517,12 @@ static void ownerSendToOwner(client *c) {
 }
 
 void ownerAdoptAccepted(client *c) {
+    /* Main is inside a long command (busy script, loading): owners stay stopped until it ends, so
+     * the new client stays on main, where it can get BUSY or send SCRIPT KILL. It goes home when idle. */
+    if (ProcessingEventsWhileBlocked) {
+        ownerGuestAdd(c);
+        return;
+    }
     ownerSendToOwner(c);
 }
 
@@ -577,8 +583,39 @@ static void ownerReturnGuests(void) {
     }
 }
 
+/* Main inside a long command (processEventsWhileBlocked: busy script, loading, module yield): the
+ * owners stay stopped until it ends, so main takes every owner client with input waiting and serves
+ * it itself (BUSY replies, SCRIPT KILL, SHUTDOWN). Level-triggered epoll reports the input to main
+ * even if the owner thread has the same event in hand; the owner then finds the client gone. */
+static void ownerTakeReadable(void) {
+    struct epoll_event evs[OWNER_EVENTS];
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, 0);
+        for (int k = 0; k < n; k++) {
+            uint64_t d = evs[k].data.u64;
+            if (d == OWNER_WAKE_TOKEN) continue; /* clients waiting to be adopted stay queued */
+            int fd = (int)(uint32_t)d;
+            client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
+            if (!c || (uint32_t)c->id != (uint32_t)(d >> 32) || !c->owner_onloop) continue;
+            ownerReclaim(c);
+            own_takes++;
+            if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+                freeClientAsync(c);
+                continue;
+            }
+            ownerGuestAdd(c);
+            if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+        }
+    }
+}
+
 void ownerAfterSleep(void) {
-    if (!own_n || ProcessingEventsWhileBlocked) return;
+    if (!own_n) return;
+    if (ProcessingEventsWhileBlocked) {
+        if (own_held) ownerTakeReadable();
+        return;
+    }
     ownerStopWorld();
     ownerFoldStats();
     ownerTakeHandoffs();
