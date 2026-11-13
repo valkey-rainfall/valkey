@@ -29,7 +29,7 @@
  *
  * Features that need one global order or view (AOF, replicas and the backlog, the replica role,
  * maxmemory, MONITOR, keyspace notifications, tracking, WATCH, keys with blocked clients, client
- * pause, modules that observe writes, the latency monitor, hotkeys, forkless save, throttling,
+ * pause, loaded modules, the latency monitor, hotkeys, forkless save, throttling,
  * loading) veto the native path while they are active: owners then hand every command to main,
  * which serves it exactly as the stock server does. One process: one replication stream, one
  * AOF, one maxmemory.
@@ -155,25 +155,27 @@ static inline void ownerCpuRelax(void) {
  * Configuration and startup
  * ---------------------------------------------------------------------------------------------- */
 
+/* Startup, before the keyspace is created: owner threads need a standalone, single-threaded main
+ * path and a keyspace split by slot. With another layout configured they switch off (and say so),
+ * so a config that asks for that layout gets exactly it. */
 int ownerValidateConfig(const char **err) {
     if (server.owner_threads == 0) return C_OK;
+    const char *off = NULL;
 #ifndef __linux__
-    *err = "owner-threads needs Linux (epoll, eventfd)";
-    return C_ERR;
+    off = "owner-threads needs Linux (epoll, eventfd)";
 #endif
     if (server.cluster_enabled) {
         /* Cluster nodes already own slots and route by them: nothing for owner threads to add. */
-        serverLog(LL_WARNING, "owner-threads is a standalone mode; cluster-enabled turns it off");
+        off = "owner-threads is a standalone mode; cluster-enabled turns it off";
+    } else if (server.io_threads_num != 1) {
+        off = "owner-threads needs io-threads 1 (the main path is the stock single-threaded loop); io-threads turns it off";
+    } else if (server.keyspace_shard_bits_config >= 0 && server.keyspace_shard_bits_config != CLUSTER_SLOT_MASK_BITS) {
+        off = "owner-threads splits the keyspace by slot; keyspace-shard-bits turns it off";
+    }
+    if (off) {
+        serverLog(LL_WARNING, "%s", off);
         server.owner_threads = 0;
         return C_OK;
-    }
-    if (server.io_threads_num != 1) {
-        *err = "owner-threads needs io-threads 1 (the main path is the stock single-threaded loop)";
-        return C_ERR;
-    }
-    if (server.keyspace_shard_bits_config >= 0 && server.keyspace_shard_bits_config != CLUSTER_SLOT_MASK_BITS) {
-        *err = "owner-threads shards the keyspace by slot; leave keyspace-shard-bits at auto";
-        return C_ERR;
     }
     if (server.owner_port && server.owner_port + server.owner_threads - 1 > 65535) {
         *err = "owner-port + owner-threads - 1 must be a valid port";
@@ -342,7 +344,8 @@ static int ownerComputeVeto(void) {
     if (server.watching_clients || server.blocked_clients_by_type[BLOCKED_LIST] ||
         server.blocked_clients_by_type[BLOCKED_ZSET] || server.blocked_clients_by_type[BLOCKED_STREAM])
         return OWN_VETO_ALL;
-    if (moduleObservesWrites() || server.blocked_clients_by_type[BLOCKED_MODULE] || server.busy_module_yield_flags)
+    if (moduleCountLoaded() || moduleObservesWrites() || server.blocked_clients_by_type[BLOCKED_MODULE] ||
+        server.busy_module_yield_flags)
         return OWN_VETO_ALL;
     if (server.latency_monitor_threshold || hotkeysEnabled() || bgIteration_iterationActive() ||
         throttle_anyThrottlers())

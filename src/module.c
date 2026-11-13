@@ -15223,6 +15223,20 @@ size_t moduleCount(void) {
     return listLength(modules);
 }
 
+/* Modules loaded at runtime or from the config (not the built-in static ones, such as Lua). Such a
+ * module may run its own threads under the GIL, which owner threads (owner.c) do not take. */
+size_t moduleCountLoaded(void) {
+    size_t n = 0;
+    listIter li;
+    listNode *ln;
+    listRewind(modules, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModule *m = listNodeValue(ln);
+        if (!m->is_static_module) n++;
+    }
+    return n;
+}
+
 /* Some module sees individual commands or key changes: a command filter, a server event or
  * keyspace listener, a command result listener, or a module data type that may be unlinked. */
 int moduleObservesWrites(void) {

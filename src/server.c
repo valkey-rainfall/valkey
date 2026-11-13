@@ -3364,6 +3364,13 @@ void initServer(void) {
     }
 
     /* Initialization after setting defaults from the config system. */
+    if (server.owner_threads) {
+        const char *err = NULL;
+        if (ownerValidateConfig(&err) != C_OK) {
+            serverLog(LL_WARNING, "Fatal: %s", err);
+            exit(1);
+        }
+    }
     resolveKeyspaceShardBits();
     server.aof_state = server.aof_enabled ? AOF_ON : AOF_OFF;
     server.fsynced_reploff = server.aof_enabled ? 0 : -1;
@@ -8758,14 +8765,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
     if (server.cluster_enabled) {
         clusterInitLast();
     }
-    if (server.owner_threads) {
-        const char *err = NULL;
-        if (ownerValidateConfig(&err) != C_OK) {
-            serverLog(LL_WARNING, "Fatal: %s", err);
-            exit(1);
-        }
-        ownerThreadsInit();
-    }
+    if (server.owner_threads) ownerThreadsInit();
 
 #if defined(LUA_ENABLED) && STATIC_LUA
     /* Initialize the LUA scripting engine on-startup only when LUA is built statically.
