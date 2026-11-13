@@ -88,7 +88,7 @@ start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overri
 
 }
 
-start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync always enable-debug-command yes save "" forkless-infrastructure-enabled yes bgsave-default-method forkless}} {
+start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 appendonly yes appendfsync always enable-debug-command yes save "" forkless-infrastructure-enabled yes forkless-policy prefer-forkless}} {
     r client setname fp-control
     r select 0
     waitForBgrewriteaof r

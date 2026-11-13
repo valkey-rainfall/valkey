@@ -470,7 +470,7 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
 
 # A forkless save reads each key's LFU frequency while reading threads touch it. (Run under TSan for the
 # race; without it this checks the snapshot loads.)
-start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkless-infrastructure-enabled yes bgsave-default-method forkless maxmemory-policy allkeys-lfu}} {
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless maxmemory-policy allkeys-lfu}} {
     r select 0
 
     test {A forkless save runs beside reads that touch the keys it saves} {
@@ -504,7 +504,7 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkl
 
 # A forkless save's thread reads the header word a touch writes, so reads leave the LRU/LFU field alone
 # until the save ends, on the reading thread and on main alike, as they do while a child runs.
-start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkless-infrastructure-enabled yes bgsave-default-method forkless maxmemory-policy allkeys-lfu lfu-log-factor 0 lfu-decay-time 0}} {
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless maxmemory-policy allkeys-lfu lfu-log-factor 0 lfu-decay-time 0}} {
     r select 0
     r config set io-threads-speculate-reads yes
 
