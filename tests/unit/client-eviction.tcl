@@ -536,6 +536,9 @@ start_server {} {
                 set rr [valkey_client]
                 lappend rrs $rr
                 $rr client setname client-$i
+                # An IO-thread fast-path client that is evicted is freed after the next reply phase (as
+                # unnamed clients on CF are); this test checks synchronous eviction order on the main path.
+                $rr debug fastpath-exclude 1
                 $rr write [join [list "*2\r\n\$$size\r\n" [string repeat v $size]] ""]
                 $rr flush
             }
