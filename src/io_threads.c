@@ -1238,6 +1238,7 @@ void cleanupThreadResources(void *dummy) {
 
     /* Free the shared query buffer */
     freeSharedQueryBuf();
+    freeParseRecycler();
 }
 
 static void ioThreadWriteSlab(writeSlab *slab) {

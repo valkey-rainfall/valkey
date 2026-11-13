@@ -838,9 +838,10 @@ void fastGetConsumeSpeculated(client *c, int count, int tid) {
         /* The parser set pending_command; left set, main would run a stale c->cmd with argc 0. */
         c->flag.pending_command = 0;
         /* Freed here, not with freeClientArgv(): that may offload the free to an IO thread, which only
-         * main may do (it updates main's job counters and a main-produced queue). */
-        for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-        zfree(c->argv);
+         * main may do (it updates main's job counters and a main-produced queue). The parser built
+         * this argv, so its blocks go back to the parser's per-thread recycler. */
+        for (int j = 0; j < c->argc; j++) parseRecycleArg(c->argv[j]);
+        parseRecycleArgv(c->argv, c->argv_len);
         c->argv = NULL;
         c->argc = 0;
         c->cmd = NULL;
@@ -859,11 +860,11 @@ void fastGetConsumeSpeculated(client *c, int count, int tid) {
         if (!(p->read_flags & READ_FLAGS_FASTGET_SPECULATED)) break;
         p->read_flags &= ~READ_FLAGS_FASTGET_SPECULATED;
         queue->off++;
-        /* Free argv for the consumed command. */
+        /* Free argv for the consumed command (back to the parser's recycler, as above). */
         for (int j = 0; j < p->argc; j++) {
-            decrRefCount(p->argv[j]);
+            parseRecycleArg(p->argv[j]);
         }
-        zfree(p->argv);
+        parseRecycleArgv(p->argv, p->argv_len);
         p->argv = NULL;
         p->argc = 0;
         c->commands_processed++;

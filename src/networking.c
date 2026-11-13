@@ -4065,6 +4065,98 @@ void freeSharedQueryBuf(void) {
     thread_shared_qb = NULL;
 }
 
+/* Per-thread recycling of the parser's short-lived allocations.
+ *
+ * A pipelined GET answered on an IO thread allocates an argv array and a key object in the parser
+ * and frees both a moment later in fastGetConsumeSpeculated(). Instead of returning them to the
+ * allocator, that path hands them back here, and the parser reuses them, by exact size: an argv
+ * array of argv_len slots, and an EMBSTR string object of the same length (identical layout to the
+ * one createStringObject() would build, so only its bytes are rewritten). The blocks stay ordinary
+ * zmalloc allocations, so memory accounting is unchanged; at most a few KB per thread are kept, and
+ * an exiting thread frees them (freeParseRecycler). */
+#define RECYCLE_ARGV_MAXLEN 4
+#define RECYCLE_DEPTH 64
+#define RECYCLE_STR_CLASSES 4 /* power of two */
+#define RECYCLE_STR_MAXLEN 64
+
+typedef struct recycleStack {
+    int n;
+    void *items[RECYCLE_DEPTH];
+} recycleStack;
+
+typedef struct recycleStrClass {
+    size_t len; /* string length this class holds while it holds any */
+    recycleStack s;
+} recycleStrClass;
+
+typedef struct parseRecycler {
+    recycleStack argv[RECYCLE_ARGV_MAXLEN + 1]; /* by argv_len */
+    recycleStrClass str[RECYCLE_STR_CLASSES];
+} parseRecycler;
+
+static _Thread_local parseRecycler parse_recycler;
+
+static inline robj **parseAllocArgv(int argv_len) {
+    if (argv_len <= RECYCLE_ARGV_MAXLEN) {
+        recycleStack *s = &parse_recycler.argv[argv_len];
+        if (s->n) return s->items[--s->n];
+    }
+    return zmalloc(sizeof(robj *) * argv_len);
+}
+
+static inline robj *parseCreateStringObject(const char *ptr, size_t len) {
+    if (len <= RECYCLE_STR_MAXLEN) {
+        recycleStrClass *k = &parse_recycler.str[len & (RECYCLE_STR_CLASSES - 1)];
+        if (k->s.n && k->len == len) {
+            robj *o = k->s.items[--k->s.n];
+            memcpy(objectGetVal(o), ptr, len);
+            return o;
+        }
+    }
+    return createStringObject(ptr, len);
+}
+
+/* Free an argv array of argv_len slots that the parser allocated, keeping it for reuse. */
+void parseRecycleArgv(robj **argv, int argv_len) {
+    if (argv_len > 0 && argv_len <= RECYCLE_ARGV_MAXLEN) {
+        recycleStack *s = &parse_recycler.argv[argv_len];
+        if (s->n < RECYCLE_DEPTH) {
+            s->items[s->n++] = argv;
+            return;
+        }
+    }
+    zfree(argv);
+}
+
+/* decrRefCount() a parsed argument, keeping an unshared, unmodified EMBSTR object for reuse. */
+void parseRecycleArg(robj *o) {
+    if (objectGetRefcount(o) == 1 && objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR &&
+        !o->hasembkey) {
+        size_t len = sdslen(objectGetVal(o));
+        if (len <= RECYCLE_STR_MAXLEN) {
+            recycleStrClass *k = &parse_recycler.str[len & (RECYCLE_STR_CLASSES - 1)];
+            if (k->s.n == 0) k->len = len;
+            if (k->len == len && k->s.n < RECYCLE_DEPTH) {
+                k->s.items[k->s.n++] = o;
+                return;
+            }
+        }
+    }
+    decrRefCount(o);
+}
+
+/* Free what this thread keeps for reuse. Called when an IO thread exits. */
+void freeParseRecycler(void) {
+    for (int i = 0; i <= RECYCLE_ARGV_MAXLEN; i++) {
+        recycleStack *s = &parse_recycler.argv[i];
+        while (s->n) zfree(s->items[--s->n]);
+    }
+    for (int i = 0; i < RECYCLE_STR_CLASSES; i++) {
+        recycleStack *s = &parse_recycler.str[i].s;
+        while (s->n) decrRefCount(s->items[--s->n]);
+    }
+}
+
 /* This function is used when we want to re-enter the event loop but there
  * is the risk that the client we are dealing with will be freed in some
  * way. This happens for instance in:
@@ -4466,7 +4558,7 @@ static int parseMultibulk(client *c,
         /* Set up argv array */
         if (*argv) zfree(*argv);
         *argv_len = min(c->multibulklen, 1024);
-        *argv = zmalloc(sizeof(robj *) * *argv_len);
+        *argv = parseAllocArgv(*argv_len);
         *argv_len_sum = 0;
 
         /* Per-slot network bytes-in calculation.
@@ -4624,7 +4716,7 @@ static int parseMultibulk(client *c,
                      * prepareCommand() would, instead of a plain value it then replaces. */
                     o = tryCreatePrebuiltStringEntry(arg, c->bulklen, objectGetVal((*argv)[1]));
                 }
-                (*argv)[(*argc)++] = o ? o : createStringObject(arg, c->bulklen);
+                (*argv)[(*argc)++] = o ? o : parseCreateStringObject(arg, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }

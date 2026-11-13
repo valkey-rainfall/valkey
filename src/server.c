@@ -4003,11 +4003,11 @@ typedef struct cmdLookupCacheEntry {
 } cmdLookupCacheEntry;
 
 static _Atomic unsigned long long command_table_epoch = 1;
-static __thread cmdLookupCacheEntry cmd_lookup_cache[CMD_LOOKUP_CACHE_SLOTS];
+static _Thread_local cmdLookupCacheEntry cmd_lookup_cache[CMD_LOOKUP_CACHE_SLOTS];
 
 /* Set by the fast path while it parses a read whose write commands run on the lanes: their
  * values are then built on the lane that stores them (see fpRead). */
-__thread int parse_defer_value_prebuild = 0;
+_Thread_local int parse_defer_value_prebuild = 0;
 
 /* Called whenever server.commands or a command's subcommand table changes. */
 void commandTableChanged(void) {
