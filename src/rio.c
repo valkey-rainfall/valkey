@@ -168,13 +168,23 @@ static size_t rioFileWrite(rio *r, const void *buf, size_t len) {
 }
 
 /* Returns 1 or 0 for success/failure. */
+/* A file rio is read by one thread for its whole life: rdbLoad, the RDB part of an AOF load and
+ * valkey-check-rdb each open their FILE locally and close it before returning, and no other thread
+ * gets the pointer (a disk-target forkless save writes its own FILE). So reads skip stdio's lock;
+ * a load makes several reads per inline command. */
+#if defined(__GLIBC__)
+#define rioFread fread_unlocked
+#else
+#define rioFread fread
+#endif
+
 static size_t rioFileRead(rio *r, void *buf, size_t len) {
-    return fread(buf, 1, len, r->io.file.fp) == len;
+    return rioFread(buf, 1, len, r->io.file.fp) == len;
 }
 
 /* Partial-read variant: returns bytes read (may be less than len), 0 on EOF, -1 on error. */
 static ssize_t rioFileReadSome(rio *r, void *buf, size_t len) {
-    size_t got = fread(buf, 1, len, r->io.file.fp);
+    size_t got = rioFread(buf, 1, len, r->io.file.fp);
     if (got == 0 && ferror(r->io.file.fp)) return -1;
     return (ssize_t)got;
 }
