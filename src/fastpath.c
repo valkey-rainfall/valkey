@@ -81,6 +81,8 @@ typedef struct fpThread {
     int seg_mm_cap;
     size_t mm_max_write;
     long long mm_barriers; /* entries this thread made barriers because their growth has no bound here, ever */
+    struct fpMmRead *mm_reads; /* the read phase's string reads whose lengths join the segment bounds */
+    int mm_nreads, mm_reads_cap;
     /* Main, write phase: where serial execution of this thread's batches resumes. */
     int scur_b, scur_e;
     /* Main, write phase: the first barrier whose keys are not prefetched yet. */
@@ -437,6 +439,9 @@ void fastpathFreeThread(int tid) {
     zfree(t->seg_count);
     zfree(t->seg_mem);
     zfree(t->seg_reads);
+    zfree(t->mm_reads);
+    t->mm_reads = NULL;
+    t->mm_nreads = t->mm_reads_cap = 0;
     while (t->nfree > 0) {
         cmdBatch *b = t->freelist[--t->nfree];
         zfree(b->arena);
@@ -740,25 +745,58 @@ static size_t fpMmArgLen(robj *o) {
     return sdsEncodedObject(o) ? sdslen(objectGetVal(o)) : LONG_STR_SIZE;
 }
 
-/* IO thread, read phase: the length of the string stored at key now (0 if none or not a string). The
- * keyspace is not written in the read phase; the find does not rehash. */
-static size_t fpMmStoredLen(serverDb *db, int shard, robj *key) {
-    if (shard < 0 || !sdsEncodedObject(key)) return 0;
-    hashtable *ht = kvstoreGetHashtable(db->keys, shard);
-    if (!ht || hashtableSize(ht) == 0) return 0;
-    hashtableIncrementalFindState fs;
-    hashtableIncrementalFindInit(&fs, ht, objectGetVal(key));
-    while (hashtableIncrementalFindStep(&fs));
-    void *found;
-    if (!hashtableIncrementalFindGetResult(&fs, &found)) return 0;
-    robj *o = found;
-    return objectGetType(o) == OBJ_STRING ? stringObjectLen(o) : 0;
+/* A string a lane entry returns, whose length now the read phase looks up in batches. */
+typedef struct fpMmRead {
+    serverDb *db;
+    robj *key;
+    int shard;
+    int seg; /* the segment whose bound gets the length */
+} fpMmRead;
+
+#define FP_MM_FIND_BATCH 16
+
+/* The thread that read the entries (or main, between phases, for any thread that did not get to it):
+ * add the length of each string the queued reads return now to its segment's bound. The finds run 16
+ * at a time, interleaved, so their cache misses overlap. The keyspace is not written meanwhile; the
+ * finds do not rehash. */
+static void fpMmResolveReads(fpThread *t) {
+    int n = t->mm_nreads;
+    for (int i = 0; i < n; i += FP_MM_FIND_BATCH) {
+        int m = n - i < FP_MM_FIND_BATCH ? n - i : FP_MM_FIND_BATCH;
+        hashtableIncrementalFindState fs[FP_MM_FIND_BATCH];
+        int live[FP_MM_FIND_BATCH];
+        for (int k = 0; k < m; k++) {
+            fpMmRead *r = &t->mm_reads[i + k];
+            hashtable *ht = r->shard >= 0 && sdsEncodedObject(r->key) ? kvstoreGetHashtable(r->db->keys, r->shard) : NULL;
+            live[k] = ht && hashtableSize(ht) > 0;
+            if (live[k]) hashtableIncrementalFindInit(&fs[k], ht, objectGetVal(r->key));
+        }
+        for (int pending = m; pending;) {
+            pending = 0;
+            for (int k = 0; k < m; k++)
+                if (live[k] == 1 && hashtableIncrementalFindStep(&fs[k])) pending++;
+                else if (live[k] == 1) live[k] = 2; /* done stepping */
+        }
+        for (int k = 0; k < m; k++) {
+            void *found;
+            if (live[k] != 2 || !hashtableIncrementalFindGetResult(&fs[k], &found)) continue;
+            robj *o = found;
+            if (objectGetType(o) == OBJ_STRING) t->seg_mem[t->mm_reads[i + k].seg] += stringObjectLen(o);
+        }
+    }
+    t->mm_nreads = 0;
+}
+
+static void fpMmQueueRead(fpThread *t, cmdEntry *e, robj *key) {
+    FP_GROW(t->mm_reads, t->mm_nreads, t->mm_reads_cap, 64);
+    t->mm_reads[t->mm_nreads++] = (fpMmRead){.db = e->db, .key = key, .shard = e->shard, .seg = t->nbarriers};
 }
 
 /* IO thread, read phase: a bound on the memory a serial run of the entry can add, or SIZE_MAX when the
  * command's growth is not bounded here (it becomes a barrier entry). *reads counts the stored strings
- * it returns, *wlen is the longest string value it stores. */
-static size_t fpMmEntryBound(cmdEntry *e, int *reads, size_t *wlen) {
+ * it returns, whose lengths are queued and added to the segment's bound before main reads it
+ * (fpMmResolveReads); *wlen is the longest string value it stores. */
+static size_t fpMmEntryBound(fpThread *t, cmdEntry *e, int *reads, size_t *wlen) {
     struct serverCommand *cmd = e->cmd;
     robj **argv = e->argv;
     int argc = e->argc;
@@ -803,7 +841,8 @@ static size_t fpMmEntryBound(cmdEntry *e, int *reads, size_t *wlen) {
     }
     if (read_from) {
         for (int j = read_from; j < argc; j += read_step) {
-            b += fpMmStoredLen(e->db, e->shard, argv[j]) + FP_MM_REPLY;
+            fpMmQueueRead(t, e, argv[j]);
+            b += FP_MM_REPLY;
             (*reads)++;
         }
     }
@@ -828,7 +867,7 @@ static void fpMmSegOpen(fpThread *t, int s) {
 static int fpMmAccount(fpThread *t, cmdEntry *e) {
     int reads;
     size_t wlen;
-    size_t b = fpMmEntryBound(e, &reads, &wlen);
+    size_t b = fpMmEntryBound(t, e, &reads, &wlen);
     if (b == SIZE_MAX) return 0;
     t->seg_mem[t->nbarriers] += b;
     t->seg_reads[t->nbarriers] += reads;
@@ -836,11 +875,14 @@ static int fpMmAccount(fpThread *t, cmdEntry *e) {
     return 1;
 }
 
-/* Main, after the read phase: the longest string value any lane entry of the iteration writes. */
+/* Main, after the read phase: the longest string value any lane entry of the iteration writes. Also
+ * resolves any read a thread left queued, so every segment bound is complete. */
 static size_t fpMmMaxWrite(void) {
     size_t m = 0;
-    for (int tid = 0; tid < fp_slots; tid++)
+    for (int tid = 0; tid < fp_slots; tid++) {
+        if (fp_threads[tid].mm_nreads) fpMmResolveReads(&fp_threads[tid]);
         if (fp_threads[tid].sbn[0] && fp_threads[tid].mm_max_write > m) m = fp_threads[tid].mm_max_write;
+    }
     return m;
 }
 
@@ -1047,6 +1089,7 @@ static void fpResetLaneVectors(fpThread *t) {
     t->seg_count[0] = 0;
     if (fp_mm_iter) fpMmSegOpen(t, 0);
     t->mm_max_write = 0;
+    t->mm_nreads = 0;
     t->scur_b = t->scur_e = 0;
     t->mcur_b = t->mcur_e = 0;
     t->pf_barrier = 0;
@@ -2203,6 +2246,7 @@ void fastpathStagedReadPhase(int tid) {
         fpRecycleBatch(t, t->cur);
         t->cur = NULL;
     }
+    if (fpDepth() == 0 && t->mm_nreads) fpMmResolveReads(t);
 }
 
 /* Main: no blocked-key or watched-key dict is rehashing, so lookups in them (fpKeyObserved on the IO
