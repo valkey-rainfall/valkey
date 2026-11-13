@@ -2341,9 +2341,10 @@ static void fpLaneCall(fpLane *L, client *c) {
 
 
 static int fpPropMode(void) {
-    if (fp_fk_mode) return FP_PROP_OPS; /* main queues an inline entry's ops to the forkless sync */
     if (server.aof_state != AOF_OFF || clusterIsAnySlotExporting()) return FP_PROP_OPS;
-    if (server.primary_host || (!server.repl_backlog && !listLength(server.replicas))) return FP_PROP_NONE;
+    /* Beside a forkless sync main also needs an inline entry's ops (fpLaneTakeProp keeps them). */
+    if (server.primary_host || (!server.repl_backlog && !listLength(server.replicas)))
+        return fp_fk_mode ? FP_PROP_OPS : FP_PROP_NONE;
     return server.repl_backlog ? FP_PROP_FRAMES : FP_PROP_OPS;
 }
 
@@ -2366,8 +2367,12 @@ static void fpLaneTakeProp(fpLane *L, cmdEntry *e, client *ec) {
             e->frames_off = (uint32_t)start;
             e->frames_len = (uint32_t)(sdslen(L->frames) - start);
             e->frames_wrap = (uint8_t)wrap;
-            serverOpArrayFree(oa);
-            return;
+            /* An inline entry beside a forkless sync keeps its ops too: main queues them to the
+             * sync at merge, and feeds the backlog from the frames. */
+            if (!e->fk_inline) {
+                serverOpArrayFree(oa);
+                return;
+            }
         }
     }
     laneProp *p = zmalloc(sizeof(*p));
@@ -2866,6 +2871,16 @@ static int fpFeedSplitPropagation(cmdEntry *e) {
     return 1;
 }
 
+/* Main: release captured ops that were not replayed. */
+static void fpFreeLaneProp(laneProp *p) {
+    for (int j = 0; j < p->numops; j++) {
+        for (int k = 0; k < p->ops[j].argc; k++) decrRefCount(p->ops[j].argv[k]);
+        zfree(p->ops[j].argv);
+    }
+    zfree(p->ops);
+    zfree(p);
+}
+
 /* Main, after a write phase: fold what the lanes accumulated and replay their propagation in T order. */
 static void fpMergeLanes(void) {
     for (int p = 0; p < fp_nparts; p++) {
@@ -2905,6 +2920,15 @@ static void fpMergeLanes(void) {
                     if (e->frames_len) {
                         replicationFeedFrames(e->db->id, fp_lanes[e->lane].frames + e->frames_off, e->frames_len,
                                               e->frames_wrap);
+                        if (e->prop) { /* inline beside a forkless sync: the ops go to the sync only */
+                            for (int j = 0; j < e->prop->numops; j++)
+                                bgIteration_queueLaneReplication(e->prop->ops[j].dbid, e->prop->ops[j].argv,
+                                                                 e->prop->ops[j].argc);
+                            fp_stat_fk_inline++;
+                            fpFreeLaneProp(e->prop);
+                            e->prop = NULL;
+                        }
+                        if (fp_fk_mode) fp_stat_fk_lane++;
                     } else {
                         if (fp_fk_mode) fp_stat_fk_lane++;
                         if (e->fk_inline) {
