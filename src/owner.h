@@ -35,6 +35,7 @@ void ownerReclaim(struct client *c);       /* freeClient on main: take the clien
 void ownerClientFreed(struct client *c);   /* freeClient on main: drop it from the guest list */
 void ownerErrorReply(struct client *c, const char *s, size_t len, int flags);
 void ownerCountOutbufDisconnect(void);
+int ownerResizeAllowed(size_t more_mem);    /* hashtable resizes on an owner thread: within its maxmemory headroom */
 int ownerClusterCommand(struct client *c); /* CLUSTER on a standalone server with owner ports */
 void ownerInfo(sds *info);
 extern int owner_accept_home; /* createClient: home owner of the connection being accepted */

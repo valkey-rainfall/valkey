@@ -493,6 +493,7 @@ client *createClient(connection *conn) {
     c->owner_why = 0;
     c->owner_onloop = 0;
     c->owner_wantout = 0;
+    c->owner_held = 0;
     c->owner_guest_node = NULL;
     return c;
 }

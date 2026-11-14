@@ -27,12 +27,27 @@
  * sequence of atomic executions in real-time order: per-key linearizable. EXEC runs on main with
  * the world stopped, hence atomic and isolated from owners.
  *
- * Features that need one global order or view (AOF, replicas and the backlog, the replica role,
- * maxmemory, MONITOR, keyspace notifications, tracking, WATCH, keys with blocked clients, client
- * pause, loaded modules, the latency monitor, hotkeys, forkless save, throttling,
+ * Features that need one global order or view (replicas and the backlog, the replica role,
+ * maxmemory-clients, MONITOR, keyspace notifications, tracking, WATCH, keys with blocked clients,
+ * client pause, loaded modules, the latency monitor, hotkeys, forkless save, throttling,
  * loading) veto the native path while they are active: owners then hand every command to main,
  * which serves it exactly as the stock server does. One process: one replication stream, one
  * AOF, one maxmemory.
+ *
+ * AOF (appendonly yes, D3veto): a native command's execution unit propagates into the owner's
+ * ectx as call() would; the owner keeps the ops in order and main replays them into the AOF buffer
+ * (replayLanePropagation) the moment it stops the world, before it runs anything itself. Every
+ * write of a key is made by one thread at a time (its owner in a window, or main with the world
+ * stopped), so the AOF has each key's writes in execution order. A reply that may show a write the
+ * AOF does not have yet (any reply of an owner with unfolded or unflushed ops) is held until main
+ * has written the AOF in beforeSleep (fsynced under appendfsync always), the same point where the
+ * stock loop sends replies: "a reply never shows a write before the AOF has it" (aofHoldsReplies).
+ *
+ * maxmemory (D3veto): an owner runs a native step (a read, a command, a table resize) only while
+ * main's last reading of used memory, plus what each owner has added since (its own zmalloc counter,
+ * measured), plus a bound on what the step can add, stays under maxmemory. Then the stock code
+ * would neither evict nor refuse before that command, and native skipping it changes nothing. A
+ * step that does not fit goes to main, whose processCommand evicts or refuses as stock does.
  *
  * shortcut: one global stop for every main iteration, and a client that falls back returns to its
  * owner as soon as it is idle (no hysteresis). Fine while main is mostly idle (cluster clients on
@@ -70,6 +85,23 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
 /* Native-path vetoes (own_veto). */
 #define OWN_VETO_ALL 1
 #define OWN_VETO_WRITE 2
+
+/* maxmemory: what a native step may add, as a headroom requirement before it runs (what it really
+ * adds is measured afterwards from the owner's own zmalloc counter). */
+#define OWN_MM_SLACK (1 << 20)       /* bookkeeping between steps (handoff nodes, fd map), all owners */
+#define OWN_MM_READ (256 * 1024)     /* one read and its parse: query buffer growth, argv objects */
+#define OWN_MM_CMD (64 * 1024)       /* a command: objects, table entries, a reply block, commandlog entries */
+#define OWN_MM_HISTOGRAM (64 * 1024) /* a command's first latency histogram (about 25 KB) */
+/* Below this headroom per owner the native path is vetoed: near the limit main serves everything (and
+ * evicts or refuses), else a client whose read does not fit would bounce between owner and main. */
+#define OWN_MM_TIGHT (2 << 20)
+
+typedef struct ownerPropUnit {
+    client *c;  /* whose command it was: main sets its woff (WAITAOF) */
+    int first;  /* its ops in pops[first .. first + n) */
+    int n;
+    int wrap;   /* MULTI/EXEC around the ops, as propagatePendingCommands would have decided */
+} ownerPropUnit;
 
 typedef struct ownerCmdStat {
     long long calls, usec, failed;
@@ -111,8 +143,23 @@ typedef struct owner {
     ownerLog *logs;
     int nlogs, logs_cap;
     void *pf; /* this owner's key prefetch batch (memory_prefetch.c); NULL below 2 keys */
+    /* AOF: the ops native commands propagated since main last folded, in execution order. Written
+     * by the owner in a window, replayed and cleared by main under the stop (ownerFoldProp). */
+    serverOp *pops;
+    int npops, pops_cap;
+    ownerPropUnit *units;
+    int nunits, units_cap;
+    int unflushed;  /* ops since main's last AOF write: this owner's replies wait (ownerReplyOut) */
+    int release;    /* main: the AOF has them now, write the held replies (ownerWriteHeld) */
+    client **held;  /* clients whose replies wait for the AOF */
+    int nheld, held_cap;
+    int wake_main;  /* this window left main something to do (ops to fold, memory over) */
+    /* maxmemory: this owner's zmalloc counter when the period (one main sleep) began. */
+    size_t mm_base;
+    unsigned long long mm_period;
     /* Totals for INFO, never cleared. */
     long long native_total, handoffs_total, adopted_total, windows_total;
+    long long held_total, mm_refused_total;
 } owner;
 
 _Thread_local owner *own_self = NULL;
@@ -139,8 +186,26 @@ static long long own_takes = 0, own_returns = 0;
 static int own_last_veto = OWN_VETO_ALL;
 static int own_dormant = 0; /* io-threads > 1: owners sleep, main serves everything */
 
+/* What the owners' next run must do, set by main when it resumes them (ownerResumeWorld). */
+static int own_aof = 0;                   /* appendonly: native ops are kept for the AOF */
+static int own_mm = 0;                    /* maxmemory: native steps check their headroom */
+static long long own_mm_slice = 0;        /* bytes each owner may add this period */
+static unsigned long long own_mm_period = 0;
+static _Atomic int own_mm_over = 0;       /* an owner went over its slice: every owner sends work to main */
+static long long own_aof_ops = 0;         /* main: ops folded into the AOF */
+
 int ownerThreadsEnabled(void) {
     return own_n > 0;
+}
+
+/* The client's replies no longer wait on its owner (it leaves the owner, or they are written). */
+static void ownerUnhold(owner *o, client *c) {
+    int i = c->owner_held - 1;
+    if (i < 0) return;
+    client *last = o->held[--o->nheld];
+    o->held[i] = last;
+    last->owner_held = i + 1;
+    c->owner_held = 0;
 }
 
 static inline void ownerCpuRelax(void) {
@@ -308,6 +373,22 @@ static void ownerLeave(owner *o) {
     atomic_store_explicit(&o->active, 0, memory_order_release);
 }
 
+/* Main, the world just stopped, before main runs anything: what native commands propagated goes to
+ * the AOF (and the WAITAOF offset) in each owner's execution order, as call() would have sent it. */
+static void ownerFoldProp(void) {
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        for (int u = 0; u < o->nunits; u++) {
+            ownerPropUnit *pu = &o->units[u];
+            long long off = server.primary_repl_offset;
+            replayLanePropagation(o->pops + pu->first, pu->n, pu->wrap);
+            if (server.primary_repl_offset != off) pu->c->woff = server.primary_repl_offset;
+            own_aof_ops += pu->n;
+        }
+        o->nunits = o->npops = 0;
+    }
+}
+
 /* Main: wait until no owner is inside a window. From here until ownerResumeWorld main has the
  * keyspace, the clients and every owner's state to itself. */
 static void ownerStopWorld(void) {
@@ -333,13 +414,28 @@ static void ownerStopWorld(void) {
     own_held = 1;
     /* The tables owners touched report their changes to their kvstores now. */
     dbLanePhaseEnd();
+    ownerFoldProp();
+}
+
+/* maxmemory: the bytes all owners may add before main must look at memory again (0 when an eviction
+ * cut short by its time limit goes on: its timer proc on main finishes it first). */
+static long long ownerMmHeadroom(void) {
+    size_t used = zmalloc_used_memory();
+    if (server.stat_last_eviction_exceeded_time || used + OWN_MM_SLACK >= server.maxmemory) return 0;
+    return (long long)(server.maxmemory - used - OWN_MM_SLACK);
 }
 
 static int ownerComputeVeto(void) {
-    if (server.aof_state != AOF_OFF || server.repl_backlog || listLength(server.replicas) || server.primary_host)
+    /* AOF on is served natively (ownerFoldProp); turning it on (AOF_WAIT_REWRITE) is not. */
+    if ((server.aof_state != AOF_OFF && server.aof_state != AOF_ON) || server.repl_backlog ||
+        listLength(server.replicas) || server.primary_host)
         return OWN_VETO_ALL;
     if (server.loading || server.async_loading || server.paused_actions || server.import_mode) return OWN_VETO_ALL;
-    if (server.maxmemory || server.maxmemory_clients) return OWN_VETO_ALL;
+    /* maxmemory is served natively within each owner's headroom (ownerMmCmdFits), down to
+     * OWN_MM_TIGHT; client eviction and batched eviction decide on main between commands from state
+     * owners change. */
+    if (server.maxmemory_clients || (server.maxmemory && server.maxmemory_eviction_batch)) return OWN_VETO_ALL;
+    if (server.maxmemory && ownerMmHeadroom() / own_n < OWN_MM_TIGHT) return OWN_VETO_ALL;
     if (listLength(server.monitors) || !trackingIsIdle() || server.notify_keyspace_events) return OWN_VETO_ALL;
     if (server.watching_clients || server.blocked_clients_by_type[BLOCKED_LIST] ||
         server.blocked_clients_by_type[BLOCKED_ZSET] || server.blocked_clients_by_type[BLOCKED_STREAM])
@@ -382,11 +478,47 @@ static void ownerSettleCommandTables(void) {
     }
 }
 
+/* Main, resuming: every op folded at this stop is in the AOF now (beforeSleep wrote it, and fsynced
+ * it under always), so the replies that waited for it may go: each owner writes its own. If the
+ * write did not happen (it cannot under always: a failed write exits), main comes back at once. */
+static void ownerReleaseHeld(void) {
+    int any = 0;
+    for (int i = 0; i < own_n; i++) any |= owners[i].unflushed | owners[i].nheld;
+    if (!any) return;
+    if (aofHoldsReplies()) flushAppendOnlyFile(0);
+    if (aofHoldsReplies()) {
+        aeSetDontWait(server.el, 1);
+        return;
+    }
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        o->unflushed = 0;
+        if (!o->nheld) continue;
+        o->release = 1;
+        uint64_t one = 1;
+        if (write(o->wakefd, &one, sizeof(one)) == -1) { /* counter full: a wakeup is pending anyway */
+        }
+    }
+}
+
+/* Main, resuming: each owner's slice of the headroom under maxmemory for the period until main runs
+ * again. Used memory is read now, with the owners stopped; each owner measures what it adds. */
+static void ownerMmPlan(void) {
+    own_mm = server.maxmemory != 0;
+    if (!own_mm) return;
+    own_mm_slice = ownerMmHeadroom() / own_n;
+    own_mm_period++;
+    atomic_store_explicit(&own_mm_over, 0, memory_order_relaxed);
+}
+
 /* Main, last thing before it sleeps: let the owners run. */
 static void ownerResumeWorld(void) {
     if (!own_held) return;
     own_last_veto = ownerComputeVeto();
     atomic_store_explicit(&own_veto, own_last_veto, memory_order_relaxed);
+    own_aof = server.aof_state == AOF_ON;
+    ownerReleaseHeld();
+    ownerMmPlan();
     ownerSettleCommandTables();
     ownerSettleTable(server.commands);
     ownerSettleTable(server.orig_commands);
@@ -575,6 +707,8 @@ void ownerReclaim(client *c) {
         if (fd < o->fdmap_cap && o->fdmap[fd] == c) o->fdmap[fd] = NULL;
         c->owner_onloop = 0;
         c->owner_wantout = 0;
+        /* Main writes what it held, after its own AOF write (beforeSleep), as for any client. */
+        ownerUnhold(o, c);
         o->nclients--;
     } else {
         pthread_mutex_lock(&o->inbox_mu);
@@ -739,6 +873,8 @@ static int ownerHandOff(owner *o, client *c, int why) {
     if (fd < o->fdmap_cap && o->fdmap[fd] == c) o->fdmap[fd] = NULL;
     c->owner_onloop = 0;
     c->owner_wantout = 0;
+    /* Held replies stay in the buffer; main writes them after its AOF write. */
+    ownerUnhold(o, c);
     o->nclients--;
     o->handoffs_total++;
     /* A shared query buffer must not leave the thread. */
@@ -841,6 +977,134 @@ static int ownerWrite(owner *o, client *c) {
     return 0;
 }
 
+/* Owner: the client's replies wait until main has written the AOF (ownerReleaseHeld). */
+static void ownerHold(owner *o, client *c) {
+    if (o->nheld == o->held_cap) {
+        o->held_cap = o->held_cap ? o->held_cap * 2 : 64;
+        o->held = zrealloc(o->held, sizeof(client *) * o->held_cap);
+    }
+    o->held[o->nheld++] = c;
+    c->owner_held = o->nheld;
+    o->held_total++;
+    ownerSetWantOut(o, c, 0); /* level-triggered EPOLLOUT would fire on and on */
+}
+
+/* Returns 1 when the client left the owner. A reply of an owner with ops main has not written to
+ * the AOF yet may show one of their writes (GET after SET of the same key), so it waits; replies
+ * already waiting keep their order behind which the new ones queue. */
+static int ownerReplyOut(owner *o, client *c) {
+    if (c->owner_held) return 0;
+    if (o->unflushed) {
+        ownerHold(o, c);
+        return 0;
+    }
+    return ownerWrite(o, c);
+}
+
+/* Owner, first thing in a window after main released them: write the held replies. */
+static void ownerWriteHeld(owner *o) {
+    o->release = 0;
+    int n = o->nheld;
+    o->nheld = 0;
+    for (int i = 0; i < n; i++) {
+        client *c = o->held[i];
+        c->owner_held = 0;
+        if (ownerWrite(o, c)) o->wake_main = 1; /* it left: main takes it */
+    }
+}
+
+/* Owner: keep what the native command's execution unit propagated, for main to replay in order
+ * (ownerFoldProp), as fastpath.c's fpLaneTakeProp does for a lane. */
+static void ownerTakeProp(owner *o, client *c) {
+    serverOpArray *oa = &ectx->also_propagate;
+    int n = oa->numops;
+    if (!own_aof) {
+        serverOpArrayFree(oa);
+        return;
+    }
+    if (o->npops + n > o->pops_cap) {
+        while (o->npops + n > o->pops_cap) o->pops_cap = o->pops_cap ? o->pops_cap * 2 : 256;
+        o->pops = zrealloc(o->pops, sizeof(serverOp) * o->pops_cap);
+    }
+    if (o->nunits == o->units_cap) {
+        o->units_cap = o->units_cap ? o->units_cap * 2 : 256;
+        o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
+    }
+    memcpy(o->pops + o->npops, oa->ops, sizeof(serverOp) * n);
+    o->units[o->nunits++] = (ownerPropUnit){
+        .c = c, .first = o->npops, .n = n, .wrap = n > 1 && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS)};
+    o->npops += n;
+    oa->numops = 0; /* the ops' argv now belong to pops */
+    o->unflushed = 1;
+    o->wake_main = 1;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Owner side: maxmemory headroom
+ * ---------------------------------------------------------------------------------------------- */
+
+/* What this owner added since the period began (negative when it freed more), or LLONG_MAX when
+ * the thread has no allocation counter of its own (then nothing runs natively under maxmemory). */
+static long long ownerMmGrowth(owner *o) {
+    size_t now;
+    if (!zmalloc_thread_used_memory(&now)) return LLONG_MAX;
+    return (long long)(now - o->mm_base);
+}
+
+/* Whether a step that may add `need` bytes fits this owner's slice. */
+static int ownerMmFits(owner *o, size_t need) {
+    if (atomic_load_explicit(&own_mm_over, memory_order_relaxed)) return 0;
+    long long g = ownerMmGrowth(o);
+    return g != LLONG_MAX && g + (long long)need <= own_mm_slice;
+}
+
+/* Owner: after a read and its parse, which can allocate more than any bound before it (a big
+ * argument's buffer). Over the slice: every owner sends its work to main until main has looked. */
+static void ownerMmAfterRead(owner *o) {
+    long long g = ownerMmGrowth(o);
+    if (g == LLONG_MAX || g > own_mm_slice) {
+        atomic_store_explicit(&own_mm_over, 1, memory_order_relaxed);
+        o->wake_main = 1;
+    }
+}
+
+/* The bytes each of this owner's growable arrays can take when it doubles. */
+static size_t ownerArraysBytes(owner *o) {
+    return sizeof(serverOp) * (size_t)o->pops_cap + sizeof(ownerPropUnit) * (size_t)o->units_cap +
+           sizeof(client *) * (size_t)o->held_cap + sizeof(ownerError) * (size_t)o->errors_cap +
+           sizeof(ownerLog) * (size_t)o->logs_cap;
+}
+
+/* The length of the string a GET (or SET ... GET) returns, looked up in this owner's own table. */
+static size_t ownerStoredLen(client *c) {
+    void *found;
+    if (!kvstoreHashtableFind(c->db->keys, OWNER_TABLE_OF_SLOT(c->slot), objectGetVal(c->argv[1]), &found)) return 0;
+    robj *v = found;
+    return objectGetType(v) == OBJ_STRING ? stringObjectLen(v) : 0;
+}
+
+/* Whether native command `kind` fits: a bound on what it can add (the value, objects and entries, the
+ * reply and a reply block, commandlog entries, a first latency histogram, the ops kept for the AOF and
+ * a lazy-expire DEL's, an array doubling) on top of what the owner added so far. */
+static int ownerMmCmdFits(owner *o, client *c, int kind) {
+    size_t b = OWN_MM_CMD + 2 * c->argv_len_sum + 64 * (size_t)c->argc + 2 * ownerArraysBytes(o);
+    if (server.latency_tracking_enabled && !o->cs[kind].hist) b += OWN_MM_HISTOGRAM;
+    if (own_aof) b += 4 * (c->argv_len_sum + 32 * (size_t)c->argc + 64);
+    int returns_value = kind == OWN_GET;
+    if (kind == OWN_SET)
+        for (int j = 3; j < c->argc && !returns_value; j++)
+            returns_value = sdsEncodedObject(c->argv[j]) && !strcasecmp(objectGetVal(c->argv[j]), "get");
+    if (returns_value) b += ownerStoredLen(c);
+    return ownerMmFits(o, b);
+}
+
+/* hashtableResizeAllowed / hashtableCollectionResizeAllowed on an owner thread. Under maxmemory every
+ * resize asks (hashtableSetResizeAskAlways); one that does not fit is skipped, as a forbidden one is. */
+int ownerResizeAllowed(size_t more_mem) {
+    if (!own_mm) return 1;
+    return ownerMmFits(own_self, more_mem);
+}
+
 /* The cluster slot of a native candidate's key (GET, SET, DEL with one key, INCR), or -1. */
 static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int read_flags) {
     if (!cmd || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) return -1;
@@ -907,10 +1171,17 @@ static int ownerNativeKind(owner *o, client *c) {
         return -1;
     if ((c->user && (c->user->flags & USER_FLAG_RETIRED)) || authRequired(c) || !ACLUserUnrestricted(c->user))
         return -1;
-    if (kind == OWN_PING) return kind;
-    if (kind != OWN_GET && (veto & OWN_VETO_WRITE)) return -1;
-    /* The slot ownerPrefetch computed: the key is hashed once per command. */
-    if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
+    if (kind != OWN_PING) {
+        if (kind != OWN_GET && (veto & OWN_VETO_WRITE)) return -1;
+        /* The slot ownerPrefetch computed: the key is hashed once per command. */
+        if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
+    }
+    /* Under maxmemory the stock server may evict or refuse before any command: main decides that
+     * once the command does not fit this owner's headroom. */
+    if (own_mm && !ownerMmCmdFits(o, c, kind)) {
+        o->mm_refused_total++;
+        return -1;
+    }
     return kind;
 }
 
@@ -931,14 +1202,28 @@ static void ownerCall(owner *o, client *c, int kind) {
     c->flag.executing_command = 1;
     c->flag.buffered_reply = 0;
     c->flag.keyspace_notified = 0;
+    long long dirty = ectx->dirty;
 
     cmd->proc(c);
 
     exitExecutionUnit();
     c->flag.executing_command = 0;
     ustime_t duration = (ustime_t)(getMonotonicUs() - start);
-    /* Only a lazy-expire DEL can be queued here, and the veto keeps every propagation target off. */
-    if (ectx->also_propagate.numops) serverOpArrayFree(&ectx->also_propagate);
+    /* Propagation as call() decides it; the ops (and a lazy-expire DEL's) are kept for the AOF. The
+     * veto keeps every other target (replicas, a backlog, slot export) off. */
+    dirty = ectx->dirty - dirty;
+    if (!c->flag.prevent_prop) {
+        int flags = dirty > 0 ? (PROPAGATE_AOF | PROPAGATE_REPL) : PROPAGATE_NONE;
+        if (c->flag.force_repl) flags |= PROPAGATE_REPL;
+        if (c->flag.force_aof) flags |= PROPAGATE_AOF;
+        if (c->flag.prevent_repl_prop || c->flag.module_prevent_repl_prop) flags &= ~PROPAGATE_REPL;
+        if (c->flag.prevent_aof_prop || c->flag.module_prevent_aof_prop) flags &= ~PROPAGATE_AOF;
+        if (flags != PROPAGATE_NONE) alsoPropagate(c->db->id, c->argv, c->argc, flags, -1);
+    }
+    c->flag.force_aof = 0;
+    c->flag.force_repl = 0;
+    c->flag.prevent_prop = 0;
+    if (ectx->also_propagate.numops) ownerTakeProp(o, c);
     ownerCmdStat *cs = &o->cs[kind];
     cs->calls++;
     cs->usec += duration;
@@ -1007,6 +1292,13 @@ static int ownerRead(owner *o, client *c) {
     if (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL)
         return ownerHandOff(o, c, OWN_WHY_IDLE);
     if (!canParseCommand(c)) return ownerHandOff(o, c, OWN_WHY_RUN);
+    /* Under maxmemory a read must fit the headroom too (query buffer, argv objects; a big argument's
+     * buffer is allocated when its header is parsed: ownerMmAfterRead). Otherwise main reads it, as
+     * the stock server; a slice this small is the OWN_MM_TIGHT veto, which keeps the client there. */
+    if (own_mm && !ownerMmFits(o, OWN_MM_READ)) {
+        o->mm_refused_total++;
+        return ownerHandOff(o, c, OWN_WHY_IDLE);
+    }
     c->read_flags = authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     readToQueryBuf(c);
     if (c->nread <= 0) {
@@ -1023,16 +1315,18 @@ static int ownerRead(owner *o, client *c) {
     ectx->cmd_time_snapshot = mstime();
     parseInputBuffer(c);
     prepareCommandQueue(c);
+    if (own_mm) ownerMmAfterRead(o);
     int to_main = ownerRunParsedInput(c, ownerTryNative);
     trimCommandQueue(c);
     trimClientQueryBuffer(c);
     if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
     if (to_main) {
-        /* Send the native replies before main appends its own; main writes what is left. */
-        if (clientHasPendingReplies(c)) ownerWriteOnce(o, c);
+        /* Send the native replies before main appends its own; main writes what is left. Replies
+         * that wait for the AOF stay: main writes them after its AOF write. */
+        if (clientHasPendingReplies(c) && !c->owner_held && !o->unflushed) ownerWriteOnce(o, c);
         return ownerHandOff(o, c, OWN_WHY_RUN);
     }
-    if (clientHasPendingReplies(c)) return ownerWrite(o, c);
+    if (clientHasPendingReplies(c)) return ownerReplyOut(o, c);
     return 0;
 }
 
@@ -1062,6 +1356,14 @@ static void *ownerThreadMain(void *arg) {
         }
         ownerEnter(o);
         o->windows_total++;
+        o->wake_main = 0;
+        if (o->release) ownerWriteHeld(o);
+        if (own_mm && o->mm_period != own_mm_period) {
+            /* A new period: what this owner adds is measured from here (it allocates only in windows). */
+            if (!zmalloc_thread_used_memory(&o->mm_base)) o->mm_base = 0;
+            o->mm_period = own_mm_period;
+        }
+        hashtableSetResizeAskAlways(own_mm); /* under maxmemory every table allocation asks */
         int handed = 0;
         for (int k = 0; k < n; k++) {
             uint64_t d = evs[k].data.u64;
@@ -1073,7 +1375,7 @@ static void *ownerThreadMain(void *arg) {
             client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
             if (!c || (uint32_t)c->id != (uint32_t)(d >> 32)) continue; /* stale: main took it back */
             uint32_t e = evs[k].events;
-            if ((e & EPOLLOUT) && ownerWrite(o, c)) {
+            if ((e & EPOLLOUT) && !c->owner_held && ownerWrite(o, c)) {
                 handed = 1;
                 continue;
             }
@@ -1082,7 +1384,7 @@ static void *ownerThreadMain(void *arg) {
             if (atomic_load_explicit(&own_stop, memory_order_relaxed)) break;
         }
         ownerLeave(o);
-        if (handed) {
+        if (handed || o->wake_main) {
             uint64_t one = 1;
             if (write(own_main_wakefd, &one, sizeof(one)) == -1) { /* a wakeup is pending anyway */
             }
@@ -1214,13 +1516,15 @@ int ownerClusterCommand(client *c) {
 }
 
 void ownerInfo(sds *info) {
-    long long native = 0, handoffs = 0, adopted = 0, windows = 0;
+    long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
     int resident = 0;
     for (int i = 0; i < own_n; i++) {
         native += owners[i].native_total;
         handoffs += owners[i].handoffs_total;
         adopted += owners[i].adopted_total;
         windows += owners[i].windows_total;
+        held += owners[i].held_total;
+        mm_refused += owners[i].mm_refused_total;
         resident += owners[i].nclients;
     }
     *info = sdscatprintf(*info,
@@ -1232,6 +1536,8 @@ void ownerInfo(sds *info) {
                          own_last_veto == OWN_VETO_ALL ? "all" : own_last_veto == OWN_VETO_WRITE ? "writes" : "none",
                          native, own_takes, own_returns, adopted, windows, resident,
                          own_guests ? listLength(own_guests) : 0UL, own_stops, own_stop_wait_us, own_stop_wait_max_us);
+    *info = sdscatprintf(*info, "owner_aof_ops:%lld\r\nowner_held_replies:%lld\r\nowner_maxmemory_to_main:%lld\r\n",
+                         own_aof_ops, held, mm_refused);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,

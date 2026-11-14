@@ -532,6 +532,8 @@ int hashtableResizeAllowed(size_t moreMem, double usedRatio) {
 
     /* A write lane under maxmemory: the allocation must fit the budget main reserved for the phase. */
     if (exec_lane && fastpathMaxmemoryPhase()) return fastpathMaxmemoryTakeBudget(moreMem);
+    /* An owner thread: the allocation must fit its maxmemory headroom (owner.c). */
+    if (own_self) return ownerResizeAllowed(moreMem);
 
     /* Avoid resizing over max memory. */
     return !overMaxmemoryAfterAlloc(moreMem);
@@ -542,6 +544,7 @@ int hashtableResizeAllowed(size_t moreMem, double usedRatio) {
 int hashtableCollectionResizeAllowed(size_t moreMem, double usedRatio) {
     UNUSED(usedRatio);
     if (exec_lane && fastpathMaxmemoryPhase()) return fastpathMaxmemoryTakeBudget(moreMem);
+    if (own_self) return ownerResizeAllowed(moreMem);
     return 1;
 }
 

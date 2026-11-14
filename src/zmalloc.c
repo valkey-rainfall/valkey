@@ -537,6 +537,15 @@ size_t zmalloc_used_memory(void) {
     return um;
 }
 
+/* This thread's own counter: what it allocated minus what it freed (modulo 2^64; the difference of two
+ * readings is the thread's net growth in between). Returns 0 when the thread has no counter of its own. */
+int zmalloc_thread_used_memory(size_t *used) {
+    if (unlikely(thread_index == -1)) zmalloc_register_thread_index();
+    if (unlikely(thread_index >= MAX_THREADS_NUM)) return 0;
+    *used = atomic_load_explicit(&used_memory_thread[thread_index].used, memory_order_relaxed);
+    return 1;
+}
+
 size_t zmalloc_used_external_memory(void) {
     return atomic_load_explicit(&used_memory_external, memory_order_relaxed);
 }
