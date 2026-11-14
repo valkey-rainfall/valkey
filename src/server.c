@@ -6959,6 +6959,9 @@ void totalNumberOfStatefulKeys(unsigned long *blocking_keys,
         bkeys += dictSize(server.db[j]->blocking_keys);
         bkeys_on_nokey += dictSize(server.db[j]->blocking_keys_unblock_on_nokey);
         wkeys += dictSize(server.db[j]->watched_keys);
+        /* shortcut: a key watched through main and through its owner at once counts twice; exact
+         * would need a merge of the registries, worth it only if INFO is used to size anything. */
+        for (int i = 0; i < ownerCount(); i++) wkeys += dictSize(ownerWatchRegistry(i, j));
     }
     if (blocking_keys) *blocking_keys = bkeys;
     if (blocking_keys_on_nokey) *blocking_keys_on_nokey = bkeys_on_nokey;
@@ -7126,7 +7129,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "blocked_clients:%d\r\n", server.blocked_clients,
                 "tracking_clients:%d\r\n", server.tracking_clients,
                 "pubsub_clients:%d\r\n", server.pubsub_clients,
-                "watching_clients:%d\r\n", server.watching_clients,
+                "watching_clients:%d\r\n", server.watching_clients + (int)ownerWatchersTotal(),
                 "clients_in_timeout_table:%llu\r\n", (unsigned long long)raxSize(server.clients_timeout_table),
                 "total_watched_keys:%lu\r\n", watched_keys,
                 "total_blocking_keys:%lu\r\n", blocking_keys,

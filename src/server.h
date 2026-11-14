@@ -1040,6 +1040,7 @@ typedef struct multiState {
                                        Array of size server.dbnum, lazily allocated.
                                        Each hashtable stores watchedKey* directly. */
     int transaction_db_id;          /* Currently SELECTed DB id in transaction context */
+    int watch_owner;                /* 1 + the owner whose registry holds watched_keys (owner.c), 0: the dbs' */
 } multiState;
 
 /* This structure holds the blocking operation state for a client.
@@ -3630,6 +3631,7 @@ size_t multiStateMemOverhead(client *c);
 void touchWatchedKey(serverDb *db, robj *key);
 int isWatchedKeyExpired(client *c);
 void touchAllWatchedKeysInDb(serverDb *emptied, serverDb *replaced_with);
+void watchMoveToMain(client *c);
 void discardTransaction(client *c);
 void flagTransaction(client *c);
 void execCommandAbort(client *c, sds error);

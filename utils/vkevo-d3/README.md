@@ -8,14 +8,18 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   `owner-cpulist`. Needs `io-threads 1` at startup (another io-threads, keyspace-shard-bits or
   cluster mode switches owners off). `CONFIG SET io-threads N>1` at runtime puts the owners to
   sleep (main takes their clients, CF's staged loop serves them); back at 1 they wake.
-- Native on the owner, no barrier, no cross-core hop: GET, SET (all options), DEL with one key,
-  INCR, PING, when the key's slot is the owner's own.
-- Everything else falls back to the main path: the client (socket, parsed input, unsent replies)
-  moves to main, runs as a stock client with the owners stopped, and goes home when idle. That
-  covers another owner's key, multi-key commands, MULTI/EXEC, Lua, blocking, pub/sub, admin.
+- Native on the owner, no barrier, no cross-core hop: GET, SET (all options), DEL, INCR, MGET,
+  MSET, PING, when every key's slot is the owner's own (multi-key commands: one slot, hash-tagged).
+  MULTI/EXEC/DISCARD too, while every queued command is one of those on the owner's keys (EXEC runs
+  inside one owner window: atomic and isolated), and WATCH/UNWATCH of the owner's keys (each owner
+  keeps its own watched-key registry; a watcher that falls back becomes a stock watcher on main).
+- Everything else falls back to the main path: the client (socket, parsed input, transaction so
+  far, unsent replies) moves to main, runs as a stock client with the owners stopped, and goes home
+  when idle. That covers another owner's key, keys in two slots, any other command inside a
+  transaction, EXEC with conditions, Lua, blocking, pub/sub, admin. No cross-owner locking.
 - Main holds the world whenever it runs (afterSleep to the end of beforeSleep); owners run only
   while main sleeps. One process: one replication stream, one AOF, one global maxmemory.
-- AOF, replicas, maxmemory, MONITOR, keyspace events, tracking, WATCH, keys with blocked clients,
+- AOF, replicas, maxmemory, MONITOR, keyspace events, tracking, WATCH through main, keys with blocked clients,
   client pause, write-observing modules, latency monitor, hotkeys, forkless save: while any is on,
   owners hand every command to main (stock behavior, main-path speed).
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
@@ -33,6 +37,8 @@ Files here:
 - `cachecannon-d3.toml.tmpl`: cachecannon `cluster = true`, seed any owner port.
 - `d3-check.py`: the correctness gate (topology, native vs fallback, MULTI atomic + isolated, WATCH,
   reply order, linearizability across paths, plain port, vetoes, expiry, stats, no crash).
+- `d3-multikey-check.py` (D3mk): native single-owner MGET/MSET/DEL/MULTI/WATCH vs a model, partial
+  groups never visible under writers on three paths, MULTI INCR pairs and WATCH CAS across paths.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 
@@ -45,7 +51,7 @@ d3-launch.sh status                      # owner_handoffs_to_main stays ~ connec
 sudo d3-steer.sh restore; d3-launch.sh stop
 ```
 
-Limits (gen 0): the native set is GET/SET/DEL(1)/INCR/PING; every main iteration stops all owners
+Limits (gen 0, native set widened in D3mk-g1 as above): every main iteration stops all owners
 (fine while main is mostly idle; a busy 6379 or many cross-owner commands stop them often); a
 fallback client returns home as soon as it is idle (no hysteresis); native commands are not
 counted in CLUSTER SLOT-STATS; while a module is loaded, owners hand every command to main, but a
