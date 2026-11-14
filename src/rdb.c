@@ -3784,7 +3784,7 @@ static respParseResult rdbReadInlineNumber(rio *rdb, char prefix, long *out) {
 /* One inline command (opcode 242 of a forkless sync stream), with the results and checks of
  * parseRespCommandFromReader (aof.c), but a small argument and its CRLF are read in one call.
  * AOF loading keeps the shared parser. */
-static respParseResult rdbReadInlineCommand(rio *rdb, int *argc_out, robj ***argv_out) {
+static respParseResult rdbReadInlineCommandRaw(rio *rdb, int *argc_out, robj ***argv_out) {
     long argc;
     int j;
     respParseResult result = rdbReadInlineNumber(rdb, '*', &argc);
@@ -3845,6 +3845,49 @@ static respParseResult rdbReadInlineCommand(rio *rdb, int *argc_out, robj ***arg
 err:
     for (int k = 0; k < j; k++) decrRefCount(argv[k]);
     zfree(argv);
+    return result;
+}
+
+/* The checksum and progress callback of an inline command's reads, once per command.
+ * rdbReadInlineCommandRaw makes about 9 small reads per plain SET, and the load's callback
+ * (checksum, event check) ran on each. While a command is read, small read chunks are copied
+ * into a staging buffer, and the real callback runs over the whole buffer at once: the checksum is
+ * the same (crc64 over the same bytes in the same order), and so are the byte counts. A chunk that
+ * does not fit is passed straight through after the staged bytes. rioRead adds a chunk's length to
+ * processed_bytes after the callback, so when staged bytes are flushed, processed_bytes is wound
+ * back by their length for the call, as the callback would have seen it. */
+static struct {
+    char buf[512];
+    size_t len;
+} rdb_inline_stage;
+
+static void rdbInlineStageFlush(rio *r) {
+    if (rdb_inline_stage.len == 0) return;
+    size_t len = rdb_inline_stage.len;
+    rdb_inline_stage.len = 0;
+    r->processed_bytes -= len;
+    rdbLoadProgressCallback(r, rdb_inline_stage.buf, len);
+    r->processed_bytes += len;
+}
+
+static void rdbInlineStageCallback(rio *r, const void *buf, size_t len) {
+    if (len > sizeof(rdb_inline_stage.buf) - rdb_inline_stage.len) {
+        rdbInlineStageFlush(r);
+        if (len > sizeof(rdb_inline_stage.buf)) {
+            rdbLoadProgressCallback(r, buf, len);
+            return;
+        }
+    }
+    memcpy(rdb_inline_stage.buf + rdb_inline_stage.len, buf, len);
+    rdb_inline_stage.len += len;
+}
+
+static respParseResult rdbReadInlineCommand(rio *rdb, int *argc_out, robj ***argv_out) {
+    if (rdb->update_cksum != rdbLoadProgressCallback) return rdbReadInlineCommandRaw(rdb, argc_out, argv_out);
+    rdb->update_cksum = rdbInlineStageCallback;
+    respParseResult result = rdbReadInlineCommandRaw(rdb, argc_out, argv_out);
+    rdb->update_cksum = rdbLoadProgressCallback;
+    rdbInlineStageFlush(rdb);
     return result;
 }
 
