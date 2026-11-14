@@ -57,6 +57,9 @@ Files here:
   d3veto-check: native EXEC in the AOF (MULTI/EXEC-wrapped as the stock EXEC, replies after the AOF
   write, replay/LOADAOF/restart digests), GET-ring and MGET replies backed by the AOF, MGET/EXEC
   maxmemory bounds, eviction and noeviction under native transactions.
+- `d3-parse-check.py` (D3-all-parse): the owner frame templates (GET/MGET) against main's parser:
+  the same bytes to every owner port and to the plain port (spellings, split reads, MGET 1-40 keys,
+  handoffs, 40 KB key, malformed frames, large-request input bytes), reply for reply.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 
