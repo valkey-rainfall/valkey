@@ -12,20 +12,24 @@
  * rule per port, utils/vkevo-d3/d3-steer.sh) gives each port its own NIC queue. Port 6379 stays
  * the stock main path for plain clients.
  *
- * Native commands: an owner runs GET, SET, DEL with one key, INCR and PING itself when the key's
- * slot is its own: no barrier and no cross-core hop. Everything else (a key another owner owns,
- * multi-key commands, MULTI/EXEC, scripts, blocking, pub/sub, admin) falls back to the main path:
- * the owner hands the client (socket, parsed input, unsent replies) to main, which runs it as a
- * stock client and hands it back once it is idle again. A client is served by one thread at a
- * time and its replies are appended in command order, so per-connection reply order holds.
+ * Native commands: an owner runs GET, SET, DEL, INCR, MGET, MSET and PING itself when every key's
+ * slot is its own (multi-key commands: one slot, as hash tags give): no barrier and no cross-core
+ * hop. MULTI/EXEC too, while every queued command is one of those on the owner's keys: the owner
+ * queues them and runs EXEC within one window. Everything else (a key another owner owns, keys in
+ * two slots, any other command inside a transaction, WATCH, scripts, blocking, pub/sub, admin)
+ * falls back to the main path: the owner hands the client (socket, parsed input, transaction so
+ * far, unsent replies) to main, which runs it as a stock client and hands it back once it is idle
+ * again. A client is served by one thread at a time and its replies are appended in command order,
+ * so per-connection reply order holds.
  *
  * The world: main holds it from afterSleep to the end of beforeSleep, that is whenever it runs.
  * Owners run "windows" only while main sleeps in epoll_wait. A window is entered with a Dekker
  * handshake (owner: active = 1, full fence, read stop; main: stop = 1, full fence, wait until
  * every active is 0), so main never overlaps a window, and two owners never touch the same key.
  * Every command is atomic with respect to everything that can touch its key, so the history is a
- * sequence of atomic executions in real-time order: per-key linearizable. EXEC runs on main with
- * the world stopped, hence atomic and isolated from owners.
+ * sequence of atomic executions in real-time order: per-key linearizable. An EXEC runs either on
+ * main with the world stopped or on the owner of all its keys inside one window: atomic and
+ * isolated either way.
  *
  * Features that need one global order or view (AOF, replicas and the backlog, the replica role,
  * maxmemory, MONITOR, keyspace notifications, tracking, WATCH, keys with blocked clients, client
@@ -61,8 +65,9 @@
 #define OWNER_EVENTS 256
 #define OWNER_WAKE_TOKEN UINT64_MAX
 
-enum { OWN_GET, OWN_SET, OWN_DEL, OWN_INCR, OWN_PING, OWN_NCMDS };
-static const char *const own_cmd_names[OWN_NCMDS] = {"get", "set", "del", "incr", "ping"};
+enum { OWN_GET, OWN_SET, OWN_DEL, OWN_INCR, OWN_PING, OWN_MGET, OWN_MSET, OWN_MULTI, OWN_EXEC, OWN_DISCARD, OWN_NCMDS };
+static const char *const own_cmd_names[OWN_NCMDS] = {"get",  "set",   "del",  "incr", "ping",
+                                                     "mget", "mset", "multi", "exec", "discard"};
 
 /* Why an owner handed a client to main (client->owner_why). */
 enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
@@ -841,13 +846,29 @@ static int ownerWrite(owner *o, client *c) {
     return 0;
 }
 
-/* The cluster slot of a native candidate's key (GET, SET, DEL with one key, INCR), or -1. */
+/* The cluster slot of a native candidate's keys, or -1: GET, SET and INCR (one key), and DEL, MGET and
+ * MSET when all their keys hash to one slot (hash-tagged, as cluster mode requires). Keys in two slots
+ * go to main even when one owner owns both: the slot cached on the command must hold for every key
+ * (getKVStoreIndexUsingCachedSlot). */
 static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int read_flags) {
     if (!cmd || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) return -1;
     serverCommandProc *p = cmd->proc;
-    if (p != getCommand && p != setCommand && p != incrCommand && (p != delCommand || argc != 2)) return -1;
+    int step; /* distance between keys; 0: one key */
+    if (p == getCommand || p == setCommand || p == incrCommand)
+        step = 0;
+    else if (p == delCommand || p == mgetCommand)
+        step = 1;
+    else if (p == msetCommand)
+        step = 2;
+    else
+        return -1;
     sds key = objectGetVal(argv[1]);
-    return (int)keyHashSlot(key, (int)sdslen(key));
+    int slot = (int)keyHashSlot(key, (int)sdslen(key));
+    for (int j = 1 + step; step && j < argc; j += step) {
+        key = objectGetVal(argv[j]);
+        if ((int)keyHashSlot(key, (int)sdslen(key)) != slot) return -1;
+    }
+    return slot;
 }
 
 /* Owner, before the client's current command: hash each command's key once and keep its slot on
@@ -885,43 +906,77 @@ static void ownerPrefetch(owner *o, client *c) {
     prefetchBatchReset();
 }
 
-/* Which native command this is, or -1 when main must run it. */
+/* The native kind of a command, or -1. */
+static int ownerKindOf(serverCommandProc *p) {
+    if (p == getCommand) return OWN_GET;
+    if (p == setCommand) return OWN_SET;
+    if (p == delCommand) return OWN_DEL;
+    if (p == incrCommand) return OWN_INCR;
+    if (p == pingCommand) return OWN_PING;
+    if (p == mgetCommand) return OWN_MGET;
+    if (p == msetCommand) return OWN_MSET;
+    if (p == multiCommand) return OWN_MULTI;
+    if (p == execCommand) return OWN_EXEC;
+    if (p == discardCommand) return OWN_DISCARD;
+    return -1;
+}
+
+/* EXEC can run here: every queued command is a native data command on this owner's keys. That is
+ * the only way an owner queues (ownerNativeKind), so this only guards the invariant. */
+static int ownerTxnNative(owner *o, client *c) {
+    for (int j = 0; j < c->mstate->count; j++) {
+        multiCmd *mc = c->mstate->commands + j;
+        int kind = ownerKindOf(mc->cmd->proc);
+        if (kind < 0 || kind >= OWN_MULTI) return 0;
+        if (kind != OWN_PING && (mc->slot < o->slot_lo || mc->slot > o->slot_hi)) return 0;
+    }
+    return 1;
+}
+
+/* Which native command this is, or -1 when main must run it. In a transaction an owner queues the
+ * native data commands on its own keys (ownerQueue) and runs EXEC (ownerExec) and DISCARD itself;
+ * anything else (another owner's key, any other command, an error to report) hands the client to
+ * main with the transaction so far, and main finishes it exactly as the stock server does. */
 static int ownerNativeKind(owner *o, client *c) {
     struct serverCommand *cmd = c->parsed_cmd;
     if (!cmd || (c->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) return -1;
     int veto = atomic_load_explicit(&own_veto, memory_order_relaxed);
     if (veto & OWN_VETO_ALL) return -1;
-    serverCommandProc *p = cmd->proc;
-    int kind;
-    if (p == getCommand)
-        kind = OWN_GET;
-    else if (p == setCommand)
-        kind = OWN_SET;
-    else if (p == delCommand && c->argc == 2)
-        kind = OWN_DEL;
-    else if (p == incrCommand)
-        kind = OWN_INCR;
-    else if (p == pingCommand)
-        kind = OWN_PING;
-    else
-        return -1;
+    int kind = ownerKindOf(cmd->proc);
+    if (kind < 0) return -1;
     if ((c->user && (c->user->flags & USER_FLAG_RETIRED)) || authRequired(c) || !ACLUserUnrestricted(c->user))
         return -1;
-    if (kind == OWN_PING) return kind;
-    if (kind != OWN_GET && (veto & OWN_VETO_WRITE)) return -1;
-    /* The slot ownerPrefetch computed: the key is hashed once per command. */
+    switch (kind) {
+    case OWN_PING: return kind;
+    case OWN_MULTI: return c->flag.multi ? -1 : kind; /* nested MULTI: main replies the error */
+    case OWN_DISCARD: return c->flag.multi ? kind : -1;
+    case OWN_EXEC:
+        /* EXEC conditions (keys), watched keys, a write veto (main rejects the EXEC): main. */
+        if (!c->flag.multi || c->argc != 1 || veto) return -1;
+        if (listLength(&c->mstate->watched_keys) || !ownerTxnNative(o, c)) return -1;
+        return kind;
+    default: break;
+    }
+    if (kind != OWN_GET && kind != OWN_MGET && (veto & OWN_VETO_WRITE)) return -1;
+    /* The slot ownerPrefetch computed: the keys are hashed once per command. */
     if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
     return kind;
 }
 
-/* The part of processCommand() and call() that applies to a native command. */
-static void ownerCall(owner *o, client *c, int kind) {
-    struct serverCommand *cmd = c->parsed_cmd;
-    c->cmd = c->lastcmd = c->realcmd = cmd;
-    ectx->current_client = c;
+static long long ownerExec(owner *o, client *c);
+
+/* The part of processCommand() and call() that applies to a native command. top: the client's own
+ * command; else a queued command run by ownerExec (call() from execCommand), which leaves lastcmd at
+ * EXEC and the current client as it is. */
+static void ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, int top) {
+    if (top) {
+        c->cmd = c->lastcmd = c->realcmd = cmd;
+        ectx->current_client = c;
+    }
+    client *prev_client = ectx->executing_client;
     ectx->executing_client = c;
     ectx->in_call++;
-    long long errors = ectx->stat_total_error_replies;
+    long long errors = ectx->stat_total_error_replies, inner_errors = 0;
     c->flag.force_aof = 0;
     c->flag.force_repl = 0;
     c->flag.prevent_prop = 0;
@@ -932,7 +987,10 @@ static void ownerCall(owner *o, client *c, int kind) {
     c->flag.buffered_reply = 0;
     c->flag.keyspace_notified = 0;
 
-    cmd->proc(c);
+    if (kind == OWN_EXEC)
+        inner_errors = ownerExec(o, c);
+    else
+        cmd->proc(c);
 
     exitExecutionUnit();
     c->flag.executing_command = 0;
@@ -942,7 +1000,8 @@ static void ownerCall(owner *o, client *c, int kind) {
     ownerCmdStat *cs = &o->cs[kind];
     cs->calls++;
     cs->usec += duration;
-    if (ectx->stat_total_error_replies > errors) cs->failed++;
+    /* As call(): a queued command's errors count for that command, not for EXEC. */
+    if (ectx->stat_total_error_replies - errors > inner_errors) cs->failed++;
     if (server.latency_tracking_enabled) updateCommandLatencyHistogram(&cs->hist, duration * 1000);
     c->duration = duration;
     void *entries[3];
@@ -960,7 +1019,66 @@ static void ownerCall(owner *o, client *c, int kind) {
     ectx->stat_numcommands++;
     o->native_total++;
     ectx->in_call--;
-    ectx->executing_client = NULL;
+    ectx->executing_client = prev_client;
+}
+
+/* execCommand() on the owner (ownerNativeKind: no EXEC conditions, no watched keys, no veto, every
+ * queued command a native one on this owner's keys). The queued commands all run inside this one
+ * window: main never overlaps a window and no other owner touches these keys, so the transaction is
+ * atomic and isolated. Returns the error replies of the queued commands (theirs, not EXEC's). */
+static long long ownerExec(owner *o, client *c) {
+    if (isWatchedKeyExpired(c)) c->flag.dirty_cas = 1;
+    if (c->flag.dirty_cas || c->flag.dirty_exec) {
+        if (c->flag.dirty_exec)
+            addReplyErrorObject(c, shared.execaborterr);
+        else
+            addReply(c, shared.nullarray[c->resp]);
+        discardTransaction(c);
+        return 0;
+    }
+    struct ClientFlags old_flags = c->flag;
+    c->flag.deny_blocking = 1;
+    unwatchAllKeys(c);
+    robj **orig_argv = c->argv;
+    int orig_argc = c->argc, orig_argv_len = c->argv_len, orig_slot = c->slot;
+    struct serverCommand *orig_cmd = c->cmd;
+    long long inner_errors = 0;
+    c->mstate->transaction_db_id = c->db->id;
+    addReplyArrayLen(c, c->mstate->count);
+    for (int j = 0; j < c->mstate->count; j++) {
+        multiCmd *mc = c->mstate->commands + j;
+        c->argc = mc->argc;
+        c->argv = mc->argv;
+        c->argv_len = mc->argv_len;
+        c->cmd = c->realcmd = mc->cmd;
+        c->slot = mc->slot; /* the keyspace lookups use the queued command's slot */
+        long long e = ectx->stat_total_error_replies;
+        ownerCall(o, c, mc->cmd, ownerKindOf(mc->cmd->proc), 0);
+        inner_errors += ectx->stat_total_error_replies - e;
+        /* Commands may alter argc/argv (MSET encodes its values): keep them in mstate. */
+        mc->argc = c->argc;
+        mc->argv = c->argv;
+        mc->argv_len = c->argv_len;
+        mc->cmd = c->cmd;
+        freeClientOriginalArgv(c);
+    }
+    if (!old_flags.deny_blocking) c->flag.deny_blocking = 0;
+    c->argv = orig_argv;
+    c->argv_len = orig_argv_len;
+    c->argc = orig_argc;
+    c->cmd = c->realcmd = orig_cmd;
+    c->slot = orig_slot;
+    discardTransaction(c);
+    return inner_errors;
+}
+
+/* processCommand()'s MULTI branch: queue the command and reply QUEUED (no call, no stats). */
+static void ownerQueue(client *c) {
+    c->cmd = c->lastcmd = c->realcmd = c->parsed_cmd;
+    ectx->current_client = c;
+    c->flag.buffered_reply = 0;
+    queueMultiCommand(c, getCommandFlags(c));
+    addReply(c, shared.queued);
 }
 
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
@@ -969,7 +1087,10 @@ static int ownerTryNative(client *c) {
     ownerPrefetch(o, c);
     int kind = ownerNativeKind(o, c);
     if (kind < 0) return 0;
-    ownerCall(o, c, kind);
+    if (c->flag.multi && kind != OWN_EXEC && kind != OWN_DISCARD)
+        ownerQueue(c);
+    else
+        ownerCall(o, c, c->parsed_cmd, kind, 1);
     commandProcessed(c);
     ectx->current_client = NULL;
     return 1;
