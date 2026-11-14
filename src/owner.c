@@ -199,6 +199,7 @@ typedef struct owner {
     /* Totals for INFO, never cleared. */
     long long native_total, handoffs_total, adopted_total, windows_total;
     long long held_total, mm_refused_total;
+    long long burst_total, bursts_total; /* GETs answered by bursts, and the bursts (ownerGetBurst) */
 } owner;
 
 _Thread_local owner *own_self = NULL;
@@ -240,6 +241,11 @@ static long long own_mm_slice = 0;        /* bytes each owner may add this perio
 static unsigned long long own_mm_period = 0;
 static _Atomic int own_mm_over = 0;       /* an owner went over its slice: every owner sends work to main */
 static long long own_aof_ops = 0;         /* main: ops folded into the AOF */
+/* GET bursts (ownerGetBurst): the command a "GET"/"get" frame resolves to, when that is getCommand under
+ * its own name (rename-command can move it); NULL turns bursts off. The shared name objects stand in
+ * for the frame's argv[0] in slow commandlog entries. */
+static struct serverCommand *own_burst_cmd = NULL;
+static robj *own_burst_name[2]; /* "GET", "get" */
 
 int ownerThreadsEnabled(void) {
     return own_n > 0;
@@ -422,6 +428,13 @@ void ownerThreadsInit(void) {
         /* By original name: rename-command moves the same command under another name. */
         own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_cmd_names[k]);
         serverAssert(own_cmds[k] != NULL);
+    }
+    /* A burst takes "GET"/"get" frames for getCommand: only while that name still means it. */
+    struct serverCommand *get = lookupCommandByCString("get");
+    if (get && get == own_cmds[OWN_GET] && get->proc == getCommand) {
+        own_burst_cmd = get;
+        own_burst_name[0] = makeObjectShared(createStringObject("GET", 3));
+        own_burst_name[1] = makeObjectShared(createStringObject("get", 3));
     }
     own_main_wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (own_main_wakefd == -1 ||
@@ -1719,6 +1732,14 @@ static long long ownerLogThreshold(int type) {
     return server.commandlog[type].threshold;
 }
 
+/* The value has an expire (D3-all-g8-k1): its expire field holds a time. An object can carry the field
+ * with EXPIRY_NONE in it (createEmbeddedStringObjectWithKeyAndExpire adds one when the allocation has
+ * room for it; PERSIST leaves it), which is no expire: lookupKey's expireIfNeeded finds the key valid.
+ * The GET and MGET runs used to send every value with the field to getCommand / mgetCommand. */
+static inline int ownerValHasExpire(const robj *val) {
+    return val->hasexpire && objectGetExpire(val) != EXPIRY_NONE;
+}
+
 /* Reply to one GET from its completed find, with getCommand's effects (touch, hit or miss count,
  * the bulk or null reply). Returns 0, having done nothing, when getCommand must run it instead: a
  * key with an expire (it may have to be deleted and the delete propagated), a value that is not a
@@ -1734,7 +1755,7 @@ static int ownerGetReply(client *c, ownerRingEntry *e, long long reply_threshold
     robj *val = found;
     /* shortcut: a key with an expire goes to getCommand even while it is valid; answer the valid
      * ones here (commandTimeSnapshot vs the expire) if TTL-heavy GET loads matter. */
-    if (val->hasexpire || objectGetType(val) != OBJ_STRING) return 0;
+    if (ownerValHasExpire(val) || objectGetType(val) != OBJ_STRING) return 0;
     if (reply_threshold >= 0) {
         size_t len = sdsEncodedObject(val) ? sdslen(objectGetVal(val)) : (size_t)sdigits10((long)objectGetVal(val));
         if ((long long)(1 + digits10(len) + 2 + len + 2) >= reply_threshold) return 0;
@@ -1947,7 +1968,7 @@ static size_t ownerMgetReply(client *c, ownerRingEntry *ring, unsigned first, in
             continue;
         }
         robj *val = found;
-        if (val->hasexpire || objectGetType(val) != OBJ_STRING) return 0;
+        if (ownerValHasExpire(val) || objectGetType(val) != OBJ_STRING) return 0;
         char ibuf[LONG_STR_SIZE];
         const char *s = ibuf;
         size_t len;
@@ -2078,6 +2099,341 @@ static int ownerMgetRun(owner *o, client *c) {
     return ownerRunEnd(o, c, cmd, OWN_MGET, answered, start);
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * GET bursts: the GET ring straight off the query buffer (D3-all-g8-k1)
+ * ---------------------------------------------------------------------------------------------- */
+
+/* A read that starts with GET frames answers them before anything is parsed: each frame is matched
+ * in the query buffer, its key copied into a ring entry and its find started; the ring is ownerGetRun's
+ * (finds in flight, a sweep, replies in command order), and each reply is formatted straight into
+ * the client's buffer. No argv, no command lookup, no per-command reset: one run's accounting per
+ * burst. A burst takes exactly what ownerTryNative would give ownerGetRun (parseOwnerFrame's GET
+ * frame, getCommand under its own name, the key in this owner's slots, no large-request or
+ * large-reply log, no expire, a string) and ends before the first frame it cannot answer; the parser
+ * then takes that frame and the rest of the buffer as before, so the commands run in order and the
+ * replies keep it. The client state a burst needs (ownerBurstReady) is the state ownerNativeKind and
+ * resetClient leave untouched over a GET; anything else parses as before.
+ * shortcut: a burst starts only where a read starts at a frame (pipelines that fit one read, as K1's);
+ * a read that starts inside a frame (a pipeline longer than one read) parses as before. Upgrade: let
+ * the parser complete that frame, run it, then burst the rest. */
+#define OWN_BURST_MAX 256    /* GETs one burst answers; the next burst picks up after them */
+#define OWN_BURST_KEY_MAX 64 /* a longer key ends the burst: the frame parser takes it */
+
+/* A burst frame's key, copied out of the query buffer as an sds8 for its find, NUL padded to whole
+ * 8-byte words (ownerBurstSlot reads them). */
+typedef struct __attribute__((__packed__)) ownerBurstKey {
+    uint8_t len, alloc;
+    unsigned char flags;
+    char buf[OWN_BURST_KEY_MAX + 8];
+} ownerBurstKey;
+
+typedef struct ownerBurstEntry {
+    hashtableIncrementalFindState find;
+    int done;
+    int absent;   /* the key's table does not exist: a miss, no find */
+    uint32_t end; /* where its frame ends, from the burst's start in the query buffer */
+    ownerBurstKey key;
+} ownerBurstEntry;
+
+/* Where an answered GET's name and key are in the query buffer: its slow commandlog entry. */
+typedef struct ownerBurstArg {
+    uint32_t key_off;
+    uint8_t key_len, lower;
+} ownerBurstArg;
+
+/* The client can take a burst now: a complete command boundary in a clean multibulk state, and
+ * everything ownerNativeKind checks for a GET, plus the reply and reset state a GET leaves as it is
+ * (resetClient clears ASKING and CACHING after a command and steps CLIENT REPLY SKIP: a client with
+ * any of them parses as before). */
+static int ownerBurstReady(client *c) {
+#ifdef LOG_REQ_RES
+    return 0; /* the request/response log records each reply's offset */
+#endif
+    if (!own_burst_cmd || own_mm || (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL)) return 0;
+    if (c->argc || c->multibulklen || c->cmd_queue.len || c->reqtype == PROTO_REQ_INLINE || c->original_argv)
+        return 0;
+    if (c->read_flags & (READ_FLAGS_AUTH_REQUIRED | READ_FLAGS_REPLICATED)) return 0;
+    if (!c->querybuf || c->qb_pos >= sdslen(c->querybuf) || c->querybuf[c->qb_pos] != '*') return 0;
+    if (!canParseCommand(c) || c->flag.multi || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next ||
+        c->flag.asking || c->flag.tracking_caching || c->flag.pushing || c->flag.primary || c->flag.fake ||
+        c->flag.script || c->flag.module || c->flag.executor || c->deferred_reply_errors)
+        return 0;
+    if (c->io_write_state == CLIENT_COMPLETED_IO || isDeferredReplyEnabled(c) || getClientType(c) != CLIENT_TYPE_NORMAL)
+        return 0;
+    if ((c->user && (c->user->flags & USER_FLAG_RETIRED)) || authRequired(c) || !ACLUserUnrestricted(c->user))
+        return 0;
+    return 1;
+}
+
+/* The GET frame at b, as parseOwnerFrame takes it: "*2\r\n$3\r\nGET\r\n$<n>\r\n<key>\r\n" with the name all
+ * upper or all lower case and 1 <= n <= key_max (a short length header: no sign, no leading zero),
+ * complete in the avail bytes there. Returns its length and sets the key's offset and length and the
+ * spelling; 0 for anything else. */
+static inline size_t ownerBurstFrame(const char *b, size_t avail, size_t key_max, size_t *key_off, size_t *key_len,
+                                     int *lower) {
+    if (avail < 20) return 0; /* the shortest: a 1-byte key */
+    /* "*2\r\n$3\r\n" then "GET\r" or "get\r" then "\n", as word compares */
+    uint64_t head, head_want;
+    uint32_t name, name_up, name_low;
+    memcpy(&head, b, 8);
+    memcpy(&head_want, "*2\r\n$3\r\n", 8);
+    memcpy(&name, b + 8, 4);
+    memcpy(&name_up, "GET\r", 4);
+    memcpy(&name_low, "get\r", 4);
+    if (head != head_want || b[12] != '\n') return 0;
+    if (name == name_up)
+        *lower = 0;
+    else if (name == name_low)
+        *lower = 1;
+    else
+        return 0;
+    if (b[13] != '$' || b[14] < '1' || b[14] > '9') return 0;
+    size_t len = (size_t)(b[14] - '0'), pos = 15;
+    if (b[15] >= '0' && b[15] <= '9') {
+        len = len * 10 + (size_t)(b[15] - '0');
+        pos = 16;
+    }
+    if (len > key_max || avail < pos + 2 + len + 2 || b[pos] != '\r' || b[pos + 1] != '\n') return 0;
+    pos += 2;
+    if (b[pos + len] != '\r' || b[pos + len + 1] != '\n') return 0;
+    *key_off = pos;
+    *key_len = len;
+    return pos + len + 2;
+}
+
+/* keyHashSlot of a burst key: the 8-byte CRC16 unless a '{' is in it (whole words: the padding is NUL),
+ * then ownerKeyHashSlot's hash tag rules. */
+static inline int ownerBurstSlot(const ownerBurstKey *k) {
+    const uint64_t ones = 0x0101010101010101ULL, highs = 0x8080808080808080ULL, brace = ones * (uint64_t)'{';
+    for (size_t i = 0; i < k->len; i += 8) {
+        uint64_t w;
+        memcpy(&w, k->buf + i, 8);
+        w ^= brace;
+        if ((w - ones) & ~w & highs) return ownerKeyHashSlot(k->buf, k->len);
+    }
+    return ownerCrc16((const unsigned char *)k->buf, k->len) & 0x3FFF;
+}
+
+/* need bytes of reply fit straight into c->buf, where _addReplyToBufferOrList would put them: nothing in
+ * the reply list, and the buffer plain (an owner client's always is: isCopyAvoidPreferred). */
+static inline int ownerBurstRoom(client *c, size_t need) {
+    if (listLength(c->reply) || server.debug_client_enforce_reply_list) return 0;
+    if (!c->bufpos)
+        c->flag.buf_encoded = 0; /* as _addReplyToBuffer starts a buffer for an owner client */
+    else if (c->flag.buf_encoded)
+        return 0;
+    return c->buf_usable_size - c->bufpos >= need;
+}
+
+static inline void ownerBurstWrote(client *c, size_t n) {
+    c->bufpos += n;
+    if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
+    c->flag.buffered_reply = 1; /* as prepareClientToWrite for an owner client */
+}
+
+/* ownerGetReply for a burst entry: getCommand's effects and its reply bytes (the bulk or the null),
+ * formatted into c->buf, or through addReplyBulk / addReplyOrErrorObject when they do not fit there.
+ * Returns 0, having done nothing, where ownerGetReply would. */
+static int ownerBurstReply(client *c, ownerBurstEntry *e, long long reply_threshold) {
+    void *found = NULL;
+    if (e->absent || !hashtableIncrementalFindGetResult(&e->find, &found)) {
+        size_t n = c->resp == 2 ? 5 : 3;
+        if (reply_threshold >= 0 && (long long)n >= reply_threshold) return 0;
+        ectx->stat_keyspace_misses++; /* the keymiss notification is vetoed while owners run */
+        if (ownerBurstRoom(c, n)) {
+            memcpy(c->buf + c->bufpos, c->resp == 2 ? "$-1\r\n" : "_\r\n", n);
+            ownerBurstWrote(c, n);
+        } else {
+            addReplyOrErrorObject(c, shared.null[c->resp]);
+        }
+        return 1;
+    }
+    robj *val = found;
+    if (ownerValHasExpire(val) || objectGetType(val) != OBJ_STRING) return 0;
+    char ibuf[LONG_STR_SIZE];
+    const char *s;
+    size_t len;
+    if (sdsEncodedObject(val)) {
+        s = objectGetVal(val);
+        len = sdslen((const_sds)s);
+    } else {
+        len = (size_t)ll2string(ibuf, sizeof(ibuf), (long)objectGetVal(val));
+        s = ibuf;
+    }
+    if (reply_threshold >= 0 && (long long)(1 + digits10(len) + 2 + len + 2) >= reply_threshold) return 0;
+    if (!c->flag.no_touch && !server.key_touch_paused) val->lru = lrulfu_touch(val->lru);
+    ectx->stat_keyspace_hits++;
+    if (!ownerBurstRoom(c, 1 + LONG_STR_SIZE + 2 + len + 2)) {
+        addReplyBulk(c, val);
+        return 1;
+    }
+    char *w = c->buf + c->bufpos, *w0 = w;
+    *w++ = '$';
+    if (len < 10) {
+        *w++ = (char)('0' + len);
+    } else if (len < 100) {
+        *w++ = (char)('0' + len / 10);
+        *w++ = (char)('0' + len % 10);
+    } else {
+        w += ll2string(w, LONG_STR_SIZE, (long long)len);
+    }
+    *w++ = '\r';
+    *w++ = '\n';
+    memcpy(w, s, len);
+    w += len;
+    *w++ = '\r';
+    *w++ = '\n';
+    ownerBurstWrote(c, (size_t)(w - w0));
+    return 1;
+}
+
+/* A burst's call() state, as ownerRunBegin without the command: the client keeps no command until the
+ * burst answered one (ownerBurstEnd), so a burst that answers none leaves it as it found it. */
+static monotime ownerBurstBegin(client *c) {
+    ectx->current_client = c;
+    ectx->executing_client = c;
+    ectx->in_call++;
+    monotime start = getMonotonicUs();
+    enterExecutionUnit(0, 0);
+    c->flag.executing_command = 1;
+    c->flag.buffered_reply = 0;
+    c->flag.keyspace_notified = 0;
+    return start;
+}
+
+/* ownerRunEnd for a burst that answered n GETs: they share its time in commandstats, the latency
+ * histogram and the slow commandlog (one entry per command at the average, its arguments taken from the
+ * frame still in the query buffer at qb), then the one reset after the last of them. */
+static void ownerBurstEnd(owner *o, client *c, int n, monotime start, const ownerBurstArg *args, const char *qb) {
+    c->flag.executing_command = 0;
+    c->net_output_bytes_curr_cmd = 0;
+    exitExecutionUnit();
+    long long usec = (long long)(getMonotonicUs() - start);
+    if (n) {
+        ownerCmdStat *cs = &o->cs[OWN_GET];
+        cs->calls += n;
+        cs->usec += usec;
+        if (server.latency_tracking_enabled)
+            updateCommandLatencyHistogramCount(&cs->hist, usec * 1000 / n > 0 ? usec * 1000 / n : 1, n);
+        long long slow = ownerLogThreshold(COMMANDLOG_TYPE_SLOW);
+        if (slow >= 0 && usec / n >= slow) {
+            for (int k = 0; k < n; k++) {
+                void *entries[3];
+                int types[3];
+                robj *argv[2] = {own_burst_name[args[k].lower], createStringObject(qb + args[k].key_off, args[k].key_len)};
+                c->argv = argv;
+                c->argc = 2;
+                c->duration = usec / n;
+                c->net_input_bytes_curr_cmd = 0;
+                ownerKeepLogs(o, entries, types, commandlogPrepareCurrentCommand(c, own_burst_cmd, entries, types));
+                decrRefCount(argv[1]);
+            }
+            c->argv = NULL;
+            c->argc = 0;
+            c->duration = 0;
+        }
+        c->commands_processed += n;
+        ectx->stat_numcommands += n;
+        o->native_total += n;
+        o->burst_total += n;
+        o->bursts_total++;
+    }
+    ectx->in_call--;
+    ectx->executing_client = NULL;
+    if (n) {
+        c->cmd = c->lastcmd = c->realcmd = own_burst_cmd;
+        commandProcessed(c); /* the reset after the burst's last command */
+    }
+    ectx->current_client = NULL;
+}
+
+/* Owner, after a read (ownerBurstReady): answer the GET frames at the start of the unparsed input, up to
+ * OWN_BURST_MAX, and step the parser position past them. Returns how many it answered. */
+static int ownerGetBurst(owner *o, client *c) {
+    long long req_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    long long reply_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    size_t key_max = OWN_BURST_KEY_MAX;
+    if ((long long)key_max > server.proto_max_bulk_len) key_max = (size_t)server.proto_max_bulk_len;
+    unsigned depth = server.prefetch_batch_max_size < 1 ? 1 : (unsigned)server.prefetch_batch_max_size;
+    if (depth > OWN_RING_MAX) depth = OWN_RING_MAX;
+    ownerBurstEntry ring[OWN_RING_MAX];
+    ownerBurstArg args[OWN_BURST_MAX];
+    const char *qb = c->querybuf + c->qb_pos;
+    size_t avail = sdslen(c->querybuf) - c->qb_pos, pos = 0, done = 0;
+    kvstore *keys = c->db->keys;
+    int open = 1, added = 0, answered = 0;
+    unsigned head = 0, tail = 0;
+    monotime start = 0;
+    for (;;) {
+        /* Fill: the next frames, while they are own-slot GETs. */
+        while (open && tail - head < depth && added < OWN_BURST_MAX) {
+            size_t koff = 0, klen = 0;
+            int lower = 0;
+            size_t flen = ownerBurstFrame(qb + pos, avail - pos, key_max, &koff, &klen, &lower);
+            if (!flen || (req_threshold >= 0 && (long long)flen >= req_threshold)) {
+                open = 0;
+                break;
+            }
+            ownerBurstEntry *e = &ring[tail % OWN_RING_MAX];
+            const char *k = qb + pos + koff;
+            if (pos + koff + klen + 8 <= avail) {
+                /* whole words, all in the buffer: the bytes past the key are overwritten next */
+                for (size_t i = 0; i < klen; i += 8) memcpy(e->key.buf + i, k + i, 8);
+            } else {
+                memcpy(e->key.buf, k, klen);
+            }
+            memset(e->key.buf + klen, 0, 8);
+            e->key.len = e->key.alloc = (uint8_t)klen;
+            e->key.flags = SDS_TYPE_8;
+            int slot = ownerBurstSlot(&e->key);
+            if (slot < o->slot_lo || slot > o->slot_hi) {
+                open = 0;
+                break;
+            }
+            /* No table for the slot: no key in it, a miss as lookupKey finds it (getCommand's reply). */
+            hashtable *ht = kvstoreGetHashtable(keys, OWNER_TABLE_OF_SLOT(slot));
+            if (!added) start = ownerBurstBegin(c);
+            e->end = (uint32_t)(pos + flen);
+            e->absent = ht == NULL;
+            e->done = e->absent;
+            if (ht) hashtableIncrementalFindInit(&e->find, ht, e->key.buf);
+            args[added] = (ownerBurstArg){.key_off = (uint32_t)(pos + koff), .key_len = (uint8_t)klen, .lower = (uint8_t)lower};
+            tail++;
+            added++;
+            pos += flen;
+        }
+        if (head == tail) break;
+        /* Sweep: one find step per pending entry. */
+        for (unsigned s = head; s < tail; s++) {
+            ownerBurstEntry *e = &ring[s % OWN_RING_MAX];
+            if (!e->done) e->done = !hashtableIncrementalFindStep(&e->find);
+        }
+        /* Drain: reply to the completed oldest entries, in command order. */
+        while (head < tail && ring[head % OWN_RING_MAX].done) {
+            ownerBurstEntry *e = &ring[head % OWN_RING_MAX];
+            if (!ownerBurstReply(c, e, reply_threshold)) {
+                open = 0;
+                tail = head; /* this frame and the rest go to the parser */
+                break;
+            }
+            done = e->end;
+            head++;
+            answered++;
+            /* An output buffer limit closes the client: run nothing more, as processInputBuffer. */
+            if (c->flag.close_asap) {
+                open = 0;
+                tail = head;
+                break;
+            }
+        }
+    }
+    if (!added) return 0;
+    c->qb_pos += done;
+    c->qb_applied = c->qb_pos;
+    ownerBurstEnd(o, c, answered, start, args, qb);
+    return answered;
+}
+
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
 static int ownerTryNative(client *c) {
     owner *o = own_self;
@@ -2158,10 +2514,19 @@ static int ownerRead(owner *o, client *c) {
     if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) return ownerHandOff(o, c, OWN_WHY_QBLIMIT);
 
     ectx->cmd_time_snapshot = mstime();
-    parseInputBuffer(c);
-    prepareCommandQueue(c);
-    if (own_mm) ownerMmAfterRead(o);
-    int to_main = ownerRunParsedInput(c, ownerTryNative);
+    /* GET frames at the start of the input: answered off the buffer (ownerGetBurst); what follows the
+     * last of them is parsed and run as before. */
+    if (ownerBurstReady(c)) {
+        while (ownerGetBurst(o, c) == OWN_BURST_MAX && !c->flag.close_asap && c->qb_pos < sdslen(c->querybuf)) {
+        }
+    }
+    int to_main = 0;
+    if (!c->flag.close_asap && c->qb_pos < sdslen(c->querybuf)) {
+        parseInputBuffer(c);
+        prepareCommandQueue(c);
+        if (own_mm) ownerMmAfterRead(o);
+        to_main = ownerRunParsedInput(c, ownerTryNative);
+    }
     trimCommandQueue(c);
     trimClientQueryBuffer(c);
     if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
@@ -2366,9 +2731,12 @@ int ownerClusterCommand(client *c) {
 
 void ownerInfo(sds *info) {
     long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
+    long long burst = 0, bursts = 0;
     int resident = 0;
     for (int i = 0; i < own_n; i++) {
         native += owners[i].native_total;
+        burst += owners[i].burst_total;
+        bursts += owners[i].bursts_total;
         handoffs += owners[i].handoffs_total;
         adopted += owners[i].adopted_total;
         windows += owners[i].windows_total;
@@ -2389,6 +2757,7 @@ void ownerInfo(sds *info) {
                          "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
                          "owner_maxmemory_to_main:%lld\r\n",
                          own_aof_ops, own_aof_drains, held, mm_refused);
+    *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,

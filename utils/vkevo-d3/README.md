@@ -52,6 +52,21 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   fsync once 32 MB are written and not fsynced and none runs (aofBackgroundFsyncIfDue), so each
   fsync, and the writes the stock loop postpones behind it, stay short at high write rates; below
   32 MB a second nothing changes. Write policy and reply release unchanged; never fsynced later.
+- D3-all-g8-k1 (GET bursts): a read that starts with GET frames answers them before anything is
+  parsed (ownerGetBurst): each `*2 $3 GET|get $n key` frame (key 1-64 B) is matched in the query
+  buffer, its key copied into a GET-ring entry as an sds and its find started; replies (bulk or null)
+  are formatted straight into the client's reply buffer, in order; no argv objects, no command lookup,
+  no per-command reset; one run's commandstats / latency / slow-log accounting per burst of up to 256
+  GETs (slow-log entries rebuilt from the frames). The burst stops before the first frame the GET ring
+  would not answer (another spelling or command, a key with an expire, a non-string, another owner's
+  key, a large-request or large-reply log entry, a partial frame) and the parser takes the rest as
+  before. Off for a client in MULTI, AUTH-pending or with a key-pattern ACL user, under CLIENT REPLY
+  OFF/SKIP, ASKING or CACHING, under maxmemory, when every native command is vetoed, and when
+  `rename-command` moved GET. A burst starts only where a read starts at a frame (a pipeline that
+  fits one read); a read that starts inside a frame parses as before. `INFO owners`:
+  `owner_burst_commands`, `owner_bursts`. The GET and MGET runs and the bursts now answer a value
+  whose object carries an expire field with no expire in it (an embedded value with room for the
+  field, or a PERSISTed key); only a real expire goes to getCommand / mgetCommand.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -99,6 +114,12 @@ Files here:
   valkey-benchmark SET load on every owner port; part `pace-everysec` checks the owners' fsync
   pacing with WAITAOF waits under a 4 KB SET load (D3-all-g6-aoftail). `d3veto-check.py` and `d3all-check.py` take
   `--fsync no` to run their AOF parts (aoftest, ring_backed) on the same path.
+- `d3-burst-check.py` (D3-all-g8-k1): the owners' GET bursts against the parent's owner path
+  (`--ref-bin`), both servers started here on loopback: the same bytes to owner 0 of each (key lengths
+  1-70, values 0 B-1 MB, INT values, three spellings, 300 and 2000 frames, split reads, single GETs,
+  mixed commands, expires, wrong type, another owner's key, RESP3, CLIENT REPLY SKIP/OFF, MULTI, a
+  key-pattern ACL user, rename-command), reply bytes, keyspace hits/misses and cmdstat_get calls equal;
+  slow, large-request and large-reply commandlog entries equal.
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):
 
