@@ -3660,7 +3660,7 @@ standardConfig static_configs[] = {
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-parallel-writes-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_parallel_writes_min, 32, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("forkless-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.forkless_lanes, 1, NULL, NULL),
-    createBoolConfig("forkless-load-hold", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.forkless_load_hold, 1, NULL, NULL),
+    createBoolConfig("forkless-load-hold", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.forkless_load_hold, 0, NULL, NULL),
     createIntConfig("forkless-lanes-gate-pct", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 10000, server.forkless_lanes_gate_pct, 25, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* replica max data age factor. */

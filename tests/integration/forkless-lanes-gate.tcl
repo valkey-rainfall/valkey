@@ -7,16 +7,17 @@ proc fkg_fp {r field} {
     getInfoProperty [$r info fastpath] $field
 }
 
-foreach {mode lanes load} {A no disabled B yes disabled A no on-empty-db B yes on-empty-db} {
+foreach {mode lanes load hold} {A no disabled no B yes disabled no A no disabled yes B yes disabled yes A no on-empty-db no B yes on-empty-db no} {
     start_server [list tags {"repl external:skip tls:skip"} overrides [list save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync yes repl-diskless-sync-delay 0 io-threads 4 io-threads-parallel-writes-min 1 notify-keyspace-events {""}]] {
         set primary [srv 0 client]
         set ph [srv 0 host]
         set pp [srv 0 port]
         $primary config set forkless-lanes $lanes
+        catch {$primary config set forkless-load-hold $hold} ;# exists on the combined branch only
         exec src/valkey-benchmark -h $ph -p $pp -r 1000000 -n 2000000 -P 64 -c 16 --threads 4 -q SET k:__rand_int__ 0123456789abcdef > /dev/null 2>@1
         start_server [list overrides [list save {} repl-diskless-load $load io-threads 4 io-threads-parallel-writes-min 1 notify-keyspace-events {""}]] {
             set replica [srv 0 client]
-            test "Forkless lanes gate at a high SET rate ($mode, replica load $load)" {
+            test "Forkless lanes gate at a high SET rate ($mode, replica load $load, load hold $hold)" {
                 set pids {}
                 for {set i 0} {$i < 6} {incr i} {
                     lappend pids [exec src/valkey-benchmark -h $ph -p $pp -r 1000000 -n 1000000000 -P 32 -c 4 --threads 2 -q SET k:__rand_int__ 0123456789abcdef > /dev/null 2>@1 &]
@@ -49,7 +50,7 @@ foreach {mode lanes load} {A no disabled B yes disabled A no on-empty-db B yes o
                 set hold_ms [fkg_fp $primary forkless_load_hold_ms]
                 foreach pid $pids { catch {exec /bin/kill -9 $pid} }
                 $primary config set rdb-key-save-delay 0
-                puts "mode=$mode load=$load presync_set_per_s=$rate link_up_under_load_ms=$up_ms drops=$drops sync_full=$fulls gate_on=$gate lane_writes=$lw load_holds=$holds load_hold_ms=$hold_ms"
+                puts "mode=$mode load=$load hold=$hold presync_set_per_s=$rate link_up_under_load_ms=$up_ms drops=$drops sync_full=$fulls gate_on=$gate lane_writes=$lw load_holds=$holds load_hold_ms=$hold_ms"
                 wait_for_condition 1200 100 {
                     [status $replica master_link_status] eq {up} &&
                     [status $primary master_repl_offset] eq [status $replica master_repl_offset]
