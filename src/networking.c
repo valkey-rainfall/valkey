@@ -499,6 +499,7 @@ client *createClient(connection *conn) {
     c->owner_why = 0;
     c->owner_onloop = 0;
     c->owner_wantout = 0;
+    c->owner_deep = 0;
     c->owner_held = 0;
     c->owner_guest_node = NULL;
     return c;
@@ -5410,20 +5411,13 @@ void ringExecuteOne(client *c) {
     processCommandAndResetClient(c);
 }
 
-/* This function can be called from the main-thread or from the IO-thread.
- * The function allocates query-buf for the client if required and reads to it from the network.
- * It will set c->nread to the bytes read from the network.
- * Returns true if the buffer was filled (more data may be available). */
-bool readToQueryBuf(client *c) {
+/* The first half of readToQueryBuf: make room in the query buffer for a read and return where it goes
+ * (*dst) and how long it may be (*readlen_out). With use_shared 0, a client that would read into the
+ * thread's shared query buffer is left untouched and 0 is returned: the caller reads elsewhere and
+ * copies the bytes in later (owner io_uring reads, several in flight per thread, vkevo D3-all-g8). */
+static inline int queryBufPrepareRead(client *c, int use_shared, char **dst, size_t *readlen_out) {
     int big_arg = 0;
     size_t qblen, readlen;
-
-    /* If the replica RDB client is marked as closed ASAP, do not try to read from it */
-    if (c->flag.close_asap) {
-        c->nread = 0;
-        return false;
-    }
-
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
     readlen = PROTO_IOBUF_LEN;
@@ -5449,6 +5443,7 @@ bool readToQueryBuf(client *c) {
     }
 
     if (c->querybuf == NULL) {
+        if (!use_shared && !big_arg) return 0;
         serverAssert(sdslen(thread_shared_qb) == 0);
         c->querybuf = big_arg ? sdsempty() : thread_shared_qb;
         qblen = sdslen(c->querybuf);
@@ -5477,12 +5472,15 @@ bool readToQueryBuf(client *c) {
         if ((c->read_flags & READ_FLAGS_STREAM_LANES) && readlen > REPL_LANES_READ_MAX) readlen = REPL_LANES_READ_MAX;
     }
     if (use_thread_shared_qb) serverAssert(c->querybuf == thread_shared_qb);
+    *dst = c->querybuf + qblen;
+    *readlen_out = readlen;
+    return 1;
+}
 
-    c->nread = connRead(c->conn, c->querybuf + qblen, readlen);
-    if (c->nread <= 0) {
-        return false;
-    }
-
+/* The second half of readToQueryBuf, once c->nread > 0 bytes are at the place the first half gave. */
+static inline bool queryBufCommitRead(client *c, size_t readlen) {
+    int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
+    size_t qblen;
     sdsIncrLen(c->querybuf, c->nread);
     qblen = sdslen(c->querybuf);
     if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
@@ -5498,6 +5496,34 @@ bool readToQueryBuf(client *c) {
         }
     }
     return (size_t)c->nread == readlen;
+}
+
+int readToQueryBufPrepare(client *c, int use_shared, char **dst, size_t *readlen) {
+    return queryBufPrepareRead(c, use_shared, dst, readlen);
+}
+
+bool readToQueryBufCommit(client *c, size_t readlen) {
+    return queryBufCommitRead(c, readlen);
+}
+
+/* This function can be called from the main-thread or from the IO-thread.
+ * The function allocates query-buf for the client if required and reads to it from the network.
+ * It will set c->nread to the bytes read from the network.
+ * Returns true if the buffer was filled (more data may be available). */
+bool readToQueryBuf(client *c) {
+    /* If the replica RDB client is marked as closed ASAP, do not try to read from it */
+    if (c->flag.close_asap) {
+        c->nread = 0;
+        return false;
+    }
+    char *dst;
+    size_t readlen;
+    queryBufPrepareRead(c, 1, &dst, &readlen);
+    c->nread = connRead(c->conn, dst, readlen);
+    if (c->nread <= 0) {
+        return false;
+    }
+    return queryBufCommitRead(c, readlen);
 }
 
 #define REPL_MAX_READS_PER_IO_EVENT 25

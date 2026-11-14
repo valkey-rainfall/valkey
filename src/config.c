@@ -3566,6 +3566,8 @@ standardConfig static_configs[] = {
     createStringConfig("owner-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.owner_cpulist, NULL, NULL, NULL),
     createStringConfig("owner-announce-ip", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.owner_announce_ip, NULL, NULL, NULL),
     createBoolConfig("owner-adopt-all", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.owner_adopt_all, 0, NULL, NULL),
+    createBoolConfig("owner-uring", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_uring, 1, NULL, NULL),
+    createIntConfig("owner-uring-deep", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_uring_deep, 32, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes", NULL, MODIFIABLE_CONFIG, server.io_threads_parallel_writes, 1, NULL, NULL),

@@ -1653,6 +1653,7 @@ typedef struct client {
     int owner_why;               /* Why the owner handed the client to main (owner.c). */
     unsigned owner_onloop : 1;   /* Registered in its owner's epoll set. */
     unsigned owner_wantout : 1;  /* Its owner waits for EPOLLOUT. */
+    unsigned owner_deep : 1;     /* Its last owner read had owner-uring-deep commands or more: not batched (owner.c). */
     int owner_held;              /* Its replies wait for the AOF: index + 1 in its owner's held list, else 0. */
     listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
 #ifdef LOG_REQ_RES
@@ -2150,6 +2151,8 @@ struct valkeyServer {
     char *owner_cpulist;                      /* owner-cpulist: owner i is pinned to the i-th CPU of the list. */
     char *owner_announce_ip;                  /* owner-announce-ip: address CLUSTER SLOTS announces. */
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */
+    int owner_uring;                          /* owner-uring: owners batch socket reads and writes through io_uring. */
+    int owner_uring_deep;                     /* owner-uring-deep: a client whose last read had this many commands skips the batch (0: none). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
@@ -3541,6 +3544,8 @@ void ioThreadWriteToClient(client *c);
 int canParseCommand(client *c);
 bool consumeCommandQueue(client *c);
 bool readToQueryBuf(client *c);
+int readToQueryBufPrepare(client *c, int use_shared, char **dst, size_t *readlen);
+bool readToQueryBufCommit(client *c, size_t readlen);
 void parseInputBuffer(client *c);
 void trimClientQueryBuffer(client *c);
 void handleParseError(client *c);

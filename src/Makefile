@@ -377,6 +377,16 @@ ifeq ($(BUILD_WITH_SYSTEMD),yes)
 	FINAL_CFLAGS+= -DHAVE_LIBSYSTEMD
 endif
 
+# vkevo D3-all-g8-iouring: owner threads batch their socket reads and writes through io_uring
+# (liburing, dnf liburing-devel). USE_LIBURING=no builds the read/write path only.
+ifeq ($(uname_S),Linux)
+USE_LIBURING?=yes
+endif
+ifeq ($(USE_LIBURING),yes)
+	FINAL_LIBS+= -luring
+	FINAL_CFLAGS+= -DHAVE_LIBURING
+endif
+
 ifeq ($(MALLOC),tcmalloc)
 	FINAL_CFLAGS+= -DUSE_TCMALLOC
 	FINAL_LIBS+= -ltcmalloc
@@ -767,6 +777,7 @@ persist-settings: distclean
 	echo BUILD_ZSTD=$(BUILD_ZSTD) >> .make-settings
 	echo ZSTD_PREFIX=$(ZSTD_PREFIX) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
+	echo USE_LIBURING=$(USE_LIBURING) >> .make-settings
 	echo BUILD_LUA=$(BUILD_LUA) >> .make-settings
 	echo USE_LIBBACKTRACE=$(USE_LIBBACKTRACE) >> .make-settings
 	echo LIBBACKTRACE_PREFIX=$(LIBBACKTRACE_PREFIX) >> .make-settings

@@ -68,7 +68,24 @@
  * shortcut: one global stop for every main iteration, and a client that falls back returns to its
  * owner as soon as it is idle (no hysteresis). Fine while main is mostly idle (cluster clients on
  * owner ports); a heavy plain-client load on 6379 or many cross-owner commands stop owners often.
- * Upgrade: per-owner stop for single-owner fallbacks, or a fallback that runs on the owner. */
+ * Upgrade: per-owner stop for single-owner fallbacks, or a fallback that runs on the owner.
+ *
+ * io_uring (owner-uring yes, the default; D3-all-g8-iouring): epoll still says which sockets are ready,
+ * but each owner reads the ready sockets OWN_URING_BATCH at a time with one io_uring_enter on its own
+ * ring (recv, MSG_DONTWAIT), runs them in event order, and sends their replies the same way (send of
+ * the plain c->buf bytes; replies with reply blocks or value references take the writev path). Every
+ * op completes inside the io_uring_enter that submits it (MSG_DONTWAIT: a socket that is not ready
+ * fails at once), so nothing is in flight outside a window, main never touches a ring, and handoffs,
+ * world stops and ProcessingEventsWhileBlocked see the sockets as the read/write path leaves them.
+ * A recv or send that moved no bytes (end of file, an error, a full socket) is redone by the stock
+ * read or write, which sets the connection state as before. A read batch's replies go out after the
+ * whole batch ran: each was queued only when ownerReplyOut would have written it right away (no
+ * unflushed AOF ops then), and one connection's replies stay in order. Held AOF replies are written
+ * in batches too. Main stopping the world ends the window after the batch in hand. Under maxmemory
+ * the reads are not batched (each read's headroom check must follow the commands before it). A client
+ * whose last read ran owner-uring-deep (32) commands or more is read, run and answered at once, as
+ * without io_uring: a deep pipeline already shares its syscalls among its commands, and deferring its
+ * reply to the end of a batch cost W=16 K1 (GET p64) 2-3% on loopback while P1 and P10 gained 10-28%. */
 
 #include "server.h"
 #include "owner.h"
@@ -86,12 +103,19 @@
 #ifdef __linux__
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
+#endif
+#ifdef HAVE_LIBURING
+#include <liburing.h>
 #endif
 
 #define OWNER_MAX 256
 #define OWNER_EVENTS 256
 #define OWNER_WAKE_TOKEN UINT64_MAX
 #define OWN_RING_MAX 128 /* GET and MGET ring slots: prefetch-batch-max-size's maximum; a power of two */
+/* io_uring (owner-uring, D3-all-g8): reads and writes per io_uring_enter. Each read slot has a
+ * PROTO_IOBUF_LEN scratch buffer (mmap: only touched pages count, and not toward used_memory). */
+#define OWN_URING_BATCH 64
 
 enum {
     OWN_GET,
@@ -149,6 +173,15 @@ typedef struct ownerLog {
     int type;
 } ownerLog;
 
+/* One read or write of a batch submitted with one io_uring_enter (owner-uring). */
+typedef struct ownerUringOp {
+    client *c;
+    char *buf;   /* read: where the bytes go (the slot's scratch, or the client's own query buffer) */
+    size_t len;
+    int scratch; /* read: buf is the slot's scratch; the bytes are copied into the query buffer */
+    int res;     /* the CQE's result */
+} ownerUringOp;
+
 typedef struct owner {
     _Atomic int active; /* inside a window: written by the owner, read by main */
     char pad0[CACHE_LINE_SIZE - sizeof(int)];
@@ -200,6 +233,20 @@ typedef struct owner {
     long long native_total, handoffs_total, adopted_total, windows_total;
     long long held_total, mm_refused_total;
     long long burst_total, bursts_total; /* GETs answered by bursts, and the bursts (ownerGetBurst) */
+    /* io_uring (owner-uring): the owner's own ring, used only by the owner thread, inside its windows.
+     * Every op is MSG_DONTWAIT and completes inside the io_uring_enter that submits it, so no op is in
+     * flight outside a window and main never sees one: the sockets, query buffers and replies are
+     * exactly as the read/write path would leave them. */
+    int uring;          /* the ring is up */
+    char *uring_scratch; /* OWN_URING_BATCH * PROTO_IOBUF_LEN */
+    ownerUringOp uops[OWN_URING_BATCH];
+    client **wq;        /* clients whose replies go out at the end of the read batch */
+    int nwq, wq_cap;
+    long long uring_enters, uring_reads, uring_writes; /* INFO, never cleared */
+    long long uring_short, uring_redo; /* sends that moved less than asked; ops redone by the syscall path */
+#ifdef HAVE_LIBURING
+    struct io_uring ring;
+#endif
 } owner;
 
 _Thread_local owner *own_self = NULL;
@@ -1180,9 +1227,8 @@ static void ownerWriteOnce(owner *o, client *c) {
     }
 }
 
-/* Returns 1 when the client left the owner. */
-static int ownerWrite(owner *o, client *c) {
-    ownerWriteOnce(o, c);
+/* After a write: the want-out flag and a close after the reply. Returns 1 when the client left the owner. */
+static int ownerWriteTail(owner *o, client *c) {
     if ((c->write_flags & WRITE_FLAGS_WRITE_ERROR) && connGetState(c->conn) != CONN_STATE_CONNECTED)
         return ownerHandOff(o, c, OWN_WHY_CLOSE);
     if (!clientHasPendingReplies(c)) {
@@ -1193,6 +1239,136 @@ static int ownerWrite(owner *o, client *c) {
         ownerSetWantOut(o, c, 1);
     }
     return 0;
+}
+
+/* Returns 1 when the client left the owner. */
+static int ownerWrite(owner *o, client *c) {
+    ownerWriteOnce(o, c);
+    return ownerWriteTail(o, c);
+}
+
+/* io_uring: submit the first n ops prepared in o->ring and wait for all n completions, which come
+ * inside this io_uring_enter (MSG_DONTWAIT: a socket that is not ready fails with -EAGAIN at once).
+ * Each op's result goes to o->uops[user_data].res. */
+#ifdef HAVE_LIBURING
+static void ownerUringRun(owner *o, int n) {
+    int tries = 0, got = 0;
+    for (;;) {
+        int r = io_uring_submit_and_wait(&o->ring, n);
+        if (r >= 0) break;
+        if ((r == -EINTR || r == -EAGAIN || r == -EBUSY) && ++tries < 1000) continue;
+        serverPanic("owner %d: io_uring_submit_and_wait: %s", o->id, strerror(-r));
+    }
+    o->uring_enters++;
+    while (got < n) {
+        struct io_uring_cqe *cqe;
+        unsigned head, seen = 0;
+        io_uring_for_each_cqe(&o->ring, head, cqe) {
+            serverAssert(cqe->user_data < (uint64_t)n);
+            o->uops[cqe->user_data].res = cqe->res;
+            seen++;
+        }
+        io_uring_cq_advance(&o->ring, seen);
+        got += seen;
+        if (got < n) {
+            int r = io_uring_wait_cqe(&o->ring, &cqe);
+            if (r < 0 && r != -EINTR && r != -EAGAIN) serverPanic("owner %d: io_uring_wait_cqe: %s", o->id, strerror(-r));
+        }
+    }
+}
+#endif
+
+/* The reply bytes a write of c would send, when they are all plain bytes in c->buf (no reply blocks,
+ * no references to values): what _writeToClient's connWrite branch sends. 0 otherwise. */
+static int ownerPlainSpan(client *c, char **buf, size_t *len) {
+    if (listLength(c->reply) || c->flag.buf_encoded || c->bufpos <= 0) return 0;
+    if (c->conn->type != connectionTypeTcp()) return 0;
+    serverAssert(c->io_last_written.data_len == 0 || c->io_last_written.buf == c->buf);
+    if ((size_t)c->bufpos <= c->io_last_written.data_len) return 0;
+    *buf = c->buf + c->io_last_written.data_len;
+    *len = (size_t)c->bufpos - c->io_last_written.data_len;
+    return 1;
+}
+
+/* ownerWriteOnce for a write io_uring made: res > 0 of the len bytes ownerPlainSpan gave went out, as
+ * if _writeToClient's connWrite loop had written them and then met a full socket (res < len). */
+static void ownerWriteDone(owner *o, client *c, ssize_t res, size_t len) {
+    c->write_flags = 0;
+    c->nwritten = res;
+    c->io_last_written.buf = c->buf;
+    c->io_last_written.bufpos = ((size_t)res == len ? (size_t)c->bufpos : 0);
+    c->io_last_written.data_len += res;
+    c->io_last_reply_block = NULL;
+    c->io_last_bufpos = 0;
+    o->writes++;
+    ownerPostWriteToClient(c);
+    c->net_output_bytes += c->nwritten;
+    c->last_interaction = server.unixtime;
+}
+
+/* Write the replies of n clients of this owner (none held), as ownerWrite would one after the other;
+ * with owner-uring, the plain ones go out OWN_URING_BATCH per io_uring_enter. A send that wrote
+ * nothing (a full socket, an error, a closed peer) is redone by ownerWrite, so the connection state
+ * and the error handling are the read/write path's. Returns 1 when any client left the owner. */
+static int ownerWriteMany(owner *o, client **cs, int n) {
+    int left = 0;
+#ifdef HAVE_LIBURING
+    int use = o->uring && server.owner_uring;
+#else
+    int use = 0;
+#endif
+    for (int i = 0; i < n;) {
+        int m = 0;
+        for (; i < n && m < OWN_URING_BATCH; i++) {
+            client *c = cs[i];
+            char *buf;
+            size_t len;
+            if (!use || !ownerPlainSpan(c, &buf, &len)) {
+                left |= ownerWrite(o, c);
+                continue;
+            }
+#ifdef HAVE_LIBURING
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&o->ring);
+            serverAssert(sqe != NULL);
+            io_uring_prep_send(sqe, c->conn->fd, buf, len, MSG_DONTWAIT);
+            io_uring_sqe_set_data64(sqe, (uint64_t)m);
+            o->uops[m] = (ownerUringOp){.c = c, .buf = buf, .len = len, .scratch = 0, .res = 0};
+            m++;
+#endif
+        }
+        if (!m) continue;
+#ifdef HAVE_LIBURING
+        ownerUringRun(o, m);
+        o->uring_writes += m;
+        for (int j = 0; j < m; j++) {
+            ownerUringOp *op = &o->uops[j];
+            if ((size_t)op->res != op->len) o->uring_short++;
+            if (op->res > 0) {
+                ownerWriteDone(o, op->c, op->res, op->len);
+                left |= ownerWriteTail(o, op->c);
+            } else {
+                o->uring_redo++;
+                left |= ownerWrite(o, op->c);
+            }
+        }
+#endif
+    }
+    return left;
+}
+
+/* A client whose replies go out at the end of the read batch (ownerReadBatch). */
+static void ownerQueueWrite(owner *o, client *c) {
+    if (o->nwq == o->wq_cap) {
+        o->wq_cap = o->wq_cap ? o->wq_cap * 2 : 2 * OWN_URING_BATCH;
+        o->wq = zrealloc(o->wq, sizeof(client *) * o->wq_cap);
+    }
+    o->wq[o->nwq++] = c;
+}
+
+static int ownerFlushWrites(owner *o) {
+    int n = o->nwq;
+    o->nwq = 0;
+    return n ? ownerWriteMany(o, o->wq, n) : 0;
 }
 
 /* Owner: the client's replies wait until main has written the AOF (ownerReleaseHeld). */
@@ -1224,11 +1400,10 @@ static void ownerWriteHeld(owner *o) {
     o->release = 0;
     int n = o->nheld;
     o->nheld = 0;
-    for (int i = 0; i < n; i++) {
-        client *c = o->held[i];
-        c->owner_held = 0;
-        if (ownerWrite(o, c)) o->wake_main = 1; /* it left: main takes it */
-    }
+    for (int i = 0; i < n; i++) o->held[i]->owner_held = 0;
+    /* ownerWriteMany may hold nothing and unhold nobody (owner_held is 0 for all), so o->held stays as is
+     * while it walks the list. */
+    if (ownerWriteMany(o, o->held, n)) o->wake_main = 1; /* one left: main takes it */
 }
 
 /* Owner: the db of the next keyed record; a SELECT before it when the buffer selected another one, as
@@ -2485,8 +2660,10 @@ void ownerCountNetOut(long long n) {
     own_self->net_out += n;
 }
 
-/* Returns 1 when the client left the owner. */
-static int ownerRead(owner *o, client *c) {
+/* ownerRead before its read: returns 1 when the client left the owner, 0 when it stays unread,
+ * OWN_READ_GO to read it. */
+#define OWN_READ_GO (-1)
+static int ownerReadPre(owner *o, client *c) {
     if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
     /* Vetoed: main serves the client exactly as the stock server, reads included (query buffer
      * accounting, client eviction, pause), so leave the input unread. */
@@ -2501,7 +2678,13 @@ static int ownerRead(owner *o, client *c) {
         return ownerHandOff(o, c, OWN_WHY_IDLE);
     }
     c->read_flags = authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
-    readToQueryBuf(c);
+    return OWN_READ_GO;
+}
+
+/* ownerRead after its read (c->nread as readToQueryBuf left it): parse, run, reply. With batch set
+ * (ownerReadBatch) a reply that may go out now is queued for the batch's writes instead. Returns 1
+ * when the client left the owner. */
+static int ownerReadPost(owner *o, client *c, int batch) {
     if (c->nread <= 0) {
         if (c->nread == 0 || connGetState(c->conn) != CONN_STATE_CONNECTED) return ownerHandOff(o, c, OWN_WHY_CLOSE);
         trimClientQueryBuffer(c); /* EAGAIN: give back the shared query buffer */
@@ -2515,7 +2698,8 @@ static int ownerRead(owner *o, client *c) {
 
     ectx->cmd_time_snapshot = mstime();
     /* GET frames at the start of the input: answered off the buffer (ownerGetBurst); what follows the
-     * last of them is parsed and run as before. */
+     * last of them is parsed and run as before. The burst's GETs count toward owner_deep too. */
+    long long ran = o->native_total;
     if (ownerBurstReady(c)) {
         while (ownerGetBurst(o, c) == OWN_BURST_MAX && !c->flag.close_asap && c->qb_pos < sdslen(c->querybuf)) {
         }
@@ -2527,6 +2711,7 @@ static int ownerRead(owner *o, client *c) {
         if (own_mm) ownerMmAfterRead(o);
         to_main = ownerRunParsedInput(c, ownerTryNative);
     }
+    c->owner_deep = server.owner_uring_deep && o->native_total - ran >= server.owner_uring_deep;
     trimCommandQueue(c);
     trimClientQueryBuffer(c);
     if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
@@ -2536,9 +2721,113 @@ static int ownerRead(owner *o, client *c) {
         if (clientHasPendingReplies(c) && !c->owner_held && !o->unflushed) ownerWriteOnce(o, c);
         return ownerHandOff(o, c, OWN_WHY_RUN);
     }
-    if (clientHasPendingReplies(c)) return ownerReplyOut(o, c);
+    if (clientHasPendingReplies(c)) {
+        /* Queued only when ownerReplyOut would write it now: the replies show no write the AOF
+         * lacks (no unflushed ops yet), so they may go out after later clients' commands too. */
+        if (batch && !c->owner_held && !o->unflushed) {
+            ownerQueueWrite(o, c);
+            return 0;
+        }
+        return ownerReplyOut(o, c);
+    }
     return 0;
 }
+
+/* Returns 1 when the client left the owner. */
+static int ownerRead(owner *o, client *c) {
+    int r = ownerReadPre(o, c);
+    if (r != OWN_READ_GO) return r;
+    readToQueryBuf(c);
+    return ownerReadPost(o, c, 0);
+}
+
+/* owner-uring: a read of c joins the batch as o->uops[m] when it can go through io_uring (a TCP
+ * client): returns 1 then. Into the client's own query buffer when it has one, else into the slot's
+ * scratch, copied into the thread's shared query buffer when the batch runs (one client at a time
+ * holds it, as with one read at a time). */
+static int ownerReadQueue(owner *o, client *c, int m) {
+    if (c->conn->type != connectionTypeTcp()) return 0;
+    ownerUringOp *op = &o->uops[m];
+    char *dst;
+    size_t len;
+    if (readToQueryBufPrepare(c, 0, &dst, &len)) {
+        *op = (ownerUringOp){.c = c, .buf = dst, .len = len, .scratch = 0, .res = 0};
+    } else {
+        *op = (ownerUringOp){.c = c, .buf = o->uring_scratch + (size_t)m * PROTO_IOBUF_LEN, .len = PROTO_IOBUF_LEN,
+                             .scratch = 1, .res = 0};
+    }
+    return 1;
+}
+
+/* owner-uring: the m queued reads with one io_uring_enter, then each client as ownerRead goes on
+ * after its read, in event order; then the replies they queued, OWN_URING_BATCH per io_uring_enter.
+ * A read that got no bytes (end of file, an error, nothing there) is redone by readToQueryBuf, so the
+ * connection state and the close and error handling are the read path's. Returns 1 when any client
+ * left the owner. */
+static int ownerReadBatch(owner *o, int m) {
+    int left = 0;
+#ifdef HAVE_LIBURING
+    for (int j = 0; j < m; j++) {
+        ownerUringOp *op = &o->uops[j];
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&o->ring);
+        serverAssert(sqe != NULL);
+        io_uring_prep_recv(sqe, op->c->conn->fd, op->buf, op->len, MSG_DONTWAIT);
+        io_uring_sqe_set_data64(sqe, (uint64_t)j);
+    }
+    ownerUringRun(o, m);
+    o->uring_reads += m;
+    /* The results leave o->uops before any client runs: the batch's writes reuse the slots. */
+    ownerUringOp ops[OWN_URING_BATCH];
+    memcpy(ops, o->uops, sizeof(ownerUringOp) * m);
+    for (int j = 0; j < m; j++) {
+        ownerUringOp *op = &ops[j];
+        client *c = op->c;
+        if (op->res > 0) {
+            c->nread = op->res;
+            size_t readlen = op->len;
+            if (op->scratch) {
+                char *dst;
+                int ok = readToQueryBufPrepare(c, 1, &dst, &readlen);
+                serverAssert(ok && readlen >= (size_t)op->res);
+                memcpy(dst, op->buf, op->res);
+            }
+            readToQueryBufCommit(c, readlen);
+        } else {
+            o->uring_redo++;
+            readToQueryBuf(c);
+        }
+        left |= ownerReadPost(o, c, 1);
+    }
+    left |= ownerFlushWrites(o);
+#else
+    UNUSED(o);
+    UNUSED(m);
+#endif
+    return left;
+}
+
+#ifdef HAVE_LIBURING
+/* Owner thread start: its own ring (one issuer, task work only when it enters) and read scratch. */
+static void ownerUringInit(owner *o) {
+    struct io_uring_params p = {0};
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SUBMIT_ALL;
+    int r = io_uring_queue_init_params(OWN_URING_BATCH, &o->ring, &p);
+    if (r < 0) {
+        serverLog(LL_WARNING, "owner %d: no io_uring (%s): reads and writes are syscalls", o->id, strerror(-r));
+        return;
+    }
+    void *s = mmap(NULL, (size_t)OWN_URING_BATCH * PROTO_IOBUF_LEN, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) {
+        serverLog(LL_WARNING, "owner %d: no io_uring scratch (%s): reads and writes are syscalls", o->id,
+                  strerror(errno));
+        io_uring_queue_exit(&o->ring);
+        return;
+    }
+    o->uring_scratch = s;
+    o->uring = 1;
+}
+#endif
 
 static void *ownerThreadMain(void *arg) {
     owner *o = arg;
@@ -2556,6 +2845,9 @@ static void *ownerThreadMain(void *arg) {
     ectx = &o->ectx;
     ioThreadsMarkOwnerThread();
     initSharedQueryBuf();
+#ifdef HAVE_LIBURING
+    ownerUringInit(o);
+#endif
 
     struct epoll_event evs[OWNER_EVENTS];
     for (;;) {
@@ -2575,7 +2867,15 @@ static void *ownerThreadMain(void *arg) {
         }
         hashtableSetResizeAskAlways(own_mm); /* under maxmemory every table allocation asks */
         int handed = 0;
-        for (int k = 0; k < n; k++) {
+        /* owner-uring: the readable clients' reads are batched, OWN_URING_BATCH per io_uring_enter, and
+         * run in event order once the batch has read; the replies follow in batches too. Main stopping
+         * the world ends the window after the batch in hand (its bytes are read: they run now).
+         * shortcut: not under maxmemory, where every read checks the headroom left after the commands
+         * before it ran (a batch would check its reads before those commands). Upgrade: reserve
+         * OWN_MM_READ per queued read in the command checks too. */
+        int batch = o->uring && server.owner_uring && !own_mm;
+        int m = 0, stop = 0;
+        for (int k = 0; k < n && !stop; k++) {
             uint64_t d = evs[k].data.u64;
             if (d == OWNER_WAKE_TOKEN) {
                 ownerTakeInbox(o);
@@ -2589,10 +2889,30 @@ static void *ownerThreadMain(void *arg) {
                 handed = 1;
                 continue;
             }
-            if (e & (EPOLLIN | EPOLLERR | EPOLLHUP)) handed |= ownerRead(o, c);
+            if (e & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
+                if (!batch || c->owner_deep) {
+                    /* A deep pipeline (owner-uring-deep commands or more in its last read) already shares
+                     * its syscalls among its commands: read, run and reply at once, as without io_uring. */
+                    handed |= ownerRead(o, c);
+                } else {
+                    int r = ownerReadPre(o, c);
+                    if (r != OWN_READ_GO) {
+                        handed |= r;
+                    } else if (ownerReadQueue(o, c, m)) {
+                        if (++m == OWN_URING_BATCH) {
+                            handed |= ownerReadBatch(o, m);
+                            m = 0;
+                        }
+                    } else {
+                        readToQueryBuf(c);
+                        handed |= ownerReadPost(o, c, 0);
+                    }
+                }
+            }
             /* Main is waiting: the rest are level-triggered and come back with the next epoll_wait. */
-            if (atomic_load_explicit(&own_stop, memory_order_relaxed)) break;
+            if (atomic_load_explicit(&own_stop, memory_order_relaxed)) stop = 1;
         }
+        if (m) handed |= ownerReadBatch(o, m);
         /* This window's AOF records: written here (everysec, no), unless main is stopping the world,
          * which folds them first thing and writes them with its own. */
         if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
@@ -2732,7 +3052,8 @@ int ownerClusterCommand(client *c) {
 void ownerInfo(sds *info) {
     long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
     long long burst = 0, bursts = 0;
-    int resident = 0;
+    long long u_enters = 0, u_reads = 0, u_writes = 0, u_short = 0, u_redo = 0;
+    int resident = 0, u_on = 0;
     for (int i = 0; i < own_n; i++) {
         native += owners[i].native_total;
         burst += owners[i].burst_total;
@@ -2743,6 +3064,12 @@ void ownerInfo(sds *info) {
         held += owners[i].held_total;
         mm_refused += owners[i].mm_refused_total;
         resident += owners[i].nclients;
+        u_enters += owners[i].uring_enters;
+        u_reads += owners[i].uring_reads;
+        u_writes += owners[i].uring_writes;
+        u_short += owners[i].uring_short;
+        u_redo += owners[i].uring_redo;
+        u_on += owners[i].uring;
     }
     *info = sdscatprintf(*info,
                          "owner_threads:%d\r\nowner_port:%d\r\nowner_veto:%s\r\nowner_native_commands:%lld\r\n"
@@ -2758,6 +3085,11 @@ void ownerInfo(sds *info) {
                          "owner_maxmemory_to_main:%lld\r\n",
                          own_aof_ops, own_aof_drains, held, mm_refused);
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
+    *info = sdscatprintf(*info,
+                         "owner_uring:%s\r\nowner_uring_rings:%d\r\nowner_uring_enters:%lld\r\n"
+                         "owner_uring_reads:%lld\r\nowner_uring_writes:%lld\r\nowner_uring_short_writes:%lld\r\n"
+                         "owner_uring_redone:%lld\r\n",
+                         server.owner_uring ? "yes" : "no", u_on, u_enters, u_reads, u_writes, u_short, u_redo);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,

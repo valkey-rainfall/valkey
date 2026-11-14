@@ -226,6 +226,11 @@ LD_LIBS := $(HIREDIS_LIB) \
 	$(LZ4_LIB) \
 	$(ZSTD_LD_LIBS)
 
+# vkevo D3-all-g8-iouring: the server objects call liburing (../Makefile USE_LIBURING, in ../.make-settings).
+ifeq ($(USE_LIBURING),yes)
+	LD_LIBS += -luring
+endif
+
 # Add libbacktrace support if enabled
 ifeq ($(USE_LIBBACKTRACE),yes)
     TEST_CFLAGS += -DUSE_LIBBACKTRACE

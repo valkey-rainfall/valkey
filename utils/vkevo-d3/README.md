@@ -75,6 +75,19 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   2 * `auto-aof-rewrite-percentage` + 100. BGREWRITEAOF, scheduled rewrites and the failure limiter
   are unchanged; every write is still in the AOF and fsynced on its policy. `INFO persistence`:
   `aof_rewrites_paced`, `aof_rewrite_pace_ms`, `aof_last_rewrite_ms`.
+- D3-all-g8-iouring (`owner-uring yes`, the default; hidden, CONFIG SET at runtime): each owner has
+  its own io_uring (liburing; `make USE_LIBURING=no` leaves it out). epoll still reports the ready
+  sockets; the owner reads them 64 per `io_uring_enter` (recv, MSG_DONTWAIT), runs them in event
+  order, then sends their replies 64 per `io_uring_enter` (plain `c->buf` bytes; replies with reply
+  blocks or value references use writev as before). Held AOF replies go out the same way. Every op
+  completes inside the call that submits it, so nothing is in flight outside an owner window; a recv
+  or send that moved no bytes is redone by the stock read/write. Reads are not batched under
+  maxmemory. A client whose last read ran `owner-uring-deep` (hidden, default 32) commands or more
+  skips the batch (read, run, reply at once): deep pipelines already share their syscalls, and
+  batching them cost W=16 K1 2-3% on loopback. `INFO owners`: `owner_uring`, `owner_uring_rings`,
+  `owner_uring_enters|reads|writes`,
+  `owner_uring_short_writes` (sends that moved less than asked), `owner_uring_redone` (ops redone by
+  the syscall path).
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -128,6 +141,11 @@ Files here:
   mixed commands, expires, wrong type, another owner's key, RESP3, CLIENT REPLY SKIP/OFF, MULTI, a
   key-pattern ACL user, rename-command), reply bytes, keyspace hits/misses and cmdstat_get calls equal;
   slow, large-request and large-reply commandlog entries equal.
+- `d3uring-check.py` (D3-all-g8-iouring): the owners' io_uring path on a running server, with
+  owner-uring yes and no: the batched reads/writes are used, pipelines split at random byte offsets
+  on concurrent connections reply for reply, a client with a 4 KB receive buffer that reads nothing
+  for 1 s (partial sends, EAGAIN, EPOLLOUT), 1 MB and 8 MB arguments in pieces, 200 abrupt closes
+  (half RST), and CONFIG SET owner-uring flipped every 20 ms under pipelines.
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):
 
