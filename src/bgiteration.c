@@ -2696,7 +2696,21 @@ void bgIteration_queueLaneReplication(int dbid, robj **argv, int argc) {
     if (it == NULL || it->completed || it->terminated) return;
     struct serverCommand *cmd = lookupCommandOrOriginal(argv, argc);
     if (!cmd || !isWriteCmd(cmd)) return;
-    queueReplicationItem(it, dbid, cmd, argc, argv);
+    /* The item gets its own copies of the arguments. A shared reference would raise the refcount of
+     * a value the command stored in the keyspace (SET stores its argument object), and READ sends a
+     * key whose object has a refcount above 1 to the main path, as if the save held it. Shared
+     * constants stay shared. */
+    robj *copies[16];
+    robj **dup = argc <= 16 ? copies : zmalloc(sizeof(robj *) * (size_t)argc);
+    for (int i = 0; i < argc; i++) {
+        robj *o = argv[i];
+        int keep = objectGetRefcount(o) == OBJ_SHARED_REFCOUNT || objectGetType(o) != OBJ_STRING;
+        dup[i] = keep ? o : dupStringObject(o);
+        if (keep) incrRefCount(o);
+    }
+    queueReplicationItem(it, dbid, cmd, argc, dup);
+    for (int i = 0; i < argc; i++) decrRefCount(dup[i]); /* the item holds its own references */
+    if (dup != copies) zfree(dup);
 }
 
 
