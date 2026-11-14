@@ -2538,7 +2538,16 @@ bool bgIteration_blockClientIfRequired(client *c) {
 }
 
 
+/* Lane inline items of one merge, queued to the iterator with one lock (bgIteration_laneReplicationFlush). */
+static fifo *lane_batch = NULL;
+
+static void queueReplicationItemTo(bgIterator *it, int dbid, struct serverCommand *cmd, int argc, robj **argv, fifo *batch);
+
 static void queueReplicationItem(bgIterator *it, int dbid, struct serverCommand *cmd, int argc, robj **argv) {
+    queueReplicationItemTo(it, dbid, cmd, argc, argv, NULL);
+}
+
+static void queueReplicationItemTo(bgIterator *it, int dbid, struct serverCommand *cmd, int argc, robj **argv, fifo *batch) {
     bgIteratorItem *item = itemFreeList_getElementOrAllocate();
     item->type = BGITERATOR_ITEM_REPLICATION;
     item->dbid = dbid;
@@ -2549,7 +2558,10 @@ static void queueReplicationItem(bgIterator *it, int dbid, struct serverCommand 
     bufferedReplicationBytes += item->u.repl.replication_size;
     it->replication_queued++;
     it->added_since_feed++;
-    mutexQueueAdd(it->items_for_iterator, item);
+    if (batch)
+        fifoPush(batch, item);
+    else
+        mutexQueueAdd(it->items_for_iterator, item);
 }
 
 
@@ -2708,9 +2720,19 @@ void bgIteration_queueLaneReplication(int dbid, robj **argv, int argc) {
         dup[i] = keep ? o : dupStringObject(o);
         if (keep) incrRefCount(o);
     }
-    queueReplicationItem(it, dbid, cmd, argc, dup);
+    if (!lane_batch) lane_batch = fifoCreate();
+    queueReplicationItemTo(it, dbid, cmd, argc, dup, lane_batch);
     for (int i = 0; i < argc; i++) decrRefCount(dup[i]); /* the item holds its own references */
     if (dup != copies) zfree(dup);
+}
+
+// PUBLIC API
+void bgIteration_laneReplicationFlush(void) {
+    serverAssert(hasMainThreadExclusivity());
+    if (!lane_batch || fifoLength(lane_batch) == 0) return;
+    bgIterator *it = lanesIterator();
+    serverAssert(it != NULL); /* items are queued only while it is live, and main does nothing else in between */
+    mutexQueueAddMultiple(it->items_for_iterator, lane_batch);
 }
 
 

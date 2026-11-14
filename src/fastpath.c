@@ -2959,6 +2959,7 @@ static void fpMergeLanes(void) {
     next_part:;
     }
     if (last) last->woff = last_woff;
+    if (fp_fk_mode) bgIteration_laneReplicationFlush(); /* this merge's inline items, with one lock */
 }
 
 /* ---------------------------------------------------------------------------------------------

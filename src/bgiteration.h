@@ -388,5 +388,6 @@ int bgIteration_laneKeyStatus(int dbid, const_sds key, dbEntry *de);
 void bgIteration_laneAfterInline(int dbid, const_sds key);
 void bgIteration_laneMergeLogs(int nlanes);
 void bgIteration_queueLaneReplication(int dbid, robj **argv, int argc);
+void bgIteration_laneReplicationFlush(void);
 
 #endif
