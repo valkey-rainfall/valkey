@@ -2,7 +2,7 @@
 """D3-all gate: where the merged features meet (D3-g2 GET ring, D3mk native multi-key/MULTI, D3veto AOF +
 maxmemory). Starts its own loopback servers (as d3veto-check.py, whose helpers it uses) and checks:
 
-  aof.*  (appendonly yes, appendfsync always)
+  aof.*  (appendonly yes, appendfsync --fsync: always by default, or no; ring_backed is strict under both)
     exec_native        native MULTI/EXEC on every owner's own tag: no handoff, native counter moves
     exec_wrap          the AOF has a native EXEC with 2+ writes as MULTI, its writes in order, EXEC, and
                        a one-write EXEC unwrapped: the same shapes the stock EXEC (plain port) writes
@@ -79,7 +79,7 @@ def wrap_shape(data, recs):
 
 
 def aof_checks():
-    srv = Server("all-aof", ["--appendonly", "yes", "--appendfsync", "always", "--auto-aof-rewrite-percentage", "0"])
+    srv = Server("all-aof", ["--appendonly", "yes", "--appendfsync", ARGS.fsync, "--auto-aof-rewrite-percentage", "0"])
     pid = srv.p.pid
     adm = srv.conn()
     rng = owner_ranges(adm)
@@ -416,6 +416,7 @@ def main():
     ap.add_argument("--cpus", default="48-51")
     ap.add_argument("--main-cpu", default="56")
     ap.add_argument("--only", choices=["aof", "mm"])
+    ap.add_argument("--fsync", choices=["always", "everysec", "no"], default="always")
     ARGS = ap.parse_args()
     veto.ARGS = ARGS
     random.seed(7)

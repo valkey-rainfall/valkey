@@ -45,6 +45,9 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   argv back whole, its key object still in slot 1 (parseRecycleKeyArgv), and the GET frame template
   takes one back in one pop and rewrites only the key bytes (parsePopKeyArgv); one key length at a
   time, other argvs go back piece by piece as before. The recycler finds an argument's bytes inline.
+- D3-all-g5 (D3-all-g4-k1 + D3-all-g4-aof): both, unchanged. A key argv is kept whole only when
+  its key's refcount is 1 (parseArgReusable), so a key an AOF op still holds (a lazy-expire DEL
+  of a GET key) goes back piece by piece; the owner's AOF records are bytes, not references.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -80,6 +83,16 @@ Files here:
   pipelines of 1-400 GET/GeT/MGET/SET/INCR frames over key lengths 1-90 (runs and random, keys that
   differ in one byte), reply for reply with the plain port and all native; used_memory flat (< 256 KB)
   over ~450 K recycled GET/MGET-of-one frames per owner.
+- `d3aof-check.py` (D3-all-aof): owner-formatted AOF records against the parent binary (`--ref-bin`):
+  the same incr AOF bytes, replies and offset on a sequential workload, offset == records, mixed-db
+  owner buffers vs a model after LOADAOF and restart, timestamps. `--fsync everysec` runs the
+  sequential parts on the owners' own AOF writes (D3-all-g4-aof).
+- `d3aofrace-check.py` (D3-all-g4-aof): owners write the AOF themselves (everysec, no) while the
+  others run: every reply backed by the AOF files (base + incr, across 3 mid-run BGREWRITEAOFs) under
+  appendfsync no, concurrent multi-db writers + plain-port and handoff writers + rewrites + an
+  everysec/always toggle vs a model live, after LOADAOF and after restart, WAITAOF; `--bench` adds a
+  valkey-benchmark SET load on every owner port. `d3veto-check.py` and `d3all-check.py` take
+  `--fsync no` to run their AOF parts (aoftest, ring_backed) on the same path.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 

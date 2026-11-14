@@ -3850,6 +3850,8 @@ static inline int aofHoldsReplies(void) {
     return !server.aof_flush_postponed_start && server.aof_last_write_status == C_OK;
 }
 void feedAppendOnlyFile(int dictid, robj **argv, int argc);
+sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv);
+sds genAofTimestampAnnotationIfNeeded(int force);
 void aofRemoveTempFile(pid_t childpid, int from_signal);
 int rewriteAppendOnlyFileBackground(void);
 int loadAppendOnlyFiles(aofManifest *am);
