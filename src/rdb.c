@@ -3486,9 +3486,20 @@ void stopSaving(int success) {
                           NULL);
 }
 
+/* Prototype: the longest time the load ran without serving events (between two
+ * processEventsWhileBlocked calls of the progress callback, or the load's start or end). */
+static void rdbLoadNoteEventsGap(void) {
+    long long now = ustime();
+    long long gap = now - server.loading_events_last_us;
+    if (server.loading_events_last_us && gap > server.stat_loading_events_max_gap_us)
+        server.stat_loading_events_max_gap_us = gap;
+    server.loading_events_last_us = now;
+}
+
 /* Track loading progress in order to serve client's from time to time
    and if needed calculate rdb checksum  */
 void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
+    server.stat_loading_progress_calls++; /* prototype */
     if (server.rdb_checksum && !(r->flags & RIO_FLAG_SKIP_RDB_CHECKSUM))
         rioGenericUpdateChecksum(r, buf, len);
 
@@ -3510,7 +3521,10 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
         /* Held inline SETs land before events run: a command there can change the lanes or turn on an
          * observer. */
         replApplyLoadFlush();
+        rdbLoadNoteEventsGap(); /* prototype */
+        server.stat_loading_events_calls++;
         processEventsWhileBlocked();
+        server.loading_events_last_us = ustime(); /* prototype: the next gap starts after the events */
         processModuleLoadingProgressEvent(0);
     }
     /* Dual-channel loads on the rdb channel before REPL_STATE_TRANSFER, so count those bytes too. */
@@ -3770,7 +3784,7 @@ static respParseResult rdbReadInlineNumber(rio *rdb, char prefix, long *out) {
 /* One inline command (opcode 242 of a forkless sync stream), with the results and checks of
  * parseRespCommandFromReader (aof.c), but a small argument and its CRLF are read in one call.
  * AOF loading keeps the shared parser. */
-static respParseResult rdbReadInlineCommand(rio *rdb, int *argc_out, robj ***argv_out) {
+static respParseResult rdbReadInlineCommandRaw(rio *rdb, int *argc_out, robj ***argv_out) {
     long argc;
     int j;
     respParseResult result = rdbReadInlineNumber(rdb, '*', &argc);
@@ -3834,6 +3848,49 @@ err:
     return result;
 }
 
+/* The checksum and progress callback of an inline command's reads, once per command.
+ * rdbReadInlineCommandRaw makes about 9 small reads per plain SET, and the load's callback
+ * (checksum, event check) ran on each. While a command is read, small read chunks are copied
+ * into a staging buffer, and the real callback runs over the whole buffer at once: the checksum is
+ * the same (crc64 over the same bytes in the same order), and so are the byte counts. A chunk that
+ * does not fit is passed straight through after the staged bytes. rioRead adds a chunk's length to
+ * processed_bytes after the callback, so when staged bytes are flushed, processed_bytes is wound
+ * back by their length for the call, as the callback would have seen it. */
+static struct {
+    char buf[512];
+    size_t len;
+} rdb_inline_stage;
+
+static void rdbInlineStageFlush(rio *r) {
+    if (rdb_inline_stage.len == 0) return;
+    size_t len = rdb_inline_stage.len;
+    rdb_inline_stage.len = 0;
+    r->processed_bytes -= len;
+    rdbLoadProgressCallback(r, rdb_inline_stage.buf, len);
+    r->processed_bytes += len;
+}
+
+static void rdbInlineStageCallback(rio *r, const void *buf, size_t len) {
+    if (len > sizeof(rdb_inline_stage.buf) - rdb_inline_stage.len) {
+        rdbInlineStageFlush(r);
+        if (len > sizeof(rdb_inline_stage.buf)) {
+            rdbLoadProgressCallback(r, buf, len);
+            return;
+        }
+    }
+    memcpy(rdb_inline_stage.buf + rdb_inline_stage.len, buf, len);
+    rdb_inline_stage.len += len;
+}
+
+static respParseResult rdbReadInlineCommand(rio *rdb, int *argc_out, robj ***argv_out) {
+    if (rdb->update_cksum != rdbLoadProgressCallback) return rdbReadInlineCommandRaw(rdb, argc_out, argv_out);
+    rdb->update_cksum = rdbInlineStageCallback;
+    respParseResult result = rdbReadInlineCommandRaw(rdb, argc_out, argv_out);
+    rdb->update_cksum = rdbLoadProgressCallback;
+    rdbInlineStageFlush(rdb);
+    return result;
+}
+
 /* Load an RDB file from the rio stream 'rdb'. We return one of the following:
  * - RDB_OK On success
  * - RDB_INCOMPATIBLE If the RDB has an invalid signature or version
@@ -3855,6 +3912,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
 
     rdb->update_cksum = rdbLoadProgressCallback;
     rdb->max_processing_chunk = server.loading_process_events_interval_bytes;
+    server.loading_events_last_us = ustime(); /* prototype: event-loop gap from the load's start */
     if (rioRead(rdb, buf, 9) == 0) goto eoferr;
     buf[9] = '\0';
     if (memcmp(buf, "REDIS0", 6) == 0) {
@@ -4407,6 +4465,7 @@ eoferr:
     /* fall through */
 
 cleanup:
+    rdbLoadNoteEventsGap(); /* prototype: the gap from the last events to the load's end */
     /* A failed load drops the inline SETs it still holds. */
     replApplyLoadEnd(ret == RDB_OK);
     /* Single exit: free the inline-command fake client (if one was created) and

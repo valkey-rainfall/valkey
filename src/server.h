@@ -2207,6 +2207,11 @@ struct valkeyServer {
     long long stat_loading_inline_parallel_applied; /* RDB load: inline SETs applied in APPLY phases */
     long long stat_loading_inline_serial_applied;   /* RDB load: inline commands run serially */
     long long stat_loading_inline_apply_phases;     /* RDB load: APPLY phases of held inline SETs */
+    long long stat_loading_progress_calls;          /* RDB load: rdbLoadProgressCallback calls (prototype) */
+    long long stat_loading_events_calls;            /* RDB load: processEventsWhileBlocked calls from it */
+    long long stat_loading_events_max_gap_us;       /* RDB load: longest time between two of those (or the
+                                                     * load's start or end), the event-loop gap */
+    long long loading_events_last_us;               /* RDB load: when events last ran (or the load began) */
     long long stat_repl_lane_apply_usec;           /* Of which APPLY phases */
     long long stat_repl_lane_barriers;             /* Commands of those plans main ran in their place */
     long long stat_numconnections;                 /* Number of connections received */
