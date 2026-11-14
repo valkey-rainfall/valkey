@@ -72,6 +72,16 @@ Files here:
 - `d3-parse-check.py` (D3-all-parse): the owner frame templates (GET/MGET) against main's parser:
   the same bytes to every owner port and to the plain port (spellings, split reads, MGET 1-40 keys,
   handoffs, 40 KB key, malformed frames, large-request input bytes), reply for reply.
+- `d3aof-check.py` (D3-all-aof): owner-formatted AOF records against the parent binary (`--ref-bin`):
+  the same incr AOF bytes, replies and offset on a sequential workload, offset == records, mixed-db
+  owner buffers vs a model after LOADAOF and restart, timestamps. `--fsync everysec` runs the
+  sequential parts on the owners' own AOF writes (D3-all-g4-aof).
+- `d3aofrace-check.py` (D3-all-g4-aof): owners write the AOF themselves (everysec, no) while the
+  others run: every reply backed by the AOF files (base + incr, across 3 mid-run BGREWRITEAOFs) under
+  appendfsync no, concurrent multi-db writers + plain-port and handoff writers + rewrites + an
+  everysec/always toggle vs a model live, after LOADAOF and after restart, WAITAOF; `--bench` adds a
+  valkey-benchmark SET load on every owner port. `d3veto-check.py` and `d3all-check.py` take
+  `--fsync no` to run their AOF parts (aoftest, ring_backed) on the same path.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 

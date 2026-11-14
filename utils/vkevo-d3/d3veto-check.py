@@ -3,7 +3,9 @@
 
 Starts its own servers (owner-threads N, loopback) from --bin, in --dir, and checks:
 
-  aof.*   (appendonly yes, appendfsync always, then everysec)
+  aof.*   (appendonly yes, appendfsync --fsync: always by default, or no; everysec may release a reply
+           behind a write postponed by a running background fsync, as the stock loop does, so aoftest is
+           strict under always and no only)
     native            owner_veto is none and owner ports run GET/SET/INCR natively
     reply_after_write with DEBUG AOF-FLUSH-SLEEP S, a native write's reply (and a GET pipelined behind
                       it) takes >= S: it left only after main's AOF write, under always and everysec
@@ -29,8 +31,9 @@ Starts its own servers (owner-threads N, loopback) from --bin, in --dir, and che
     lowered           CONFIG SET maxmemory below used: native writes go to main, which evicts below it
 
 Usage: d3veto-check.py --bin src/valkey-server --dir /tmp/x --n 4 --port 26379 --owner-port 26400
-                       --cpus 48-51 --main-cpu 56 [--only aof|mm]
-Prints PASS/FAIL lines and a final 'D3VETO {json}' line; exit 1 on any FAIL.
+                       --cpus 48-51 --main-cpu 56 [--only aof|mm] [--fsync always|everysec|no]
+Prints PASS/FAIL lines and a final 'D3VETO {json}' line; exit 1 on any FAIL. waitaof is not run under
+--fsync no (WAITAOF's local count needs an fsync).
 """
 import argparse
 import json
@@ -199,7 +202,7 @@ def rec(*args):
 # ------------------------------------------------------------------------------------------------
 
 def aof_checks():
-    srv = Server("aof", ["--appendonly", "yes", "--appendfsync", "always", "--auto-aof-rewrite-percentage", "0"])
+    srv = Server("aof", ["--appendonly", "yes", "--appendfsync", ARGS.fsync, "--auto-aof-rewrite-percentage", "0"])
     pid = srv.p.pid
     adm = srv.conn()
     rng = owner_ranges(adm)
@@ -238,7 +241,7 @@ def aof_checks():
             c.close()
         ok = all(ms >= S - 50 and r1 == "OK" and r2 == mode.encode() for ms, r1, r2 in worst)
         check("aof.reply_after_write.%s" % mode, ok, "ms per owner %s (flush sleep %d ms)" % ([w[0] for w in worst], S))
-    adm.cmd("CONFIG", "SET", "appendfsync", "always")
+    adm.cmd("CONFIG", "SET", "appendfsync", ARGS.fsync)
 
     # aoftest: every reply is backed by the AOF when it arrives
     af = AofFile(srv)
@@ -309,12 +312,13 @@ def aof_checks():
     check("aof.lazy_expire_record", all(r is None and a >= 1 for r, b, a in lz), lz)
 
     # WAITAOF after a native write
-    c = srv.conn(0)
-    k = keys_of(rng, 0, b"wa", 1)[0]
-    c.cmd("SET", k, b"v")
-    wr = c.cmd("WAITAOF", 1, 0, 2000)
-    check("aof.waitaof", wr == [1, 0], wr)
-    c.close()
+    if ARGS.fsync != "no":
+        c = srv.conn(0)
+        k = keys_of(rng, 0, b"wa", 1)[0]
+        c.cmd("SET", k, b"v")
+        wr = c.cmd("WAITAOF", 1, 0, 2000)
+        check("aof.waitaof", wr == [1, 0], wr)
+        c.close()
 
     # replay: mixed load, model, DEBUG LOADAOF, restart
     adm.cmd("FLUSHALL")
@@ -627,6 +631,7 @@ def main():
     ap.add_argument("--cpus", default="48-51")
     ap.add_argument("--main-cpu", default="56")
     ap.add_argument("--only", choices=["aof", "mm"])
+    ap.add_argument("--fsync", choices=["always", "everysec", "no"], default="always")
     ARGS = ap.parse_args()
     random.seed(7)
     if ARGS.only in (None, "aof"):

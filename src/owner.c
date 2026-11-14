@@ -43,13 +43,19 @@
  * AOF, one maxmemory.
  *
  * AOF (appendonly yes, D3veto): a native command's execution unit propagates into the owner's
- * ectx as call() would; the owner keeps the ops in order and main replays them into the AOF buffer
- * (replayLanePropagation) the moment it stops the world, before it runs anything itself. Every
+ * ectx as call() would; the owner formats the ops into its own AOF records right away, as
+ * feedAppendOnlyFile would (D3-all-aof). Under appendfsync everysec or no the owner writes its
+ * records to the AOF itself at the end of the window that made them (ownerDrainAof, D3-all-g4-aof):
+ * owners take turns on one lock, append to the AOF buffer and flush it as beforeSleep does, and main
+ * is not woken for it. Under always (one fsync for every owner's records, not one per window), and
+ * whenever main stops the world, main appends each owner's remaining bytes to the AOF buffer the
+ * moment it stops the world, before it runs anything itself. Every
  * write of a key is made by one thread at a time (its owner in a window, or main with the world
  * stopped), so the AOF has each key's writes in execution order. A reply that may show a write the
- * AOF does not have yet (any reply of an owner with unfolded or unflushed ops) is held until main
- * has written the AOF in beforeSleep (fsynced under appendfsync always), the same point where the
- * stock loop sends replies: "a reply never shows a write before the AOF has it" (aofHoldsReplies).
+ * AOF does not have yet (any reply of an owner with unwritten ops) is held until that write: the
+ * owner's own flush, or main's in beforeSleep (fsynced under appendfsync always), the same point
+ * where the stock loop sends replies: "a reply never shows a write before the AOF has it"
+ * (aofHoldsReplies).
  * A native EXEC keeps all its queued commands' ops as one unit, in MULTI/EXEC when more than one,
  * as the stock EXEC's execution unit propagates them (D3-all).
  *
@@ -123,10 +129,9 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
 #define OWN_MM_TIGHT (2 << 20)
 
 typedef struct ownerPropUnit {
-    client *c;  /* whose command it was: main sets its woff (WAITAOF) */
-    int first;  /* its ops in pops[first .. first + n) */
-    int n;
-    int wrap;   /* MULTI/EXEC around the ops, as propagatePendingCommands would have decided */
+    client *c; /* whose command it was: its woff is set when the records are appended (WAITAOF) */
+    int n;     /* its ops (INFO owner_aof_ops) */
+    int repl;  /* replication offset steps its records take: one per AOF record with the REPL target */
 } ownerPropUnit;
 
 typedef struct ownerCmdStat {
@@ -171,13 +176,19 @@ typedef struct owner {
     void *pf; /* this owner's key prefetch batch (memory_prefetch.c); NULL below 2 keys */
     dict **watched;     /* per db: the keys this owner's clients WATCH here (multi.c), like db->watched_keys */
     long long watchers; /* clients with keys in it; written by the owner, or by main under the stop */
-    /* AOF: the ops native commands propagated since main last folded, in execution order. Written
-     * by the owner in a window, replayed and cleared by main under the stop (ownerFoldProp). */
-    serverOp *pops;
-    int npops, pops_cap;
+    /* AOF: the records of the ops native commands propagated since they last went to the AOF buffer,
+     * in execution order, formatted by the owner as feedAppendOnlyFile formats them (ownerTakeProp).
+     * Written by the owner in a window; appended to the AOF buffer and cleared by the owner at the end
+     * of the window (ownerDrainAof) or by main under the stop (ownerFoldProp). The SELECT before the
+     * first keyed record depends on the db the AOF stream has selected then, so it is decided there
+     * (ownerAofAppend); the owner writes the later ones. */
+    sds aofbuf;
+    size_t aof_sel_at; /* where in aofbuf the first keyed record starts */
+    int aof_first_db;  /* that record's db; -1: no keyed record yet */
+    int aof_db;        /* the db selected at the end of aofbuf (once aof_first_db != -1) */
     ownerPropUnit *units;
     int nunits, units_cap;
-    int unflushed;  /* ops since main's last AOF write: this owner's replies wait (ownerReplyOut) */
+    int unflushed;  /* ops not written to the AOF yet: this owner's replies wait (ownerReplyOut) */
     int release;    /* main: the AOF has them now, write the held replies (ownerWriteHeld) */
     client **held;  /* clients whose replies wait for the AOF */
     int nheld, held_cap;
@@ -216,6 +227,13 @@ static int own_dormant = 0; /* io-threads > 1: owners sleep, main serves everyth
 
 /* What the owners' next run must do, set by main when it resumes them (ownerResumeWorld). */
 static int own_aof = 0;                   /* appendonly: native ops are kept for the AOF */
+/* appendonly with appendfsync everysec or no: each owner writes its own records to the AOF at the end
+ * of its window (ownerDrainAof), one owner at a time on own_aof_mu, and its held replies go then; main
+ * stops the world only for its own work. Under always main still writes them for every owner at once
+ * (ownerFoldProp, then one fsync in beforeSleep). */
+static int own_aof_drain = 0;
+static pthread_mutex_t own_aof_mu = PTHREAD_MUTEX_INITIALIZER;
+static long long own_aof_drains = 0;      /* owner AOF writes (under own_aof_mu) */
 static int own_mm = 0;                    /* maxmemory: native steps check their headroom */
 static long long own_mm_slice = 0;        /* bytes each owner may add this period */
 static unsigned long long own_mm_period = 0;
@@ -422,6 +440,8 @@ void ownerThreadsInit(void) {
         pthread_mutex_init(&o->inbox_mu, NULL);
         o->watched = zmalloc(sizeof(dict *) * server.dbnum);
         for (int j = 0; j < server.dbnum; j++) o->watched[j] = dictCreate(&keylistDictType);
+        o->aofbuf = sdsempty();
+        o->aof_first_db = -1;
         o->fdmap_cap = 1024;
         o->fdmap = zcalloc(sizeof(client *) * o->fdmap_cap);
         o->epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -492,20 +512,74 @@ static void ownerLeave(owner *o) {
     atomic_store_explicit(&o->active, 0, memory_order_release);
 }
 
-/* Main, the world just stopped, before main runs anything: what native commands propagated goes to
- * the AOF (and the WAITAOF offset) in each owner's execution order, as call() would have sent it. */
-static void ownerFoldProp(void) {
-    for (int i = 0; i < own_n; i++) {
-        owner *o = &owners[i];
+/* What native commands propagated on owner o since its records last went to the AOF buffer goes
+ * there now (and to the WAITAOF offset), in the owner's execution order, as call() would have sent
+ * it. The owner formatted the records (ownerTakeProp); this appends them as propagateNow and
+ * feedAppendOnlyFile would have fed them one by one: the same timestamp annotation, SELECTs and
+ * bytes, and one replication offset step per record with the REPL target. Replicas, a backlog and
+ * slot export veto the native path (ownerComputeVeto), so the AOF is the only target.
+ * The caller has the AOF state (server.aof_buf, the selected db, the offset) to itself: main with
+ * the world stopped (ownerFoldProp), or owner o inside its window holding own_aof_mu
+ * (ownerDrainAof); main never overlaps a window, and the owners take turns on the lock. */
+static void ownerAofAppend(owner *o) {
+    if (!o->nunits) return;
+    /* propagateNow: shouldPropagate (the AOF target) and propagate_to_aof; feedAppendOnlyFile's own
+     * state check for the bytes. */
+    int feed = server.replication_allowed && !server.loading && server.aof_state != AOF_OFF;
+    int to_aof = server.aof_state == AOF_ON ||
+                 (server.aof_state == AOF_WAIT_REWRITE && server.child_type == CHILD_TYPE_AOF);
+    if (feed) {
+        /* The veto held since main resumed the owners, and nothing ran on main since (slot export
+         * needs cluster mode, where owner threads are off). */
+        serverAssert(server.primary_host == NULL && server.repl_backlog == NULL && !listLength(server.replicas));
+        size_t len = sdslen(o->aofbuf);
+        if (to_aof && len) {
+            if (server.aof_timestamp_enabled) {
+                sds ts = genAofTimestampAnnotationIfNeeded(0);
+                if (ts != NULL) {
+                    server.aof_buf = sdscatsds(server.aof_buf, ts);
+                    sdsfree(ts);
+                }
+            }
+            if (o->aof_first_db == -1) {
+                server.aof_buf = sdscatlen(server.aof_buf, o->aofbuf, len);
+            } else {
+                server.aof_buf = sdscatlen(server.aof_buf, o->aofbuf, o->aof_sel_at);
+                if (o->aof_first_db != server.aof_selected_db) {
+                    char seldb[64];
+                    snprintf(seldb, sizeof(seldb), "%d", o->aof_first_db);
+                    server.aof_buf = sdscatprintf(server.aof_buf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n",
+                                                  (unsigned long)strlen(seldb), seldb);
+                }
+                server.aof_buf = sdscatlen(server.aof_buf, o->aofbuf + o->aof_sel_at, len - o->aof_sel_at);
+                server.aof_selected_db = o->aof_db;
+            }
+        }
         for (int u = 0; u < o->nunits; u++) {
             ownerPropUnit *pu = &o->units[u];
-            long long off = server.primary_repl_offset;
-            replayLanePropagation(o->pops + pu->first, pu->n, pu->wrap);
-            if (server.primary_repl_offset != off) pu->c->woff = server.primary_repl_offset;
+            if (pu->repl) {
+                server.primary_repl_offset += pu->repl; /* replicationFeedReplicas without replicas */
+                pu->c->woff = server.primary_repl_offset;
+            }
             own_aof_ops += pu->n;
         }
-        o->nunits = o->npops = 0;
     }
+    o->nunits = 0;
+    o->aof_first_db = -1;
+    /* shortcut: the buffer keeps up to 1 MB between folds (the stock aof_buf keeps 4 KB); a bigger
+     * one is freed. Upgrade if owners' write bursts make that churn. */
+    if (sdsalloc(o->aofbuf) > (1 << 20)) {
+        sdsfree(o->aofbuf);
+        o->aofbuf = sdsempty();
+    } else {
+        sdsclear(o->aofbuf);
+    }
+}
+
+/* Main, the world just stopped, before main runs anything: the records owners have not written
+ * themselves (ownerDrainAof) go to the AOF buffer ahead of anything main feeds. */
+static void ownerFoldProp(void) {
+    for (int i = 0; i < own_n; i++) ownerAofAppend(&owners[i]);
 }
 
 /* Main: wait until no owner is inside a window. From here until ownerResumeWorld main has the
@@ -636,6 +710,7 @@ static void ownerResumeWorld(void) {
     own_last_veto = ownerComputeVeto();
     atomic_store_explicit(&own_veto, own_last_veto, memory_order_relaxed);
     own_aof = server.aof_state == AOF_ON;
+    own_aof_drain = own_aof && server.aof_fsync != AOF_FSYNC_ALWAYS;
     ownerReleaseHeld();
     ownerMmPlan();
     ownerSettleCommandTables();
@@ -1118,8 +1193,8 @@ static void ownerHold(owner *o, client *c) {
     ownerSetWantOut(o, c, 0); /* level-triggered EPOLLOUT would fire on and on */
 }
 
-/* Returns 1 when the client left the owner. A reply of an owner with ops main has not written to
- * the AOF yet may show one of their writes (GET after SET of the same key), so it waits; replies
+/* Returns 1 when the client left the owner. A reply of an owner with ops not written to the AOF
+ * yet may show one of their writes (GET after SET of the same key), so it waits; replies
  * already waiting keep their order behind which the new ones queue. */
 static int ownerReplyOut(owner *o, client *c) {
     if (c->owner_held) return 0;
@@ -1142,8 +1217,30 @@ static void ownerWriteHeld(owner *o) {
     }
 }
 
-/* Owner: keep what the native command's execution unit propagated, for main to replay in order
- * (ownerFoldProp), as fastpath.c's fpLaneTakeProp does for a lane. */
+/* Owner: the db of the next keyed record; a SELECT before it when the buffer selected another one, as
+ * feedAppendOnlyFile writes it. The first keyed record's SELECT depends on the db the AOF stream has
+ * selected when the buffer is appended (ownerAofAppend). */
+static void ownerAofSelect(owner *o, int dbid) {
+    if (dbid == -1) return;
+    if (o->aof_first_db == -1) {
+        o->aof_first_db = o->aof_db = dbid;
+        o->aof_sel_at = sdslen(o->aofbuf);
+        return;
+    }
+    if (dbid == o->aof_db) return;
+    char seldb[64];
+    snprintf(seldb, sizeof(seldb), "%d", dbid);
+    o->aofbuf = sdscatprintf(o->aofbuf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n", (unsigned long)strlen(seldb), seldb);
+    o->aof_db = dbid;
+}
+
+/* Owner: format what the native command's execution unit propagated into this owner's AOF records,
+ * as propagatePendingCommands -> propagateNow -> feedAppendOnlyFile would (MULTI/EXEC around more
+ * than one op, unless the command touches arbitrary keys), and free the ops here, on the thread that
+ * made them. The bytes are appended in order by this owner (ownerDrainAof) or by main at its stop
+ * (ownerFoldProp). With the AOF on and no replicas, a
+ * backlog or slot export (vetoed), an op propagates only through its AOF target, and each such
+ * record with the REPL target steps the replication offset (WAITAOF). */
 static void ownerTakeProp(owner *o, client *c) {
     serverOpArray *oa = &ectx->also_propagate;
     int n = oa->numops;
@@ -1151,21 +1248,68 @@ static void ownerTakeProp(owner *o, client *c) {
         serverOpArrayFree(oa);
         return;
     }
-    if (o->npops + n > o->pops_cap) {
-        while (o->npops + n > o->pops_cap) o->pops_cap = o->pops_cap ? o->pops_cap * 2 : 256;
-        o->pops = zrealloc(o->pops, sizeof(serverOp) * o->pops_cap);
-    }
     if (o->nunits == o->units_cap) {
         o->units_cap = o->units_cap ? o->units_cap * 2 : 256;
         o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
     }
-    memcpy(o->pops + o->npops, oa->ops, sizeof(serverOp) * n);
-    o->units[o->nunits++] = (ownerPropUnit){
-        .c = c, .first = o->npops, .n = n, .wrap = n > 1 && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS)};
-    o->npops += n;
-    oa->numops = 0; /* the ops' argv now belong to pops */
+    /* shared.multi / shared.exec as catAppendOnlyGenericCommand formats them, without touching the
+     * shared objects from this thread. */
+    static const char multi_rec[] = "*1\r\n$5\r\nMULTI\r\n", exec_rec[] = "*1\r\n$4\r\nEXEC\r\n";
+    int wrap = n > 1 && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS), repl = 0;
+    if (wrap) {
+        o->aofbuf = sdscatlen(o->aofbuf, multi_rec, sizeof(multi_rec) - 1);
+        repl++;
+    }
+    for (int j = 0; j < n; j++) {
+        serverOp *op = oa->ops + j;
+        if (!(op->target & PROPAGATE_AOF)) continue;
+        ownerAofSelect(o, op->dbid);
+        o->aofbuf = catAppendOnlyGenericCommand(o->aofbuf, op->argc, op->argv);
+        if (op->target & PROPAGATE_REPL) repl++;
+    }
+    if (wrap) {
+        o->aofbuf = sdscatlen(o->aofbuf, exec_rec, sizeof(exec_rec) - 1);
+        repl++;
+    }
+    serverOpArrayFree(oa);
+    o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = n, .repl = repl};
     o->unflushed = 1;
-    o->wake_main = 1;
+    if (!own_aof_drain) o->wake_main = 1; /* else this owner writes them at the end of its window */
+}
+
+/* Owner, end of a window, appendfsync everysec or no (own_aof_drain): write this window's records to
+ * the AOF here instead of waking main to stop the world for them, then let the replies that waited
+ * for them go. Owners take turns on own_aof_mu and main never overlaps a window, so the holder has
+ * main's AOF state to itself: its records go to the AOF buffer behind everything fed before them
+ * (main's own, the records main folded at its last stop, other owners' drains), and
+ * flushAppendOnlyFile writes the buffer as beforeSleep does, with the same policy: the write, an
+ * fsync job once a second under everysec, a write postponed behind a running fsync, a failed write
+ * kept in the buffer. The replies then go exactly when the stock loop would send them: when
+ * aofHoldsReplies() is false. Each key is written by one thread at a time and its records reach the
+ * buffer in that thread's execution order, so the AOF has each key's writes in order. */
+static void ownerDrainAof(owner *o) {
+    pthread_mutex_lock(&own_aof_mu);
+    ownerAofAppend(o);
+    flushAppendOnlyFile(0);
+    own_aof_drains++;
+    int hold = aofHoldsReplies();
+    /* writeCommandsDeniedByDiskError's AOF part: after a failed write or background fsync the next
+     * write goes to main, which refuses it, as processCommand would, until the AOF works again. */
+    int err = server.aof_last_write_status == C_ERR ||
+              atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_acquire) == C_ERR;
+    pthread_mutex_unlock(&own_aof_mu);
+    if (err) {
+        atomic_fetch_or_explicit(&own_veto, OWN_VETO_WRITE, memory_order_relaxed);
+        o->wake_main = 1;
+    }
+    if (hold) {
+        /* Not under everysec or no (a write that did not happen leaves aofHoldsReplies false), but if
+         * it were: main writes the buffer and releases the replies (ownerReleaseHeld). */
+        o->wake_main = 1;
+        return;
+    }
+    o->unflushed = 0;
+    if (o->nheld) ownerWriteHeld(o);
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -1199,7 +1343,7 @@ static void ownerMmAfterRead(owner *o) {
 
 /* The bytes each of this owner's growable arrays can take when it doubles. */
 static size_t ownerArraysBytes(owner *o) {
-    return sizeof(serverOp) * (size_t)o->pops_cap + sizeof(ownerPropUnit) * (size_t)o->units_cap +
+    return sdsalloc(o->aofbuf) + sizeof(ownerPropUnit) * (size_t)o->units_cap +
            sizeof(client *) * (size_t)o->held_cap + sizeof(ownerError) * (size_t)o->errors_cap +
            sizeof(ownerLog) * (size_t)o->logs_cap;
 }
@@ -2066,6 +2210,10 @@ static void *ownerThreadMain(void *arg) {
             /* Main is waiting: the rest are level-triggered and come back with the next epoll_wait. */
             if (atomic_load_explicit(&own_stop, memory_order_relaxed)) break;
         }
+        /* This window's AOF records: written here (everysec, no), unless main is stopping the world,
+         * which folds them first thing and writes them with its own. */
+        if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
+            ownerDrainAof(o);
         ownerLeave(o);
         if (handed || o->wake_main) {
             uint64_t one = 1;
@@ -2219,8 +2367,10 @@ void ownerInfo(sds *info) {
                          own_last_veto == OWN_VETO_ALL ? "all" : own_last_veto == OWN_VETO_WRITE ? "writes" : "none",
                          native, own_takes, own_returns, adopted, windows, resident,
                          own_guests ? listLength(own_guests) : 0UL, own_stops, own_stop_wait_us, own_stop_wait_max_us);
-    *info = sdscatprintf(*info, "owner_aof_ops:%lld\r\nowner_held_replies:%lld\r\nowner_maxmemory_to_main:%lld\r\n",
-                         own_aof_ops, held, mm_refused);
+    *info = sdscatprintf(*info,
+                         "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
+                         "owner_maxmemory_to_main:%lld\r\n",
+                         own_aof_ops, own_aof_drains, held, mm_refused);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,
