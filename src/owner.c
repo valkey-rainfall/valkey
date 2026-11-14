@@ -85,7 +85,7 @@
 #define OWNER_MAX 256
 #define OWNER_EVENTS 256
 #define OWNER_WAKE_TOKEN UINT64_MAX
-#define OWN_RING_MAX 128 /* GET ring slots: prefetch-batch-max-size's maximum; a power of two */
+#define OWN_RING_MAX 128 /* GET and MGET ring slots: prefetch-batch-max-size's maximum; a power of two */
 
 enum {
     OWN_GET,
@@ -1599,6 +1599,81 @@ static void ownerRunArgs(client *c, int k, robj ***argv, int *argc, size_t *in) 
     }
 }
 
+/* The start of a run of n commands (ownerGetRun, ownerMgetRun): call()'s state around them. */
+static monotime ownerRunBegin(client *c, struct serverCommand *cmd) {
+    c->cmd = c->lastcmd = c->realcmd = cmd;
+    ectx->current_client = c;
+    ectx->executing_client = c;
+    ectx->in_call++;
+    monotime start = getMonotonicUs();
+    enterExecutionUnit(0, 0);
+    c->flag.executing_command = 1;
+    c->flag.buffered_reply = 0;
+    c->flag.keyspace_notified = 0;
+    return start;
+}
+
+/* The end of a run that answered the client's first n commands (all `cmd`, native kind `kind`): as in
+ * fastget, they share the run's time in commandstats, the latency histogram and the slow commandlog
+ * (one entry per command at the run's average; the large-request and -reply ones did not run here),
+ * and their argvs go back to the parser's recycler. Returns n; 0 leaves the current command as it is. */
+static int ownerRunEnd(owner *o, client *c, struct serverCommand *cmd, int kind, int n, monotime start) {
+    cmdQueue *q = &c->cmd_queue;
+    c->flag.executing_command = 0;
+    c->net_output_bytes_curr_cmd = 0;
+    exitExecutionUnit();
+    long long usec = (long long)(getMonotonicUs() - start);
+    if (n) {
+        ownerCmdStat *cs = &o->cs[kind];
+        cs->calls += n;
+        cs->usec += usec;
+        if (server.latency_tracking_enabled)
+            updateCommandLatencyHistogramCount(&cs->hist, usec * 1000 / n > 0 ? usec * 1000 / n : 1, n);
+        long long slow = ownerLogThreshold(COMMANDLOG_TYPE_SLOW);
+        if (slow >= 0 && usec / n >= slow) {
+            robj **saved_argv = c->argv;
+            int saved_argc = c->argc;
+            for (int k = 0; k < n; k++) {
+                void *entries[3];
+                int types[3];
+                size_t in;
+                ownerRunArgs(c, k, &c->argv, &c->argc, &in);
+                c->duration = usec / n;
+                c->net_input_bytes_curr_cmd = 0;
+                ownerKeepLogs(o, entries, types, commandlogPrepareCurrentCommand(c, cmd, entries, types));
+            }
+            c->argv = saved_argv;
+            c->argc = saved_argc;
+            c->duration = 0;
+        }
+        /* Consume, as fastGetConsumeSpeculated: the owner's parser built these argvs. */
+        for (int j = 0; j < c->argc; j++) parseRecycleArg(c->argv[j]);
+        parseRecycleArgv(c->argv, c->argv_len);
+        c->argv = NULL;
+        c->argc = 0;
+        c->argv_len = 0;
+        c->argv_len_sum = 0;
+        for (int k = 1; k < n; k++) {
+            parsedCommand *p = &q->cmds[q->off++];
+            c->qb_applied += p->input_bytes;
+            for (int j = 0; j < p->argc; j++) parseRecycleArg(p->argv[j]);
+            parseRecycleArgv(p->argv, p->argv_len);
+            p->argv = NULL;
+            p->argc = 0;
+        }
+        if (q->off == q->len) q->off = q->len = 0;
+        c->commands_processed += n;
+        ectx->stat_numcommands += n;
+        o->native_total += n;
+    }
+    ectx->in_call--;
+    ectx->executing_client = NULL;
+    if (!n) return 0; /* nothing done: ownerCall runs the current command */
+    commandProcessed(c); /* the reset after the run's last command (one reset per command is the same) */
+    ectx->current_client = NULL;
+    return n;
+}
+
 /* Owner: answer the client's current GET and the own-slot GETs queued behind it as one run. Up to
  * prefetch-batch-max-size key finds are in flight in a ring; each sweep steps every pending find
  * once (one prefetch each) and replies to the oldest commands whose finds completed, then tops the
@@ -1624,15 +1699,7 @@ static int ownerGetRun(owner *o, client *c) {
     ring[0].done = 0;
     hashtableIncrementalFindInit(&ring[0].find, ht, objectGetVal(c->argv[1]));
 
-    c->cmd = c->lastcmd = c->realcmd = cmd;
-    ectx->current_client = c;
-    ectx->executing_client = c;
-    ectx->in_call++;
-    monotime start = getMonotonicUs();
-    enterExecutionUnit(0, 0);
-    c->flag.executing_command = 1;
-    c->flag.buffered_reply = 0;
-    c->flag.keyspace_notified = 0;
+    monotime start = ownerRunBegin(c, cmd);
     for (;;) {
         /* Fill: top the ring up with the own-slot GETs queued behind. */
         while (open && tail - head < depth && next < q->len) {
@@ -1681,61 +1748,172 @@ static int ownerGetRun(owner *o, client *c) {
             }
         }
     }
-    c->flag.executing_command = 0;
-    c->net_output_bytes_curr_cmd = 0;
-    exitExecutionUnit();
-    long long usec = (long long)(getMonotonicUs() - start);
-    int n = (int)head;
-    if (n) {
-        ownerCmdStat *cs = &o->cs[OWN_GET];
-        cs->calls += n;
-        cs->usec += usec;
-        if (server.latency_tracking_enabled)
-            updateCommandLatencyHistogramCount(&cs->hist, usec * 1000 / n > 0 ? usec * 1000 / n : 1, n);
-        long long slow = ownerLogThreshold(COMMANDLOG_TYPE_SLOW);
-        if (slow >= 0 && usec / n >= slow) {
-            /* Each command at the run's average; the large-request and -reply ones did not run here. */
-            robj **saved_argv = c->argv;
-            int saved_argc = c->argc;
-            for (int k = 0; k < n; k++) {
-                void *entries[3];
-                int types[3];
-                size_t in;
-                ownerRunArgs(c, k, &c->argv, &c->argc, &in);
-                c->duration = usec / n;
-                c->net_input_bytes_curr_cmd = 0;
-                ownerKeepLogs(o, entries, types, commandlogPrepareCurrentCommand(c, cmd, entries, types));
+    return ownerRunEnd(o, c, cmd, OWN_GET, (int)head, start);
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * MGET runs: the GET ring over every key of the own-slot MGETs (D3-all-g2)
+ * ---------------------------------------------------------------------------------------------- */
+
+#define OWN_MGET_REPLY_MAX 4096 /* an MGET reply gathered in one buffer; a longer one runs mgetCommand */
+
+/* Gather one MGET's reply from its n completed finds (ring slots first..first+n-1) into buf in one
+ * pass, with mgetCommand's effects: a touch and a keyspace hit per found string, a miss and a null
+ * per missing key. Returns the reply's length, or 0, having changed nothing, when mgetCommand must
+ * run it instead: a key with an expire (lazy expire stays in lookupKey), a value that is not a
+ * string, a reply longer than buf or one the large-reply commandlog records. */
+static size_t ownerMgetReply(client *c, ownerRingEntry *ring, unsigned first, int n, char *buf,
+                             long long reply_threshold) {
+    robj *vals[OWN_RING_MAX];
+    char *w = buf, *end = buf + OWN_MGET_REPLY_MAX;
+    *w++ = '*';
+    w += ll2string(w, LONG_STR_SIZE, n);
+    *w++ = '\r';
+    *w++ = '\n';
+    for (int i = 0; i < n; i++) {
+        void *found = NULL;
+        vals[i] = NULL;
+        if (!hashtableIncrementalFindGetResult(&ring[(first + i) % OWN_RING_MAX].find, &found)) {
+            if (end - w < 5) return 0;
+            if (c->resp == 2) {
+                memcpy(w, "$-1\r\n", 5);
+                w += 5;
+            } else {
+                memcpy(w, "_\r\n", 3);
+                w += 3;
             }
-            c->argv = saved_argv;
-            c->argc = saved_argc;
-            c->duration = 0;
+            continue;
         }
-        /* Consume, as fastGetConsumeSpeculated: the owner's parser built these argvs. */
-        for (int j = 0; j < c->argc; j++) parseRecycleArg(c->argv[j]);
-        parseRecycleArgv(c->argv, c->argv_len);
-        c->argv = NULL;
-        c->argc = 0;
-        c->argv_len = 0;
-        c->argv_len_sum = 0;
-        for (int k = 1; k < n; k++) {
-            parsedCommand *p = &q->cmds[q->off++];
-            c->qb_applied += p->input_bytes;
-            for (int j = 0; j < p->argc; j++) parseRecycleArg(p->argv[j]);
-            parseRecycleArgv(p->argv, p->argv_len);
-            p->argv = NULL;
-            p->argc = 0;
+        robj *val = found;
+        if (val->hasexpire || objectGetType(val) != OBJ_STRING) return 0;
+        char ibuf[LONG_STR_SIZE];
+        const char *s = ibuf;
+        size_t len;
+        if (sdsEncodedObject(val)) {
+            s = objectGetVal(val);
+            len = sdslen((sds)s);
+        } else {
+            len = (size_t)ll2string(ibuf, sizeof(ibuf), (long)objectGetVal(val));
         }
-        if (q->off == q->len) q->off = q->len = 0;
-        c->commands_processed += n;
-        ectx->stat_numcommands += n;
-        o->native_total += n;
+        if ((size_t)(end - w) < 1 + LONG_STR_SIZE + 2 + len + 2) return 0;
+        *w++ = '$';
+        w += ll2string(w, LONG_STR_SIZE, (long long)len);
+        *w++ = '\r';
+        *w++ = '\n';
+        memcpy(w, s, len);
+        w += len;
+        *w++ = '\r';
+        *w++ = '\n';
+        vals[i] = val;
     }
-    ectx->in_call--;
-    ectx->executing_client = NULL;
-    if (!n) return 0; /* nothing done: ownerCall runs the current command */
-    commandProcessed(c); /* the reset after the run's last command (one reset per GET is the same) */
-    ectx->current_client = NULL;
-    return n;
+    size_t total = (size_t)(w - buf);
+    if (reply_threshold >= 0 && (long long)total >= reply_threshold) return 0;
+    int touch = !c->flag.no_touch && !server.key_touch_paused;
+    for (int i = 0; i < n; i++) {
+        if (!vals[i]) {
+            ectx->stat_keyspace_misses++; /* the keymiss notification is vetoed while owners run */
+            continue;
+        }
+        if (touch) vals[i]->lru = lrulfu_touch(vals[i]->lru);
+        ectx->stat_keyspace_hits++;
+    }
+    return total;
+}
+
+/* The own-slot table of an MGET the run can take (its keys hash to one slot: ownerKeySlot), or NULL. */
+static hashtable *ownerMgetTable(owner *o, client *c, int slot, int argc, size_t in, long long req_threshold) {
+    if (argc - 1 > OWN_RING_MAX || slot < o->slot_lo || slot > o->slot_hi) return NULL;
+    if (req_threshold >= 0 && (long long)in >= req_threshold) return NULL;
+    return kvstoreGetHashtable(c->db->keys, OWNER_TABLE_OF_SLOT(slot));
+}
+
+/* Owner: answer the client's current MGET and the own-slot MGETs queued behind it as one run, with
+ * ownerGetRun's ring over their keys: up to prefetch-batch-max-size key finds in flight (a whole
+ * MGET always fits: one is let in alone when the ring is empty), each sweep steps every pending find
+ * once, and the oldest MGET whose finds have all completed is answered in one pass from them
+ * (ownerMgetReply, no second lookup), then the ring tops up with the next MGET's keys. The run ends
+ * before the first command that is not an own-slot MGET of at most OWN_RING_MAX keys, that
+ * ownerMgetReply leaves to mgetCommand, or that the large-request commandlog records; the caller
+ * runs that one. Cross-owner and two-slot MGETs never get here (ownerKeySlot: main). Returns the
+ * number of commands answered and consumed; 0 leaves the current one untouched. */
+static int ownerMgetRun(owner *o, client *c) {
+    long long req_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    long long reply_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    hashtable *ht = ownerMgetTable(o, c, c->slot, c->argc, c->net_input_bytes_curr_cmd, req_threshold);
+    if (!ht) return 0;
+    unsigned depth = server.prefetch_batch_max_size < 1 ? 1 : (unsigned)server.prefetch_batch_max_size;
+    if (depth > OWN_RING_MAX) depth = OWN_RING_MAX;
+    ownerRingEntry ring[OWN_RING_MAX];
+    char buf[OWN_MGET_REPLY_MAX];
+    struct serverCommand *cmd = c->parsed_cmd;
+    cmdQueue *q = &c->cmd_queue;
+    int next = q->off, open = 1;
+    int added = 1, answered = 0;    /* commands of the run in the ring / answered */
+    unsigned head = 0, tail = 0;    /* key finds: the answered MGETs' keys end at head */
+    for (int j = 1; j < c->argc; j++, tail++) {
+        ring[tail].done = 0;
+        hashtableIncrementalFindInit(&ring[tail].find, ht, objectGetVal(c->argv[j]));
+    }
+
+    monotime start = ownerRunBegin(c, cmd);
+    for (;;) {
+        /* Fill: whole own-slot MGETs from the queue while their keys fit the ring's depth. */
+        while (open && next < q->len) {
+            parsedCommand *p = &q->cmds[next];
+            if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) || !p->cmd || p->cmd->proc != mgetCommand ||
+                (p->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
+                open = 0;
+                break;
+            }
+            if (p->slot < 0) p->slot = ownerKeySlot(p->cmd, p->argv, p->argc, p->read_flags);
+            hashtable *pht = ownerMgetTable(o, c, p->slot, p->argc, p->input_bytes, req_threshold);
+            if (!pht) {
+                open = 0;
+                break;
+            }
+            if (tail > head && tail - head + (unsigned)(p->argc - 1) > depth) break; /* after the next answer */
+            for (int j = 1; j < p->argc; j++, tail++) {
+                ownerRingEntry *e = &ring[tail % OWN_RING_MAX];
+                e->done = 0;
+                hashtableIncrementalFindInit(&e->find, pht, objectGetVal(p->argv[j]));
+            }
+            added++;
+            next++;
+        }
+        if (answered == added) break;
+        /* Sweep: one find step per pending key. */
+        for (unsigned s = head; s < tail; s++) {
+            ownerRingEntry *e = &ring[s % OWN_RING_MAX];
+            if (!e->done) e->done = !hashtableIncrementalFindStep(&e->find);
+        }
+        /* Drain: answer the oldest MGETs whose keys all completed, in command order. */
+        while (answered < added) {
+            robj **argv;
+            int argc;
+            size_t in;
+            ownerRunArgs(c, answered, &argv, &argc, &in);
+            int n = argc - 1, k = 0;
+            while (k < n && ring[(head + k) % OWN_RING_MAX].done) k++;
+            if (k < n) break;
+            c->net_output_bytes_curr_cmd = 0;
+            size_t len = ownerMgetReply(c, ring, head, n, buf, reply_threshold);
+            if (!len) {
+                open = 0;
+                added = answered; /* the rest go command by command */
+                break;
+            }
+            addReplyProto(c, buf, len);
+            head += (unsigned)n;
+            answered++;
+            /* An output buffer limit closes the client: run nothing more, as processInputBuffer. */
+            if (c->flag.close_asap) {
+                open = 0;
+                added = answered;
+                break;
+            }
+        }
+    }
+    return ownerRunEnd(o, c, cmd, OWN_MGET, answered, start);
 }
 
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
@@ -1749,10 +1927,11 @@ static int ownerTryNative(client *c) {
         ownerPrefetch(o, c);
         ownerQueue(c);
     } else {
-        /* shortcut: under maxmemory GETs run one by one (ownerNativeKind bounds each reply); the ring
-         * answers up to prefetch-batch-max-size GETs with no headroom check between them. Upgrade:
-         * check each ring reply's value length against the headroom before it is added. */
+        /* shortcut: under maxmemory GETs and MGETs run one by one (ownerNativeKind bounds each reply);
+         * a ring run answers up to prefetch-batch-max-size keys' commands with no headroom check
+         * between them. Upgrade: check each ring reply's value length against the headroom first. */
         if (kind == OWN_GET && !own_mm && ownerGetRun(o, c)) return 1;
+        if (kind == OWN_MGET && !own_mm && ownerMgetRun(o, c)) return 1;
         ownerPrefetch(o, c);
         ownerCall(o, c, c->parsed_cmd, kind, 1);
         /* EXEC's bound is a sum over its queued commands: should it still have gone over, every

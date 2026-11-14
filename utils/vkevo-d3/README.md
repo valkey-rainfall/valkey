@@ -32,6 +32,15 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
 - D3-all (D3-g2 + D3mk + D3veto): a native EXEC under AOF keeps its queued commands' ops as one unit
   (MULTI/EXEC-wrapped when more than one, as the stock EXEC); under maxmemory MGET and EXEC are bounded
   by the stored values they can return, and owner GETs run one by one (no D3-g2 GET ring).
+- D3-all-g2 (MGET run): an owner answers the client's current own-slot MGET and the own-slot MGETs
+  queued behind it as one run through the GET ring: up to `prefetch-batch-max-size` key finds in
+  flight across the MGETs (a whole MGET always fits), and each MGET's reply is gathered in one pass
+  from its finds into one buffer (one `addReplyProto`, no second lookup). An MGET with a TTL key, a
+  non-string, a reply over 4 KB or a large-request/-reply commandlog hit runs `mgetCommand` as before;
+  cross-owner and two-slot MGETs still go to main. Off under maxmemory, like the GET ring.
+- D3-all-g3 (D3-all-g2-parse + D3-all-g2-mget): an owner's MGET of up to 32 keys reaches the
+  MGET run through the frame template (parseOwnerFrame builds the argv the run reads its keys
+  from); a longer one through parseMultibulk, as before.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -57,6 +66,9 @@ Files here:
   d3veto-check: native EXEC in the AOF (MULTI/EXEC-wrapped as the stock EXEC, replies after the AOF
   write, replay/LOADAOF/restart digests), GET-ring and MGET replies backed by the AOF, MGET/EXEC
   maxmemory bounds, eviction and noeviction under native transactions.
+- `d3-mget-check.py` (D3-all-g2): the owner MGET run vs a model over ring sizes, raw reply bytes equal
+  to the plain port's in RESP2 and RESP3, MGET commandstats / keyspace hits and misses / native counts,
+  slow, large-reply and large-request commandlogs, touch and CLIENT NO-TOUCH.
 - `d3-parse-check.py` (D3-all-parse): the owner frame templates (GET/MGET) against main's parser:
   the same bytes to every owner port and to the plain port (spellings, split reads, MGET 1-40 keys,
   handoffs, 40 KB key, malformed frames, large-request input bytes), reply for reply.
