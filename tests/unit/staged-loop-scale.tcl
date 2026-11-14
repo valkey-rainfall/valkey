@@ -41,6 +41,30 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
         assert_equal 1000 [llength [r keys sls:p:*]]
     }
 
+    test {Staged loop: a saturating burst brings every IO thread in at once} {
+        wait_for_condition 100 20 {
+            [sls_active] == 0
+        } else {
+            fail "IO threads stayed in at a trickle: [r info fastpath]"
+        }
+        set fds {}
+        for {set c 0} {$c < 8} {incr c} { lappend fds [sls_socket] }
+        set cmd {}
+        for {set i 0} {$i < 4000} {incr i} { append cmd "*3\r\n\$3\r\nSET\r\n\$9\r\nsls:b:[format %03d [expr {$i % 1000}]]\r\n\$1\r\nx\r\n" }
+        foreach fd $fds { puts -nonewline $fd $cmd; flush $fd }
+        # Workers in use while the burst runs: the first change from 0 must take all of them.
+        set seen {}
+        for {set i 0} {$i < 200} {incr i} {
+            set a [sls_active]
+            if {$a != 0 && [lsearch -exact $seen $a] < 0} { lappend seen $a }
+            if {$a == 3} break
+        }
+        foreach fd $fds { set got 0; while {$got < 4000 * 5} { incr got [string length [read $fd [expr {4000 * 5 - $got}]]] } }
+        foreach fd $fds { close $fd }
+        assert_equal 3 [lindex $seen 0]
+        assert_equal 1000 [llength [r keys sls:b:*]]
+    }
+
     test {Staged loop: io-threads-always-active keeps every IO thread in} {
         r config set io-threads-always-active yes
         wait_for_condition 100 20 {

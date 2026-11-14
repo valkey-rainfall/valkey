@@ -605,13 +605,17 @@ static void stagedSetWorkers(int want) {
  * time in phase work (its lane share and the execution, not barrier waits or wakes) plus the workers'
  * phase time. Every STAGED_SCALE_SAMPLE_US main compares the work with the time passed: enough
  * threads to keep each below STAGED_SCALE_TARGET_PCT busy take part from the next iteration, so a load
- * that saturates the current threads doubles them within a sample or two. Fewer take part only after
- * STAGED_SCALE_DOWN_US in which no sample needed more. The hidden io-threads-always-active keeps every
- * enrolled worker in. */
+ * that saturates the current threads doubles them within a sample or two. An iteration that kept main
+ * and the current workers busy for STAGED_SCALE_SATURATED_PCT of a wall time of at least
+ * STAGED_SCALE_SAMPLE_US brings every worker in at once: a burst arriving on few workers would
+ * otherwise run one long iteration per doubling. Fewer take part only after STAGED_SCALE_DOWN_US in
+ * which no sample needed more. The hidden io-threads-always-active keeps every enrolled worker in. */
 #define STAGED_SCALE_SAMPLE_US 1000
 #define STAGED_SCALE_TARGET_PCT 40
 #define STAGED_SCALE_DOWN_US 100000
+#define STAGED_SCALE_SATURATED_PCT 90
 static uint64_t sl_iter_work_ns = 0;   /* last iteration's work */
+static uint64_t sl_iter_wall_ns = 0;   /* last iteration's wall time, from the read phase to the reply */
 static uint64_t sl_scale_work_ns = 0;  /* work since the sample started */
 static monotime sl_scale_sample_start = 0;
 uint64_t stagedLastIterationWorkNs(void) {
@@ -645,6 +649,13 @@ static void stagedScaleWorkers(void) {
         need = (int)(sl_scale_work_ns * 100 / ((uint64_t)span * 1000 * STAGED_SCALE_TARGET_PCT)) - 1;
         if (need < 0) need = 0;
         if (need > sl_workers) need = sl_workers;
+        /* Saturated: the last iteration's work filled the threads that ran it. Measured on the iteration,
+         * not the sample, so a poll sleep before a burst does not hide it.
+         * shortcut: a slow command executed on lanes also reads as saturated and brings every worker in
+         * for STAGED_SCALE_DOWN_US; count the commands per iteration if that shows up at low load. */
+        if (sl_iter_wall_ns >= (uint64_t)STAGED_SCALE_SAMPLE_US * 1000 &&
+            sl_iter_work_ns * 100 >= sl_iter_wall_ns * STAGED_SCALE_SATURATED_PCT * (uint64_t)(sl_active + 1))
+            need = sl_workers;
     }
     sl_scale_work_ns = 0;
     sl_scale_sample_start = now;
@@ -877,6 +888,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     replyPhase(el);
     cronStatsRecord(CRON_JOB_SL_REPLY, getMonotonicUs() - t);
     sl_iter_work_ns = (sl_main_work_ns - mwork0) + (stagedWorkerWorkNs(active0) - work0);
+    sl_iter_wall_ns = stagedNowNs() - t0;
     sl_scale_work_ns += sl_iter_work_ns;
     /* Publish the next stable offset now, so this iteration's writes need not wait for the next collect. */
     replStreamSenderTick();
