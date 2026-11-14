@@ -67,6 +67,14 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   `owner_burst_commands`, `owner_bursts`. The GET and MGET runs and the bursts now answer a value
   whose object carries an expire field with no expire in it (an embedded value with room for the
   field, or a PERSISTed key); only a real expire goes to getCommand / mgetCommand.
+- D3-all-g8-aofpace: automatic (growth) AOF rewrites are paced. After a successful rewrite that ran
+  T, the next automatic one waits until T * `aof-rewrite-pace` / 100 has passed since it ended
+  (default 200: rewriting at most a third of the time; 0 = upstream). The growth base includes what
+  was written during the rewrite, so a faster rewrite only meant more rewrites, each a fork plus a
+  copy-on-write of the whole dataset at millions of SETs/s. Pacing yields once growth reaches
+  2 * `auto-aof-rewrite-percentage` + 100. BGREWRITEAOF, scheduled rewrites and the failure limiter
+  are unchanged; every write is still in the AOF and fsynced on its policy. `INFO persistence`:
+  `aof_rewrites_paced`, `aof_rewrite_pace_ms`, `aof_last_rewrite_ms`.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.

@@ -1820,7 +1820,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
             server.aof_current_size > server.aof_rewrite_min_size) {
             long long base = server.aof_rewrite_base_size ? server.aof_rewrite_base_size : 1;
             long long growth = (server.aof_current_size * 100 / base) - 100;
-            if (growth >= server.aof_rewrite_perc && !aofRewriteLimited()) {
+            if (growth >= server.aof_rewrite_perc && !aofRewriteLimited() && !aofRewritePaced(growth)) {
                 serverLog(LL_NOTICE, "Starting automatic rewriting of AOF on %lld%% growth", growth);
                 rewriteAppendOnlyFileBackground();
             }
@@ -2695,6 +2695,11 @@ void initServerConfig(void) {
     atomic_store_explicit(&server.aof_bio_fsync_status, C_OK, memory_order_relaxed);
     server.aof_rewrite_time_last = -1;
     server.aof_rewrite_time_start = -1;
+    server.aof_rewrite_mono_start = 0;
+    server.aof_rewrite_mono_end = 0;
+    server.aof_rewrite_last_us = 0;
+    server.aof_rewrite_pacing = 0;
+    server.aof_rewrite_pace_start = 0;
     server.aof_lastbgrewrite_status = C_OK;
     server.aof_delayed_fsync = 0;
     server.aof_fd = -1;
@@ -3223,6 +3228,8 @@ void resetServerStats(void) {
         memset(server.inst_metric[j].samples, 0, sizeof(server.inst_metric[j].samples));
     }
     server.stat_aof_rewrites = 0;
+    server.stat_aof_rewrites_paced = 0;
+    server.stat_aof_rewrite_pace_us = 0;
     server.stat_rdb_saves = 0;
     server.stat_aofrw_consecutive_failures = 0;
     server.stat_net_input_bytes = 0;
@@ -7298,6 +7305,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "aof_current_rewrite_time_sec:%jd\r\n", (intmax_t)((server.child_type != CHILD_TYPE_AOF) ? -1 : time(NULL) - server.aof_rewrite_time_start),
                 "aof_last_bgrewrite_status:%s\r\n", (server.aof_lastbgrewrite_status == C_OK ? "ok" : "err"),
                 "aof_rewrites:%lld\r\n", server.stat_aof_rewrites,
+                "aof_rewrites_paced:%lld\r\n", server.stat_aof_rewrites_paced,
+                "aof_rewrite_pace_ms:%lld\r\n", server.stat_aof_rewrite_pace_us / 1000,
+                "aof_last_rewrite_ms:%lld\r\n", server.aof_rewrite_last_us / 1000,
                 "aof_rewrites_consecutive_failures:%lld\r\n", server.stat_aofrw_consecutive_failures,
                 "aof_last_write_status:%s\r\n", (server.aof_last_write_status == C_OK && aof_bio_fsync_status == C_OK) ? "ok" : "err",
                 "aof_last_cow_size:%zu\r\n", server.stat_aof_cow_bytes,

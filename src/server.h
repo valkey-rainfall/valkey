@@ -2386,6 +2386,16 @@ struct valkeyServer {
     mstime_t aof_last_fsync;            /* mstime of last fsync() */
     time_t aof_rewrite_time_last;       /* Time used by last AOF rewrite run. */
     time_t aof_rewrite_time_start;      /* Current AOF rewrite start time. */
+    int aof_rewrite_pace;               /* vkevo: auto AOF rewrite pacing, percent of the last successful
+                                         * rewrite's run time that must pass after it ends before the next
+                                         * automatic (growth) rewrite starts; 0 = off (upstream). */
+    monotime aof_rewrite_mono_start;    /* vkevo: monotonic start of the current AOF rewrite. */
+    monotime aof_rewrite_mono_end;      /* vkevo: monotonic end of the last successful AOF rewrite. */
+    long long aof_rewrite_last_us;      /* vkevo: run time of the last successful AOF rewrite (0 = none). */
+    int aof_rewrite_pacing;             /* vkevo: the pending automatic rewrite is being held by pacing. */
+    monotime aof_rewrite_pace_start;    /* vkevo: when pacing started holding it. */
+    long long stat_aof_rewrites_paced;  /* vkevo: automatic rewrites whose start pacing delayed. */
+    long long stat_aof_rewrite_pace_us; /* vkevo: total time automatic rewrites were held by pacing. */
     time_t aof_cur_timestamp;           /* Current record timestamp in AOF */
     int aof_timestamp_enabled;          /* Enable record timestamp in AOF */
     int aof_lastbgrewrite_status;       /* C_OK or C_ERR */
@@ -3867,6 +3877,7 @@ void aofOpenIfNeededOnServerStart(void);
 void aofManifestFree(aofManifest *am);
 int aofDelHistoryFiles(void);
 int aofRewriteLimited(void);
+int aofRewritePaced(long long growth);
 int rewriteSlotToAppendOnlyFileRio(rio *aof, int db_num, int hashslot, size_t *key_count);
 
 /* Child info */

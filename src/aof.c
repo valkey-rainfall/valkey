@@ -895,6 +895,37 @@ int aofRewriteLimited(void) {
     return 1;
 }
 
+/* vkevo D3-all-g8-aofpace: pace automatic (growth-triggered) AOF rewrites.
+ *
+ * The growth trigger compares the AOF with its size right after the last rewrite, and that size includes
+ * what was written to the INCR file while the rewrite ran. Under a steady write rate the gap between two
+ * rewrites is therefore about as long as the rewrite itself, and a faster rewrite (a child on its own CPU)
+ * just means more rewrites per second of load. Every rewrite costs the same whatever its length: a fork and
+ * a copy-on-write of every page the writers touch, which at millions of SETs per second is the whole
+ * dataset. So after a successful rewrite that ran T us, the next automatic rewrite waits until
+ * T * aof-rewrite-pace / 100 us have passed since it ended (pace 200: rewriting at most a third of the time).
+ *
+ * Only the start of an automatic rewrite moves. Every write still goes to the AOF and is fsynced on the
+ * appendfsync policy, so durability is unchanged; the INCR file just grows longer before it is compacted.
+ * BGREWRITEAOF, a scheduled rewrite (also the one that turns AOF on) and the failure limiter are not paced.
+ * To bound the AOF, pacing yields once growth reaches twice the size at which the trigger fired
+ * (growth >= 2 * auto-aof-rewrite-percentage + 100). Returns 1 to hold the rewrite, 0 to start it. */
+int aofRewritePaced(long long growth) {
+    if (server.aof_rewrite_pace <= 0 || server.aof_rewrite_last_us <= 0) return 0;
+    if (growth >= 2LL * server.aof_rewrite_perc + 100) return 0;
+    long long hold = server.aof_rewrite_last_us / 100 * server.aof_rewrite_pace;
+    long long since = (long long)(getMonotonicUs() - server.aof_rewrite_mono_end);
+    if (since >= hold) return 0;
+    if (!server.aof_rewrite_pacing) {
+        server.aof_rewrite_pacing = 1;
+        server.aof_rewrite_pace_start = getMonotonicUs();
+        server.stat_aof_rewrites_paced++;
+        serverLog(LL_VERBOSE, "Automatic AOF rewrite on %lld%% growth paced for %lld ms (last rewrite %lld ms)",
+                  growth, (hold - since) / 1000, server.aof_rewrite_last_us / 1000);
+    }
+    return 1;
+}
+
 /* ----------------------------------------------------------------------------
  * AOF file implementation
  * ------------------------------------------------------------------------- */
@@ -987,6 +1018,8 @@ void stopAppendOnly(void) {
     }
     server.aof_last_incr_size = 0;
     server.aof_last_incr_fsync_offset = 0;
+    server.aof_rewrite_last_us = 0; /* vkevo aofpace: a new AOF starts unpaced */
+    server.aof_rewrite_pacing = 0;
     server.fsynced_reploff = -1;
     atomic_store_explicit(&server.fsynced_reploff_pending, 0, memory_order_relaxed);
     killAppendOnlyChild();
@@ -2727,6 +2760,11 @@ int rewriteAppendOnlyFileBackground(void) {
         serverLog(LL_NOTICE, "Background append only file rewriting started by pid %ld", (long)childpid);
         server.aof_rewrite_scheduled = 0;
         server.aof_rewrite_time_start = time(NULL);
+        server.aof_rewrite_mono_start = getMonotonicUs();
+        if (server.aof_rewrite_pacing) {
+            server.stat_aof_rewrite_pace_us += (long long)(server.aof_rewrite_mono_start - server.aof_rewrite_pace_start);
+            server.aof_rewrite_pacing = 0;
+        }
         server.aof_rewrite_use_rdb_preamble = server.aof_use_rdb_preamble;
         return C_OK;
     }
@@ -2845,6 +2883,7 @@ int getBaseAndIncrAppendOnlyFilesNum(aofManifest *am) {
 /* A background append only file rewriting (BGREWRITEAOF) terminated its work.
  * Handle this. */
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
+    int rewrite_ok = 0; /* vkevo aofpace: only a successful rewrite paces the next automatic one */
     if (!bysignal && exitcode == 0) {
         char tmpfile[256];
         long long now = ustime();
@@ -2952,6 +2991,7 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         server.stat_aofrw_consecutive_failures = 0;
 
         serverLog(LL_NOTICE, "Background AOF rewrite finished successfully");
+        rewrite_ok = 1;
         /* Change state from WAIT_REWRITE to ON if needed */
         if (server.aof_state == AOF_WAIT_REWRITE) {
             server.aof_state = AOF_ON;
@@ -2991,6 +3031,12 @@ cleanup:
     }
     server.aof_rewrite_time_last = time(NULL) - server.aof_rewrite_time_start;
     server.aof_rewrite_time_start = -1;
+    if (rewrite_ok) {
+        server.aof_rewrite_mono_end = getMonotonicUs();
+        server.aof_rewrite_last_us = (long long)(server.aof_rewrite_mono_end - server.aof_rewrite_mono_start);
+    } else {
+        server.aof_rewrite_last_us = 0;
+    }
     /* Schedule a new rewrite if we are waiting for it to switch the AOF ON. */
     if (server.aof_state == AOF_WAIT_REWRITE) server.aof_rewrite_scheduled = 1;
 }
