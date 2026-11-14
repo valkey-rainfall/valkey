@@ -88,6 +88,16 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   `owner_uring_enters|reads|writes`,
   `owner_uring_short_writes` (sends that moved less than asked), `owner_uring_redone` (ops redone by
   the syscall path).
+- D3-all-g9-fold: g8-k1 (GET bursts), g8-aofpace (paced rewrites) and g8-iouring in one tree, with two
+  io_uring defaults changed from the fleet A/B: `owner-uring-deep` is 0 (every read is batched, deep
+  pipelines included: W=32 K1 +4.8%, K2 +2.7% vs 32) and, under appendonly, the owners keep
+  D3-all-g7-rwchild's syscall reads and writes (held AOF replies included) unless `owner-uring-aof yes`
+  (hidden, CONFIG SET at runtime): batching under AOF tied K13 throughput and raised its SET p99 21% at
+  W=32. Under maxmemory reads stay unbatched as before. A burst drains whatever the read put in the query
+  buffer (syscall read or the batch's recv, in the client's turn of the batch), then the parser takes
+  the rest; replies go out through the batch's sends or the write path. `INFO owners`:
+  `owner_uring_batching` (`yes`, or why not: `off`, `aof`, `maxmemory`), `owner_uring_deep`,
+  `owner_uring_aof`.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.

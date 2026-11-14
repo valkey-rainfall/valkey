@@ -2153,6 +2153,7 @@ struct valkeyServer {
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */
     int owner_uring;                          /* owner-uring: owners batch socket reads and writes through io_uring. */
     int owner_uring_deep;                     /* owner-uring-deep: a client whose last read had this many commands skips the batch (0: none). */
+    int owner_uring_aof;                      /* owner-uring-aof: owners batch under appendonly too (default no: the syscall path). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */

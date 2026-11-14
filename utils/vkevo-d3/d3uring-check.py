@@ -2,8 +2,12 @@
 """D3-all-g8-iouring: the owner io_uring read/write path against a running server (owner-threads N,
 owner-uring yes). Every check goes through the owner ports with keys each port's owner owns, so the
 batched reads and writes are the ones under test; each runs three ways: [all] owner-uring yes with
-owner-uring-deep 0 (every read batched), [yes] the server's owner-uring-deep (deep pipelines on the syscall
-path, clients moving between the two), [no] owner-uring no.
+owner-uring-deep 0 (every read batched), [yes] the server's owner-uring-deep, or 32 when that is 0 (deep
+pipelines on the syscall path, clients moving between the two), [no] owner-uring no.
+D3-all-g9-fold: where the server keeps the owners off io_uring (INFO owners owner_uring_batching aof or
+maxmemory: appendonly without owner-uring-aof, or maxmemory), [path] and the io_uring part of
+[backpressure] check the bypass instead: no io_uring reads (and, under aof, no io_uring writes); every
+other check runs as is.
 
   path          owner_uring_reads / owner_uring_writes grow while native commands run (the path is used)
   order         concurrent connections, random pipelines of SET/GET/INCR/MGET/DEL/PING split at random byte
@@ -16,7 +20,7 @@ path, clients moving between the two), [no] owner-uring no.
                 read path), then GET: the same bytes
   aborts        200 connections send a pipeline and close at once (half with RST): the server keeps
                 serving, every port answers, resident owner clients drop back
-  toggle        CONFIG SET owner-uring (and owner-uring-deep 0 / default) flips every 20 ms while 8 connections run pipelines: every reply right
+  toggle        CONFIG SET owner-uring (and owner-uring-deep 0 / default, owner-uring-aof) flips every 20 ms while 8 connections run pipelines: every reply right
   no_crash      same pid, every port answers PING
 
 Usage: d3uring-check.py --port 6379 --owner-port 6400 --n 4. PASS/FAIL lines, a final URINGCHECK {json};
@@ -255,20 +259,28 @@ def main():
 
     t, deep0 = cmd(a.port, "CONFIG", "GET", "owner-uring-deep")
     deep0 = deep0[1][1] if deep0 and len(deep0) > 1 else b"32"
+    deep_yes = deep0 if deep0 not in (b"0", b"") else b"32"  # [yes]: a threshold, so clients move between paths
+    t, uaof = cmd(a.port, "CONFIG", "GET", "owner-uring-aof")
+    uaof0 = uaof[1][1] if t == b"*" and uaof and len(uaof) > 1 else None  # None: no such config (pre-g9)
     # all: owner-uring yes and owner-uring-deep 0 (every read batched); yes: the server's own owner-uring-deep
     # (deep pipelines take the syscall path, clients move between the two); no: the syscall path only
     for mode in ("all", "yes", "no"):
         cmd(a.port, "CONFIG", "SET", "owner-uring", "no" if mode == "no" else "yes")
-        cmd(a.port, "CONFIG", "SET", "owner-uring-deep", b"0" if mode == "all" else deep0)
+        cmd(a.port, "CONFIG", "SET", "owner-uring-deep", b"0" if mode == "all" else deep_yes)
         reset()
         b = info_owners(a.port)
+        bypass = b.get("owner_uring_batching") if b.get("owner_uring_batching") in ("aof", "maxmemory") else None
         errs = run_order2()
         aft = info_owners(a.port)
         res("order[%s]" % mode, not errs, "; ".join(errs[:3]) or "%d conns x 30 rounds" % (len(ports) * 3))
         dr = aft.get("owner_uring_reads", 0) - b.get("owner_uring_reads", 0)
         dw = aft.get("owner_uring_writes", 0) - b.get("owner_uring_writes", 0)
         dn = aft["owner_native_commands"] - b["owner_native_commands"]
-        if mode != "no":
+        if mode != "no" and bypass:
+            ok = aft.get("owner_uring_rings") == a.n and dr == 0 and dn > 0 and (bypass != "aof" or dw == 0)
+            res("path[%s,bypass-%s]" % (mode, bypass), ok,
+                "rings %s reads +%d writes +%d native +%d" % (aft.get("owner_uring_rings"), dr, dw, dn))
+        elif mode != "no":
             res("path[%s]" % mode, aft.get("owner_uring_rings") == a.n and dr > 0 and dw > 0 and dn > 0,
                 "rings %s reads +%d writes +%d native +%d" % (aft.get("owner_uring_rings"), dr, dw, dn))
         else:
@@ -317,8 +329,10 @@ def main():
             dws = aft.get("owner_uring_short_writes", 0) - b.get("owner_uring_short_writes", 0)
             dwu = aft.get("owner_uring_writes", 0) - b.get("owner_uring_writes", 0)
             ok = got == n and bad == 0 and not sender_err
-            if mode == "all" and vsize == 100:
+            if mode == "all" and vsize == 100 and not bypass:
                 ok = ok and dwu > 0 and dws > 0  # the io_uring sends met the full socket
+            elif mode != "no" and bypass == "aof":
+                ok = ok and dwu == 0  # appendonly: the write path only
             res("backpressure[%s,%dB]" % (mode, vsize), ok,
                 "replies %d/%d bad %d %s io_uring sends +%d short +%d" % (got, n, bad, ";".join(sender_err), dwu, dws))
 
@@ -371,7 +385,9 @@ def main():
         m = 0
         while not stop[0]:
             cmd(a.port, "CONFIG", "SET", "owner-uring", "no" if m % 2 == 0 else "yes")
-            cmd(a.port, "CONFIG", "SET", "owner-uring-deep", b"0" if m % 4 < 2 else deep0)
+            cmd(a.port, "CONFIG", "SET", "owner-uring-deep", b"0" if m % 4 < 2 else deep_yes)
+            if uaof0 is not None:  # g9-fold: under appendonly, the owners also move on and off io_uring
+                cmd(a.port, "CONFIG", "SET", "owner-uring-aof", "yes" if m % 3 == 0 else "no")
             m += 1
             time.sleep(0.02)
 
@@ -384,6 +400,8 @@ def main():
     tt.join()
     cmd(a.port, "CONFIG", "SET", "owner-uring", "yes")
     cmd(a.port, "CONFIG", "SET", "owner-uring-deep", deep0)
+    if uaof0 is not None:
+        cmd(a.port, "CONFIG", "SET", "owner-uring-aof", uaof0)
     res("toggle", not errs, "; ".join(errs[:3]) or "ok")
 
     pid1 = cmd(a.port, "INFO", "server")[1].decode()

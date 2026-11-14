@@ -80,12 +80,16 @@
  * A recv or send that moved no bytes (end of file, an error, a full socket) is redone by the stock
  * read or write, which sets the connection state as before. A read batch's replies go out after the
  * whole batch ran: each was queued only when ownerReplyOut would have written it right away (no
- * unflushed AOF ops then), and one connection's replies stay in order. Held AOF replies are written
- * in batches too. Main stopping the world ends the window after the batch in hand. Under maxmemory
- * the reads are not batched (each read's headroom check must follow the commands before it). A client
- * whose last read ran owner-uring-deep (32) commands or more is read, run and answered at once, as
- * without io_uring: a deep pipeline already shares its syscalls among its commands, and deferring its
- * reply to the end of a batch cost W=16 K1 (GET p64) 2-3% on loopback while P1 and P10 gained 10-28%. */
+ * unflushed AOF ops then), and one connection's replies stay in order. Main stopping the world ends
+ * the window after the batch in hand. Under maxmemory the reads are not batched (each read's headroom
+ * check must follow the commands before it). With owner-uring-deep N > 0 a client whose last read ran
+ * N commands or more is read, run and answered at once, as without io_uring; the default is 0 (D3-all-
+ * g9-fold): every read is batched, deep pipelines included (fleet W=32 K1 +4.8%, K2 +2.7% vs 32).
+ *
+ * D3-all-g9-fold: under appendonly the owners keep the syscall path (reads, replies and held AOF
+ * replies, as D3-all-g7-rwchild), unless owner-uring-aof yes: batching there tied K13 (SET p1 + AOF)
+ * throughput at fleet W=32 and raised its SET p99 21%. The GET bursts (ownerGetBurst) drain what either
+ * path read into the query buffer, in the read's turn of the batch, before the parser. */
 
 #include "server.h"
 #include "owner.h"
@@ -1306,6 +1310,14 @@ static void ownerWriteDone(owner *o, client *c, ssize_t res, size_t len) {
     c->last_interaction = server.unixtime;
 }
 
+/* io_uring in this window (D3-all-g9-fold): the ring is up, owner-uring is on, and appendonly is off
+ * unless owner-uring-aof yes. Under appendonly the owners read and write as D3-all-g7-rwchild did (the
+ * K13 SET tail); under maxmemory only the reads stay unbatched (ownerThreadMain). own_aof changes only
+ * while the owners are stopped, so one window sees one answer. */
+static inline int ownerUringOn(owner *o) {
+    return o->uring && server.owner_uring && (!own_aof || server.owner_uring_aof);
+}
+
 /* Write the replies of n clients of this owner (none held), as ownerWrite would one after the other;
  * with owner-uring, the plain ones go out OWN_URING_BATCH per io_uring_enter. A send that wrote
  * nothing (a full socket, an error, a closed peer) is redone by ownerWrite, so the connection state
@@ -1313,7 +1325,7 @@ static void ownerWriteDone(owner *o, client *c, ssize_t res, size_t len) {
 static int ownerWriteMany(owner *o, client **cs, int n) {
     int left = 0;
 #ifdef HAVE_LIBURING
-    int use = o->uring && server.owner_uring;
+    int use = ownerUringOn(o);
 #else
     int use = 0;
 #endif
@@ -2872,8 +2884,9 @@ static void *ownerThreadMain(void *arg) {
          * the world ends the window after the batch in hand (its bytes are read: they run now).
          * shortcut: not under maxmemory, where every read checks the headroom left after the commands
          * before it ran (a batch would check its reads before those commands). Upgrade: reserve
-         * OWN_MM_READ per queued read in the command checks too. */
-        int batch = o->uring && server.owner_uring && !own_mm;
+         * OWN_MM_READ per queued read in the command checks too. Not under appendonly either, unless
+         * owner-uring-aof yes (ownerUringOn). */
+        int batch = ownerUringOn(o) && !own_mm;
         int m = 0, stop = 0;
         for (int k = 0; k < n && !stop; k++) {
             uint64_t d = evs[k].data.u64;
@@ -3090,6 +3103,13 @@ void ownerInfo(sds *info) {
                          "owner_uring_reads:%lld\r\nowner_uring_writes:%lld\r\nowner_uring_short_writes:%lld\r\n"
                          "owner_uring_redone:%lld\r\n",
                          server.owner_uring ? "yes" : "no", u_on, u_enters, u_reads, u_writes, u_short, u_redo);
+    /* D3-all-g9-fold: whether the owners batch now (ownerUringOn): yes, or why not. */
+    const char *batching = !server.owner_uring || !u_on                  ? "off"
+                           : own_aof && !server.owner_uring_aof         ? "aof"
+                           : own_mm                                     ? "maxmemory"
+                                                                        : "yes";
+    *info = sdscatprintf(*info, "owner_uring_batching:%s\r\nowner_uring_deep:%d\r\nowner_uring_aof:%s\r\n", batching,
+                         server.owner_uring_deep, server.owner_uring_aof ? "yes" : "no");
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,
