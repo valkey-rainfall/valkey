@@ -60,8 +60,9 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
 
 Files here:
 
-- `d3-launch.sh`: start/stop/status one server at a given W (owners on CPUs cpu0..cpu0+W-1, main
-  and bio on cpu0).
+- `d3-launch.sh`: start/stop/status one server at a given W (owners on CPUs cpu0..cpu0+W-1, main on
+  cpu0; the bio thread and the AOF-rewrite and RDB children on `--bg-cpu`, default 63 = the bench host's
+  OS core, outside the owners, where D0's bench server has the same three).
 - `d3-steer.sh` (root): ENA ntuple rule per owner port (`dst-port 6400+i -> queue i mod NQ`) and XPS
   by RX queue. Same mechanism as D1's d1-steer.sh. **Run `restore` after the D3 cells.**
 - `cachecannon-d3.toml.tmpl`: cachecannon `cluster = true`, seed any owner port.
@@ -99,7 +100,7 @@ Files here:
   pacing with WAITAOF waits under a 4 KB SET load (D3-all-g6-aoftail). `d3veto-check.py` and `d3all-check.py` take
   `--fsync no` to run their AOF parts (aoftest, ring_backed) on the same path.
 
-Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
+Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):
 
 ```
 d3-launch.sh start --bin ~/d3/src/valkey-server --w $W --bind "198.51.100.17 127.0.0.1" --announce-ip 198.51.100.17
