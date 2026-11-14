@@ -53,6 +53,10 @@ Files here:
   (`--bin --dir --n`): replies after the AOF write (DEBUG AOF-FLUSH-SLEEP), round-1 aoftest (every
   reply backed by the AOF file), replay vs a model (DEBUG LOADAOF, restart, BGREWRITEAOF), WAITAOF,
   eviction limit and key accounting, noeviction refusals, used_memory vs the plain path.
+- `d3all-check.py` (D3-all): where the merged features meet; starts its own loopback servers like
+  d3veto-check: native EXEC in the AOF (MULTI/EXEC-wrapped as the stock EXEC, replies after the AOF
+  write, replay/LOADAOF/restart digests), GET-ring and MGET replies backed by the AOF, MGET/EXEC
+  maxmemory bounds, eviction and noeviction under native transactions.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 
