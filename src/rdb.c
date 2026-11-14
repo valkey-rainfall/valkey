@@ -3726,13 +3726,7 @@ done:
     return res;
 }
 
-/* Adapts rioRead to the read_fn signature used by parseRespCommandFromReader. */
-static size_t rdbRioReader(void *ctx, void *buf, size_t len) {
-    return rioRead((rio *)ctx, buf, len);
-}
-
-/* Adapts rioRead to the readline_fn signature used by parseRespCommandFromReader: like fgets, reads
- * up to and including '\n'. The line is an inline command's "*<n>\r\n" or "$<n>\r\n" header and
+/* Reads an inline command's header line: like fgets, reads up to and including '\n'. The line is an inline command's "*<n>\r\n" or "$<n>\r\n" header and
  * the next byte belongs to the next RDB item, so a read must never pass the '\n' (rio cannot
  * unread). Each read takes the fewest bytes the line can still need: 4 first (the shortest valid
  * header is "*1\r\n"), then 2 while no '\r' was seen, then 1 after a '\r'. A "SET k v" header set
@@ -3741,11 +3735,11 @@ static size_t rdbRioReader(void *ctx, void *buf, size_t len) {
  * bytes, or a '\n' without '\r'); the bytes after it are consumed, so the line is returned
  * empty, which the parser reports as a format error, as it does for such a line read byte by
  * byte. */
-static char *rdbRioReadLine(void *ctx, char *buf, int size) {
+static char *rdbRioReadLine(rio *rdb, char *buf, int size) {
     int pos = 0, want = 4;
     while (pos < size - 1) {
         if (want > size - 1 - pos) want = size - 1 - pos;
-        if (rioRead((rio *)ctx, buf + pos, want) == 0) break;
+        if (rioRead(rdb, buf + pos, want) == 0) break;
         char *nl = memchr(buf + pos, '\n', want);
         pos += want;
         if (nl == buf + pos - 1) break;
@@ -3758,6 +3752,86 @@ static char *rdbRioReadLine(void *ctx, char *buf, int size) {
     if (pos == 0) return NULL;
     buf[pos] = '\0';
     return buf;
+}
+
+/* A "<prefix><number>\r\n" header of an inline command, with the checks of readRespNumberLine
+ * (aof.c). */
+static respParseResult rdbReadInlineNumber(rio *rdb, char prefix, long *out) {
+    char buf[LONG_STR_SIZE + 3];
+    if (rdbRioReadLine(rdb, buf, sizeof(buf)) == NULL) return RESP_PARSE_EOF;
+    if (buf[0] != prefix) return RESP_PARSE_FMTERR;
+    char *newline = strchr(buf, '\n');
+    if (!newline) return strlen(buf) == sizeof(buf) - 1 ? RESP_PARSE_FMTERR : RESP_PARSE_EOF;
+    if (newline[-1] != '\r') return RESP_PARSE_FMTERR;
+    if (!string2l(buf + 1, newline - buf - 2, out)) return RESP_PARSE_FMTERR;
+    return RESP_PARSE_OK;
+}
+
+/* One inline command (opcode 242 of a forkless sync stream), with the results and checks of
+ * parseRespCommandFromReader (aof.c), but a small argument and its CRLF are read in one call.
+ * AOF loading keeps the shared parser. */
+static respParseResult rdbReadInlineCommand(rio *rdb, int *argc_out, robj ***argv_out) {
+    long argc;
+    int j;
+    respParseResult result = rdbReadInlineNumber(rdb, '*', &argc);
+    if (result != RESP_PARSE_OK) return result;
+    if (argc < 1 || argc > INT_MAX || (size_t)argc > SIZE_MAX / sizeof(robj *)) return RESP_PARSE_FMTERR;
+
+    robj **argv = ztrymalloc(sizeof(robj *) * argc);
+    if (argv == NULL) return RESP_PARSE_OOM;
+    for (j = 0; j < argc; j++) {
+        long len;
+        result = rdbReadInlineNumber(rdb, '$', &len);
+        if (result != RESP_PARSE_OK) goto err;
+        /* A negative len would become a huge size_t. */
+        if (len < 0) {
+            result = RESP_PARSE_FMTERR;
+            goto err;
+        }
+        robj *arg;
+        if (len <= 62) {
+            /* A small argument and its CRLF in one read, then copied, as the online stream's
+             * parser copies small arguments. */
+            char small[64];
+            if (rioRead(rdb, small, (size_t)len + 2) == 0) {
+                result = RESP_PARSE_EOF;
+                goto err;
+            }
+            if (small[len] != '\r' || small[len + 1] != '\n') {
+                result = RESP_PARSE_FMTERR;
+                goto err;
+            }
+            arg = createStringObject(small, len);
+        } else {
+            /* A large argument: the payload into its sds, the CRLF in a second read. */
+            sds argsds = sdstrynewlen(SDS_NOINIT, len);
+            if (argsds == NULL) {
+                result = RESP_PARSE_OOM;
+                goto err;
+            }
+            char crlf[2];
+            if (rioRead(rdb, argsds, len) == 0 || rioRead(rdb, crlf, 2) == 0) {
+                sdsfree(argsds);
+                result = RESP_PARSE_EOF;
+                goto err;
+            }
+            if (crlf[0] != '\r' || crlf[1] != '\n') {
+                sdsfree(argsds);
+                result = RESP_PARSE_FMTERR;
+                goto err;
+            }
+            arg = createObject(OBJ_STRING, argsds);
+        }
+        argv[j] = arg;
+    }
+    *argc_out = (int)argc;
+    *argv_out = argv;
+    return RESP_PARSE_OK;
+
+err:
+    for (int k = 0; k < j; k++) decrRefCount(argv[k]);
+    zfree(argv);
+    return result;
 }
 
 /* Load an RDB file from the rio stream 'rdb'. We return one of the following:
@@ -3846,7 +3920,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             }
             robj **argv = NULL;
             int argc = 0;
-            respParseResult pr = parseRespCommandFromReader(rdbRioReader, rdbRioReadLine, rdb, &argc, &argv);
+            respParseResult pr = rdbReadInlineCommand(rdb, &argc, &argv);
             if (pr == RESP_PARSE_EOF) goto eoferr;
             if (pr == RESP_PARSE_FMTERR) goto inlinefmterr;
             if (pr == RESP_PARSE_OOM) goto inlineoomerr;
