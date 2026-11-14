@@ -3486,9 +3486,20 @@ void stopSaving(int success) {
                           NULL);
 }
 
+/* Prototype: the longest time the load ran without serving events (between two
+ * processEventsWhileBlocked calls of the progress callback, or the load's start or end). */
+static void rdbLoadNoteEventsGap(void) {
+    long long now = ustime();
+    long long gap = now - server.loading_events_last_us;
+    if (server.loading_events_last_us && gap > server.stat_loading_events_max_gap_us)
+        server.stat_loading_events_max_gap_us = gap;
+    server.loading_events_last_us = now;
+}
+
 /* Track loading progress in order to serve client's from time to time
    and if needed calculate rdb checksum  */
 void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
+    server.stat_loading_progress_calls++; /* prototype */
     if (server.rdb_checksum && !(r->flags & RIO_FLAG_SKIP_RDB_CHECKSUM))
         rioGenericUpdateChecksum(r, buf, len);
 
@@ -3510,7 +3521,10 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
         /* Held inline SETs land before events run: a command there can change the lanes or turn on an
          * observer. */
         replApplyLoadFlush();
+        rdbLoadNoteEventsGap(); /* prototype */
+        server.stat_loading_events_calls++;
         processEventsWhileBlocked();
+        server.loading_events_last_us = ustime(); /* prototype: the next gap starts after the events */
         processModuleLoadingProgressEvent(0);
     }
     /* Dual-channel loads on the rdb channel before REPL_STATE_TRANSFER, so count those bytes too. */
@@ -3855,6 +3869,7 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
 
     rdb->update_cksum = rdbLoadProgressCallback;
     rdb->max_processing_chunk = server.loading_process_events_interval_bytes;
+    server.loading_events_last_us = ustime(); /* prototype: event-loop gap from the load's start */
     if (rioRead(rdb, buf, 9) == 0) goto eoferr;
     buf[9] = '\0';
     if (memcmp(buf, "REDIS0", 6) == 0) {
@@ -4407,6 +4422,7 @@ eoferr:
     /* fall through */
 
 cleanup:
+    rdbLoadNoteEventsGap(); /* prototype: the gap from the last events to the load's end */
     /* A failed load drops the inline SETs it still holds. */
     replApplyLoadEnd(ret == RDB_OK);
     /* Single exit: free the inline-command fake client (if one was created) and

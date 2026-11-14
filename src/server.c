@@ -3145,6 +3145,9 @@ void resetServerStats(void) {
     server.stat_loading_inline_parallel_applied = 0;
     server.stat_loading_inline_serial_applied = 0;
     server.stat_loading_inline_apply_phases = 0;
+    server.stat_loading_progress_calls = 0;
+    server.stat_loading_events_calls = 0;
+    server.stat_loading_events_max_gap_us = 0;
     server.stat_repl_lane_apply_usec = 0;
     server.stat_repl_lane_barriers = 0;
     server.stat_numconnections = 0;
@@ -7331,9 +7334,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscatprintf(info,
                             "loading_inline_parallel_applied:%lld\r\n"
                             "loading_inline_serial_applied:%lld\r\n"
-                            "loading_inline_apply_phases:%lld\r\n",
+                            "loading_inline_apply_phases:%lld\r\n"
+                            "loading_progress_calls:%lld\r\n"
+                            "loading_events_calls:%lld\r\n"
+                            "loading_events_max_gap_us:%lld\r\n",
                             server.stat_loading_inline_parallel_applied, server.stat_loading_inline_serial_applied,
-                            server.stat_loading_inline_apply_phases);
+                            server.stat_loading_inline_apply_phases, server.stat_loading_progress_calls,
+                            server.stat_loading_events_calls, server.stat_loading_events_max_gap_us);
         info = genValkeyInfoStringACLStats(info);
     }
 
