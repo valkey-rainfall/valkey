@@ -3514,6 +3514,7 @@ void initSharedQueryBuf(void);
 void freeSharedQueryBuf(void);
 void parseRecycleArgv(robj **argv, int argv_len);
 void parseRecycleArg(robj *o);
+int parseRecycleKeyArgv(robj **argv, int argc, int argv_len);
 void freeParseRecycler(void);
 client *lookupClientByID(uint64_t id);
 int authRequired(client *c);

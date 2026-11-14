@@ -41,6 +41,10 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
 - D3-all-g3 (D3-all-g2-parse + D3-all-g2-mget): an owner's MGET of up to 32 keys reaches the
   MGET run through the frame template (parseOwnerFrame builds the argv the run reads its keys
   from); a longer one through parseMultibulk, as before.
+- D3-all-g4-k1 (argument recycling): a GET run (or an MGET run of one-key MGETs) gives each consumed
+  argv back whole, its key object still in slot 1 (parseRecycleKeyArgv), and the GET frame template
+  takes one back in one pop and rewrites only the key bytes (parsePopKeyArgv); one key length at a
+  time, other argvs go back piece by piece as before. The recycler finds an argument's bytes inline.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -72,6 +76,10 @@ Files here:
 - `d3-parse-check.py` (D3-all-parse): the owner frame templates (GET/MGET) against main's parser:
   the same bytes to every owner port and to the plain port (spellings, split reads, MGET 1-40 keys,
   handoffs, 40 KB key, malformed frames, large-request input bytes), reply for reply.
+- `d3-recycle-check.py` (D3-all-g4-k1): the owner's argument recycling against main: own-slot
+  pipelines of 1-400 GET/GeT/MGET/SET/INCR frames over key lengths 1-90 (runs and random, keys that
+  differ in one byte), reply for reply with the plain port and all native; used_memory flat (< 256 KB)
+  over ~450 K recycled GET/MGET-of-one frames per owner.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 

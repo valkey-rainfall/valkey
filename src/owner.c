@@ -1613,6 +1613,14 @@ static monotime ownerRunBegin(client *c, struct serverCommand *cmd) {
     return start;
 }
 
+/* Give a consumed command's argv back to the parser: a shared name + one key whole (the GET frame
+ * template takes it back in one pop), anything else argument by argument. */
+static inline void ownerRecycleArgs(robj **argv, int argc, int argv_len) {
+    if (parseRecycleKeyArgv(argv, argc, argv_len)) return;
+    for (int j = 0; j < argc; j++) parseRecycleArg(argv[j]);
+    parseRecycleArgv(argv, argv_len);
+}
+
 /* The end of a run that answered the client's first n commands (all `cmd`, native kind `kind`): as in
  * fastget, they share the run's time in commandstats, the latency histogram and the slow commandlog
  * (one entry per command at the run's average; the large-request and -reply ones did not run here),
@@ -1647,8 +1655,7 @@ static int ownerRunEnd(owner *o, client *c, struct serverCommand *cmd, int kind,
             c->duration = 0;
         }
         /* Consume, as fastGetConsumeSpeculated: the owner's parser built these argvs. */
-        for (int j = 0; j < c->argc; j++) parseRecycleArg(c->argv[j]);
-        parseRecycleArgv(c->argv, c->argv_len);
+        ownerRecycleArgs(c->argv, c->argc, c->argv_len);
         c->argv = NULL;
         c->argc = 0;
         c->argv_len = 0;
@@ -1656,8 +1663,7 @@ static int ownerRunEnd(owner *o, client *c, struct serverCommand *cmd, int kind,
         for (int k = 1; k < n; k++) {
             parsedCommand *p = &q->cmds[q->off++];
             c->qb_applied += p->input_bytes;
-            for (int j = 0; j < p->argc; j++) parseRecycleArg(p->argv[j]);
-            parseRecycleArgv(p->argv, p->argv_len);
+            ownerRecycleArgs(p->argv, p->argc, p->argv_len);
             p->argv = NULL;
             p->argc = 0;
         }
