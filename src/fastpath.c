@@ -684,6 +684,8 @@ static int fpTrySplit(fpThread *t, cmdEntry *e, client *c) {
     int checks = fp_check_blocked || fp_check_watched;
     uint8_t *keypart = fpSplitAlloc(t, (size_t)nkeys);
     int count[FP_MAX_LANES];
+    /* A part index is below FP_MAX_LANES: part_of (int8_t) and keypart (uint8_t) hold it up to 128 lanes. */
+    static_assert(FP_MAX_LANES <= 128, "part indexes of a split are int8_t");
     int8_t part_of[FP_MAX_LANES];
     memset(count, 0, sizeof(int) * fp_nlanes);
     memset(part_of, -1, sizeof(part_of));

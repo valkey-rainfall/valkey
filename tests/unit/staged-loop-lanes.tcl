@@ -1017,3 +1017,35 @@ start_cluster 1 1 {tags {"staged-loop cluster external:skip tls:skip"} overrides
         close $fd
     }
 }
+
+# More IO threads than 64: the write phase runs up to FP_MAX_LANES (128) lanes, and a multi-key command
+# split over all of them keeps every part (part indexes past 127).
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 140 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+    r client setname pwl-control
+    r select 0
+    r config set notify-keyspace-events ""
+    set host [srv 0 host]
+    set port [srv 0 port]
+
+    test {Write lanes: MSET and MGET split over 128 lanes keep every key} {
+        set fd [pwl_fast_socket r $host $port]
+        set entries [pwl_lane_entries r]
+        set mset [list mset]
+        set mget [list mget]
+        set want {}
+        for {set i 0} {$i < 600} {incr i} {
+            lappend mset pwl:wide$i v$i
+            lappend mget pwl:wide$i
+            lappend want v$i
+        }
+        set buf [pwl_resp {*}$mset]
+        append buf [pwl_resp {*}$mget]
+        puts -nonewline $fd $buf
+        flush $fd
+        assert_equal {+OK} [pwl_read_reply $fd]
+        assert_equal $want [pwl_read_reply $fd]
+        assert_morethan [pwl_lane_entries r] $entries
+        assert_equal 600 [r exists {*}[lrange $mget 1 end]]
+        close $fd
+    }
+}

@@ -124,7 +124,7 @@ void fastpathStagedReleaseAll(void);
 void fastpathStagedAdoptClients(void);
 
 /* Parallel write phase. */
-#define FP_MAX_LANES 64 /* write lanes; more IO threads than this leave the rest idle in the write phase */
+#define FP_MAX_LANES 128 /* write lanes; more IO threads than this leave the rest idle in the write phase */
 
 /* Who asks whether a primary's work may run on lanes now. A replica's stream: fastpathStreamParallelAllowed. */
 enum {
