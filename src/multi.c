@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "owner.h"
 
 /* ================================ MULTI/EXEC ============================== */
 
@@ -449,6 +450,7 @@ typedef struct watchedKey {
     robj *key;
     serverDb *db;
     client *client;
+    dict *registry;       /* The dict this key's client list is in: db->watched_keys or an owner's (owner.c). */
     unsigned expired : 1; /* Flag that we're watching an already expired key. */
 } watchedKey;
 
@@ -490,7 +492,19 @@ void watchForKey(client *c, robj *key) {
     list *clients = NULL;
     watchedKey *wk;
 
-    if (listLength(&c->mstate->watched_keys) == 0) server.watching_clients++;
+    if (listLength(&c->mstate->watched_keys) == 0) {
+        /* An owner thread registers its client's keys in its own registry (the client watches only
+         * that owner's keys, owner.c); main in the db's, whose watchers keep owners off the native
+         * path. watch_owner says which, and which count the client is in. */
+        int me = ownerSelfId();
+        c->mstate->watch_owner = me + 1;
+        if (me >= 0)
+            ownerWatchersAdd(me, 1);
+        else
+            server.watching_clients++;
+    }
+    dict *registry = c->mstate->watch_owner ? ownerWatchRegistry(c->mstate->watch_owner - 1, c->db->id)
+                                            : c->db->watched_keys;
 
     /* Lazily allocate the per-db hashtable array. */
     if (c->mstate->watched_keys_by_db == NULL) {
@@ -508,10 +522,10 @@ void watchForKey(client *c, robj *key) {
     }
 
     /* This key is not already watched in this DB. Let's add it */
-    dictEntry *de = dictFind(c->db->watched_keys, key);
+    dictEntry *de = dictFind(registry, key);
     if (de == NULL) {
         clients = listCreate();
-        dictAdd(c->db->watched_keys, key, clients);
+        dictAdd(registry, key, clients);
         incrRefCount(key);
     } else {
         key = dictGetKey(de);
@@ -523,6 +537,7 @@ void watchForKey(client *c, robj *key) {
     wk->key = key;
     wk->client = c;
     wk->db = c->db;
+    wk->registry = registry;
     wk->expired = keyIsExpired(c->db, key);
     incrRefCount(key);
     listAddNodeTail(&c->mstate->watched_keys, wk);
@@ -551,7 +566,7 @@ void unwatchAllKeys(client *c) {
         serverAssertWithInfo(c, NULL, clients != NULL);
         listUnlinkNode(clients, watchedKeyGetClientNode(wk));
         /* Kill the entry at all if this was the only client */
-        if (listLength(clients) == 0) dictDelete(wk->db->watched_keys, wk->key);
+        if (listLength(clients) == 0) dictDelete(wk->registry, wk->key);
         /* Remove this watched key from the client->watched list */
         listDelNode(&c->mstate->watched_keys, ln);
         c->mstate->watched_keys_mem -= getStringObjectMemory(wk->key);
@@ -568,7 +583,39 @@ void unwatchAllKeys(client *c) {
         }
     }
 
-    server.watching_clients--;
+    if (c->mstate->watch_owner)
+        ownerWatchersAdd(c->mstate->watch_owner - 1, -1);
+    else
+        server.watching_clients--;
+    c->mstate->watch_owner = 0;
+}
+
+/* Main, owners stopped (owner.c, when a client comes to main): move c's keys from its owner's
+ * registry to the dbs', so every watcher main serves is a stock one (and keeps the owners vetoed). */
+void watchMoveToMain(client *c) {
+    if (!c->mstate || !c->mstate->watch_owner) return;
+    listIter li;
+    listNode *ln;
+    listRewind(&c->mstate->watched_keys, &li);
+    while ((ln = listNext(&li))) {
+        watchedKey *wk = listNodeValue(ln);
+        list *clients = watchedKeyGetClients(wk);
+        listUnlinkNode(clients, watchedKeyGetClientNode(wk));
+        if (listLength(clients) == 0) dictDelete(wk->registry, wk->key);
+        dictEntry *de = dictFind(wk->db->watched_keys, wk->key);
+        if (de == NULL) {
+            clients = listCreate();
+            dictAdd(wk->db->watched_keys, wk->key, clients);
+            incrRefCount(wk->key);
+        } else {
+            clients = dictGetVal(de);
+        }
+        watchedKeyLinkToClients(clients, wk);
+        wk->registry = wk->db->watched_keys;
+    }
+    ownerWatchersAdd(c->mstate->watch_owner - 1, -1);
+    c->mstate->watch_owner = 0;
+    if (listLength(&c->mstate->watched_keys)) server.watching_clients++;
 }
 
 /* Iterates over the watched_keys list and looks for an expired key. Keys which
@@ -588,15 +635,15 @@ int isWatchedKeyExpired(client *c) {
     return 0;
 }
 
-/* "Touch" a key, so that if this key is being WATCHed by some client the
+/* "Touch" a key in one registry, so that if this key is being WATCHed by some client the
  * next EXEC will fail. */
-void touchWatchedKey(serverDb *db, robj *key) {
+static void touchWatchedKeyIn(dict *registry, serverDb *db, robj *key) {
     list *clients;
     listIter li;
     listNode *ln;
 
-    if (dictSize(db->watched_keys) == 0) return;
-    clients = dictFetchValue(db->watched_keys, key);
+    if (!registry || dictSize(registry) == 0) return;
+    clients = dictFetchValue(registry, key);
     if (!clients) return;
 
     /* Mark all the clients watching this key as CLIENT_DIRTY_CAS */
@@ -629,6 +676,20 @@ void touchWatchedKey(serverDb *db, robj *key) {
     }
 }
 
+/* "Touch" a key, so that if this key is being WATCHed by some client the
+ * next EXEC will fail. An owner thread changes only its own keys, which only
+ * its own registry can hold (watchers in the dbs' registries keep owners off
+ * the native path); main checks the db's registry and the key owner's. */
+void touchWatchedKey(serverDb *db, robj *key) {
+    int me = ownerSelfId();
+    if (me >= 0) {
+        touchWatchedKeyIn(ownerWatchRegistry(me, db->id), db, key);
+        return;
+    }
+    touchWatchedKeyIn(db->watched_keys, db, key);
+    if (ownerWatchersTotal()) touchWatchedKeyIn(ownerWatchRegistry(ownerOfKey(key), db->id), db, key);
+}
+
 /* Set CLIENT_DIRTY_CAS to all clients of DB when DB is dirty.
  * It may happen in the following situations:
  * FLUSHDB, FLUSHALL, SWAPDB, end of successful diskless replication.
@@ -636,14 +697,14 @@ void touchWatchedKey(serverDb *db, robj *key) {
  * replaced_with: for SWAPDB, the WATCH should be invalidated if
  * the key exists in either of them, and skipped only if it
  * doesn't exist in both. */
-void touchAllWatchedKeysInDb(serverDb *emptied, serverDb *replaced_with) {
+static void touchAllWatchedKeysInRegistry(dict *registry, serverDb *emptied, serverDb *replaced_with) {
     listIter li;
     listNode *ln;
     dictEntry *de;
 
-    if (dictSize(emptied->watched_keys) == 0) return;
+    if (!registry || dictSize(registry) == 0) return;
 
-    dictIterator *di = dictGetSafeIterator(emptied->watched_keys);
+    dictIterator *di = dictGetSafeIterator(registry);
     while ((de = dictNext(di)) != NULL) {
         robj *key = dictGetKey(de);
         int exists_in_emptied = dbFind(emptied, objectGetVal(key)) != NULL;
@@ -678,6 +739,13 @@ void touchAllWatchedKeysInDb(serverDb *emptied, serverDb *replaced_with) {
         }
     }
     dictReleaseIterator(di);
+}
+
+/* Main only (FLUSHDB, FLUSHALL, SWAPDB, diskless load): the db's registry and every owner's. */
+void touchAllWatchedKeysInDb(serverDb *emptied, serverDb *replaced_with) {
+    touchAllWatchedKeysInRegistry(emptied->watched_keys, emptied, replaced_with);
+    for (int i = 0; i < ownerCount(); i++)
+        touchAllWatchedKeysInRegistry(ownerWatchRegistry(i, emptied->id), emptied, replaced_with);
 }
 
 void watchCommand(client *c) {

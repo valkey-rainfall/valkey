@@ -39,4 +39,15 @@ int ownerClusterCommand(struct client *c); /* CLUSTER on a standalone server wit
 void ownerInfo(sds *info);
 extern int owner_accept_home; /* createClient: home owner of the connection being accepted */
 
+/* WATCH (multi.c): an owner keeps its own registry (a dict like db->watched_keys) of the keys its
+ * clients WATCH on it; only that owner, or main with the owners stopped, touches it. */
+struct hashtable;
+struct serverObject;
+int ownerCount(void);
+int ownerSelfId(void); /* this owner thread's id, -1 on any other thread */
+struct hashtable *ownerWatchRegistry(int owner, int dbid);
+void ownerWatchersAdd(int owner, int delta); /* clients with keys in an owner's registry */
+long long ownerWatchersTotal(void);          /* main: all owners' */
+int ownerOfKey(struct serverObject *key);
+
 #endif
