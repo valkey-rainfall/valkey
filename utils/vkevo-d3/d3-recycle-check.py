@@ -73,8 +73,9 @@ def main():
     ranges = sorted((int(s[2][1]), int(s[0]), int(s[1])) for s in d3.Conn(a.host, a.owner_port).cmd("CLUSTER", "SLOTS"))
     d3.check("recycle.topology", len(ranges) == a.n, ranges[:3])
 
-    keys = {}  # port -> {length: [keys]}
+    keys = {}  # port -> {length: [keys]}; index 3 of each length stays missing
     tagged = {}  # port -> keys that share the owner's tag (MGET-able)
+    tags = {}  # port -> the owner's hash tag
     for port, lo, hi in ranges:
         i = 0
         while True:
@@ -82,6 +83,7 @@ def main():
             if lo <= d3.key_slot(t) <= hi:
                 break
             i += 1
+        tags[port] = t
         keys[port] = {}
         for L in range(1, MAXLEN + 1):
             ks = keys_in(rng, lo, hi, L, t, 4)
@@ -103,8 +105,8 @@ def main():
         """Frames for one own-slot pipeline; every write key is SET before it is read in it and the
         counter is reset first, so both sides see the same replies."""
         allk = [k for ks in keys[port].values() for k in ks]
-        wk = rng.sample(tagged[port], 3)
-        cnt = tagged[port][0] + b":cnt"
+        wk = [tags[port] + b":w%d" % j for j in rng.sample(range(8), 3)]  # never among the read keys
+        cnt = tags[port] + b":cnt"
         out = [frame(b"SET", cnt, b"0")] + [frame(b"SET", k, b"w%d" % j) for j, k in enumerate(wk)]
         L = rng.randint(1, MAXLEN)
         while len(out) < nframes:
@@ -160,11 +162,14 @@ def main():
         d3.check("recycle.replies_port_%d" % port, bad == 0 and total > 0, "%d/%d differ %s" % (bad, total, first))
         d3.check("recycle.native_port_%d" % port, nat >= total, "%d native for %d own-slot frames" % (nat, total))
 
-    # 2. memory: recycled GET and MGET-of-one traffic does not grow used_memory
+    # 2. memory: recycled GET and MGET-of-one traffic does not grow used_memory. Missing keys (index 3)
+    # of slots that hold keys: a miss always ends in a GET/MGET run (ownerRunEnd recycles), while a
+    # stored value whose allocation got a spare expire field goes to getCommand (no recycling).
     def traffic(port, batches, L):
         c = d3.Conn(a.host, port)
         ks = keys[port][L]
-        batch = b"".join(frame(b"GET" if j % 4 else b"MGET", ks[j % len(ks)]) for j in range(64))
+        miss = ks[3]
+        batch = b"".join(frame(b"GET" if j % 4 else b"MGET", miss) for j in range(64))
         for _ in range(batches):
             c.s.sendall(batch)
             read_n(c, 64)
