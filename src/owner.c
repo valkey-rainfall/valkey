@@ -110,6 +110,7 @@ typedef struct owner {
     int nerrors, errors_cap;
     ownerLog *logs;
     int nlogs, logs_cap;
+    void *pf; /* this owner's key prefetch batch (memory_prefetch.c); NULL below 2 keys */
     /* Totals for INFO, never cleared. */
     long long native_total, handoffs_total, adopted_total, windows_total;
 } owner;
@@ -742,6 +743,14 @@ static int ownerHandOff(owner *o, client *c, int why) {
     o->handoffs_total++;
     /* A shared query buffer must not leave the thread. */
     if (c->querybuf && c->querybuf == thread_shared_qb) trimClientQueryBuffer(c);
+    /* The slots and prefetch marks ownerPrefetch left on the parsed commands are this owner's:
+     * main gets them as the parser left them. */
+    c->slot = -1;
+    c->read_flags &= ~READ_FLAGS_PREFETCHED;
+    for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+        c->cmd_queue.cmds[i].slot = -1;
+        c->cmd_queue.cmds[i].read_flags &= ~READ_FLAGS_PREFETCHED;
+    }
     c->owner_why = why;
     c->owner_tid = OWNER_IN_TRANSIT;
     pthread_mutex_lock(&own_main_mu);
@@ -832,6 +841,50 @@ static int ownerWrite(owner *o, client *c) {
     return 0;
 }
 
+/* The cluster slot of a native candidate's key (GET, SET, DEL with one key, INCR), or -1. */
+static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int read_flags) {
+    if (!cmd || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) return -1;
+    serverCommandProc *p = cmd->proc;
+    if (p != getCommand && p != setCommand && p != incrCommand && (p != delCommand || argc != 2)) return -1;
+    sds key = objectGetVal(argv[1]);
+    return (int)keyHashSlot(key, (int)sdslen(key));
+}
+
+/* Owner, before the client's current command: hash each command's key once and keep its slot on
+ * the command (c->slot, p->slot) for ownerNativeKind and the keyspace lookups
+ * (getKVStoreIndexUsingCachedSlot), and prefetch the keys of the current command and the queue
+ * behind it into this owner's batch until the batch is full, as fastpath.c's fpPrefetchRange does.
+ * The commands walked are marked READ_FLAGS_PREFETCHED; the first unmarked one starts the next
+ * batch. Only keys in this owner's slots are looked up: other owners change their tables meanwhile. */
+static void ownerPrefetch(owner *o, client *c) {
+    if (c->read_flags & READ_FLAGS_PREFETCHED) return;
+    c->read_flags |= READ_FLAGS_PREFETCHED;
+    if (c->slot < 0) c->slot = ownerKeySlot(c->parsed_cmd, c->argv, c->argc, c->read_flags);
+    cmdQueue *q = &c->cmd_queue;
+    if (q->off >= q->len) return; /* one command: nothing to overlap */
+    if (prefetchLaneBatchSize(o->pf) != server.prefetch_batch_max_size) {
+        prefetchLaneBatchFree(o->pf);
+        o->pf = prefetchLaneBatchCreate();
+        prefetchLaneBatchUse(o->pf); /* this thread's prefetchBatch* calls use it, never main's */
+    }
+    if (!o->pf) return;
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int room = 1;
+    if (c->slot >= o->slot_lo && c->slot <= o->slot_hi)
+        room = prefetchBatchAddCommand(c->parsed_cmd, c->argv, c->argc, c->db, OWNER_TABLE_OF_SLOT(c->slot), &result);
+    for (int i = q->off; i < q->len && room; i++) {
+        parsedCommand *p = &q->cmds[i];
+        p->read_flags |= READ_FLAGS_PREFETCHED;
+        if (p->slot < 0) p->slot = ownerKeySlot(p->cmd, p->argv, p->argc, p->read_flags);
+        if (p->slot >= o->slot_lo && p->slot <= o->slot_hi)
+            room = prefetchBatchAddCommand(p->cmd, p->argv, p->argc, c->db, OWNER_TABLE_OF_SLOT(p->slot), &result);
+    }
+    getKeysFreeResult(&result);
+    prefetchBatchRun();
+    prefetchBatchReset();
+}
+
 /* Which native command this is, or -1 when main must run it. */
 static int ownerNativeKind(owner *o, client *c) {
     struct serverCommand *cmd = c->parsed_cmd;
@@ -856,9 +909,8 @@ static int ownerNativeKind(owner *o, client *c) {
         return -1;
     if (kind == OWN_PING) return kind;
     if (kind != OWN_GET && (veto & OWN_VETO_WRITE)) return -1;
-    sds key = objectGetVal(c->argv[1]);
-    int slot = (int)keyHashSlot(key, (int)sdslen(key));
-    if (slot < o->slot_lo || slot > o->slot_hi) return -1; /* another owner's key: main */
+    /* The slot ownerPrefetch computed: the key is hashed once per command. */
+    if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
     return kind;
 }
 
@@ -914,6 +966,7 @@ static void ownerCall(owner *o, client *c, int kind) {
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
 static int ownerTryNative(client *c) {
     owner *o = own_self;
+    ownerPrefetch(o, c);
     int kind = ownerNativeKind(o, c);
     if (kind < 0) return 0;
     ownerCall(o, c, kind);

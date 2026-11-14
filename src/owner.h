@@ -18,6 +18,8 @@ extern _Thread_local struct owner *own_self;
 /* With owner threads the standalone keyspace has 2^OWNER_SHARD_BITS tables, each a range of
  * 16384 >> OWNER_SHARD_BITS slots; every owner owns whole tables. */
 #define OWNER_SHARD_BITS 10
+/* The keyspace table of a slot (CLUSTER_SLOT_MASK_BITS is in cluster.h). */
+#define OWNER_TABLE_OF_SLOT(slot) ((slot) >> (CLUSTER_SLOT_MASK_BITS - OWNER_SHARD_BITS))
 
 int ownerThreadsEnabled(void);
 int ownerValidateConfig(const char **err);

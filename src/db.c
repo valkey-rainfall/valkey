@@ -274,7 +274,7 @@ static int keyspaceShard(sds key) {
 int getKVStoreIndexForKey(sds key) {
     if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
     /* Owner threads (owner.c) own slot ranges: their standalone keyspace is split by slot range. */
-    if (server.owner_threads) return (int)(keyHashSlot(key, (int)sdslen(key)) >> (CLUSTER_SLOT_MASK_BITS - OWNER_SHARD_BITS));
+    if (server.owner_threads) return OWNER_TABLE_OF_SLOT((int)keyHashSlot(key, (int)sdslen(key)));
     if (server.keyspace_shard_bits) return keyspaceShard(key);
     return 0;
 }
@@ -287,6 +287,8 @@ int getKVStoreIndexUsingCachedSlot(sds key) {
     /* A write lane's executor carries the shard of every key its command declared. */
     client *c = ectx->current_client;
     if (exec_lane && c && c->slot >= 0 && c->flag.executing_command) return c->slot;
+    /* An owner thread's native command carries its key's cluster slot (owner.c ownerKeySlot). */
+    if (own_self && c && c->slot >= 0 && c->flag.executing_command) return OWNER_TABLE_OF_SLOT(c->slot);
     return getKVStoreIndexForKey(key);
 }
 
