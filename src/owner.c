@@ -60,6 +60,7 @@
 #define OWNER_MAX 256
 #define OWNER_EVENTS 256
 #define OWNER_WAKE_TOKEN UINT64_MAX
+#define OWN_RING_MAX 128 /* GET ring slots: prefetch-batch-max-size's maximum; a power of two */
 
 enum { OWN_GET, OWN_SET, OWN_DEL, OWN_INCR, OWN_PING, OWN_NCMDS };
 static const char *const own_cmd_names[OWN_NCMDS] = {"get", "set", "del", "incr", "ping"};
@@ -210,9 +211,58 @@ static int ownerCpuOf(int i) {
 static void ownerAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 
+/* The slot hash of the owner hot path: keyHashSlot() (the slot a cluster client routes a key by),
+ * with its CRC16 taken 8 bytes per step instead of 1. own_crc16[k][v] is the CRC16 of 8 bytes with
+ * byte k = v and the rest 0, built from crc16() itself: CRC16 with init 0 is linear, so a chunk's
+ * CRC is the XOR of its bytes' entries, with the running CRC folded into the first two bytes.
+ * keyHashSlot's byte loop was 7.5% of an owner's CPU under pipelined GETs (D3-g1 perf). */
+static uint16_t own_crc16[8][256];
+
+static inline uint16_t ownerCrc16(const unsigned char *s, size_t len) {
+    uint16_t crc = 0;
+    for (; len >= 8; s += 8, len -= 8)
+        crc = own_crc16[0][s[0] ^ (crc >> 8)] ^ own_crc16[1][s[1] ^ (crc & 0xff)] ^ own_crc16[2][s[2]] ^
+              own_crc16[3][s[3]] ^ own_crc16[4][s[4]] ^ own_crc16[5][s[5]] ^ own_crc16[6][s[6]] ^ own_crc16[7][s[7]];
+    for (; len; len--) crc = (uint16_t)(crc << 8) ^ own_crc16[7][(crc >> 8) ^ *s++]; /* [7] is crc16's table */
+    return crc;
+}
+
+/* keyHashSlot(key, len), hash tags included. */
+static inline int ownerKeyHashSlot(const char *key, size_t len) {
+    const char *s = memchr(key, '{', len);
+    if (s) {
+        const char *e = memchr(s + 1, '}', len - (size_t)(s + 1 - key));
+        if (e && e > s + 1) return ownerCrc16((const unsigned char *)s + 1, (size_t)(e - s - 1)) & 0x3FFF;
+    }
+    return ownerCrc16((const unsigned char *)key, len) & 0x3FFF;
+}
+
+static void ownerSlotHashInit(void) {
+    char buf[80];
+    for (int k = 0; k < 8; k++) {
+        for (int v = 0; v < 256; v++) {
+            memset(buf, 0, 8);
+            buf[k] = (char)v;
+            own_crc16[k][v] = crc16(buf, 8);
+        }
+    }
+    /* Self-check against keyHashSlot: every length to 80, bytes with many '{' and '}'. */
+    uint64_t x = 0x9e3779b97f4a7c15ULL;
+    for (int i = 0; i < 20000; i++) {
+        int len = i % 81;
+        for (int j = 0; j < len; j++) {
+            x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+            unsigned char b = (unsigned char)(x >> 56);
+            buf[j] = (b & 7) == 0 ? '{' : (b & 7) == 1 ? '}' : (char)b;
+        }
+        serverAssert(ownerKeyHashSlot(buf, len) == (int)keyHashSlot(buf, len));
+    }
+}
+
 void ownerThreadsInit(void) {
     if (server.owner_threads == 0) return;
 #ifdef __linux__
+    ownerSlotHashInit();
     own_n = server.owner_threads;
     owners = zcalloc(sizeof(owner) * own_n);
     own_main_inbox = listCreate();
@@ -847,19 +897,19 @@ static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int re
     serverCommandProc *p = cmd->proc;
     if (p != getCommand && p != setCommand && p != incrCommand && (p != delCommand || argc != 2)) return -1;
     sds key = objectGetVal(argv[1]);
-    return (int)keyHashSlot(key, (int)sdslen(key));
+    return ownerKeyHashSlot(key, sdslen(key));
 }
 
-/* Owner, before the client's current command: hash each command's key once and keep its slot on
- * the command (c->slot, p->slot) for ownerNativeKind and the keyspace lookups
- * (getKVStoreIndexUsingCachedSlot), and prefetch the keys of the current command and the queue
- * behind it into this owner's batch until the batch is full, as fastpath.c's fpPrefetchRange does.
- * The commands walked are marked READ_FLAGS_PREFETCHED; the first unmarked one starts the next
- * batch. Only keys in this owner's slots are looked up: other owners change their tables meanwhile. */
+/* Owner, before a native command other than a GET run (ownerGetRun): hash each queued command's key
+ * once and keep its slot on the command (p->slot; ownerTryNative did c->slot) for ownerNativeKind
+ * and the keyspace lookups (getKVStoreIndexUsingCachedSlot), and prefetch the keys of the current
+ * command and the queue behind it into this owner's batch until the batch is full, as fastpath.c's
+ * fpPrefetchRange does. The commands walked are marked READ_FLAGS_PREFETCHED; the first unmarked
+ * one starts the next batch. Only keys in this owner's slots are looked up: other owners change
+ * their tables meanwhile. */
 static void ownerPrefetch(owner *o, client *c) {
     if (c->read_flags & READ_FLAGS_PREFETCHED) return;
     c->read_flags |= READ_FLAGS_PREFETCHED;
-    if (c->slot < 0) c->slot = ownerKeySlot(c->parsed_cmd, c->argv, c->argc, c->read_flags);
     cmdQueue *q = &c->cmd_queue;
     if (q->off >= q->len) return; /* one command: nothing to overlap */
     if (prefetchLaneBatchSize(o->pf) != server.prefetch_batch_max_size) {
@@ -909,9 +959,20 @@ static int ownerNativeKind(owner *o, client *c) {
         return -1;
     if (kind == OWN_PING) return kind;
     if (kind != OWN_GET && (veto & OWN_VETO_WRITE)) return -1;
-    /* The slot ownerPrefetch computed: the key is hashed once per command. */
+    /* The slot ownerTryNative computed: the key is hashed once per command. */
     if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
     return kind;
+}
+
+/* Keep a native command's commandlog entries for main, which adds them when it folds the stats. */
+static void ownerKeepLogs(owner *o, void **entries, int *types, int n) {
+    for (int i = 0; i < n; i++) {
+        if (o->nlogs == o->logs_cap) {
+            o->logs_cap = o->logs_cap ? o->logs_cap * 2 : 8;
+            o->logs = zrealloc(o->logs, sizeof(ownerLog) * o->logs_cap);
+        }
+        o->logs[o->nlogs++] = (ownerLog){.entry = entries[i], .type = types[i]};
+    }
 }
 
 /* The part of processCommand() and call() that applies to a native command. */
@@ -947,14 +1008,7 @@ static void ownerCall(owner *o, client *c, int kind) {
     c->duration = duration;
     void *entries[3];
     int types[3];
-    int n = commandlogPrepareCurrentCommand(c, cmd, entries, types);
-    for (int i = 0; i < n; i++) {
-        if (o->nlogs == o->logs_cap) {
-            o->logs_cap = o->logs_cap ? o->logs_cap * 2 : 8;
-            o->logs = zrealloc(o->logs, sizeof(ownerLog) * o->logs_cap);
-        }
-        o->logs[o->nlogs++] = (ownerLog){.entry = entries[i], .type = types[i]};
-    }
+    ownerKeepLogs(o, entries, types, commandlogPrepareCurrentCommand(c, cmd, entries, types));
     c->duration = 0;
     c->commands_processed++;
     ectx->stat_numcommands++;
@@ -963,12 +1017,204 @@ static void ownerCall(owner *o, client *c, int kind) {
     ectx->executing_client = NULL;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * GET runs: D0's fastget streaming ring (fastget.c fastGetSpeculateBatch) on the owner
+ * ---------------------------------------------------------------------------------------------- */
+
+typedef struct ownerRingEntry {
+    hashtableIncrementalFindState find;
+    int done;
+} ownerRingEntry;
+
+/* A commandlog type's threshold, or -1 while that log records nothing. */
+static long long ownerLogThreshold(int type) {
+    if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
+    return server.commandlog[type].threshold;
+}
+
+/* Reply to one GET from its completed find, with getCommand's effects (touch, hit or miss count,
+ * the bulk or null reply). Returns 0, having done nothing, when getCommand must run it instead: a
+ * key with an expire (it may have to be deleted and the delete propagated), a value that is not a
+ * string (WRONGTYPE), or a reply the large-reply commandlog records. */
+static int ownerGetReply(client *c, ownerRingEntry *e, long long reply_threshold) {
+    void *found = NULL;
+    if (!hashtableIncrementalFindGetResult(&e->find, &found)) {
+        if (reply_threshold >= 0 && (c->resp == 2 ? 5 : 3) >= reply_threshold) return 0;
+        ectx->stat_keyspace_misses++; /* the keymiss notification is vetoed while owners run */
+        addReplyOrErrorObject(c, shared.null[c->resp]);
+        return 1;
+    }
+    robj *val = found;
+    /* shortcut: a key with an expire goes to getCommand even while it is valid; answer the valid
+     * ones here (commandTimeSnapshot vs the expire) if TTL-heavy GET loads matter. */
+    if (val->hasexpire || objectGetType(val) != OBJ_STRING) return 0;
+    if (reply_threshold >= 0) {
+        size_t len = sdsEncodedObject(val) ? sdslen(objectGetVal(val)) : (size_t)sdigits10((long)objectGetVal(val));
+        if ((long long)(1 + digits10(len) + 2 + len + 2) >= reply_threshold) return 0;
+    }
+    if (!c->flag.no_touch && !server.key_touch_paused) val->lru = lrulfu_touch(val->lru);
+    ectx->stat_keyspace_hits++;
+    addReplyBulk(c, val);
+    return 1;
+}
+
+/* The arguments of the k-th command of a run: the current one, then the queue from its offset. */
+static void ownerRunArgs(client *c, int k, robj ***argv, int *argc, size_t *in) {
+    if (k == 0) {
+        *argv = c->argv, *argc = c->argc, *in = c->net_input_bytes_curr_cmd;
+    } else {
+        parsedCommand *p = &c->cmd_queue.cmds[c->cmd_queue.off + k - 1];
+        *argv = p->argv, *argc = p->argc, *in = p->input_bytes;
+    }
+}
+
+/* Owner: answer the client's current GET and the own-slot GETs queued behind it as one run. Up to
+ * prefetch-batch-max-size key finds are in flight in a ring; each sweep steps every pending find
+ * once (one prefetch each) and replies to the oldest commands whose finds completed, then tops the
+ * ring up from the queue, so the next keys load while the current one is answered. A reply comes
+ * from the find (no second lookup). The run ends before the first command that is not an own-slot
+ * GET, that ownerGetReply leaves to getCommand, or that the large-request commandlog records; the
+ * caller runs that one. As in fastget, the run's commands share its time in commandstats, the
+ * latency histogram and the slow commandlog. Returns the number of commands answered and
+ * consumed (their argvs go back to the parser's recycler); 0 leaves the current one untouched. */
+static int ownerGetRun(owner *o, client *c) {
+    long long req_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    long long reply_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (req_threshold >= 0 && (long long)c->net_input_bytes_curr_cmd >= req_threshold) return 0;
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, OWNER_TABLE_OF_SLOT(c->slot));
+    if (!ht) return 0;
+    unsigned depth = server.prefetch_batch_max_size < 1 ? 1 : (unsigned)server.prefetch_batch_max_size;
+    if (depth > OWN_RING_MAX) depth = OWN_RING_MAX;
+    ownerRingEntry ring[OWN_RING_MAX];
+    struct serverCommand *cmd = c->parsed_cmd;
+    cmdQueue *q = &c->cmd_queue;
+    int next = q->off, open = 1;
+    unsigned head = 0, tail = 1;
+    ring[0].done = 0;
+    hashtableIncrementalFindInit(&ring[0].find, ht, objectGetVal(c->argv[1]));
+
+    c->cmd = c->lastcmd = c->realcmd = cmd;
+    ectx->current_client = c;
+    ectx->executing_client = c;
+    ectx->in_call++;
+    monotime start = getMonotonicUs();
+    enterExecutionUnit(0, 0);
+    c->flag.executing_command = 1;
+    c->flag.buffered_reply = 0;
+    c->flag.keyspace_notified = 0;
+    for (;;) {
+        /* Fill: top the ring up with the own-slot GETs queued behind. */
+        while (open && tail - head < depth && next < q->len) {
+            parsedCommand *p = &q->cmds[next];
+            if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) || !p->cmd || p->cmd->proc != getCommand ||
+                (p->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
+                open = 0;
+                break;
+            }
+            if (p->slot < 0) p->slot = ownerKeySlot(p->cmd, p->argv, p->argc, p->read_flags);
+            hashtable *pht = NULL;
+            if (p->slot >= o->slot_lo && p->slot <= o->slot_hi &&
+                (req_threshold < 0 || (long long)p->input_bytes < req_threshold))
+                pht = kvstoreGetHashtable(c->db->keys, OWNER_TABLE_OF_SLOT(p->slot));
+            if (!pht) {
+                open = 0;
+                break;
+            }
+            ownerRingEntry *e = &ring[tail % OWN_RING_MAX];
+            e->done = 0;
+            hashtableIncrementalFindInit(&e->find, pht, objectGetVal(p->argv[1]));
+            tail++;
+            next++;
+        }
+        if (next >= q->len) open = 0;
+        if (head == tail) break;
+        /* Sweep: one find step per pending entry. */
+        for (unsigned s = head; s < tail; s++) {
+            ownerRingEntry *e = &ring[s % OWN_RING_MAX];
+            if (!e->done) e->done = !hashtableIncrementalFindStep(&e->find);
+        }
+        /* Drain: reply to the completed oldest entries, in command order. */
+        while (head < tail && ring[head % OWN_RING_MAX].done) {
+            c->net_output_bytes_curr_cmd = 0;
+            if (!ownerGetReply(c, &ring[head % OWN_RING_MAX], reply_threshold)) {
+                open = 0;
+                tail = head; /* the rest go command by command */
+                break;
+            }
+            head++;
+            /* An output buffer limit closes the client: run nothing more, as processInputBuffer. */
+            if (c->flag.close_asap) {
+                open = 0;
+                tail = head;
+                break;
+            }
+        }
+    }
+    c->flag.executing_command = 0;
+    c->net_output_bytes_curr_cmd = 0;
+    exitExecutionUnit();
+    long long usec = (long long)(getMonotonicUs() - start);
+    int n = (int)head;
+    if (n) {
+        ownerCmdStat *cs = &o->cs[OWN_GET];
+        cs->calls += n;
+        cs->usec += usec;
+        if (server.latency_tracking_enabled)
+            updateCommandLatencyHistogramCount(&cs->hist, usec * 1000 / n > 0 ? usec * 1000 / n : 1, n);
+        long long slow = ownerLogThreshold(COMMANDLOG_TYPE_SLOW);
+        if (slow >= 0 && usec / n >= slow) {
+            /* Each command at the run's average; the large-request and -reply ones did not run here. */
+            robj **saved_argv = c->argv;
+            int saved_argc = c->argc;
+            for (int k = 0; k < n; k++) {
+                void *entries[3];
+                int types[3];
+                size_t in;
+                ownerRunArgs(c, k, &c->argv, &c->argc, &in);
+                c->duration = usec / n;
+                c->net_input_bytes_curr_cmd = 0;
+                ownerKeepLogs(o, entries, types, commandlogPrepareCurrentCommand(c, cmd, entries, types));
+            }
+            c->argv = saved_argv;
+            c->argc = saved_argc;
+            c->duration = 0;
+        }
+        /* Consume, as fastGetConsumeSpeculated: the owner's parser built these argvs. */
+        for (int j = 0; j < c->argc; j++) parseRecycleArg(c->argv[j]);
+        parseRecycleArgv(c->argv, c->argv_len);
+        c->argv = NULL;
+        c->argc = 0;
+        c->argv_len = 0;
+        c->argv_len_sum = 0;
+        for (int k = 1; k < n; k++) {
+            parsedCommand *p = &q->cmds[q->off++];
+            c->qb_applied += p->input_bytes;
+            for (int j = 0; j < p->argc; j++) parseRecycleArg(p->argv[j]);
+            parseRecycleArgv(p->argv, p->argv_len);
+            p->argv = NULL;
+            p->argc = 0;
+        }
+        if (q->off == q->len) q->off = q->len = 0;
+        c->commands_processed += n;
+        ectx->stat_numcommands += n;
+        o->native_total += n;
+    }
+    ectx->in_call--;
+    ectx->executing_client = NULL;
+    if (!n) return 0; /* nothing done: ownerCall runs the current command */
+    commandProcessed(c); /* the reset after the run's last command (one reset per GET is the same) */
+    ectx->current_client = NULL;
+    return n;
+}
+
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
 static int ownerTryNative(client *c) {
     owner *o = own_self;
-    ownerPrefetch(o, c);
+    if (c->slot < 0) c->slot = ownerKeySlot(c->parsed_cmd, c->argv, c->argc, c->read_flags);
     int kind = ownerNativeKind(o, c);
     if (kind < 0) return 0;
+    if (kind == OWN_GET && ownerGetRun(o, c)) return 1;
+    ownerPrefetch(o, c);
     ownerCall(o, c, kind);
     commandProcessed(c);
     ectx->current_client = NULL;
