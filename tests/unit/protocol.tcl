@@ -51,6 +51,64 @@ start_server {tags {"protocol network"}} {
         assert_equal value [r get split:header]
     }
 
+    test "GET and MGET frames: whole, split, spellings, arity and malformed" {
+        # An owner thread parses these with its frame templates; any other thread with parseMultibulk.
+        r set frame:a va
+        r set frame:b vb
+        r set {} empty
+        foreach {payload reply} {
+            "*2\r\n\$3\r\nGET\r\n\$7\r\nframe:a\r\n" va
+            "*2\r\n\$3\r\nget\r\n\$7\r\nframe:b\r\n" vb
+            "*2\r\n\$3\r\nGeT\r\n\$7\r\nframe:a\r\n" va
+            "*2\r\n\$3\r\nGET\r\n\$0\r\n\r\n" empty
+            "*2\r\n\$4\r\nMGET\r\n\$7\r\nframe:a\r\n" va
+            "*3\r\n\$4\r\nMGET\r\n\$7\r\nframe:a\r\n\$7\r\nframe:b\r\n" {va vb}
+            "*4\r\n\$4\r\nmget\r\n\$7\r\nframe:b\r\n\$7\r\nframe:x\r\n\$7\r\nframe:a\r\n" {vb {} va}
+            "*3\r\n\$4\r\nMgEt\r\n\$7\r\nframe:b\r\n\$7\r\nframe:a\r\n" {vb va}
+        } {
+            reconnect
+            r write $payload
+            r flush
+            assert_equal $reply [r read]
+            reconnect
+            foreach ch [split $payload {}] {
+                r write $ch
+                r flush
+                after 1
+            }
+            assert_equal $reply [r read]
+        }
+        reconnect
+        r write "*3\r\n\$3\r\nGET\r\n\$7\r\nframe:a\r\n\$7\r\nframe:b\r\n"
+        r flush
+        assert_error "*wrong number of arguments*" {r read}
+        # 32 keys (the template's cap) and 40 (the generic loop), pipelined with GET and SET.
+        set keys {}
+        set want {}
+        for {set j 0} {$j < 40} {incr j} {
+            lappend keys frame:a frame:x
+            lappend want va {}
+        }
+        assert_equal [lrange $want 0 31] [r mget {*}[lrange $keys 0 31]]
+        assert_equal $want [r mget {*}$keys]
+        r write "*2\r\n\$3\r\nGET\r\n\$7\r\nframe:a\r\n*3\r\n\$3\r\nSET\r\n\$7\r\nframe:c\r\n\$2\r\nvc\r\n*3\r\n\$4\r\nMGET\r\n\$7\r\nframe:c\r\n\$7\r\nframe:b\r\n"
+        r flush
+        assert_equal va [r read]
+        assert_equal OK [r read]
+        assert_equal {vc vb} [r read]
+        foreach {payload err} {
+            "*2\r\n\$3\r\nGET\r\n\$7\r\nframe:aXY" "*Protocol error*"
+            "*3\r\n\$4\r\nMGET\r\n\$7\r\nframe:a\r\n\$7\r\nframe:bXY" "*Protocol error*"
+            "*3\r\n\$4\r\nMGET\r\n\$7\r\nframe:a\r\n%7\r\nframe:b\r\n" "*expected '\$', got '%'*"
+            "*2\r\n\$3\r\nGET\r\n\$07\r\nframe:a\r\n" "*invalid bulk length*"
+        } {
+            reconnect
+            r write $payload
+            r flush
+            assert_error $err {r read}
+        }
+    }
+
     test "Malformed length headers are protocol errors" {
         foreach {payload err} {
             "*1\r\n\$+4\r\nping\r\n" "*invalid bulk length*"

@@ -186,6 +186,12 @@ static int parseMultibulk(client *c,
                           int *argv_len,
                           size_t *argv_len_sum,
                           unsigned long long *net_input_bytes_curr_cmd);
+static int parseOwnerFrame(client *c,
+                           int *argc,
+                           robj ***argv,
+                           int *argv_len,
+                           size_t *argv_len_sum,
+                           unsigned long long *net_input_bytes_curr_cmd);
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
@@ -4385,8 +4391,13 @@ static void setProtocolError(const char *errstr, client *c) {
  * command is in RESP format, so the first byte in the command is found
  * to be '*'. Otherwise, for inline commands parseInlineBuffer() is called. */
 void parseMultibulkBuffer(client *c) {
-    int flag = parseMultibulk(c, &c->argc, &c->argv, &c->argv_len,
-                              &c->argv_len_sum, &c->net_input_bytes_curr_cmd);
+    /* An owner thread takes a complete GET or MGET frame with its template (parseOwnerFrame). */
+    int flag = own_self && c->multibulklen == 0 &&
+                       parseOwnerFrame(c, &c->argc, &c->argv, &c->argv_len, &c->argv_len_sum,
+                                       &c->net_input_bytes_curr_cmd)
+                   ? READ_FLAGS_PARSING_COMPLETED
+                   : parseMultibulk(c, &c->argc, &c->argv, &c->argv_len, &c->argv_len_sum,
+                                    &c->net_input_bytes_curr_cmd);
     c->read_flags |= flag;
 
     /* Record qb_pos for commandProcessed(). Written unconditionally because a
@@ -4425,8 +4436,11 @@ void parseMultibulkBuffer(client *c) {
         }
         parsedCommand *p = &queue->cmds[queue->len++];
         memset(p, 0, sizeof(*p));
-        flag = parseMultibulk(c, &p->argc, &p->argv, &p->argv_len,
-                              &p->argv_len_sum, &p->input_bytes);
+        if (own_self && parseOwnerFrame(c, &p->argc, &p->argv, &p->argv_len, &p->argv_len_sum, &p->input_bytes))
+            flag = READ_FLAGS_PARSING_COMPLETED;
+        else
+            flag = parseMultibulk(c, &p->argc, &p->argv, &p->argv_len,
+                                  &p->argv_len_sum, &p->input_bytes);
         p->read_flags = flag;
         p->slot = -1;
     }
@@ -4452,6 +4466,9 @@ typedef struct sharedCommandName {
 static sharedCommandName shared_cmdnames[CMDNAME_SLOTS];
 /* The shared "SET" and "set" objects, for the parser's SET value prebuild. */
 static robj *shared_cmdname_set[2];
+/* The shared "GET"/"get" and "MGET"/"mget" objects, for the owner's frame templates. */
+static robj *shared_cmdname_get[2];
+static robj *shared_cmdname_mget[2];
 
 static inline unsigned int cmdNameSlot(const char *p, size_t len) {
     uint32_t h = (uint32_t)len;
@@ -4505,6 +4522,10 @@ void createSharedCommandNames(void) {
     }
     shared_cmdname_set[0] = lookupSharedCommandName("SET", 3);
     shared_cmdname_set[1] = lookupSharedCommandName("set", 3);
+    shared_cmdname_get[0] = lookupSharedCommandName("GET", 3);
+    shared_cmdname_get[1] = lookupSharedCommandName("get", 3);
+    shared_cmdname_mget[0] = lookupSharedCommandName("MGET", 4);
+    shared_cmdname_mget[1] = lookupSharedCommandName("mget", 4);
 }
 
 /* Fast path for a RESP length header ("*<n>\r\n" or "$<n>\r\n") at p, with
@@ -4522,6 +4543,76 @@ static inline size_t parseShortRespLength(const char *p, size_t avail, long long
     if (i + 1 >= avail || p[i] != '\r' || p[i + 1] != '\n') return 0;
     *ll = v;
     return i - 1;
+}
+
+/* Owner threads (owner.c): templates for the owner's hot read frames, complete in the buffer at the
+ * start of a command:
+ *   GET : "*2\r\n$3\r\nGET\r\n$<n>\r\n<key>\r\n"
+ *   MGET: "*<N>\r\n$4\r\nMGET\r\n" then N-1 times "$<n>\r\n<key>\r\n", 2 <= N <= PARSE_FRAME_MAXARGS
+ * with the name all upper or all lower case and every key header a short one (parseShortRespLength)
+ * under PROTO_MBULK_BIG_ARG. Fixed-shape compares replace parseMultibulk()'s per-argument loop, and
+ * the whole frame is checked before anything is built. Builds exactly the state parseMultibulk()
+ * would build for it (argv and argv_len, the shared name object, the key objects, lengths, input
+ * bytes, parser position) and returns 1. Returns 0, having changed nothing, for any other frame
+ * (another command or spelling, a partial or malformed frame, an empty key, an AUTH-pending or
+ * replicated client): parseMultibulk() then parses or rejects it as before. */
+#define PARSE_FRAME_MAXARGS 33 /* MGET of up to 32 keys; longer ones take the generic loop */
+static int parseOwnerFrame(client *c,
+                           int *argc,
+                           robj ***argv,
+                           int *argv_len,
+                           size_t *argv_len_sum,
+                           unsigned long long *net_input_bytes_curr_cmd) {
+    if (c->read_flags & (READ_FLAGS_REPLICATED | READ_FLAGS_AUTH_REQUIRED)) return 0;
+    const char *b = c->querybuf + c->qb_pos;
+    size_t avail = sdslen(c->querybuf) - c->qb_pos;
+    long long n, len;
+    size_t digits = parseShortRespLength(b, avail, &n);
+    if (!digits || b[0] != '*' || n < 2 || n > PARSE_FRAME_MAXARGS) return 0;
+    size_t pos = digits + 3;
+    robj *name;
+    size_t name_len;
+    if (n == 2 && avail >= pos + 9 &&
+        (memcmp(b + pos, "$3\r\nGET\r\n", 9) == 0 || memcmp(b + pos, "$3\r\nget\r\n", 9) == 0)) {
+        name = shared_cmdname_get[b[pos + 4] == 'g'];
+        name_len = 3;
+    } else if (avail >= pos + 10 &&
+               (memcmp(b + pos, "$4\r\nMGET\r\n", 10) == 0 || memcmp(b + pos, "$4\r\nmget\r\n", 10) == 0)) {
+        name = shared_cmdname_mget[b[pos + 4] == 'm'];
+        name_len = 4;
+    } else {
+        return 0;
+    }
+    if (!name) return 0;
+    pos += name_len + 6;
+    uint32_t key_off[PARSE_FRAME_MAXARGS], key_len[PARSE_FRAME_MAXARGS];
+    for (int j = 1; j < n; j++) {
+        if (pos >= avail || b[pos] != '$') return 0;
+        digits = parseShortRespLength(b + pos, avail - pos, &len);
+        if (!digits || len >= PROTO_MBULK_BIG_ARG || len > server.proto_max_bulk_len) return 0;
+        pos += digits + 3;
+        if (avail - pos < (size_t)len + 2 || b[pos + len] != '\r' || b[pos + len + 1] != '\n') return 0;
+        key_off[j] = (uint32_t)pos;
+        key_len[j] = (uint32_t)len;
+        pos += len + 2;
+    }
+
+    if (*argv) zfree(*argv);
+    *argv_len = (int)n;
+    *argv = parseAllocArgv((int)n);
+    (*argv)[0] = name;
+    size_t sum = name_len;
+    for (int j = 1; j < n; j++) {
+        (*argv)[j] = parseCreateStringObject(b + key_off[j], key_len[j]);
+        sum += key_len[j];
+    }
+    *argc = (int)n;
+    *argv_len_sum = sum;
+    *net_input_bytes_curr_cmd += pos; /* the frame's bytes, as parseMultibulk() sums them */
+    c->qb_pos += pos;
+    c->bulklen = -1;
+    c->reqtype = 0;
+    return 1;
 }
 
 /* Incremental parsing of a command in the client's query buffer.
