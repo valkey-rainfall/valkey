@@ -24,19 +24,24 @@ base file is plain commands, no automatic rewrite) from --bin and checks:
                          LOADAOF and after a restart from the AOF, dbsize of dbs 1-3 equal, and DEBUG DIGEST equal
                          in all three
   race.waitaof.everysec  after the load, a native SET then WAITAOF 1 0 3000 on every owner answers [1, 0]
+  race.fsync_pace.everysec  (D3-all-g6-aoftail, part pace-everysec) owner 0 SETs 4 KB values as fast as it can
+                         while a plain-port client does SET then WAITAOF 1 0 3000 20 times: each answers [1, 0]
+                         and the 90th percentile wait is under 600 ms (owner drains start an fsync each 32 MB
+                         unsynced; the once-a-second fsync alone puts it near 1 s)
   race.drains.<mode>     owner_aof_drains moved (the owners wrote the AOF themselves; owner_world_stops is
                          shown next to it), aof_last_write_status and aof_last_bgrewrite_status ok
   race.no_crash.<mode>   no crash lines in the server log
 
 Usage: d3aofrace-check.py --bin src/valkey-server --dir /tmp/x --n 4 --port 27379 --owner-port 27400
                           --cpus 8-11 --main-cpu 16 [--bench src/valkey-benchmark] [--secs 4]
-                          [--parts backed-no,backed-everysec,model-no,model-everysec]
+                          [--parts backed-no,backed-everysec,model-no,model-everysec,pace-everysec]
 Prints PASS/FAIL (and INFO) lines and a final 'D3AOFRACE {json}' line; exit 1 on any FAIL. On a binary
 without owner_aof_drains (the parent) race.drains fails by construction; the rest applies as is.
 """
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -297,6 +302,59 @@ def drains(mode, o0, o1, per):
               per.get("aof_rewrites")))
 
 
+def pace():
+    """everysec, D3-all-g6-aoftail: owner 0 writes 4 KB values as fast as it can (hundreds of MB/s of AOF)
+    while a plain-port client does SET then WAITAOF 1 0 3000, 20 times. Owner drains start an fsync each
+    time 32 MB are unsynced, so every wait is short; the stock once-a-second fsync alone puts p90 near 1 s."""
+    srv = server("pace-everysec", "everysec")
+    adm = srv.conn()
+    keys = keys_of(owner_ranges(adm), 0, b"pace", 2048)
+    stop, errs, sent, waits = threading.Event(), [], [0], []
+    val = b"v" * 4096
+
+    def heavy():
+        try:
+            c, n = srv.conn(0), 0
+            while not stop.is_set() and n < (2 << 30) // len(val):  # at most 2 GB of values
+                c.send([("SET", keys[(n + j) % len(keys)], val) for j in range(16)])
+                for _ in range(16):
+                    assert c.read() == "OK"
+                n += 16
+            sent[0] = n
+            c.close()
+        except Exception as e:  # noqa
+            errs.append(repr(e))
+
+    th = threading.Thread(target=heavy)
+    th.start()
+    try:
+        c = srv.conn()
+        time.sleep(0.5)
+        for _ in range(20):
+            c.cmd("SET", b"fsync-pace", b"1")
+            t0 = time.monotonic()
+            r = c.cmd("WAITAOF", 1, 0, 3000)
+            waits.append(round((time.monotonic() - t0) * 1000) if r == [1, 0] else repr(r))
+            time.sleep(0.03)
+        c.close()
+    except Exception as e:  # noqa
+        errs.append(repr(e))
+    stop.set()
+    th.join()
+    per = info(adm, "persistence")
+    ms = sorted(x for x in waits if isinstance(x, int))
+    p90 = ms[min(len(ms) - 1, len(ms) * 9 // 10)] if ms else None
+    check("race.fsync_pace.everysec", not errs and len(ms) == len(waits) == 20 and p90 < 600
+          and per.get("aof_last_write_status") == "ok",
+          "WAITAOF waits (ms) %s, p90 %s; %d SETs of 4 KB on owner 0, AOF %s B, errors %s" % (
+              waits, p90, sent[0], per.get("aof_current_size"), errs[:2]))
+    adm.close()
+    crash = srv.crashed()
+    srv.stop()
+    shutil.rmtree(os.path.join(srv.dir, "appendonlydir"), ignore_errors=True)  # up to 2 GB
+    check("race.no_crash.pace.everysec", crash == 0, "crash lines %d" % crash)
+
+
 def model_run(mode):
     srv = server("model-" + mode, mode)
     adm = srv.conn()
@@ -458,7 +516,7 @@ def main():
     ap.add_argument("--main-cpu", default="16")
     ap.add_argument("--bench", default="")
     ap.add_argument("--secs", type=float, default=4.0)
-    ap.add_argument("--parts", default="backed-no,backed-everysec,model-no,model-everysec")
+    ap.add_argument("--parts", default="backed-no,backed-everysec,model-no,model-everysec,pace-everysec")
     ARGS = ap.parse_args()
     veto.ARGS = ARGS
     parts = ARGS.parts.split(",")
@@ -470,6 +528,8 @@ def main():
         model_run("no")
     if "model-everysec" in parts:
         model_run("everysec")
+    if "pace-everysec" in parts:
+        pace()
     res = d3.RESULTS
     fails = [r["check"] for r in res if not r["ok"]]
     print("D3AOFRACE " + json.dumps(dict(n=ARGS.n, checks=len(res), fails=fails)))

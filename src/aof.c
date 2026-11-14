@@ -935,6 +935,20 @@ void aof_background_fsync_and_close(int fd) {
     bioCreateCloseAofJob(fd, server.primary_repl_offset, 1);
 }
 
+/* Under everysec, start a background fsync once min_bytes are written since the last one started and
+ * none is running: flushAppendOnlyFile's everysec step for an empty buffer (everything fed is written,
+ * so the job's offset is on disk once it ends), triggered by bytes instead of the second. Owner
+ * threads call it after their AOF write (owner.c ownerDrainAof). */
+void aofBackgroundFsyncIfDue(long long min_bytes) {
+    if (server.aof_fsync != AOF_FSYNC_EVERYSEC || sdslen(server.aof_buf) != 0 ||
+        server.aof_last_incr_size - server.aof_last_incr_fsync_offset < min_bytes ||
+        (server.aof_no_fsync_on_rewrite && hasActiveChildProcess()) || aofFsyncInProgress())
+        return;
+    aof_background_fsync(server.aof_fd);
+    server.aof_last_incr_fsync_offset = server.aof_last_incr_size;
+    server.aof_last_fsync = server.mstime;
+}
+
 /* Kills an AOFRW child process if exists */
 void killAppendOnlyChild(void) {
     int statloc;

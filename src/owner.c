@@ -234,6 +234,7 @@ static int own_aof = 0;                   /* appendonly: native ops are kept for
 static int own_aof_drain = 0;
 static pthread_mutex_t own_aof_mu = PTHREAD_MUTEX_INITIALIZER;
 static long long own_aof_drains = 0;      /* owner AOF writes (under own_aof_mu) */
+#define OWN_AOF_FSYNC_BYTES (32LL << 20) /* everysec: an owner drain starts an fsync once this much is unsynced */
 static int own_mm = 0;                    /* maxmemory: native steps check their headroom */
 static long long own_mm_slice = 0;        /* bytes each owner may add this period */
 static unsigned long long own_mm_period = 0;
@@ -1286,11 +1287,22 @@ static void ownerTakeProp(owner *o, client *c) {
  * fsync job once a second under everysec, a write postponed behind a running fsync, a failed write
  * kept in the buffer. The replies then go exactly when the stock loop would send them: when
  * aofHoldsReplies() is false. Each key is written by one thread at a time and its records reach the
- * buffer in that thread's execution order, so the AOF has each key's writes in order. */
+ * buffer in that thread's execution order, so the AOF has each key's writes in order.
+ * Under everysec the drain also starts the next background fsync once OWN_AOF_FSYNC_BYTES are written
+ * and not fsynced and none runs, besides the stock once a second (D3-all-g6-aoftail). The stock write
+ * is postponed while an fsync runs, so the buffer piles up for the whole fsync, and the first drain
+ * after it writes all of it under own_aof_mu while every other owner waits on the lock with its
+ * replies held. K13 at about 450 MB/s of AOF (W=16 loopback, 150 B values) showed fsyncs of 100-300
+ * ms once a second, 50-100 MB writes after them and lock holds up to 47 ms. Bounding the bytes per
+ * fsync bounds its time and the pile behind it; below 32 MB a second nothing changes. Never later
+ * than stock: data is fsynced sooner; the write policy and the reply release are unchanged.
+ * shortcut: one byte threshold for every disk. Upgrade: derive it from the measured fsync time if
+ * disks differ a lot. */
 static void ownerDrainAof(owner *o) {
     pthread_mutex_lock(&own_aof_mu);
     ownerAofAppend(o);
     flushAppendOnlyFile(0);
+    aofBackgroundFsyncIfDue(OWN_AOF_FSYNC_BYTES);
     own_aof_drains++;
     int hold = aofHoldsReplies();
     /* writeCommandsDeniedByDiskError's AOF part: after a failed write or background fsync the next

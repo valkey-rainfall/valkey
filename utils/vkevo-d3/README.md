@@ -48,6 +48,10 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
 - D3-all-g5 (D3-all-g4-k1 + D3-all-g4-aof): both, unchanged. A key argv is kept whole only when
   its key's refcount is 1 (parseArgReusable), so a key an AOF op still holds (a lazy-expire DEL
   of a GET key) goes back piece by piece; the owner's AOF records are bytes, not references.
+- D3-all-g6-aoftail: under appendfsync everysec an owner's AOF drain also starts the background
+  fsync once 32 MB are written and not fsynced and none runs (aofBackgroundFsyncIfDue), so each
+  fsync, and the writes the stock loop postpones behind it, stay short at high write rates; below
+  32 MB a second nothing changes. Write policy and reply release unchanged; never fsynced later.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -91,7 +95,8 @@ Files here:
   others run: every reply backed by the AOF files (base + incr, across 3 mid-run BGREWRITEAOFs) under
   appendfsync no, concurrent multi-db writers + plain-port and handoff writers + rewrites + an
   everysec/always toggle vs a model live, after LOADAOF and after restart, WAITAOF; `--bench` adds a
-  valkey-benchmark SET load on every owner port. `d3veto-check.py` and `d3all-check.py` take
+  valkey-benchmark SET load on every owner port; part `pace-everysec` checks the owners' fsync
+  pacing with WAITAOF waits under a 4 KB SET load (D3-all-g6-aoftail). `d3veto-check.py` and `d3all-check.py` take
   `--fsync no` to run their AOF parts (aoftest, ring_backed) on the same path.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
