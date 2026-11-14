@@ -1653,6 +1653,7 @@ typedef struct client {
     int owner_why;               /* Why the owner handed the client to main (owner.c). */
     unsigned owner_onloop : 1;   /* Registered in its owner's epoll set. */
     unsigned owner_wantout : 1;  /* Its owner waits for EPOLLOUT. */
+    int owner_held;              /* Its replies wait for the AOF: index + 1 in its owner's held list, else 0. */
     listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;

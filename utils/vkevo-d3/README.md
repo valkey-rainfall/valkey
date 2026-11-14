@@ -19,9 +19,19 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   transaction, EXEC with conditions, Lua, blocking, pub/sub, admin. No cross-owner locking.
 - Main holds the world whenever it runs (afterSleep to the end of beforeSleep); owners run only
   while main sleeps. One process: one replication stream, one AOF, one global maxmemory.
-- AOF, replicas, maxmemory, MONITOR, keyspace events, tracking, WATCH through main, keys with blocked clients,
+- Replicas, maxmemory-clients, MONITOR, keyspace events, tracking, WATCH through main, keys with blocked clients,
   client pause, write-observing modules, latency monitor, hotkeys, forkless save: while any is on,
   owners hand every command to main (stock behavior, main-path speed).
+- D3veto: `appendonly yes` and `maxmemory` stay native. AOF: each native command's propagated ops
+  are kept per owner and replayed into the AOF buffer by main when it stops the world, before it
+  runs anything; an owner's replies wait (`owner_held_replies`) until main's beforeSleep AOF write
+  (fsync under `always`). maxmemory: a native read/command/resize runs only if main's last reading
+  of used memory + what the owner added since (its own zmalloc counter) + a bound for the step
+  stays under maxmemory, split per owner; under 2 MB of headroom per owner, everything goes to main,
+  which evicts or refuses as stock (`owner_maxmemory_to_main` counts single refusals).
+- D3-all (D3-g2 + D3mk + D3veto): a native EXEC under AOF keeps its queued commands' ops as one unit
+  (MULTI/EXEC-wrapped when more than one, as the stock EXEC); under maxmemory MGET and EXEC are bounded
+  by the stored values they can return, and owner GETs run one by one (no D3-g2 GET ring).
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -39,6 +49,10 @@ Files here:
   reply order, linearizability across paths, plain port, vetoes, expiry, stats, no crash).
 - `d3-multikey-check.py` (D3mk): native single-owner MGET/MSET/DEL/MULTI/WATCH vs a model, partial
   groups never visible under writers on three paths, MULTI INCR pairs and WATCH CAS across paths.
+- `d3veto-check.py`: AOF and maxmemory with native owners; starts its own loopback servers
+  (`--bin --dir --n`): replies after the AOF write (DEBUG AOF-FLUSH-SLEEP), round-1 aoftest (every
+  reply backed by the AOF file), replay vs a model (DEBUG LOADAOF, restart, BGREWRITEAOF), WAITAOF,
+  eviction limit and key accounting, noeviction refusals, used_memory vs the plain path.
 
 Bench host (W worker CPUs 0..W-1, NIC IRQs on 64-95):
 
