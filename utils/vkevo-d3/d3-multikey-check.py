@@ -444,6 +444,108 @@ def main():
           isinstance(r3[9], Err) and r3[9].startswith("EXECABORT") and r3[10] is None, r3)
     c.close()
 
+    # --- watch: WATCH/UNWATCH of own keys on the owner; a write from every path aborts the EXEC
+    def iget(section, field):
+        return d3.info(adm, section).get(field)
+
+    p = ports[0]
+    wt = tags_for(p, 1, b"wa")[0]
+    wk, wk2, wn = b"{%s}:w" % wt, b"{%s}:w2" % wt, b"{%s}:n" % wt
+    far_k = b"{%s}:x" % tags_for(other(p), 1, b"wa")[0]
+    c = Conn(H, p)
+    c.cmd("PING")
+    time.sleep(0.2)
+    writers = {"same_owner": Conn(H, p), "plain": Conn(H, a.port), "other_owner": Conn(H, other(p))}
+    res, ok = {}, True
+    for name, wr in writers.items():
+        adm.cmd("SET", wk, "0")
+        time.sleep(0.1)
+        s0 = ostat(adm)
+        r = [c.cmd("WATCH", wk, wk2), c.cmd("GET", wk)]
+        during = (iget("clients", "watching_clients"), iget("clients", "total_watched_keys"), iget("owners", "owner_veto"))
+        wr.cmd("SET", wk, name)
+        c.send([("MULTI",), ("SET", wk, "mine"), ("EXEC",)])
+        r += [c.read() for _ in range(3)] + [c.cmd("GET", wk)]
+        after = iget("clients", "watching_clients")
+        s1 = ostat(adm)
+        dh = s1["owner_handoffs_to_main"] - s0["owner_handoffs_to_main"]
+        res[name] = (r, during, after, dh)
+        # the watcher stays on its owner: only the other owner's writer hands off
+        ok &= r == ["OK", b"0", "OK", "QUEUED", None, name.encode()] and during == ("1", "2", "none") and \
+            after == "0" and dh == (1 if name == "other_owner" else 0)
+    check("watch.native_aborts_on_write_from_every_path", ok, res)
+    s0 = ostat(adm)
+    c.send([("WATCH", wk), ("GET", wk), ("MULTI",), ("INCR", wn), ("EXEC",), ("WATCH", wk), ("UNWATCH",)])
+    r = [c.read() for _ in range(7)]
+    writers["same_owner"].cmd("SET", wk, "z")
+    c.send([("MULTI",), ("SET", wk2, "y"), ("EXEC",)])
+    r += [c.read() for _ in range(3)]
+    s1 = ostat(adm)
+    check("watch.untouched_and_unwatch_succeed_native",
+          r == ["OK", b"other_owner", "OK", "QUEUED", [1], "OK", "OK", "OK", "QUEUED", ["OK"]] and
+          s1["owner_handoffs_to_main"] == s0["owner_handoffs_to_main"] and iget("clients", "watching_clients") == "0",
+          (r, s1["owner_handoffs_to_main"] - s0["owner_handoffs_to_main"]))
+    # a native watcher that falls back (another owner's key) becomes a stock watcher on main
+    r = [c.cmd("WATCH", wk), c.cmd("GET", far_k)]
+    moved = (iget("clients", "watching_clients"), iget("owners", "owner_veto"))
+    writers["same_owner"].cmd("SET", wk, "after-move")
+    c.send([("MULTI",), ("SET", wk, "mine"), ("EXEC",)])
+    r += [c.read() for _ in range(3)] + [c.cmd("GET", wk)]
+    time.sleep(0.3)
+    s0 = ostat(adm)
+    home = [c.cmd("GET", wk) for _ in range(20)]
+    s1 = ostat(adm)
+    check("watch.fallback_moves_watcher_to_main",
+          r == ["OK", None, "OK", "QUEUED", None, b"after-move"] and moved == ("1", "all") and
+          iget("clients", "watching_clients") == "0" and s1["owner_native_commands"] - s0["owner_native_commands"] >= 20,
+          (r, moved, s1["owner_native_commands"] - s0["owner_native_commands"]))
+    # an expired watched key fails the EXEC; FLUSHALL touches native watchers
+    adm.cmd("PSETEX", wk, 300, "v")
+    r = [c.cmd("WATCH", wk)]
+    time.sleep(0.5)
+    c.send([("MULTI",), ("GET", wk), ("EXEC",)])
+    r += [c.read() for _ in range(3)]
+    c.cmd("SET", wk, "1")
+    r += [c.cmd("WATCH", wk), adm.cmd("FLUSHALL")]
+    c.send([("MULTI",), ("SET", wk, "2"), ("EXEC",)])
+    r += [c.read() for _ in range(3)] + [c.cmd("GET", wk)]
+    check("watch.expired_key_and_flushall_abort", r == ["OK", "OK", "QUEUED", None, "OK", "OK", "OK", "QUEUED", None, None], r)
+    [w.close() for w in writers.values()]
+    c.close()
+
+    # --- watch CAS: WATCH k; GET k; MULTI; SET k v+1; EXEC from the owner, another owner and main
+    ck = b"{%s}:cas" % tags_for(ports[N // 2], 1, b"cas")[0]
+    adm.cmd("SET", ck, 0)
+    cpaths = [ports[N // 2], ports[N // 2], other(ports[N // 2]), a.port]
+    wins, tries, cerr = [0] * len(cpaths), [0] * len(cpaths), []
+
+    def cas_worker(t):
+        cc = Conn(H, cpaths[t])
+        while wins[t] < 150 and tries[t] < 30000:
+            tries[t] += 1
+            cc.send([("WATCH", ck), ("GET", ck)])
+            v = [cc.read() for _ in range(2)][1]
+            cc.send([("MULTI",), ("SET", ck, int(v) + 1), ("EXEC",)])
+            r = [cc.read() for _ in range(3)][2]
+            if r == ["OK"]:
+                wins[t] += 1
+            elif r is not None:
+                cerr.append(r)
+        cc.close()
+
+    s0 = ostat(adm)
+    th = [threading.Thread(target=cas_worker, args=(t,)) for t in range(len(cpaths))]
+    [t.start() for t in th]
+    [t.join() for t in th]
+    s1 = ostat(adm)
+    fin = int(adm.cmd("GET", ck))
+    check("watch.cas_no_lost_update_mixed_paths", not cerr and fin == sum(wins) and min(wins) == 150,
+          "wins %s tries %s final %d errors %s native +%d watching_clients %s" %
+          (wins, tries, fin, cerr[:2], s1["owner_native_commands"] - s0["owner_native_commands"],
+           iget("clients", "watching_clients")))
+    check("watch.registries_empty_after", iget("clients", "watching_clients") == "0" and
+          iget("clients", "total_watched_keys") == "0", (iget("clients", "watching_clients"), iget("clients", "total_watched_keys")))
+
     alive = {}
     for x in ports + [a.port]:
         try:
