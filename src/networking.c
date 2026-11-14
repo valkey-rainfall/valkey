@@ -4141,9 +4141,27 @@ typedef struct recycleStrClass {
 typedef struct parseRecycler {
     recycleStack argv[RECYCLE_ARGV_MAXLEN + 1]; /* by argv_len */
     recycleStrClass str[RECYCLE_STR_CLASSES];
+    /* Owner threads: 2-slot argvs of a shared name and one key (GET, MGET of one key), kept whole
+     * with the key object still in slot 1, so the owner's frame template takes both in one pop and
+     * rewrites only the key bytes (parsePopKeyArgv, parseRecycleKeyArgv). */
+    recycleStrClass keyargv;
 } parseRecycler;
 
 static _Thread_local parseRecycler parse_recycler;
+
+/* objectGetVal() of an object that passes parseArgReusable() (EMBSTR, no embedded key), inline: the
+ * value's type-8 sds follows the object header and, when the allocation had room for one, an expire
+ * field (createEmbeddedStringObjectWithKeyAndExpire). Checked against objectGetVal() at startup. */
+static inline char *parseEmbstrVal(const robj *o) {
+    return (char *)o + sizeof(robj) - sizeof(void *) + (o->hasexpire ? sizeof(long long) : 0) +
+           sizeof(struct sdshdr8);
+}
+
+/* An unshared, unmodified EMBSTR argument the parser can rewrite for another one of its length. */
+static inline int parseArgReusable(const robj *o) {
+    return objectGetRefcount(o) == 1 && objectGetType(o) == OBJ_STRING &&
+           objectGetEncoding(o) == OBJ_ENCODING_EMBSTR && !o->hasembkey;
+}
 
 static inline robj **parseAllocArgv(int argv_len) {
     if (argv_len <= RECYCLE_ARGV_MAXLEN) {
@@ -4158,11 +4176,35 @@ static inline robj *parseCreateStringObject(const char *ptr, size_t len) {
         recycleStrClass *k = &parse_recycler.str[len & (RECYCLE_STR_CLASSES - 1)];
         if (k->s.n && k->len == len) {
             robj *o = k->s.items[--k->s.n];
-            memcpy(objectGetVal(o), ptr, len);
+            memcpy(parseEmbstrVal(o), ptr, len);
             return o;
         }
     }
     return createStringObject(ptr, len);
+}
+
+/* A kept 2-slot argv whose key object (slot 1) has length len, or NULL. Slot 0 is stale. */
+static inline robj **parsePopKeyArgv(size_t len) {
+    recycleStrClass *k = &parse_recycler.keyargv;
+    if (k->s.n && k->len == len) return k->s.items[--k->s.n];
+    return NULL;
+}
+
+/* Keep a consumed argv of a shared name and one reusable key whole, for parsePopKeyArgv. Returns 0,
+ * having done nothing, for any other argv: the caller frees it with parseRecycleArg/parseRecycleArgv.
+ * shortcut: one key length at a time (the first kept while the stack is empty); a load mixing key
+ * lengths recycles the others piece by piece (parseRecycleArg). Upgrade to classes by length if needed. */
+int parseRecycleKeyArgv(robj **argv, int argc, int argv_len) {
+    if (argc != 2 || argv_len != 2 || objectGetRefcount(argv[0]) != OBJ_SHARED_REFCOUNT ||
+        !parseArgReusable(argv[1]))
+        return 0;
+    recycleStrClass *k = &parse_recycler.keyargv;
+    size_t len = sdslen(parseEmbstrVal(argv[1]));
+    if (!len) return 0; /* the templates never take the empty key: it would hold the stack */
+    if (k->s.n == 0) k->len = len;
+    if (k->len != len || k->s.n == RECYCLE_DEPTH) return 0;
+    k->s.items[k->s.n++] = argv;
+    return 1;
 }
 
 /* Free an argv array of argv_len slots that the parser allocated, keeping it for reuse. */
@@ -4179,9 +4221,8 @@ void parseRecycleArgv(robj **argv, int argv_len) {
 
 /* decrRefCount() a parsed argument, keeping an unshared, unmodified EMBSTR object for reuse. */
 void parseRecycleArg(robj *o) {
-    if (objectGetRefcount(o) == 1 && objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR &&
-        !o->hasembkey) {
-        size_t len = sdslen(objectGetVal(o));
+    if (parseArgReusable(o)) {
+        size_t len = sdslen(parseEmbstrVal(o));
         if (len <= RECYCLE_STR_MAXLEN) {
             recycleStrClass *k = &parse_recycler.str[len & (RECYCLE_STR_CLASSES - 1)];
             if (k->s.n == 0) k->len = len;
@@ -4203,6 +4244,12 @@ void freeParseRecycler(void) {
     for (int i = 0; i < RECYCLE_STR_CLASSES; i++) {
         recycleStack *s = &parse_recycler.str[i].s;
         while (s->n) decrRefCount(s->items[--s->n]);
+    }
+    recycleStack *s = &parse_recycler.keyargv.s;
+    while (s->n) {
+        robj **argv = s->items[--s->n];
+        decrRefCount(argv[1]);
+        zfree(argv);
     }
 }
 
@@ -4526,6 +4573,16 @@ void createSharedCommandNames(void) {
     shared_cmdname_get[1] = lookupSharedCommandName("get", 3);
     shared_cmdname_mget[0] = lookupSharedCommandName("MGET", 4);
     shared_cmdname_mget[1] = lookupSharedCommandName("mget", 4);
+    /* The recycler's inline objectGetVal (parseEmbstrVal) must agree with the object layout, for
+     * every EMBSTR length (parseRecycleKeyArgv keeps keys of any). */
+    char buf[256];
+    memset(buf, 'k', sizeof(buf));
+    for (size_t len = 0; len < sizeof(buf); len++) {
+        robj *o = createStringObject(buf, len);
+        if (objectGetEncoding(o) == OBJ_ENCODING_EMBSTR && !o->hasembkey)
+            serverAssert(parseEmbstrVal(o) == (char *)objectGetVal(o));
+        decrRefCount(o);
+    }
 }
 
 /* Fast path for a RESP length header ("*<n>\r\n" or "$<n>\r\n") at p, with
@@ -4599,13 +4656,18 @@ static int parseOwnerFrame(client *c,
 
     if (*argv) zfree(*argv);
     *argv_len = (int)n;
-    *argv = parseAllocArgv((int)n);
-    (*argv)[0] = name;
-    size_t sum = name_len;
-    for (int j = 1; j < n; j++) {
-        (*argv)[j] = parseCreateStringObject(b + key_off[j], key_len[j]);
-        sum += key_len[j];
+    /* A GET (or one-key MGET) takes a kept name + key argv whole: only the key bytes are written. */
+    robj **a = n == 2 ? parsePopKeyArgv(key_len[1]) : NULL;
+    if (a) {
+        memcpy(parseEmbstrVal(a[1]), b + key_off[1], key_len[1]);
+    } else {
+        a = parseAllocArgv((int)n);
+        for (int j = 1; j < n; j++) a[j] = parseCreateStringObject(b + key_off[j], key_len[j]);
     }
+    a[0] = name;
+    *argv = a;
+    size_t sum = name_len;
+    for (int j = 1; j < n; j++) sum += key_len[j];
     *argc = (int)n;
     *argv_len_sum = sum;
     *net_input_bytes_curr_cmd += pos; /* the frame's bytes, as parseMultibulk() sums them */
