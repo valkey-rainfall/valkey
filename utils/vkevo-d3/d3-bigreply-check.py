@@ -363,18 +363,22 @@ def interact_backpressure(p, rng, tag, reverse):
     # (GET and SET bursts take turns), reverse SET of a 2 KB value, GET, SET small (the parser's path). The other
     # two replace the values with others of 2.0-2.6 KB (by reference too, small requests) and change them again;
     # forward's APPEND hands the client to main, which gets plain bytes (ownerHandOff copies the references).
+    # D3-all-g14-fold: reverse runs its three phases three times (other values each round), ~5.6 MB of replies: one
+    # round's 1.86 MB can fit in the server socket's autotuned send buffer (tcp_wmem max 4 MB) with no partial write
+    # at all (g12 / g13 took their first partial write after 794 of 800 references; this tree's runs after none).
     cmds = []
-    for ph in range(3):
-        for i, k in enumerate(ks):
-            sm, mid = small((nm, ph, i)), body(2048 + 13 * (i % 40), (nm, ph, i))
-            if not reverse:
-                cmds += ([("GET", k), ("SET", k, sm)], [("SET", k, mid), ("GET", k), ("APPEND", k, b"x"), ("GET", k)],
-                         [("GET", k), ("SET", k, sm)])[ph]
-            else:
-                # APPEND would hand the client to main (not native on the owners): the writes here are SETs
-                cmds += ([("SET", k, mid), ("GET", k), ("SET", k, sm)],
-                         [("SET", k, sm), ("GET", k), ("SET", k, mid), ("GET", k)],
-                         [("SET", k, mid + b"z"), ("GET", k), ("GET", k), ("SET", k, sm)])[ph]
+    for rd in range(3 if reverse else 1):
+        for ph in range(3):
+            for i, k in enumerate(ks):
+                sm, mid = small((nm, rd, ph, i)), body(2048 + 13 * (i % 40), (nm, rd, ph, i))
+                if not reverse:
+                    cmds += ([("GET", k), ("SET", k, sm)], [("SET", k, mid), ("GET", k), ("APPEND", k, b"x"), ("GET", k)],
+                             [("GET", k), ("SET", k, sm)])[ph]
+                else:
+                    # APPEND would hand the client to main (not native on the owners): the writes here are SETs
+                    cmds += ([("SET", k, mid), ("GET", k), ("SET", k, sm)],
+                             [("SET", k, sm), ("GET", k), ("SET", k, mid), ("GET", k)],
+                             [("SET", k, mid + b"z"), ("GET", k), ("GET", k), ("SET", k, sm)])[ph]
     want = b"".join(simulate(dict(init), cmds))
     final = dict(init)
     simulate(final, cmds)
