@@ -2183,6 +2183,8 @@ struct valkeyServer {
     int owner_set_burst;                      /* owner-set-burst: owners answer plain SET frames off the query buffer (default yes). */
     int owner_bigreply_min;                   /* owner-bigreply-min: owners send GET values of this many bytes or more from where they are (default 2048; 0: copy all). */
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
+    int owner_repl_native;                    /* owner-repl-native: owners stay native with replicas / a backlog (g11-repl, default yes). */
+    int owner_repl_sender;                    /* owner-repl-sender: with owner threads, repl-stream-sender starts as append (default yes). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */

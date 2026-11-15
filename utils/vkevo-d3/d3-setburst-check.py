@@ -537,7 +537,9 @@ def main():
             reps.append((p, c))
         time.sleep(0.5)
         run_cases(su, random.Random(99), full=False)
-        d3.check("sb.replica.no_burst", su.sb_total == 0, "owner_setburst_commands +%d" % su.sb_total)
+        # D3-all-g11-repl: owners stay native with a replica attached, so SET bursts run (the reference, with
+        # replicas vetoing its owners, runs none); replies, stats and the replicas' digests are the same.
+        d3.check("sb.replica.bursts_ran", su.sb_total > 0, "owner_setburst_commands +%d" % su.sb_total)
         for s, (p, c) in zip(su.srvs, reps):
             s.plain.cmd("WAIT", "1", "2000")
             dg = [s.plain.cmd("DEBUG", "DIGEST"), c.cmd("DEBUG", "DIGEST")]

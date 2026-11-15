@@ -34,13 +34,27 @@
  * main with the world stopped or on the owner of all its keys inside one window: atomic and
  * isolated either way.
  *
- * Features that need one global order or view (replicas and the backlog, the replica role,
+ * Features that need one global order or view (the replica role,
  * maxmemory-clients, MONITOR, keyspace notifications, tracking, WATCH through main, keys with
  * blocked clients, client pause, loaded modules, the latency monitor, hotkeys, forkless save,
  * throttling,
  * loading) veto the native path while they are active: owners then hand every command to main,
  * which serves it exactly as the stock server does. One process: one replication stream, one
  * AOF, one maxmemory.
+ *
+ * Replicas (D3-all-g11-repl): a primary with replicas or a backlog stays native. Each native
+ * write's record (formatted on the owner for the AOF, below) is also the replication stream's frame
+ * for it, so the owner appends its window's records to the shared replication buffer at the end of
+ * the window, on the AOF drain's lock (or main does at its stop), as replicationFeedReplicas would
+ * have one by one: offset, SELECT, backlog, replica references and output buffer limits, and each
+ * client's WAIT offset. A key's writes are made by one thread at a time and reach the stream in that
+ * thread's order, so every key's writes are in order; a reply waits until its write is in the stream
+ * (held as for the AOF), so a client never sees a write the stream lacks and its later writes on
+ * other owners come after it; main stops the owners and folds their records before anything it runs
+ * (a fork for a full sync, PSYNC from the backlog, a replica coming online, active expiry and
+ * eviction DELs, cross-owner and multi-slot commands), so a snapshot and the stream after it agree.
+ * The repl-stream-sender thread (started as append by owner-repl-sender) writes the replica sockets
+ * from what an append publishes: neither main nor an owner writes them on the hot path.
  *
  * AOF (appendonly yes, D3veto): a native command's execution unit propagates into the owner's
  * ectx as call() would; the owner formats the ops into its own AOF records right away, as
@@ -183,6 +197,7 @@ typedef struct ownerPropUnit {
     client *c; /* whose command it was: its woff is set when the records are appended (WAITAOF) */
     int n;     /* its ops (INFO owner_aof_ops) */
     int repl;  /* replication offset steps its records take: one per AOF record with the REPL target */
+    size_t end; /* where its records end in the owner's aofbuf (its WAIT offset with a backlog) */
 } ownerPropUnit;
 
 typedef struct ownerCmdStat {
@@ -338,6 +353,15 @@ static int own_aof = 0;                   /* appendonly: native ops are kept for
  * stops the world only for its own work. Under always main still writes them for every owner at once
  * (ownerFoldProp, then one fsync in beforeSleep). */
 static int own_aof_drain = 0;
+/* D3-all-g11-repl: a top-level primary with replicas or a replication backlog. Native ops are kept as
+ * records for the replication stream too (the same bytes as the AOF's), appended to the shared
+ * replication buffer by the owner at the end of its window (ownerDrainAof, on own_aof_mu, as the
+ * AOF drain) or by main at its stop (ownerFoldProp), with the replication offset, SELECT state and
+ * WAIT offsets replicationFeedReplicas would give. own_keep: records are kept for either stream;
+ * own_aof_drain then also covers the replication-only case. */
+static int own_repl = 0;
+static int own_keep = 0;
+static long long own_repl_ops = 0, own_repl_bytes = 0; /* INFO: ops and bytes owners fed the stream */
 static pthread_mutex_t own_aof_mu = PTHREAD_MUTEX_INITIALIZER;
 static long long own_aof_drains = 0;      /* owner AOF writes (under own_aof_mu) */
 #define OWN_AOF_FSYNC_BYTES (32LL << 20) /* everysec: an owner drain starts an fsync once this much is unsynced */
@@ -530,6 +554,11 @@ void ownerThreadsInit(void) {
 #ifdef __linux__
     ownerSlotHashInit();
     own_n = server.owner_threads;
+    /* D3-all-g11-repl: owners append to the replication buffer while main sleeps, so the replica sockets
+     * are written by the repl-stream-sender thread (it streams what an append publishes, off main and
+     * off the owners) unless the config says otherwise. The thread starts from main (its CPU set). */
+    if (server.owner_repl_sender && server.repl_stream_sender == REPL_STREAM_SENDER_NO)
+        server.repl_stream_sender = REPL_STREAM_SENDER_APPEND;
     owners = zcalloc(sizeof(owner) * own_n);
     own_main_inbox = listCreate();
     own_guests = listCreate();
@@ -645,23 +674,31 @@ static void ownerLeave(owner *o) {
  * there now (and to the WAITAOF offset), in the owner's execution order, as call() would have sent
  * it. The owner formatted the records (ownerTakeProp); this appends them as propagateNow and
  * feedAppendOnlyFile would have fed them one by one: the same timestamp annotation, SELECTs and
- * bytes, and one replication offset step per record with the REPL target. Replicas, a backlog and
- * slot export veto the native path (ownerComputeVeto), so the AOF is the only target.
- * The caller has the AOF state (server.aof_buf, the selected db, the offset) to itself: main with
- * the world stopped (ownerFoldProp), or owner o inside its window holding own_aof_mu
- * (ownerDrainAof); main never overlaps a window, and the owners take turns on the lock. */
+ * bytes, and one replication offset step per record with the REPL target.
+ * D3-all-g11-repl: with replicas or a backlog (a top-level primary), the same records go to the
+ * replication stream as replicationFeedReplicas would have fed them one by one: replicas prepared to
+ * write first, the SELECT before the first keyed record when the stream has another db selected
+ * (server.replicas_eldb; the later SELECTs are in the records), the bytes into the shared replication
+ * buffer (feedReplicationBuffer: offset, backlog, replica references, output buffer limits), and each
+ * client's WAIT offset at the end of its own records. The records' frames are the ones the stock
+ * stream carries (catAppendOnlyGenericCommand and replicationFeedReplicas format a command alike).
+ * The caller has the AOF and replication state (server.aof_buf, the selected dbs, the offset, the
+ * replication buffer and the replica clients) to itself: main with the world stopped (ownerFoldProp),
+ * or owner o inside its window holding own_aof_mu (ownerDrainAof); main never overlaps a window, and
+ * the owners take turns on the lock. The repl-stream-sender thread reads only bytes below the stable
+ * offset published after the append (feedReplicationBuffer), as with main appending. */
 static void ownerAofAppend(owner *o) {
     if (!o->nunits) return;
     /* propagateNow: shouldPropagate (the AOF target) and propagate_to_aof; feedAppendOnlyFile's own
      * state check for the bytes. */
-    int feed = server.replication_allowed && !server.loading && server.aof_state != AOF_OFF;
+    int allowed = server.replication_allowed && !server.loading;
+    int feed = allowed && server.aof_state != AOF_OFF;
     int to_aof = server.aof_state == AOF_ON ||
                  (server.aof_state == AOF_WAIT_REWRITE && server.child_type == CHILD_TYPE_AOF);
+    /* shouldPropagate's REPL target. Slot export needs cluster mode, where owner threads are off. */
+    int repl = allowed && server.primary_host == NULL && (server.repl_backlog || listLength(server.replicas));
+    size_t len = sdslen(o->aofbuf);
     if (feed) {
-        /* The veto held since main resumed the owners, and nothing ran on main since (slot export
-         * needs cluster mode, where owner threads are off). */
-        serverAssert(server.primary_host == NULL && server.repl_backlog == NULL && !listLength(server.replicas));
-        size_t len = sdslen(o->aofbuf);
         if (to_aof && len) {
             if (server.aof_timestamp_enabled) {
                 sds ts = genAofTimestampAnnotationIfNeeded(0);
@@ -680,13 +717,58 @@ static void ownerAofAppend(owner *o) {
                 server.aof_selected_db = o->aof_db;
             }
         }
+        for (int u = 0; u < o->nunits; u++) own_aof_ops += o->units[u].n;
+    }
+    if (repl) {
+        /* replicationFeedReplicas: there is a backlog whenever there are replicas. */
+        serverAssert(server.repl_backlog != NULL);
+        prepareReplicasToWrite();
+        long long base = server.primary_repl_offset;
+        size_t sel_len = 0;
+        if (len) {
+            if (o->aof_first_db == -1) {
+                feedReplicationBuffer(o->aofbuf, len);
+            } else {
+                if (o->aof_sel_at) feedReplicationBuffer(o->aofbuf, o->aof_sel_at);
+                if (server.replicas_eldb != o->aof_first_db) {
+                    /* generateSelectCommand's bytes (replicationFeedSelectDb) */
+                    char sel[96], seldb[32];
+                    int dl = snprintf(seldb, sizeof(seldb), "%d", o->aof_first_db);
+                    int sl = snprintf(sel, sizeof(sel), "*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n", dl, seldb);
+                    feedReplicationBuffer(sel, (size_t)sl);
+                    sel_len = (size_t)sl;
+                }
+                feedReplicationBuffer(o->aofbuf + o->aof_sel_at, len - o->aof_sel_at);
+                server.replicas_eldb = o->aof_db;
+            }
+        }
+        for (int u = 0; u < o->nunits; u++) {
+            ownerPropUnit *pu = &o->units[u];
+            size_t at = pu->end + (o->aof_first_db != -1 && pu->end > o->aof_sel_at ? sel_len : 0);
+            pu->c->woff = base + (long long)at;
+            own_repl_ops += pu->n;
+        }
+        own_repl_bytes += server.primary_repl_offset - base;
+        /* An owner may have closed a replica on its output buffer limit (freeClientAsync on an owner
+         * thread only flags it); main queues the close at its stop (ownerReplCloses). */
+        if (own_self) {
+            listIter li;
+            listNode *ln;
+            listRewind(server.replicas, &li);
+            while ((ln = listNext(&li))) {
+                client *r = ln->value;
+                /* A replica main writes itself (not the repl-stream-sender's) waits for main. */
+                if (r->flag.close_asap || (r->flag.pending_write && !r->repl_data->stream_via_sender))
+                    o->wake_main = 1;
+            }
+        }
+    } else if (feed) {
         for (int u = 0; u < o->nunits; u++) {
             ownerPropUnit *pu = &o->units[u];
             if (pu->repl) {
                 server.primary_repl_offset += pu->repl; /* replicationFeedReplicas without replicas */
                 pu->c->woff = server.primary_repl_offset;
             }
-            own_aof_ops += pu->n;
         }
     }
     o->nunits = 0;
@@ -701,10 +783,24 @@ static void ownerAofAppend(owner *o) {
     }
 }
 
+/* Main, world stopped: a replica an owner closed on its output buffer limit has close_asap set but is
+ * not queued yet (freeClientAsync on an owner thread only flags the client): queue it as
+ * freeClientAsync on main would. */
+static void ownerReplCloses(void) {
+    listIter li;
+    listNode *ln;
+    listRewind(server.replicas, &li);
+    while ((ln = listNext(&li))) {
+        client *r = ln->value;
+        if (r->flag.close_asap && !listSearchKey(server.clients_to_close, r)) listAddNodeTail(server.clients_to_close, r);
+    }
+}
+
 /* Main, the world just stopped, before main runs anything: the records owners have not written
  * themselves (ownerDrainAof) go to the AOF buffer ahead of anything main feeds. */
 static void ownerFoldProp(void) {
     for (int i = 0; i < own_n; i++) ownerAofAppend(&owners[i]);
+    if (listLength(server.replicas)) ownerReplCloses();
 }
 
 /* Main: wait until no owner is inside a window. From here until ownerResumeWorld main has the
@@ -744,9 +840,11 @@ static long long ownerMmHeadroom(void) {
 }
 
 static int ownerComputeVeto(void) {
-    /* AOF on is served natively (ownerFoldProp); turning it on (AOF_WAIT_REWRITE) is not. */
-    if ((server.aof_state != AOF_OFF && server.aof_state != AOF_ON) || server.repl_backlog ||
-        listLength(server.replicas) || server.primary_host)
+    /* AOF on is served natively (ownerFoldProp); turning it on (AOF_WAIT_REWRITE) is not. Replicas and
+     * the backlog of a top-level primary are served natively too (D3-all-g11-repl: ownerAofAppend
+     * feeds the stream); being a replica is not. */
+    if ((server.aof_state != AOF_OFF && server.aof_state != AOF_ON) || server.primary_host ||
+        (!server.owner_repl_native && (server.repl_backlog || listLength(server.replicas))))
         return OWN_VETO_ALL;
     if (server.loading || server.async_loading || server.paused_actions || server.import_mode) return OWN_VETO_ALL;
     /* maxmemory is served natively within each owner's headroom (ownerMmCmdFits), down to
@@ -836,7 +934,12 @@ static void ownerResumeWorld(void) {
     own_last_veto = ownerComputeVeto();
     atomic_store_explicit(&own_veto, own_last_veto, memory_order_relaxed);
     own_aof = server.aof_state == AOF_ON;
-    own_aof_drain = own_aof && server.aof_fsync != AOF_FSYNC_ALWAYS;
+    own_repl = !(own_last_veto & OWN_VETO_ALL) && server.primary_host == NULL &&
+               (server.repl_backlog != NULL || listLength(server.replicas) != 0);
+    own_keep = own_aof || own_repl;
+    /* Each owner appends its own records at the end of its window, except under appendfsync always
+     * (main writes every owner's records at its stop and fsyncs them once). */
+    own_aof_drain = own_keep && !(own_aof && server.aof_fsync == AOF_FSYNC_ALWAYS);
     ownerReleaseHeld();
     ownerMmPlan();
     ownerSettleCommandTables();
@@ -1720,10 +1823,13 @@ static void ownerAofSelect(owner *o, int dbid) {
 static void ownerTakeProp(owner *o, client *c) {
     serverOpArray *oa = &ectx->also_propagate;
     int n = oa->numops;
-    if (!own_aof) {
+    if (!own_keep) {
         serverOpArrayFree(oa);
         return;
     }
+    /* One record buffer serves both streams: with both on, every native op has both targets
+     * (ownerNativeKind sends clients with propagation flags to main); with one on, its target. */
+    int want = (own_aof ? PROPAGATE_AOF : 0) | (own_repl ? PROPAGATE_REPL : 0);
     if (o->nunits == o->units_cap) {
         o->units_cap = o->units_cap ? o->units_cap * 2 : 256;
         o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
@@ -1739,7 +1845,8 @@ static void ownerTakeProp(owner *o, client *c) {
     }
     for (int j = 0; j < n; j++) {
         serverOp *op = oa->ops + j;
-        if (!(op->target & PROPAGATE_AOF)) continue;
+        if (!(op->target & want)) continue;
+        serverAssert(!own_aof || !own_repl || (op->target & want) == want);
         ownerAofSelect(o, op->dbid);
         o->aofbuf = aofCatCommand(o->aofbuf, op->argc, op->argv, fmt);
         if (op->target & PROPAGATE_REPL) repl++;
@@ -1749,7 +1856,7 @@ static void ownerTakeProp(owner *o, client *c) {
         repl++;
     }
     serverOpArrayFree(oa);
-    o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = n, .repl = repl};
+    o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = n, .repl = repl, .end = sdslen(o->aofbuf)};
     o->unflushed = 1;
     if (!own_aof_drain) o->wake_main = 1; /* else this owner writes them at the end of its window */
 }
@@ -1777,14 +1884,20 @@ static void ownerTakeProp(owner *o, client *c) {
 static void ownerDrainAof(owner *o) {
     pthread_mutex_lock(&own_aof_mu);
     ownerAofAppend(o);
-    flushAppendOnlyFile(0);
-    aofBackgroundFsyncIfDue(OWN_AOF_FSYNC_BYTES);
-    own_aof_drains++;
-    int hold = aofHoldsReplies();
-    /* writeCommandsDeniedByDiskError's AOF part: after a failed write or background fsync the next
-     * write goes to main, which refuses it, as processCommand would, until the AOF works again. */
-    int err = server.aof_last_write_status == C_ERR ||
+    int hold = 0, err = 0;
+    if (own_aof) {
+        flushAppendOnlyFile(0);
+        aofBackgroundFsyncIfDue(OWN_AOF_FSYNC_BYTES);
+        own_aof_drains++;
+        hold = aofHoldsReplies();
+        /* writeCommandsDeniedByDiskError's AOF part: after a failed write or background fsync the next
+         * write goes to main, which refuses it, as processCommand would, until the AOF works again. */
+        err = server.aof_last_write_status == C_ERR ||
               atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_acquire) == C_ERR;
+        /* repl-stream-sender with the AOF on: replica bytes go once the AOF has them (as the sender's
+         * tick bounds them on main), here the moment this drain wrote them. */
+        if (own_repl && !hold) replStreamSenderPublishStable(server.primary_repl_offset);
+    }
     pthread_mutex_unlock(&own_aof_mu);
     if (err) {
         atomic_fetch_or_explicit(&own_veto, OWN_VETO_WRITE, memory_order_relaxed);
@@ -1871,9 +1984,9 @@ static size_t ownerMmExecBound(owner *o, client *c) {
     for (int j = 0; j < ms->count; j++) {
         multiCmd *mc = ms->commands + j;
         b += OWN_MM_CMD + 64 * (size_t)mc->argc + ownerReplyValuesLen(c, mc->cmd, mc->argv, mc->argc, mc->slot);
-        if (own_aof) b += 4 * (32 * (size_t)mc->argc + 64) + 2 * sizeof(serverOp);
+        if (own_keep) b += 4 * (32 * (size_t)mc->argc + 64) + 2 * sizeof(serverOp);
     }
-    if (own_aof) b += 4 * ms->argv_len_sums;
+    if (own_keep) b += 4 * ms->argv_len_sums;
     if (server.latency_tracking_enabled)
         for (int k = 0; k < OWN_MULTI; k++)
             if (!o->cs[k].hist) b += OWN_MM_HISTOGRAM; /* a queued command's first histogram */
@@ -1887,7 +2000,7 @@ static size_t ownerMmExecBound(owner *o, client *c) {
 static int ownerMmCmdFits(owner *o, client *c, int kind) {
     size_t b = OWN_MM_CMD + 2 * c->argv_len_sum + 64 * (size_t)c->argc + 2 * ownerArraysBytes(o);
     if (server.latency_tracking_enabled && !o->cs[kind].hist) b += OWN_MM_HISTOGRAM;
-    if (own_aof) b += 4 * (c->argv_len_sum + 32 * (size_t)c->argc + 64);
+    if (own_keep) b += 4 * (c->argv_len_sum + 32 * (size_t)c->argc + 64);
     if (kind == OWN_EXEC)
         b += ownerMmExecBound(o, c);
     else
@@ -2013,6 +2126,12 @@ static int ownerNativeKind(owner *o, client *c) {
     if (veto & OWN_VETO_ALL) return -1;
     int kind = ownerKindOf(cmd->proc);
     if (kind < 0) return -1;
+    /* With both streams on, one record buffer serves both (ownerTakeProp): a client whose ops could
+     * have only one of the targets runs on main. */
+    if (own_aof && own_repl &&
+        (c->flag.prevent_aof_prop || c->flag.prevent_repl_prop || c->flag.module_prevent_aof_prop ||
+         c->flag.module_prevent_repl_prop || c->flag.force_aof || c->flag.force_repl))
+        return -1;
     if ((c->user && (c->user->flags & USER_FLAG_RETIRED)) || authRequired(c) || !ACLUserUnrestricted(c->user))
         return -1;
     /* This client's watched keys, if any, are in this owner's registry (a client watching through main
@@ -3150,7 +3269,7 @@ static int ownerSetBurst(owner *o, client *c) {
             break;
         }
         ectx->dirty++;
-        if (own_aof) {
+        if (own_keep) {
             if (!ran) ownerAofSelect(o, c->db->id);
             if (server.aof_fd_fmt == AOF_FMT_COMPACT) /* vkevo binaof: the same SET as a compact record */
                 o->aofbuf = aofCatCompactSet(o->aofbuf, e->lower, e->key.buf, e->key.len, qb + e->val_off, e->val_len);
@@ -3168,13 +3287,13 @@ static int ownerSetBurst(owner *o, client *c) {
         /* An output buffer limit closes the client: run nothing more, as processInputBuffer. */
         if (c->flag.close_asap) break;
     }
-    if (ran && own_aof) {
+    if (ran && own_keep) {
         /* ownerTakeProp's unit for these records: each SET one op with the AOF and REPL targets. */
         if (o->nunits == o->units_cap) {
             o->units_cap = o->units_cap ? o->units_cap * 2 : 256;
             o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
         }
-        o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = ran, .repl = ran};
+        o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = ran, .repl = ran, .end = sdslen(o->aofbuf)};
         o->unflushed = 1;
         if (!own_aof_drain) o->wake_main = 1; /* else this owner writes them at the end of its window */
     }
@@ -3700,6 +3819,8 @@ void ownerInfo(sds *info) {
                          "owner_mm_exact_windows:%lld\r\n",
                          server.owner_mm_lease ? "yes" : "no", own_mm ? own_mm_slice : 0LL, mm_lease_w, mm_exact_w);
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
+    *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
+                         server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
     *info = sdscatprintf(*info, "owner_set_burst:%s\r\nowner_setburst_commands:%lld\r\nowner_setbursts:%lld\r\n",
                          server.owner_set_burst && own_setburst_cmd ? "yes" : "no", setburst, setbursts);
     *info = sdscatprintf(*info,
