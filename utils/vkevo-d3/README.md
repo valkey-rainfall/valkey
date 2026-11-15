@@ -188,6 +188,12 @@ Files here:
   equal; OBJECT REFCOUNT 1 and DEBUG DIGEST equal at the end; then (tree only) 8 readers and 4 writers
   on the same keys (every value whole) and a 4 KB cachecannon load (used_memory back after FLUSHALL).
   Suites plain, AOF everysec and always (replies that wait for the AOF), maxmemory (no references).
+  D3-all-g12-fold (`--ref-bin` D3-all-g10-setburst): a GET's reference against the writes that replace its
+  value in the same window, SET bursts among them: GET big; SET big small / SET big other-big / APPEND big x
+  and the reverse orders, in one write, in pieces and one frame per write, and from a 4 KB receive buffer
+  read after every GET ran (3 x 200 interactions on 200 keys); replies (also against a model), cmdstat_set,
+  owner_setburst_commands, the keyspace (type, encoding, value, PTTL, DEBUG DIGEST-VALUE) equal,
+  OBJECT REFCOUNT 1; and 2 writers of plain small SETs in the concurrent run.
 
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):
