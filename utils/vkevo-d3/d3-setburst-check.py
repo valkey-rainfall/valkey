@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""D3-all-g10-setburst check for the owners' SET bursts (owner.c ownerSetBurst: the leading plain
+"""D3-all-g10-setburst check for the owners' SET bursts (D3-all-g11-maxmem: suites mm / mmaofes / mmoff added for
+memory leases; run it with --ref-bin = D3-all-g10-setburst, whose SETs under maxmemory take the parser's path) (owner.c ownerSetBurst: the leading plain
 "SET key value" frames of a read run straight off the query buffer), against the parent's owner path
 (D3-all-g9-fold), byte for byte.
 
@@ -15,7 +16,10 @@ Suites (fresh servers each):
   plain     appendonly no: every case below
   aof       appendonly yes, appendfsync always: every case + WAITAOF after bursts
   aofes     appendonly yes, appendfsync everysec: every case + WAITAOF
-  mm        maxmemory 1gb allkeys-lru: no SET burst runs (the tree's owner_setburst_commands +0), same replies
+  mm        maxmemory 1gb allkeys-lru (D3-all-g11-maxmem: inside the memory lease SET bursts run): every case
+  mmaofes   maxmemory 1gb allkeys-lru + appendonly everysec: every case + WAITAOF (AOF bytes as the ref's)
+  mmoff     maxmemory 1gb allkeys-lru + owner-mm-lease no on the tree's server only: no SET burst runs (the tree's
+            owner_setburst_commands +0), same replies
   notify    notify-keyspace-events KEA: no SET burst; the keyspace events a subscriber got are the same bytes
   replica   a replica attached to each: no SET burst; same replies; the replica's DEBUG DIGEST is its primary's
   rename    rename-command set myset: no SET burst; SET unknown, MYSET runs
@@ -433,9 +437,12 @@ def main():
     def want(n):
         return not only or n in only
 
+    mmargs = ["--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
     for name, extra, aof in (("plain", [], False),
                              ("aof", aofargs + ["--appendfsync", "always"], True),
-                             ("aofes", aofargs + ["--appendfsync", "everysec"], True)):
+                             ("aofes", aofargs + ["--appendfsync", "everysec"], True),
+                             ("mm", mmargs, False),
+                             ("mmaofes", mmargs + aofargs + ["--appendfsync", "everysec"], True)):
         if not want(name):
             continue
         su = Suite(name, a, extra, aof=aof)
@@ -447,7 +454,8 @@ def main():
         su.stop()
 
     # suites where no SET burst may run
-    for name, extra, extra_tree in (("mm", ["--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"], []),
+    for name, extra, extra_tree in (("mmoff", ["--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"],
+                                     ["--owner-mm-lease", "no"]),
                                     ("notify", ["--notify-keyspace-events", "KEA"], []),
                                     ("off", [], ["--owner-set-burst", "no"])):
         if not want(name):
