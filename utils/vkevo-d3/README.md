@@ -201,6 +201,12 @@ Files here:
   appendonly, compact records decoded and resp bytes, SET bursts in the leases) and mmswitch
   (aof-incr-format flipped at 6 rewrites under SET-burst load inside the leases; every incr and history
   file has its manifest's format and decodes; each key its writer's last acknowledged value).
+- `d3-repl-check.py` (D3-all-g11-repl): owners native with replicas; see its docstring. D3-all-g14-fold adds
+  the suites cx / cxalways (a compact-incr-AOF primary with 1-2 replicas: owners encode every record in
+  compact for the AOF and in RESP for the stream, owner_repl_split yes; replicas converge, no resync but a
+  restarted replica's partial one, WAIT counts, LOADAOF and a primary restart keep the digest), cxresp
+  (aof-incr-format resp: shared bytes, owner_repl_split no), cxflip (aof-incr-format flipped at 6 rewrites
+  under load with a replica: the link never breaks) and cxmm (maxmemory + replica + AOF: leases ran).
 
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):

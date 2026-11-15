@@ -527,6 +527,124 @@ def suite_newreplica(name, extra):
         x.stop()
 
 
+# ---------------------------------------------------------------- D3-all-g14-fold: compact incr AOF + replicas
+def pers(p):
+    return info(p.c, "persistence")
+
+
+def wait_rewrite(p, secs=60):
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        x = pers(p)
+        if x.get("aof_rewrite_in_progress") == "0" and x.get("aof_rewrite_scheduled") == "0":
+            return x
+        time.sleep(0.02)
+    return pers(p)
+
+
+def suite_cx(name, extra, nrep=2, want_fmt="compact", want_split="yes", mm=False):
+    """A primary with the incr AOF in want_fmt (compact by default: owners encode each record twice, compact for
+    the AOF and RESP for the stream) and nrep replicas under the random load: replicas parse the stream (a compact
+    frame would break the link: sync counts stay), converge (digest, dbsize, offsets), WAIT counts; mid-load
+    replica r0 SHUTDOWN + restart: partial resync; the primary's DEBUG LOADAOF and a restart of the primary on its
+    own AOF keep its digest. mm: maxmemory + leases (SET bursts and lease windows ran, nothing evicted)."""
+    d = os.path.join(A.dir, name)
+    p = Primary("primary", A.bin, d, ["--appendonly", "yes", "--appendfsync", "everysec"] + list(extra))
+    reps = [replica("r%d" % i, i, d) for i in range(nrep)]
+    d3.check(name + ".online", online(p, nrep) and all(link_up(r) for r in reps))
+    wait_rewrite(p)
+    time.sleep(0.3)
+    veto_check(p, name)
+    o = info(p.c, "owners")
+    fmt = pers(p).get("aof_incr_format_open")
+    d3.check(name + ".formats", fmt == want_fmt and o.get("owner_repl_split") == want_split,
+             "aof_incr_format_open %s owner_repl_split %s" % (fmt, o.get("owner_repl_split")))
+    o0 = ostat(p.c)
+    f0, pk0 = stat(p, "sync_full"), stat(p, "sync_partial_ok")
+    L = Loader(p, seed=31).start()
+    time.sleep(A.secs / 2)
+    r0 = reps[0]
+    r0.stop(nosave=False)
+    time.sleep(0.3)
+    r0.start()
+    d3.check(name + ".restart.partial", link_up(r0) and stat(p, "sync_partial_ok") == pk0 + 1 and stat(p, "sync_full") == f0,
+             "sync_full %d->%d partial_ok %d->%d" % (f0, stat(p, "sync_full"), pk0, stat(p, "sync_partial_ok")))
+    time.sleep(A.secs / 2)
+    L.stop()
+    d3.check(name + ".load_errors", not L.errors, L.errors[:3])
+    o1 = ostat(p.c)
+    dsplit = o1.get("owner_repl_split_ops", 0) - o0.get("owner_repl_split_ops", 0)
+    dops = o1.get("owner_repl_ops", 0) - o0.get("owner_repl_ops", 0)
+    dsb = o1.get("owner_setburst_commands", 0) - o0.get("owner_setburst_commands", 0)
+    d3.check(name + ".stream_ops", dops > 1000 and ((dsplit > 0) == (want_split == "yes")) and dsb > 0,
+             "owner_repl_ops +%d owner_repl_split_ops +%d owner_setburst_commands +%d" % (dops, dsplit, dsb))
+    if mm:
+        dlw = o1.get("owner_mm_lease_windows", 0) - o0.get("owner_mm_lease_windows", 0)
+        d3.check(name + ".leases", dlw > 0 and stat(p, "evicted_keys") == 0,
+                 "owner_mm_lease_windows +%d evicted %d" % (dlw, stat(p, "evicted_keys")))
+    pd, pn = quiesce(p, reps, name)
+    d3.check(name + ".no_resync", stat(p, "sync_full") == f0 and stat(p, "sync_partial_ok") == pk0 + 1,
+             "sync_full %d->%d partial_ok %d->%d (only r0's restart)" % (f0, stat(p, "sync_full"), pk0, stat(p, "sync_partial_ok")))
+    c = wait_counts(p, reps, name)
+    c.close()
+    pd, pn = p.c.cmd("DEBUG", "DIGEST"), p.c.cmd("DBSIZE")  # wait_counts wrote a key
+    p.c.cmd("DEBUG", "LOADAOF")
+    d3.check(name + ".loadaof.digest", p.c.cmd("DEBUG", "DIGEST") == pd and p.c.cmd("DBSIZE") == pn)
+    # the primary restarted on its own AOF (replicas stopped first, so nothing writes)
+    for r in reps:
+        r.stop()
+    p.stop()
+    p.start()
+    wait_rewrite(p)
+    d3.check(name + ".restart_primary.digest", p.c.cmd("DEBUG", "DIGEST") == pd and p.c.cmd("DBSIZE") == pn,
+             "after restart %s / %s" % (p.c.cmd("DEBUG", "DIGEST"), pd))
+    for x in [p] + reps:
+        d3.check("%s.%s.no_crash" % (name, x.name), x.crashed() == 0, x.crashed())
+    p.stop()
+
+
+def suite_cxflip():
+    """aof-incr-format flipped (resp, compact, ...) at 6 rewrites while the load runs with a replica attached: the
+    open format follows the config, owner_repl_split with it; the replica's link never breaks (no full or partial
+    resync: every frame it got parsed); then it converges, LOADAOF and a primary restart keep the digest."""
+    name = "cxflip"
+    d = os.path.join(A.dir, name)
+    p = Primary("primary", A.bin, d, ["--appendonly", "yes", "--appendfsync", "everysec"])
+    r = replica("r0", 0, d)
+    d3.check(name + ".online", online(p, 1) and link_up(r))
+    wait_rewrite(p)
+    f0, pk0 = stat(p, "sync_full"), stat(p, "sync_partial_ok")
+    L = Loader(p, seed=41).start()
+    want, seen = ["resp", "compact", "resp", "compact", "resp", "compact"], []
+    for f in want:
+        time.sleep(0.5)
+        p.c.cmd("CONFIG", "SET", "aof-incr-format", f)
+        wait_rewrite(p)
+        p.c.cmd("BGREWRITEAOF")
+        x = wait_rewrite(p)
+        time.sleep(0.1)
+        seen.append((x.get("aof_incr_format_open"), info(p.c, "owners").get("owner_repl_split")))
+    time.sleep(0.5)
+    L.stop()
+    d3.check(name + ".load_errors", not L.errors, L.errors[:3])
+    expect = [(f, "yes" if f == "compact" else "no") for f in want]
+    d3.check(name + ".switches", seen == expect and pers(p).get("aof_last_bgrewrite_status") == "ok",
+             "seen %s want %s" % (seen, expect))
+    pd, pn = quiesce(p, [r], name)
+    d3.check(name + ".link_never_broke", stat(p, "sync_full") == f0 and stat(p, "sync_partial_ok") == pk0,
+             "sync_full %d->%d partial_ok %d->%d" % (f0, stat(p, "sync_full"), pk0, stat(p, "sync_partial_ok")))
+    p.c.cmd("DEBUG", "LOADAOF")
+    d3.check(name + ".loadaof.digest", p.c.cmd("DEBUG", "DIGEST") == pd and p.c.cmd("DBSIZE") == pn)
+    r.stop()
+    p.stop()
+    p.start()
+    wait_rewrite(p)
+    d3.check(name + ".restart_primary.digest", p.c.cmd("DEBUG", "DIGEST") == pd)
+    for x in (p, r):
+        d3.check("%s.%s.no_crash" % (name, x.name), x.crashed() == 0, x.crashed())
+    p.stop()
+
+
 # ---------------------------------------------------------------- model: same streams, three servers
 def model_streams(p, nconn=8, per=3000, seed=99):
     """per-connection deterministic streams on disjoint keys (connection i only touches keys with prefix c<i>:)"""
@@ -666,6 +784,13 @@ def main():
                                                      "--owner-uring-aof", "yes"], nrep=1)),
         ("diskless", lambda: suite_newreplica("diskless", ["--repl-diskless-sync", "no"])),
         ("off", lambda: suite_base("off", ["--owner-repl-native", "no"], nrep=1, want_native=False)),
+        # D3-all-g14-fold: compact incr AOF + replicas (owners encode RESP for the stream), RESP AOF (shared bytes),
+        # format flips at rewrites with a replica, maxmemory + replica + AOF
+        ("cx", lambda: suite_cx("cx", [], nrep=2)),
+        ("cxalways", lambda: suite_cx("cxalways", ["--appendfsync", "always"], nrep=1)),
+        ("cxresp", lambda: suite_cx("cxresp", ["--aof-incr-format", "resp"], nrep=1, want_fmt="resp", want_split="no")),
+        ("cxflip", suite_cxflip),
+        ("cxmm", lambda: suite_cx("cxmm", ["--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"], nrep=1, mm=True)),
         ("model", suite_model),
     ]
     for s, fn in suites:

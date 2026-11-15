@@ -192,12 +192,16 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
 #define OWN_MM_LEASE_ROOM (2 * OWN_URING_BATCH * OWN_MM_READ)
 /* A SET burst's slow commandlog entries, made after its last SET: per SET (the entry, its key and value). */
 #define OWN_MM_SETBURST_LOG 1024
+/* The bound factor for the records a step formats (sds doubling of the owner's record buffer): twice when
+ * the owner encodes each record twice, compact for the AOF and RESP for the stream (D3-all-g14-fold). */
+#define OWN_MM_REC ((size_t)(own_split ? 8 : 4))
 
 typedef struct ownerPropUnit {
     client *c; /* whose command it was: its woff is set when the records are appended (WAITAOF) */
     int n;     /* its ops (INFO owner_aof_ops) */
     int repl;  /* replication offset steps its records take: one per AOF record with the REPL target */
     size_t end; /* where its records end in the owner's aofbuf (its WAIT offset with a backlog) */
+    size_t rend; /* D3-all-g14-fold: the same in replbuf, when the stream keeps its own RESP copy (own_split) */
 } ownerPropUnit;
 
 typedef struct ownerCmdStat {
@@ -281,6 +285,10 @@ typedef struct owner {
     size_t aof_sel_at; /* where in aofbuf the first keyed record starts */
     int aof_first_db;  /* that record's db; -1: no keyed record yet */
     int aof_db;        /* the db selected at the end of aofbuf (once aof_first_db != -1) */
+    /* D3-all-g14-fold: the replication stream's own copy of the records, in RESP, kept only while the
+     * AOF's records are compact and the stream is on (own_split); the same dbs and SELECTs as aofbuf. */
+    sds replbuf;
+    size_t repl_sel_at; /* where in replbuf the first keyed record starts */
     ownerPropUnit *units;
     int nunits, units_cap;
     int unflushed;  /* ops not written to the AOF yet: this owner's replies wait (ownerReplyOut) */
@@ -362,6 +370,15 @@ static int own_aof_drain = 0;
 static int own_repl = 0;
 static int own_keep = 0;
 static long long own_repl_ops = 0, own_repl_bytes = 0; /* INFO: ops and bytes owners fed the stream */
+/* D3-all-g14-fold (g11-binaof x g11-repl): replicas always get RESP frames. own_rec_fmt is the format of
+ * the records in each owner's aofbuf: the open incr file's (server.aof_fd_fmt) with the AOF on, else RESP
+ * (the stream's). With the AOF's records compact and the stream on (own_split), each owner also writes
+ * every record once more in RESP into its replbuf, which feeds the stream; otherwise the stream and the
+ * AOF share aofbuf's bytes. All three change only while the owners are stopped (ownerResumeWorld), as
+ * aof_fd_fmt does (a rewrite starting, appendonly on), after main folded every owner's records. */
+static int own_rec_fmt = AOF_FMT_RESP;
+static int own_split = 0;
+static long long own_split_ops = 0; /* INFO: ops the owners encoded twice (compact for the AOF, RESP for the stream) */
 static pthread_mutex_t own_aof_mu = PTHREAD_MUTEX_INITIALIZER;
 static long long own_aof_drains = 0;      /* owner AOF writes (under own_aof_mu) */
 #define OWN_AOF_FSYNC_BYTES (32LL << 20) /* everysec: an owner drain starts an fsync once this much is unsynced */
@@ -599,6 +616,7 @@ void ownerThreadsInit(void) {
         o->watched = zmalloc(sizeof(dict *) * server.dbnum);
         for (int j = 0; j < server.dbnum; j++) o->watched[j] = dictCreate(&keylistDictType);
         o->aofbuf = sdsempty();
+        o->replbuf = sdsempty();
         o->aof_first_db = -1;
         o->fdmap_cap = 1024;
         o->fdmap = zcalloc(sizeof(client *) * o->fdmap_cap);
@@ -725,11 +743,17 @@ static void ownerAofAppend(owner *o) {
         prepareReplicasToWrite();
         long long base = server.primary_repl_offset;
         size_t sel_len = 0;
-        if (len) {
+        /* D3-all-g14-fold: the stream's frames are RESP. With the AOF's records compact (own_split) they are
+         * replbuf's (the same records, encoded in RESP by the owner); otherwise aofbuf's, which are RESP. */
+        serverAssert(own_split || own_rec_fmt == AOF_FMT_RESP);
+        char *rb = own_split ? o->replbuf : o->aofbuf;
+        size_t rlen = own_split ? sdslen(o->replbuf) : len;
+        size_t rsel = own_split ? o->repl_sel_at : o->aof_sel_at;
+        if (rlen) {
             if (o->aof_first_db == -1) {
-                feedReplicationBuffer(o->aofbuf, len);
+                feedReplicationBuffer(rb, rlen);
             } else {
-                if (o->aof_sel_at) feedReplicationBuffer(o->aofbuf, o->aof_sel_at);
+                if (rsel) feedReplicationBuffer(rb, rsel);
                 if (server.replicas_eldb != o->aof_first_db) {
                     /* generateSelectCommand's bytes (replicationFeedSelectDb) */
                     char sel[96], seldb[32];
@@ -738,15 +762,17 @@ static void ownerAofAppend(owner *o) {
                     feedReplicationBuffer(sel, (size_t)sl);
                     sel_len = (size_t)sl;
                 }
-                feedReplicationBuffer(o->aofbuf + o->aof_sel_at, len - o->aof_sel_at);
+                feedReplicationBuffer(rb + rsel, rlen - rsel);
                 server.replicas_eldb = o->aof_db;
             }
         }
         for (int u = 0; u < o->nunits; u++) {
             ownerPropUnit *pu = &o->units[u];
-            size_t at = pu->end + (o->aof_first_db != -1 && pu->end > o->aof_sel_at ? sel_len : 0);
+            size_t end = own_split ? pu->rend : pu->end;
+            size_t at = end + (o->aof_first_db != -1 && end > rsel ? sel_len : 0);
             pu->c->woff = base + (long long)at;
             own_repl_ops += pu->n;
+            if (own_split) own_split_ops += pu->n;
         }
         own_repl_bytes += server.primary_repl_offset - base;
         /* An owner may have closed a replica on its output buffer limit (freeClientAsync on an owner
@@ -780,6 +806,12 @@ static void ownerAofAppend(owner *o) {
         o->aofbuf = sdsempty();
     } else {
         sdsclear(o->aofbuf);
+    }
+    if (sdsalloc(o->replbuf) > (1 << 20)) {
+        sdsfree(o->replbuf);
+        o->replbuf = sdsempty();
+    } else {
+        sdsclear(o->replbuf);
     }
 }
 
@@ -937,6 +969,8 @@ static void ownerResumeWorld(void) {
     own_repl = !(own_last_veto & OWN_VETO_ALL) && server.primary_host == NULL &&
                (server.repl_backlog != NULL || listLength(server.replicas) != 0);
     own_keep = own_aof || own_repl;
+    own_rec_fmt = own_aof ? server.aof_fd_fmt : AOF_FMT_RESP;
+    own_split = own_aof && own_repl && own_rec_fmt != AOF_FMT_RESP;
     /* Each owner appends its own records at the end of its window, except under appendfsync always
      * (main writes every owner's records at its stop and fsyncs them once). */
     own_aof_drain = own_keep && !(own_aof && server.aof_fsync == AOF_FSYNC_ALWAYS);
@@ -1806,10 +1840,12 @@ static void ownerAofSelect(owner *o, int dbid) {
     if (o->aof_first_db == -1) {
         o->aof_first_db = o->aof_db = dbid;
         o->aof_sel_at = sdslen(o->aofbuf);
+        o->repl_sel_at = sdslen(o->replbuf);
         return;
     }
     if (dbid == o->aof_db) return;
-    o->aofbuf = aofCatSelect(o->aofbuf, dbid, server.aof_fd_fmt);
+    o->aofbuf = aofCatSelect(o->aofbuf, dbid, own_rec_fmt);
+    if (own_split) o->replbuf = aofCatSelect(o->replbuf, dbid, AOF_FMT_RESP); /* the stream's copy, RESP */
     o->aof_db = dbid;
 }
 
@@ -1836,11 +1872,13 @@ static void ownerTakeProp(owner *o, client *c) {
     }
     /* shared.multi / shared.exec as catAppendOnlyGenericCommand formats them, without touching the
      * shared objects from this thread. vkevo binaof: every record in the open incr file's format
-     * (server.aof_fd_fmt changes only with the owners stopped and their records folded). */
-    int fmt = server.aof_fd_fmt;
+     * (server.aof_fd_fmt changes only with the owners stopped and their records folded); D3-all-g14-fold:
+     * own_rec_fmt (RESP with the AOF off), plus a RESP copy for the stream when that format is compact. */
+    int fmt = own_rec_fmt;
     int wrap = n > 1 && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS), repl = 0;
     if (wrap) {
         o->aofbuf = aofCatMulti(o->aofbuf, fmt);
+        if (own_split) o->replbuf = aofCatMulti(o->replbuf, AOF_FMT_RESP);
         repl++;
     }
     for (int j = 0; j < n; j++) {
@@ -1849,14 +1887,17 @@ static void ownerTakeProp(owner *o, client *c) {
         serverAssert(!own_aof || !own_repl || (op->target & want) == want);
         ownerAofSelect(o, op->dbid);
         o->aofbuf = aofCatCommand(o->aofbuf, op->argc, op->argv, fmt);
+        if (own_split) o->replbuf = catAppendOnlyGenericCommand(o->replbuf, op->argc, op->argv);
         if (op->target & PROPAGATE_REPL) repl++;
     }
     if (wrap) {
         o->aofbuf = aofCatExec(o->aofbuf, fmt);
+        if (own_split) o->replbuf = aofCatExec(o->replbuf, AOF_FMT_RESP);
         repl++;
     }
     serverOpArrayFree(oa);
-    o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = n, .repl = repl, .end = sdslen(o->aofbuf)};
+    o->units[o->nunits++] =
+        (ownerPropUnit){.c = c, .n = n, .repl = repl, .end = sdslen(o->aofbuf), .rend = sdslen(o->replbuf)};
     o->unflushed = 1;
     if (!own_aof_drain) o->wake_main = 1; /* else this owner writes them at the end of its window */
 }
@@ -1919,6 +1960,19 @@ static void ownerDrainAof(owner *o) {
 
 /* What this owner added since the period began (negative when it freed more), or LLONG_MAX when
  * the thread has no allocation counter of its own (then nothing runs natively under maxmemory). */
+static long long ownerMmGrowth(owner *o);
+
+/* D3-all-g14-fold (g11-repl x g11-maxmem): the replication buffer blocks this owner's window will
+ * allocate when it appends its records to the stream at the window's end (ownerAofAppend on the owner
+ * counts them as the owner's growth, as g11-repl does): the stream's pending bytes (replbuf's, or
+ * aofbuf's when the stream shares them) plus the blocks' headers, held in the lease from the moment
+ * the records are formatted, so a check never admits a step the append would then push over the lease. */
+static inline long long ownerMmStreamDue(owner *o) {
+    if (!own_repl) return 0;
+    size_t n = own_split ? sdslen(o->replbuf) : sdslen(o->aofbuf);
+    return n ? (long long)(n + (n >> 4) + 1024) : 0;
+}
+
 static long long ownerMmGrowth(owner *o) {
     size_t now;
     if (!zmalloc_thread_used_memory(&now)) return LLONG_MAX;
@@ -1930,7 +1984,7 @@ static long long ownerMmGrowth(owner *o) {
 static int ownerMmFits(owner *o, size_t need) {
     if (atomic_load_explicit(&own_mm_over, memory_order_relaxed)) return 0;
     long long g = ownerMmGrowth(o);
-    return g != LLONG_MAX && g + (long long)need + (long long)o->mm_resv <= own_mm_slice;
+    return g != LLONG_MAX && g + (long long)need + (long long)o->mm_resv + ownerMmStreamDue(o) <= own_mm_slice;
 }
 
 /* Owner: after a read and its parse, which can allocate more than any bound before it (a big
@@ -1938,7 +1992,7 @@ static int ownerMmFits(owner *o, size_t need) {
  * to main until main has looked. */
 static void ownerMmAfterRead(owner *o) {
     long long g = ownerMmGrowth(o);
-    if (g == LLONG_MAX || g + (long long)o->mm_resv > own_mm_slice) {
+    if (g == LLONG_MAX || g + (long long)o->mm_resv + ownerMmStreamDue(o) > own_mm_slice) {
         atomic_store_explicit(&own_mm_over, 1, memory_order_relaxed);
         o->wake_main = 1;
     }
@@ -1946,7 +2000,7 @@ static void ownerMmAfterRead(owner *o) {
 
 /* The bytes each of this owner's growable arrays can take when it doubles. */
 static size_t ownerArraysBytes(owner *o) {
-    return sdsalloc(o->aofbuf) + sizeof(ownerPropUnit) * (size_t)o->units_cap +
+    return sdsalloc(o->aofbuf) + sdsalloc(o->replbuf) + sizeof(ownerPropUnit) * (size_t)o->units_cap +
            sizeof(client *) * (size_t)o->held_cap + sizeof(ownerError) * (size_t)o->errors_cap +
            sizeof(ownerLog) * (size_t)o->logs_cap;
 }
@@ -1984,9 +2038,9 @@ static size_t ownerMmExecBound(owner *o, client *c) {
     for (int j = 0; j < ms->count; j++) {
         multiCmd *mc = ms->commands + j;
         b += OWN_MM_CMD + 64 * (size_t)mc->argc + ownerReplyValuesLen(c, mc->cmd, mc->argv, mc->argc, mc->slot);
-        if (own_keep) b += 4 * (32 * (size_t)mc->argc + 64) + 2 * sizeof(serverOp);
+        if (own_keep) b += OWN_MM_REC * (32 * (size_t)mc->argc + 64) + 2 * sizeof(serverOp);
     }
-    if (own_keep) b += 4 * ms->argv_len_sums;
+    if (own_keep) b += OWN_MM_REC * ms->argv_len_sums;
     if (server.latency_tracking_enabled)
         for (int k = 0; k < OWN_MULTI; k++)
             if (!o->cs[k].hist) b += OWN_MM_HISTOGRAM; /* a queued command's first histogram */
@@ -2000,7 +2054,7 @@ static size_t ownerMmExecBound(owner *o, client *c) {
 static int ownerMmCmdFits(owner *o, client *c, int kind) {
     size_t b = OWN_MM_CMD + 2 * c->argv_len_sum + 64 * (size_t)c->argc + 2 * ownerArraysBytes(o);
     if (server.latency_tracking_enabled && !o->cs[kind].hist) b += OWN_MM_HISTOGRAM;
-    if (own_keep) b += 4 * (c->argv_len_sum + 32 * (size_t)c->argc + 64);
+    if (own_keep) b += OWN_MM_REC * (c->argv_len_sum + 32 * (size_t)c->argc + 64);
     if (kind == OWN_EXEC)
         b += ownerMmExecBound(o, c);
     else
@@ -2015,7 +2069,7 @@ static int ownerMmCmdFits(owner *o, client *c, int kind) {
 static int ownerMmSetBurstFits(owner *o, size_t argv_len, int ran) {
     size_t b = OWN_MM_CMD + 2 * argv_len + 64 * 3 + 2 * ownerArraysBytes(o) + (size_t)(ran + 1) * OWN_MM_SETBURST_LOG;
     if (server.latency_tracking_enabled && !o->cs[OWN_SET].hist) b += OWN_MM_HISTOGRAM;
-    if (own_aof) b += 4 * (argv_len + 32 * 3 + 64);
+    if (own_keep) b += OWN_MM_REC * (argv_len + 32 * 3 + 64); /* g14: records for the stream too (g11-repl) */
     return ownerMmFits(o, b);
 }
 
@@ -3271,10 +3325,12 @@ static int ownerSetBurst(owner *o, client *c) {
         ectx->dirty++;
         if (own_keep) {
             if (!ran) ownerAofSelect(o, c->db->id);
-            if (server.aof_fd_fmt == AOF_FMT_COMPACT) /* vkevo binaof: the same SET as a compact record */
+            if (own_rec_fmt == AOF_FMT_COMPACT) /* vkevo binaof: the same SET as a compact record */
                 o->aofbuf = aofCatCompactSet(o->aofbuf, e->lower, e->key.buf, e->key.len, qb + e->val_off, e->val_len);
             else
                 o->aofbuf = sdscatlen(o->aofbuf, qb + e->frame_off, e->frame_len);
+            /* D3-all-g14-fold: the stream gets the frame's RESP bytes as they came in */
+            if (own_split) o->replbuf = sdscatlen(o->replbuf, qb + e->frame_off, e->frame_len);
         }
         if (ownerBurstRoom(c, 5)) {
             memcpy(c->buf + c->bufpos, "+OK\r\n", 5);
@@ -3293,7 +3349,8 @@ static int ownerSetBurst(owner *o, client *c) {
             o->units_cap = o->units_cap ? o->units_cap * 2 : 256;
             o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
         }
-        o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = ran, .repl = ran, .end = sdslen(o->aofbuf)};
+        o->units[o->nunits++] =
+            (ownerPropUnit){.c = c, .n = ran, .repl = ran, .end = sdslen(o->aofbuf), .rend = sdslen(o->replbuf)};
         o->unflushed = 1;
         if (!own_aof_drain) o->wake_main = 1; /* else this owner writes them at the end of its window */
     }
@@ -3821,6 +3878,9 @@ void ownerInfo(sds *info) {
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
     *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
                          server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
+    /* D3-all-g14-fold: owner_repl_split: the owners encode each record twice (compact AOF, RESP stream). */
+    *info = sdscatprintf(*info, "owner_repl_split:%s\r\nowner_repl_split_ops:%lld\r\n", own_split ? "yes" : "no",
+                         own_split_ops);
     *info = sdscatprintf(*info, "owner_set_burst:%s\r\nowner_setburst_commands:%lld\r\nowner_setbursts:%lld\r\n",
                          server.owner_set_burst && own_setburst_cmd ? "yes" : "no", setburst, setbursts);
     *info = sdscatprintf(*info,
