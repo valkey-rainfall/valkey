@@ -666,7 +666,7 @@ static void ownerAofAppend(owner *o) {
             if (server.aof_timestamp_enabled) {
                 sds ts = genAofTimestampAnnotationIfNeeded(0);
                 if (ts != NULL) {
-                    server.aof_buf = sdscatsds(server.aof_buf, ts);
+                    server.aof_buf = aofCatAnnotation(server.aof_buf, ts, server.aof_fd_fmt);
                     sdsfree(ts);
                 }
             }
@@ -674,12 +674,8 @@ static void ownerAofAppend(owner *o) {
                 server.aof_buf = sdscatlen(server.aof_buf, o->aofbuf, len);
             } else {
                 server.aof_buf = sdscatlen(server.aof_buf, o->aofbuf, o->aof_sel_at);
-                if (o->aof_first_db != server.aof_selected_db) {
-                    char seldb[64];
-                    snprintf(seldb, sizeof(seldb), "%d", o->aof_first_db);
-                    server.aof_buf = sdscatprintf(server.aof_buf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n",
-                                                  (unsigned long)strlen(seldb), seldb);
-                }
+                if (o->aof_first_db != server.aof_selected_db)
+                    server.aof_buf = aofCatSelect(server.aof_buf, o->aof_first_db, server.aof_fd_fmt);
                 server.aof_buf = sdscatlen(server.aof_buf, o->aofbuf + o->aof_sel_at, len - o->aof_sel_at);
                 server.aof_selected_db = o->aof_db;
             }
@@ -1706,9 +1702,7 @@ static void ownerAofSelect(owner *o, int dbid) {
         return;
     }
     if (dbid == o->aof_db) return;
-    char seldb[64];
-    snprintf(seldb, sizeof(seldb), "%d", dbid);
-    o->aofbuf = sdscatprintf(o->aofbuf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n", (unsigned long)strlen(seldb), seldb);
+    o->aofbuf = aofCatSelect(o->aofbuf, dbid, server.aof_fd_fmt);
     o->aof_db = dbid;
 }
 
@@ -1731,22 +1725,23 @@ static void ownerTakeProp(owner *o, client *c) {
         o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
     }
     /* shared.multi / shared.exec as catAppendOnlyGenericCommand formats them, without touching the
-     * shared objects from this thread. */
-    static const char multi_rec[] = "*1\r\n$5\r\nMULTI\r\n", exec_rec[] = "*1\r\n$4\r\nEXEC\r\n";
+     * shared objects from this thread. vkevo binaof: every record in the open incr file's format
+     * (server.aof_fd_fmt changes only with the owners stopped and their records folded). */
+    int fmt = server.aof_fd_fmt;
     int wrap = n > 1 && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS), repl = 0;
     if (wrap) {
-        o->aofbuf = sdscatlen(o->aofbuf, multi_rec, sizeof(multi_rec) - 1);
+        o->aofbuf = aofCatMulti(o->aofbuf, fmt);
         repl++;
     }
     for (int j = 0; j < n; j++) {
         serverOp *op = oa->ops + j;
         if (!(op->target & PROPAGATE_AOF)) continue;
         ownerAofSelect(o, op->dbid);
-        o->aofbuf = catAppendOnlyGenericCommand(o->aofbuf, op->argc, op->argv);
+        o->aofbuf = aofCatCommand(o->aofbuf, op->argc, op->argv, fmt);
         if (op->target & PROPAGATE_REPL) repl++;
     }
     if (wrap) {
-        o->aofbuf = sdscatlen(o->aofbuf, exec_rec, sizeof(exec_rec) - 1);
+        o->aofbuf = aofCatExec(o->aofbuf, fmt);
         repl++;
     }
     serverOpArrayFree(oa);
@@ -3153,7 +3148,10 @@ static int ownerSetBurst(owner *o, client *c) {
         ectx->dirty++;
         if (own_aof) {
             if (!ran) ownerAofSelect(o, c->db->id);
-            o->aofbuf = sdscatlen(o->aofbuf, qb + e->frame_off, e->frame_len);
+            if (server.aof_fd_fmt == AOF_FMT_COMPACT) /* vkevo binaof: the same SET as a compact record */
+                o->aofbuf = aofCatCompactSet(o->aofbuf, e->lower, e->key.buf, e->key.len, qb + e->val_off, e->val_len);
+            else
+                o->aofbuf = sdscatlen(o->aofbuf, qb + e->frame_off, e->frame_len);
         }
         if (ownerBurstRoom(c, 5)) {
             memcpy(c->buf + c->bufpos, "+OK\r\n", 5);

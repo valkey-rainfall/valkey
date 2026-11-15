@@ -119,6 +119,9 @@ proc assert_aof_manifest_content {manifest_path content} {
         lappend lines $line
     }
 
+    # vkevo D3-all-g11-binaof: a compact incr file's line ends with "format compact" (the default incr
+    # format); the expected lines name files, seqs and types only.
+    set lines [lmap l $lines {regsub { format compact$} $l {}}]
     assert_equal [llength $lines] [llength $content]
 
     for { set i 0 } { $i < [llength $lines] } {incr i} {

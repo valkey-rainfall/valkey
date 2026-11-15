@@ -334,6 +334,150 @@ int checkSingleAof(char *aof_filename, char *aof_filepath, int last_file, int fi
     return AOF_CHECK_OK;
 }
 
+/* vkevo binaof: check a compact incr AOF (AOF_COMPACT_MAGIC + records, aof.c "Compact incr AOF") with
+ * the server's own record reader. The same verdicts as checkSingleAof: ok_up_to is the end of the last
+ * whole record outside an open MULTI; a short file is fixed (truncated there) only if it is the last
+ * file; #TS annotations truncate for --truncate-to-timestamp as in RESP files. */
+int checkSingleCompactAof(char *aof_filename, char *aof_filepath, int last_file, int fix) {
+    off_t pos = 0, diff;
+    int multi = 0;
+    long long records = 0;
+
+    FILE *fp = fopen(aof_filepath, "r+");
+    if (fp == NULL) {
+        printf("Cannot open file %s: %s, aborting...\n", aof_filepath, strerror(errno));
+        exit(1);
+    }
+    struct valkey_stat sb;
+    if (valkey_fstat(fileno(fp), &sb) == -1) {
+        printf("Cannot stat file: %s, aborting...\n", aof_filename);
+        fclose(fp);
+        exit(1);
+    }
+    off_t size = sb.st_size;
+    if (size == 0) {
+        fclose(fp);
+        return AOF_CHECK_EMPTY;
+    }
+    char mg[AOF_COMPACT_MAGIC_LEN];
+    size_t mglen = fread(mg, 1, sizeof(mg), fp);
+    if (mglen < AOF_COMPACT_MAGIC_LEN && !memcmp(mg, AOF_COMPACT_MAGIC, mglen)) {
+        epos = 0;
+        ERROR("Compact AOF %s ends inside its header", aof_filename);
+    } else if (mglen != AOF_COMPACT_MAGIC_LEN || memcmp(mg, AOF_COMPACT_MAGIC, AOF_COMPACT_MAGIC_LEN)) {
+        printf("AOF %s is listed as compact but has no compact header, aborting...\n", aof_filename);
+        exit(1);
+    } else {
+        pos = AOF_COMPACT_MAGIC_LEN;
+        while (1) {
+            off_t at = ftello(fp);
+            if (!multi) pos = at;
+            epos = at;
+            sds annot = NULL;
+            int kind = AOFC_KIND_OTHER;
+            int r = aofCompactReadRecord(fp, size, 0, NULL, NULL, to_timestamp ? &annot : NULL, &kind);
+            if (r == AOFC_EOF) break;
+            if (r == AOFC_TRUNC) {
+                ERROR("Compact record cut by the end of the file");
+                break;
+            }
+            if (r == AOFC_IOERR) {
+                printf("Failed to read from AOF %s, aborting...\n", aof_filename);
+                exit(1);
+            }
+            if (r == AOFC_BAD) {
+                ERROR("Unknown compact record in AOF %s", aof_filename);
+                break;
+            }
+            if (r == AOFC_ANNOT) {
+                if (annot && !strncmp(annot, "TS:", 3)) {
+                    char *endptr;
+                    errno = 0;
+                    time_t ts = strtol(annot + 3, &endptr, 10);
+                    int bad = errno != 0 || *endptr != '\0';
+                    sdsfree(annot);
+                    if (bad) {
+                        printf("Invalid timestamp annotation\n");
+                        exit(1);
+                    }
+                    if (ts <= to_timestamp) continue;
+                    if (at == AOF_COMPACT_MAGIC_LEN) {
+                        printf("AOF %s has nothing before timestamp %jd, aborting...\n", aof_filename,
+                               (intmax_t)to_timestamp);
+                        exit(1);
+                    }
+                    if (!last_file) {
+                        printf("Failed to truncate AOF %s to timestamp %jd to offset %lld because it is not the last "
+                               "file.\n",
+                               aof_filename, (intmax_t)to_timestamp, (long long)at);
+                        exit(1);
+                    }
+                    if (ftruncate(fileno(fp), at) == -1) {
+                        printf("Failed to truncate AOF %s to timestamp %jd\n", aof_filename, (intmax_t)to_timestamp);
+                        exit(1);
+                    }
+                    fclose(fp);
+                    return AOF_CHECK_TIMESTAMP_TRUNCATED;
+                }
+                if (annot) sdsfree(annot);
+                continue;
+            }
+            records++;
+            if (kind == AOFC_KIND_MULTI) {
+                if (multi++) {
+                    ERROR("Unexpected MULTI in AOF %s", aof_filename);
+                    break;
+                }
+            } else if (kind == AOFC_KIND_EXEC) {
+                if (--multi) {
+                    ERROR("Unexpected EXEC in AOF %s", aof_filename);
+                    break;
+                }
+            }
+        }
+        if (strlen(error) == 0 && multi) {
+            epos = ftello(fp);
+            ERROR("Reached EOF before reading EXEC for MULTI");
+        }
+        if (strlen(error) == 0) pos = ftello(fp);
+    }
+    if (strlen(error) > 0) printf("%s\n", error);
+    diff = size - pos;
+    if (diff == 0 && to_timestamp) {
+        printf("Truncate nothing in AOF %s to timestamp %jd\n", aof_filename, (intmax_t)to_timestamp);
+        fclose(fp);
+        return AOF_CHECK_OK;
+    }
+    printf("AOF analyzed: filename=%s, size=%lld, ok_up_to=%lld, records=%lld, diff=%lld (compact)\n", aof_filename,
+           (long long)size, (long long)pos, records, (long long)diff);
+    if (diff > 0) {
+        if (fix) {
+            if (!last_file) {
+                printf("Failed to truncate AOF %s because it is not the last file\n", aof_filename);
+                exit(1);
+            }
+            char buf[2];
+            printf("This will shrink the AOF %s from %lld bytes, with %lld bytes, to %lld bytes\n", aof_filename,
+                   (long long)size, (long long)diff, (long long)pos);
+            printf("Continue? [y/N]: ");
+            if (fgets(buf, sizeof(buf), stdin) == NULL || strncasecmp(buf, "y", 1) != 0) {
+                printf("Aborting...\n");
+                exit(1);
+            }
+            if (ftruncate(fileno(fp), pos) == -1) {
+                printf("Failed to truncate AOF %s\n", aof_filename);
+                exit(1);
+            }
+            fclose(fp);
+            return AOF_CHECK_TRUNCATED;
+        }
+        printf("AOF %s is not valid. Use the --fix option to try fixing it.\n", aof_filename);
+        exit(1);
+    }
+    fclose(fp);
+    return AOF_CHECK_OK;
+}
+
 /* Used to determine whether the file is an RDB file. These two possibilities:
  * 1. The file is an old style RDB-preamble AOF
  * 2. The file is a BASE AOF in Multi Part AOF
@@ -494,7 +638,11 @@ void checkMultiPartAof(char *dirpath, char *manifest_filepath, int fix) {
             sds aof_filename = (char *)ai->file_name;
             sds aof_filepath = makePath(dirpath, aof_filename);
             last_file = ++aof_num == total_num;
-            ret = checkSingleAof(aof_filename, aof_filepath, last_file, fix, 0);
+            if (ai->file_fmt == AOF_FMT_COMPACT) {
+                ret = checkSingleCompactAof(aof_filename, aof_filepath, last_file, fix);
+            } else {
+                ret = checkSingleAof(aof_filename, aof_filepath, last_file, fix, 0);
+            }
             printAofStyle(ret, aof_filename, (char *)"INCR AOF");
             sdsfree(aof_filepath);
         }

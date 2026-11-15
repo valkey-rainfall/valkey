@@ -1992,7 +1992,27 @@ typedef struct {
     sds file_name;           /* file name */
     long long file_seq;      /* file sequence */
     aof_file_type file_type; /* file type */
+    int file_fmt;            /* AOF_FMT_RESP or AOF_FMT_COMPACT (incr files; manifest key "format") */
 } aofInfo;
+
+/* Incr AOF record formats (vkevo binaof). RESP: the stock command stream. COMPACT: an 8-byte header
+ * (AOF_COMPACT_MAGIC) then binary records, one opcode byte each (aof.c, "Compact incr AOF"). The
+ * manifest names the format of every compact incr file ("format compact"); RESP lines are unchanged. */
+#define AOF_FMT_RESP 0
+#define AOF_FMT_COMPACT 1
+#define AOF_COMPACT_MAGIC "\xfeVKAOFC\x01"
+#define AOF_COMPACT_MAGIC_LEN 8
+/* aofCompactReadRecord() results. */
+#define AOFC_REC 0   /* a command (argv filled when building) */
+#define AOFC_ANNOT 1 /* an annotation (text in *annot when asked) */
+#define AOFC_EOF 2   /* clean end of file at a record boundary */
+#define AOFC_TRUNC 3 /* the file ends inside the record */
+#define AOFC_BAD 4   /* not a record: unknown opcode or zero argc */
+#define AOFC_IOERR 5 /* read error */
+/* aofCompactReadRecord() kind of the command read (valkey-check-aof's MULTI/EXEC tracking). */
+#define AOFC_KIND_OTHER 0
+#define AOFC_KIND_MULTI 1
+#define AOFC_KIND_EXEC 2
 
 typedef struct {
     aofInfo *base_aof_info;       /* BASE file information. NULL if there is no BASE file. */
@@ -2380,6 +2400,8 @@ struct valkeyServer {
     int aof_enabled;                    /* AOF configuration */
     int aof_state;                      /* AOF_(ON|OFF|WAIT_REWRITE) */
     int aof_fsync;                      /* Kind of fsync() policy */
+    int aof_incr_format;                /* aof-incr-format: AOF_FMT_* of the next new incr AOF file */
+    int aof_fd_fmt;                     /* AOF_FMT_* of the incr file aof_fd writes (records are encoded so) */
     char *aof_filename;                 /* Basename of the AOF file and manifest file */
     char *aof_dirname;                  /* Name of the AOF directory */
     int aof_no_fsync_on_rewrite;        /* Don't fsync if a rewrite is in prog. */
@@ -3877,6 +3899,14 @@ static inline int aofHoldsReplies(void) {
 }
 void feedAppendOnlyFile(int dictid, robj **argv, int argc);
 sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv);
+sds catAppendOnlyCompactCommand(sds dst, int argc, robj **argv);
+sds aofCatCommand(sds dst, int argc, robj **argv, int fmt);
+sds aofCatSelect(sds dst, int dbid, int fmt);
+sds aofCatAnnotation(sds dst, sds ann, int fmt);
+sds aofCatMulti(sds dst, int fmt);
+sds aofCatExec(sds dst, int fmt);
+sds aofCatCompactSet(sds dst, int lower, const char *key, size_t klen, const char *val, size_t vlen);
+int aofCompactReadRecord(FILE *fp, off_t fsize, int build, int *argcp, robj ***argvp, sds *annot, int *kind);
 sds genAofTimestampAnnotationIfNeeded(int force);
 void aofRemoveTempFile(pid_t childpid, int from_signal);
 int rewriteAppendOnlyFileBackground(void);

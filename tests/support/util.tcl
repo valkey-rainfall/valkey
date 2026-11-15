@@ -1170,13 +1170,68 @@ proc read_from_aof {fp} {
     return $res
 }
 
+# vkevo D3-all-g11-binaof: compact incr AOF records (src/aof.c "Compact incr AOF"), decoded to the same
+# argument list read_from_aof returns for the RESP record (command name lower case).
+set ::aofc_magic "\xfeVKAOFC\x01"
+set ::aofc_cmds {set del incr decr incrby decrby incrbyfloat append pexpireat persist select multi exec unlink
+    setrange hset hdel lpush rpush lpop rpop sadd srem zadd zrem hincrby mset xadd flushall flushdb expire pexpire}
+
+proc read_compact_varint {fp} {
+    set x 0
+    set shift 0
+    while 1 {
+        set b [read $fp 1]
+        if {$b eq ""} {error "compact AOF: truncated varint"}
+        binary scan $b cu c
+        set x [expr {$x | (($c & 0x7f) << $shift)}]
+        if {!($c & 0x80)} {return $x}
+        incr shift 7
+    }
+}
+
+proc read_from_compact_aof {fp} {
+    while 1 {
+        set b [read $fp 1]
+        if {$b eq ""} {return ""}
+        binary scan $b cu op
+        if {$op == 4} {
+            read $fp [read_compact_varint $fp]
+            continue
+        }
+        if {$op == 1 || $op == 2} {
+            set res {set}
+            set n 2
+        } elseif {$op & 0x80} {
+            set res [list [lindex $::aofc_cmds [expr {$op & 0x3f}]]]
+            set n [read_compact_varint $fp]
+        } elseif {$op == 3} {
+            set res {}
+            set n [read_compact_varint $fp]
+        } else {
+            error "compact AOF: bad opcode $op"
+        }
+        for {set j 0} {$j < $n} {incr j} {
+            set arg [read $fp [read_compact_varint $fp]]
+            if {[llength $res] == 0} {set arg [string tolower $arg]}
+            lappend res $arg
+        }
+        return $res
+    }
+}
+
 proc assert_aof_content {aof_path patterns} {
     set fp [open $aof_path r]
     fconfigure $fp -translation binary
     fconfigure $fp -blocking 1
+    set compact [expr {[read $fp 8] eq $::aofc_magic}]
+    if {!$compact} {seek $fp 0}
 
     for {set j 0} {$j < [llength $patterns]} {incr j} {
-        assert_match [lindex $patterns $j] [read_from_aof $fp]
+        if {$compact} {
+            assert_match [lindex $patterns $j] [read_from_compact_aof $fp]
+        } else {
+            assert_match [lindex $patterns $j] [read_from_aof $fp]
+        }
     }
 }
 

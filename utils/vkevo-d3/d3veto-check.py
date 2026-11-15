@@ -46,6 +46,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 d3 = __import__("d3-check")
+import aofcompact  # noqa: E402  (D3-all-g11-binaof: compact incr files)
 Conn, Err, key_slot, check, info, ostat = d3.Conn, d3.Err, d3.key_slot, d3.check, d3.info, d3.ostat
 
 ARGS = None
@@ -176,7 +177,7 @@ class AofFile:
         self.dir = os.path.join(srv.dir, "appendonlydir")
         self.lock = threading.Lock()
         man = [f for f in os.listdir(self.dir) if f.endswith(".manifest")][0]
-        incr = [l.split()[1] for l in open(os.path.join(self.dir, man)) if l.split()[-1] == "i"][-1]
+        incr = [l.split()[1] for l in open(os.path.join(self.dir, man)) if " type i" in l][-1]  # g11: + "format compact"
         self.path = os.path.join(self.dir, incr)
         self.data = bytearray()
         self.seen = {}  # pattern -> [count, bytes of data scanned]
@@ -186,6 +187,8 @@ class AofFile:
             with open(self.path, "rb") as f:
                 f.seek(len(self.data))
                 self.data += f.read()
+            if aofcompact.is_compact(self.data):  # D3-all-g11-binaof: the same records, compact
+                pat = aofcompact.resp_to_compact(pat)
             cnt, upto = self.seen.get(pat, (0, 0))
             # matches ending past `upto` are the new ones; records never overlap
             cnt += bytes(self.data[max(0, upto - len(pat) + 1):]).count(pat)

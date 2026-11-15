@@ -52,6 +52,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 d3 = __import__("d3-check")  # Conn, Err, key_slot, check, info, ostat, RESULTS
 bc = __import__("d3-burst-check")  # Raw, Server, key_in, ALNUM
+import aofcompact  # noqa: E402  (D3-all-g11-binaof: compact incr files)
 
 ALNUM = bc.ALNUM
 FAR = 4102444800000  # 2100-01-01 in ms: a TTL that never ends in a run
@@ -165,6 +166,15 @@ class Suite:
             fa, fb = self.aof_files()
             same = fa == fb and fa and len(fa[-1][1]) > 0
             detail = "%d incr file(s), %d bytes" % (len(fa), sum(len(x[1]) for x in fa))
+            if fa and fb and any(aofcompact.is_compact(x[1]) for x in fa + fb):
+                # D3-all-g11-binaof: compact incr files differ in bytes by design: the records must decode
+                # to the same argv, file for file.
+                ra = [(n, aofcompact.parse_any(d)) for n, d in fa]
+                rb = [(n, aofcompact.parse_any(d)) for n, d in fb]
+                same = ra == rb and len(fa[-1][1]) > 0
+                detail = "SEMANTIC (compact): %d incr file(s), %d / %d bytes, %d records decode %s" % (
+                    len(fa), sum(len(x[1]) for x in fa), sum(len(x[1]) for x in fb), sum(len(r[1][0]) for r in ra),
+                    "equal" if same else "DIFFERENT")
             if not same and fa and fb and len(fa) == len(fb):
                 x, y = fa[-1][1], fb[-1][1]
                 i = next((j for j in range(min(len(x), len(y))) if x[j] != y[j]), min(len(x), len(y)))

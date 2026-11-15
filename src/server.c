@@ -7324,7 +7324,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                     "aof_pending_rewrite:%d\r\n", server.aof_rewrite_scheduled,
                     "aof_buffer_length:%zu\r\n", sdslen(server.aof_buf),
                     "aof_pending_bio_fsync:%lu\r\n", bioPendingJobsOfType(BIO_AOF_FSYNC),
-                    "aof_delayed_fsync:%lu\r\n", server.aof_delayed_fsync));
+                    "aof_delayed_fsync:%lu\r\n", server.aof_delayed_fsync,
+                    "aof_incr_format_open:%s\r\n", server.aof_fd == -1 ? "none" : server.aof_fd_fmt == AOF_FMT_COMPACT ? "compact" : "resp"));
         }
 
         if (server.loading) {

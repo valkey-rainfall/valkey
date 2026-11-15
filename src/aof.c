@@ -100,6 +100,7 @@ void aof_background_fsync_and_close(int fd);
 #define AOF_MANIFEST_KEY_FILE_NAME "file"
 #define AOF_MANIFEST_KEY_FILE_SEQ "seq"
 #define AOF_MANIFEST_KEY_FILE_TYPE "type"
+#define AOF_MANIFEST_KEY_FILE_FORMAT "format"
 
 /* Create an empty aofInfo. */
 aofInfo *aofInfoCreate(void) {
@@ -120,20 +121,24 @@ aofInfo *aofInfoDup(aofInfo *orig) {
     ai->file_name = sdsdup(orig->file_name);
     ai->file_seq = orig->file_seq;
     ai->file_type = orig->file_type;
+    ai->file_fmt = orig->file_fmt;
     return ai;
 }
 
 /* Format aofInfo as a string and it will be a line in the manifest.
  *
- * When update this format, make sure to update valkey-check-aof as well. */
+ * When update this format, make sure to update valkey-check-aof as well.
+ * vkevo binaof: a compact incr file's line ends with "format compact" (older servers ignore the key,
+ * then refuse the file at its first byte); RESP lines are byte for byte the stock ones. */
 sds aofInfoFormat(sds buf, aofInfo *ai) {
     sds filename_repr = NULL;
 
     if (sdsneedsrepr(ai->file_name)) filename_repr = sdscatrepr(sdsempty(), ai->file_name, sdslen(ai->file_name));
 
-    sds ret = sdscatprintf(buf, "%s %s %s %lld %s %c\n", AOF_MANIFEST_KEY_FILE_NAME,
+    sds ret = sdscatprintf(buf, "%s %s %s %lld %s %c%s\n", AOF_MANIFEST_KEY_FILE_NAME,
                            filename_repr ? filename_repr : ai->file_name, AOF_MANIFEST_KEY_FILE_SEQ, ai->file_seq,
-                           AOF_MANIFEST_KEY_FILE_TYPE, ai->file_type);
+                           AOF_MANIFEST_KEY_FILE_TYPE, ai->file_type,
+                           ai->file_fmt == AOF_FMT_COMPACT ? " " AOF_MANIFEST_KEY_FILE_FORMAT " compact" : "");
     sdsfree(filename_repr);
 
     return ret;
@@ -329,6 +334,15 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
                 ai->file_seq = atoll(argv[i + 1]);
             } else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_FILE_TYPE)) {
                 ai->file_type = (argv[i + 1])[0];
+            } else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_FILE_FORMAT)) {
+                if (!strcasecmp(argv[i + 1], "compact")) {
+                    ai->file_fmt = AOF_FMT_COMPACT;
+                } else if (!strcasecmp(argv[i + 1], "resp")) {
+                    ai->file_fmt = AOF_FMT_RESP;
+                } else {
+                    err = "Unknown AOF file format";
+                    goto loaderr;
+                }
             }
             /* else if (!strcasecmp(argv[i], AOF_MANIFEST_KEY_OTHER)) {} */
         }
@@ -345,6 +359,10 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
         if (ai->file_type == AOF_FILE_TYPE_BASE) {
             if (am->base_aof_info) {
                 err = "Found duplicate base file information";
+                goto loaderr;
+            }
+            if (ai->file_fmt != AOF_FMT_RESP) {
+                err = "A BASE file can't be in compact format";
                 goto loaderr;
             }
             am->base_aof_info = ai;
@@ -450,6 +468,20 @@ sds getNewBaseFileNameAndMarkPreAsHistory(aofManifest *am, int aof_use_rdb_pream
     return am->base_aof_info->file_name;
 }
 
+/* vkevo binaof: the format of a new incr AOF file: aof-incr-format, unless records encoded for the
+ * open file are still in the AOF buffer (a forced flush that did not write them all): then the new file
+ * keeps the open file's format, so those bytes stay readable, and the switch waits for the next one. */
+static int aofNextIncrFormat(void) {
+    if (server.aof_fd != -1 && sdslen(server.aof_buf)) return server.aof_fd_fmt;
+    return server.aof_incr_format;
+}
+
+/* Write a compact incr file's header at the start of the empty file fd. */
+static int aofWriteCompactHeader(int fd) {
+    ssize_t n = write(fd, AOF_COMPACT_MAGIC, AOF_COMPACT_MAGIC_LEN);
+    return n == AOF_COMPACT_MAGIC_LEN ? C_OK : C_ERR;
+}
+
 /* Get a new INCR type AOF name.
  *
  * INCR AOF naming rules: `server.aof_filename`.seq.incr.aof
@@ -460,6 +492,7 @@ sds getNewBaseFileNameAndMarkPreAsHistory(aofManifest *am, int aof_use_rdb_pream
 sds getNewIncrAofName(aofManifest *am) {
     aofInfo *ai = aofInfoCreate();
     ai->file_type = AOF_FILE_TYPE_INCR;
+    ai->file_fmt = aofNextIncrFormat();
     ai->file_name = sdscatprintf(sdsempty(), "%s.%lld%s%s", server.aof_filename, ++am->curr_incr_file_seq,
                                  INCR_FILE_SUFFIX, AOF_FORMAT_SUFFIX);
     ai->file_seq = am->curr_incr_file_seq;
@@ -731,6 +764,8 @@ void aofOpenIfNeededOnServerStart(void) {
     /* Because we will 'exit(1)' if open AOF or persistent manifest fails, so
      * we don't need atomic modification here. */
     sds aof_name = getLastIncrAofName(server.aof_manifest);
+    aofInfo *last_ai = listNodeValue(listLast(server.aof_manifest->incr_aof_list));
+    int aof_fmt = last_ai->file_fmt;
 
     /* Here we should use 'O_APPEND' flag. */
     sds aof_filepath = makePath(server.aof_dirname, aof_name);
@@ -738,6 +773,14 @@ void aofOpenIfNeededOnServerStart(void) {
     sdsfree(aof_filepath);
     if (server.aof_fd == -1) {
         serverLog(LL_WARNING, "Can't open the append-only file %s: %s", aof_name, strerror(errno));
+        exit(1);
+    }
+    /* vkevo binaof: keep writing the last incr file in its own format; a new or empty compact file
+     * starts with its header (loading truncated a compact file cut inside its header to empty). */
+    server.aof_fd_fmt = aof_fmt;
+    if (aof_fmt == AOF_FMT_COMPACT && getAppendOnlyFileSize(aof_name, NULL) == 0 &&
+        aofWriteCompactHeader(server.aof_fd) != C_OK) {
+        serverLog(LL_WARNING, "Can't write the compact AOF header of %s: %s", aof_name, strerror(errno));
         exit(1);
     }
 
@@ -787,19 +830,27 @@ int openNewIncrAofForAppend(void) {
     if (server.aof_state == AOF_OFF) return C_OK;
 
     /* Open new AOF. */
+    int new_fmt;
     if (server.aof_state == AOF_WAIT_REWRITE) {
         /* Use a temporary INCR AOF file to accumulate data during AOF_WAIT_REWRITE. */
         new_aof_name = getTempIncrAofName();
+        new_fmt = aofNextIncrFormat();
     } else {
         /* Dup a temp aof_manifest to modify. */
         temp_am = aofManifestDup(server.aof_manifest);
         new_aof_name = sdsdup(getNewIncrAofName(temp_am));
+        new_fmt = ((aofInfo *)listNodeValue(listLast(temp_am->incr_aof_list)))->file_fmt;
     }
     sds new_aof_filepath = makePath(server.aof_dirname, new_aof_name);
     newfd = open(new_aof_filepath, O_WRONLY | O_TRUNC | O_CREAT, 0666);
     sdsfree(new_aof_filepath);
     if (newfd == -1) {
         serverLog(LL_WARNING, "Can't open the append-only file %s: %s", new_aof_name, strerror(errno));
+        goto cleanup;
+    }
+    /* vkevo binaof: a compact file has its header before the manifest names it. */
+    if (new_fmt == AOF_FMT_COMPACT && aofWriteCompactHeader(newfd) != C_OK) {
+        serverLog(LL_WARNING, "Can't write the compact AOF header of %s: %s", new_aof_name, strerror(errno));
         goto cleanup;
     }
 
@@ -824,9 +875,11 @@ int openNewIncrAofForAppend(void) {
         server.aof_last_fsync = server.mstime;
     }
     server.aof_fd = newfd;
+    server.aof_fd_fmt = new_fmt;
 
-    /* Reset the aof_last_incr_size. */
-    server.aof_last_incr_size = 0;
+    /* Reset the aof_last_incr_size (a compact file starts with its header). */
+    server.aof_last_incr_size = new_fmt == AOF_FMT_COMPACT ? AOF_COMPACT_MAGIC_LEN : 0;
+    if (new_fmt == AOF_FMT_COMPACT) server.aof_current_size += AOF_COMPACT_MAGIC_LEN;
     /* Reset the aof_last_incr_fsync_offset. */
     server.aof_last_incr_fsync_offset = 0;
     /* Update `server.aof_manifest`. */
@@ -1082,7 +1135,7 @@ int restartAOFWithSyncRdb(void) {
     serverAssert(server.aof_state == AOF_OFF);
 
     int ret = C_ERR;
-    int newfd = -1, rdbfile_renamed = 0;
+    int newfd = -1, rdbfile_renamed = 0, new_fmt = AOF_FMT_RESP;
     sds new_base_filename = NULL;
     sds new_base_filepath = NULL;
     sds new_incr_filename = NULL;
@@ -1117,6 +1170,11 @@ int restartAOFWithSyncRdb(void) {
     newfd = open(new_incr_filepath, O_WRONLY | O_TRUNC | O_CREAT, 0666);
     if (newfd == -1) {
         serverLog(LL_WARNING, "Can't open the append-only file %s: %s", new_incr_filename, strerror(errno));
+        goto cleanup;
+    }
+    new_fmt = ((aofInfo *)listNodeValue(listLast(temp_am->incr_aof_list)))->file_fmt;
+    if (new_fmt == AOF_FMT_COMPACT && aofWriteCompactHeader(newfd) != C_OK) {
+        serverLog(LL_WARNING, "Can't write the compact AOF header of %s: %s", new_incr_filename, strerror(errno));
         goto cleanup;
     }
 
@@ -1156,12 +1214,13 @@ int restartAOFWithSyncRdb(void) {
     server.stat_aofrw_consecutive_failures = 0;
 
     server.aof_last_fsync = server.mstime;
-    server.aof_last_incr_size = 0;
+    server.aof_last_incr_size = new_fmt == AOF_FMT_COMPACT ? AOF_COMPACT_MAGIC_LEN : 0;
     server.aof_last_incr_fsync_offset = 0;
     server.aof_rewrite_base_size = getAppendOnlyFileSize(new_base_filename, NULL);
-    server.aof_current_size = server.aof_rewrite_base_size;
+    server.aof_current_size = server.aof_rewrite_base_size + server.aof_last_incr_size;
 
     server.aof_fd = newfd;
+    server.aof_fd_fmt = new_fmt;
     server.aof_state = AOF_ON;
 
     serverLog(LL_NOTICE, "Reused RDB file from primary sync as AOF base file: %s", new_base_filename);
@@ -1489,6 +1548,288 @@ sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv) {
     return dst;
 }
 
+/* ----------------------------------------------------------------------------
+ * Compact incr AOF (vkevo binaof)
+ *
+ * A compact incr file is AOF_COMPACT_MAGIC (8 bytes; its first byte is neither '*' nor '#', so a
+ * server that only knows RESP refuses the file at once) and then records. Each record is one opcode
+ * byte and its payload; lengths are unsigned LEB128 varints (7 bits a byte, low bits first):
+ *
+ *   0x01 / 0x02          SET / set with exactly key and value: <klen> key <vlen> value
+ *   0x03                 any command: <argc> then argc x (<len> bytes)
+ *   0x04                 annotation (the text of a RESP "#..." line without '#' and CRLF): <len> bytes
+ *   0x80|i / 0xC0|i      command i of aofc_cmds, spelled upper / lower case: <argc - 1> then the args
+ *
+ * Every record decodes to the argv catAppendOnlyGenericCommand would have written, byte for byte
+ * (the command name keeps its spelling; mixed case goes to 0x03), so a load replays the same
+ * commands. For SET k v with a 16 B key and value that is 35 bytes instead of 59.
+ * aofc_cmds only ever grows at the end: the index is part of the format.
+ * ------------------------------------------------------------------------- */
+#define AOFC_OP_SET 0x01
+#define AOFC_OP_SET_LOWER 0x02
+#define AOFC_OP_ARGV 0x03
+#define AOFC_OP_ANNOT 0x04
+#define AOFC_OP_CMD 0x80
+#define AOFC_OP_CMD_LOWER 0x40 /* with AOFC_OP_CMD */
+#define AOFC_NCMDS 32
+
+static const char *aofc_cmds[AOFC_NCMDS] = {
+    "SET",    "DEL",    "INCR",    "DECR",      "INCRBY", "DECRBY", "INCRBYFLOAT", "APPEND",
+    "PEXPIREAT", "PERSIST", "SELECT", "MULTI",   "EXEC",   "UNLINK", "SETRANGE",    "HSET",
+    "HDEL",   "LPUSH",  "RPUSH",   "LPOP",      "RPOP",   "SADD",   "SREM",        "ZADD",
+    "ZREM",   "HINCRBY", "MSET",   "XADD",      "FLUSHALL", "FLUSHDB", "EXPIRE",    "PEXPIRE"};
+static const char *aofc_lcmds[AOFC_NCMDS] = {
+    "set",    "del",    "incr",    "decr",      "incrby", "decrby", "incrbyfloat", "append",
+    "pexpireat", "persist", "select", "multi",   "exec",   "unlink", "setrange",    "hset",
+    "hdel",   "lpush",  "rpush",   "lpop",      "rpop",   "sadd",   "srem",        "zadd",
+    "zrem",   "hincrby", "mset",   "xadd",      "flushall", "flushdb", "expire",    "pexpire"};
+#define AOFC_CMD_SET 0
+#define AOFC_CMD_SELECT 10
+#define AOFC_CMD_MULTI 11
+#define AOFC_CMD_EXEC 12
+
+static inline char *aofcPutVarint(char *p, uint64_t v) {
+    while (v >= 0x80) {
+        *p++ = (char)(v | 0x80);
+        v >>= 7;
+    }
+    *p++ = (char)v;
+    return p;
+}
+
+static inline sds aofcCatBytes(sds dst, const char *p, size_t len) {
+    dst = sdsMakeRoomFor(dst, len + 10);
+    char *w = dst + sdslen(dst);
+    char *e = aofcPutVarint(w, len);
+    memcpy(e, p, len);
+    sdsIncrLen(dst, (ssize_t)((e - w) + len));
+    return dst;
+}
+
+static inline sds aofcCatArg(sds dst, robj *o) {
+    if (sdsEncodedObject(o)) {
+        sds s = objectGetVal(o);
+        return aofcCatBytes(dst, s, sdslen(s));
+    }
+    serverAssert(objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_INT);
+    char nb[32];
+    int n = ll2string(nb, sizeof(nb), (long)objectGetVal(o));
+    return aofcCatBytes(dst, nb, (size_t)n);
+}
+
+/* The aofc_cmds index of the name, all upper case (*lower 0) or all lower case (*lower 1); -1 else. */
+static int aofcCmdIndex(const char *name, size_t len, int *lower) {
+    if (len == 3 && (name[0] == 'S' || name[0] == 's')) { /* SET first: the common record */
+        if (!memcmp(name, "SET", 3)) return *lower = 0, AOFC_CMD_SET;
+        if (!memcmp(name, "set", 3)) return *lower = 1, AOFC_CMD_SET;
+    }
+    for (int i = 0; i < AOFC_NCMDS; i++) {
+        if (strlen(aofc_cmds[i]) != len) continue;
+        if (!memcmp(name, aofc_cmds[i], len)) return *lower = 0, i;
+        if (!memcmp(name, aofc_lcmds[i], len)) return *lower = 1, i;
+    }
+    return -1;
+}
+
+sds catAppendOnlyCompactCommand(sds dst, int argc, robj **argv) {
+    char h[16];
+    int j = 0;
+    if (sdsEncodedObject(argv[0])) {
+        sds name = objectGetVal(argv[0]);
+        int lower = 0, i = aofcCmdIndex(name, sdslen(name), &lower);
+        if (i == AOFC_CMD_SET && argc == 3) {
+            h[0] = (char)(lower ? AOFC_OP_SET_LOWER : AOFC_OP_SET);
+            dst = sdscatlen(dst, h, 1);
+            dst = aofcCatArg(dst, argv[1]);
+            return aofcCatArg(dst, argv[2]);
+        }
+        if (i >= 0) {
+            h[0] = (char)(AOFC_OP_CMD | (lower ? AOFC_OP_CMD_LOWER : 0) | i);
+            dst = sdscatlen(dst, h, aofcPutVarint(h + 1, (uint64_t)(argc - 1)) - h);
+            j = 1;
+        }
+    }
+    if (j == 0) {
+        h[0] = AOFC_OP_ARGV;
+        dst = sdscatlen(dst, h, aofcPutVarint(h + 1, (uint64_t)argc) - h);
+    }
+    for (; j < argc; j++) dst = aofcCatArg(dst, argv[j]);
+    return dst;
+}
+
+/* A plain SET record from raw bytes (owner SET bursts: the frame's key and value). */
+sds aofCatCompactSet(sds dst, int lower, const char *key, size_t klen, const char *val, size_t vlen) {
+    dst = sdsMakeRoomFor(dst, 1 + 10 + klen + 10 + vlen);
+    char *w = dst + sdslen(dst), *p = w;
+    *p++ = (char)(lower ? AOFC_OP_SET_LOWER : AOFC_OP_SET);
+    p = aofcPutVarint(p, klen);
+    memcpy(p, key, klen);
+    p += klen;
+    p = aofcPutVarint(p, vlen);
+    memcpy(p, val, vlen);
+    p += vlen;
+    sdsIncrLen(dst, (ssize_t)(p - w));
+    return dst;
+}
+
+/* A command record in the format of the file it goes to. */
+sds aofCatCommand(sds dst, int argc, robj **argv, int fmt) {
+    return fmt == AOF_FMT_COMPACT ? catAppendOnlyCompactCommand(dst, argc, argv)
+                                  : catAppendOnlyGenericCommand(dst, argc, argv);
+}
+
+/* SELECT <dbid> as feedAppendOnlyFile writes it, in the format fmt. */
+sds aofCatSelect(sds dst, int dbid, int fmt) {
+    char seldb[64];
+    int n = snprintf(seldb, sizeof(seldb), "%d", dbid);
+    if (fmt != AOF_FMT_COMPACT)
+        return sdscatprintf(dst, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n", (unsigned long)n, seldb);
+    char h[2] = {(char)(AOFC_OP_CMD | AOFC_CMD_SELECT), 1};
+    dst = sdscatlen(dst, h, 2);
+    return aofcCatBytes(dst, seldb, (size_t)n);
+}
+
+/* MULTI / EXEC as catAppendOnlyGenericCommand formats shared.multi / shared.exec. */
+sds aofCatMulti(sds dst, int fmt) {
+    if (fmt != AOF_FMT_COMPACT) return sdscatlen(dst, "*1\r\n$5\r\nMULTI\r\n", 15);
+    char h[2] = {(char)(AOFC_OP_CMD | AOFC_CMD_MULTI), 0};
+    return sdscatlen(dst, h, 2);
+}
+
+sds aofCatExec(sds dst, int fmt) {
+    if (fmt != AOF_FMT_COMPACT) return sdscatlen(dst, "*1\r\n$4\r\nEXEC\r\n", 14);
+    char h[2] = {(char)(AOFC_OP_CMD | AOFC_CMD_EXEC), 0};
+    return sdscatlen(dst, h, 2);
+}
+
+/* An annotation line ann ("#...\r\n", as genAofTimestampAnnotationIfNeeded makes it). */
+sds aofCatAnnotation(sds dst, sds ann, int fmt) {
+    if (fmt != AOF_FMT_COMPACT) return sdscatsds(dst, ann);
+    size_t len = sdslen(ann);
+    serverAssert(len >= 3 && ann[0] == '#' && ann[len - 2] == '\r' && ann[len - 1] == '\n');
+    char h[1] = {AOFC_OP_ANNOT};
+    dst = sdscatlen(dst, h, 1);
+    return aofcCatBytes(dst, ann + 1, len - 3);
+}
+
+/* Read a varint of at most *rem bytes of fp. Returns AOFC_REC, AOFC_TRUNC or AOFC_IOERR / AOFC_BAD. */
+static int aofcGetVarint(FILE *fp, off_t *rem, uint64_t *v) {
+    uint64_t x = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+        if (*rem <= 0) return AOFC_TRUNC;
+        int c = getc_unlocked(fp);
+        if (c == EOF) return ferror(fp) ? AOFC_IOERR : AOFC_TRUNC;
+        (*rem)--;
+        x |= (uint64_t)(c & 0x7f) << shift;
+        if (!(c & 0x80)) {
+            *v = x;
+            return AOFC_REC;
+        }
+    }
+    return AOFC_BAD;
+}
+
+/* Read <len> bytes into a new sds (build) or skip them. A length past the end of the file is a
+ * truncated record, as a short read is for RESP. */
+static int aofcGetBytes(FILE *fp, off_t *rem, int build, sds *out) {
+    uint64_t len;
+    int r = aofcGetVarint(fp, rem, &len);
+    if (r != AOFC_REC) return r;
+    if (len > (uint64_t)*rem) return AOFC_TRUNC;
+    if (build) {
+        sds s = sdsnewlen(SDS_NOINIT, len);
+        if (len && fread(s, len, 1, fp) != 1) {
+            sdsfree(s);
+            return ferror(fp) ? AOFC_IOERR : AOFC_TRUNC;
+        }
+        *out = s;
+    } else if (len && fseeko(fp, (off_t)len, SEEK_CUR) == -1) {
+        return AOFC_IOERR;
+    }
+    *rem -= (off_t)len;
+    return AOFC_REC;
+}
+
+static int aofcKindOf(const char *name, size_t len) {
+    if (len == 5 && !strncasecmp(name, "multi", 5)) return AOFC_KIND_MULTI;
+    if (len == 4 && !strncasecmp(name, "exec", 4)) return AOFC_KIND_EXEC;
+    return AOFC_KIND_OTHER;
+}
+
+/* Read the compact record at fp (a file of fsize bytes). build: *argvp / *argcp get the command's
+ * argv (string objects the caller frees); else the payload is skipped. *annot (if not NULL) gets an
+ * annotation's text, *kind (if not NULL) MULTI / EXEC / other. Returns AOFC_REC, AOFC_ANNOT, AOFC_EOF at
+ * the end of the file on a record boundary, AOFC_TRUNC when the file ends inside the record, AOFC_BAD
+ * for an unknown opcode or an empty argv, AOFC_IOERR. */
+int aofCompactReadRecord(FILE *fp, off_t fsize, int build, int *argcp, robj ***argvp, sds *annot, int *kind) {
+    off_t pos = ftello(fp);
+    if (pos == -1) return AOFC_IOERR;
+    off_t rem = fsize - pos;
+    int op = getc_unlocked(fp);
+    if (op == EOF) return ferror(fp) ? AOFC_IOERR : AOFC_EOF;
+    rem--;
+    if (kind) *kind = AOFC_KIND_OTHER;
+    if (op == AOFC_OP_ANNOT) {
+        sds s = NULL;
+        int r = aofcGetBytes(fp, &rem, annot != NULL, &s);
+        if (r != AOFC_REC) return r;
+        if (annot) *annot = s;
+        return AOFC_ANNOT;
+    }
+    uint64_t argc;
+    int r, first = 0; /* first: argv[0] comes from the opcode */
+    const char *name = NULL;
+    if (op == AOFC_OP_SET || op == AOFC_OP_SET_LOWER) {
+        argc = 3;
+        name = op == AOFC_OP_SET ? aofc_cmds[AOFC_CMD_SET] : aofc_lcmds[AOFC_CMD_SET];
+        first = 1;
+    } else if (op & AOFC_OP_CMD) {
+        int i = op & 0x3f;
+        if (i >= AOFC_NCMDS) return AOFC_BAD;
+        name = (op & AOFC_OP_CMD_LOWER) ? aofc_lcmds[i] : aofc_cmds[i];
+        if ((r = aofcGetVarint(fp, &rem, &argc)) != AOFC_REC) return r;
+        argc += 1;
+        first = 1;
+    } else if (op == AOFC_OP_ARGV) {
+        if ((r = aofcGetVarint(fp, &rem, &argc)) != AOFC_REC) return r;
+        if (argc == 0) return AOFC_BAD;
+    } else {
+        return AOFC_BAD;
+    }
+    /* Each argument takes at least one byte: a longer argv runs past the end of the file. */
+    if (argc - first > (uint64_t)rem) return AOFC_TRUNC;
+    if (argc > (uint64_t)INT_MAX) return AOFC_BAD;
+    if (kind && name) *kind = aofcKindOf(name, strlen(name));
+    robj **argv = NULL;
+    if (build) {
+        argv = zmalloc(sizeof(robj *) * argc);
+        if (first) argv[0] = createStringObject(name, strlen(name));
+    }
+    for (uint64_t j = first; j < argc; j++) {
+        sds s = NULL;
+        int want = build || (kind && j == 0);
+        if ((r = aofcGetBytes(fp, &rem, want, &s)) != AOFC_REC) {
+            if (build) {
+                for (uint64_t k = 0; k < j; k++) decrRefCount(argv[k]);
+                zfree(argv);
+            } else if (s) {
+                sdsfree(s);
+            }
+            return r;
+        }
+        if (j == 0 && kind) *kind = aofcKindOf(s, sdslen(s));
+        if (build)
+            argv[j] = createObject(OBJ_STRING, s);
+        else if (s)
+            sdsfree(s);
+    }
+    if (build) {
+        *argvp = argv;
+        *argcp = (int)argc;
+    }
+    return AOFC_REC;
+}
+
 /* Generate a piece of timestamp annotation for AOF if current record timestamp
  * in AOF is not equal server unix time. If we specify 'force' argument to 1,
  * we would generate one without check, currently, it is useful in AOF rewriting
@@ -1531,10 +1872,11 @@ void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
     }
 
     /* Feed timestamp if needed */
+    int fmt = server.aof_fd_fmt;
     if (server.aof_timestamp_enabled) {
         sds ts = genAofTimestampAnnotationIfNeeded(0);
         if (ts != NULL) {
-            server.aof_buf = sdscatsds(server.aof_buf, ts);
+            server.aof_buf = aofCatAnnotation(server.aof_buf, ts, fmt);
             sdsfree(ts);
         }
     }
@@ -1542,17 +1884,13 @@ void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
     /* The DB this command was targeting is not the same as the last command
      * we appended. To issue a SELECT command is needed. */
     if (dictid != -1 && dictid != server.aof_selected_db) {
-        char seldb[64];
-
-        snprintf(seldb, sizeof(seldb), "%d", dictid);
-        server.aof_buf =
-            sdscatprintf(server.aof_buf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n", (unsigned long)strlen(seldb), seldb);
+        server.aof_buf = aofCatSelect(server.aof_buf, dictid, fmt);
         server.aof_selected_db = dictid;
     }
 
     /* All commands should be propagated the same way in AOF as in replication.
-     * No need for AOF-specific translation. */
-    server.aof_buf = catAppendOnlyGenericCommand(server.aof_buf, argc, argv);
+     * No need for AOF-specific translation. (vkevo binaof: in the open incr file's format.) */
+    server.aof_buf = aofCatCommand(server.aof_buf, argc, argv, fmt);
 }
 
 /* ----------------------------------------------------------------------------
@@ -1597,7 +1935,7 @@ struct client *createAOFClient(void) {
  * AOF_NOT_EXIST: AOF file doesn't exist.
  * AOF_EMPTY: The AOF file is empty (nothing to load).
  * AOF_FAILED: Failed to load the AOF file. */
-int loadSingleAppendOnlyFile(char *filename) {
+int loadSingleAppendOnlyFile(char *filename, int fmt) {
     struct client *fakeClient;
     struct valkey_stat sb;
     int old_aof_state = server.aof_state;
@@ -1606,6 +1944,7 @@ int loadSingleAppendOnlyFile(char *filename) {
     off_t valid_before_multi = 0; /* Offset before MULTI command loaded. */
     off_t last_progress_report_size = 0;
     int ret = AOF_OK;
+    int compact = 0; /* vkevo binaof: the file is a compact incr AOF (fmt says which the manifest expects) */
 
     sds aof_filepath = makePath(server.aof_dirname, filename);
     FILE *fp = fopen(aof_filepath, "r");
@@ -1646,6 +1985,28 @@ int loadSingleAppendOnlyFile(char *filename) {
     if (!rdbHasFileSignature(sig, siglen)) {
         /* Not in RDB format, seek back at 0 offset. */
         if (fseek(fp, 0, SEEK_SET) == -1) goto readerr;
+        /* vkevo binaof: a compact incr file starts with its header; the manifest must agree. */
+        unsigned char mg[AOF_COMPACT_MAGIC_LEN];
+        size_t mglen = fread(mg, 1, sizeof(mg), fp);
+        if (mglen == AOF_COMPACT_MAGIC_LEN && !memcmp(mg, AOF_COMPACT_MAGIC, AOF_COMPACT_MAGIC_LEN)) {
+            compact = 1;
+        } else if (fmt == AOF_FMT_COMPACT && mglen < AOF_COMPACT_MAGIC_LEN && feof(fp) &&
+                   !memcmp(mg, AOF_COMPACT_MAGIC, mglen)) {
+            /* The file ends inside its header: nothing in it was written yet. */
+            serverLog(LL_WARNING, "The compact AOF file %s ends inside its header", filename);
+            valid_up_to = 0;
+            goto uxeof;
+        } else if (fseek(fp, 0, SEEK_SET) == -1) {
+            goto readerr;
+        }
+        if (compact != (fmt == AOF_FMT_COMPACT)) {
+            serverLog(LL_WARNING,
+                      compact ? "The AOF file %s is in compact format but the manifest does not say so"
+                              : "The AOF manifest lists %s as a compact AOF file but it has no compact header",
+                      filename);
+            goto fmterr;
+        }
+        if (compact) valid_up_to = AOF_COMPACT_MAGIC_LEN;
     } else {
         /* RDB format. Pass loading the RDB functions. */
         rio rdb;
@@ -1692,6 +2053,19 @@ int loadSingleAppendOnlyFile(char *filename) {
             last_progress_report_size += progress_delta;
             processEventsWhileBlocked();
             processModuleLoadingProgressEvent(1);
+        }
+        if (compact) {
+            /* vkevo binaof: one compact record; the rest of the loop is the RESP path's. */
+            int rk = aofCompactReadRecord(fp, sb.st_size, 1, &argc, &argv, NULL, NULL);
+            if (rk == AOFC_EOF) break;
+            if (rk == AOFC_ANNOT) continue;
+            if (rk == AOFC_TRUNC) goto uxeof;
+            if (rk == AOFC_IOERR) goto readerr;
+            if (rk != AOFC_REC) goto fmterr;
+            fakeClient->argc = argc;
+            fakeClient->argv = argv;
+            fakeClient->argv_len = argc;
+            goto run_cmd;
         }
         if (fgets(buf, sizeof(buf), fp) == NULL) {
             if (feof(fp)) {
@@ -1746,6 +2120,7 @@ int loadSingleAppendOnlyFile(char *filename) {
         }
 
         /* Command lookup */
+    run_cmd:;
         sds err = NULL;
         fakeClient->cmd = fakeClient->lastcmd = cmd = lookupCommand(argv, argc);
         if ((!cmd && !commandCheckExistence(fakeClient, &err)) || (cmd && !commandCheckArity(cmd, argc, &err))) {
@@ -1915,7 +2290,7 @@ int loadAppendOnlyFiles(aofManifest *am) {
         base_size = getAppendOnlyFileSize(aof_name, NULL);
         last_file = ++aof_num == total_num;
         start = ustime();
-        ret = loadSingleAppendOnlyFile(aof_name);
+        ret = loadSingleAppendOnlyFile(aof_name, AOF_FMT_RESP);
         if (ret == AOF_OK || (ret == AOF_TRUNCATED && last_file)) {
             serverLog(LL_NOTICE, "DB loaded from base file %s: %.3f seconds", aof_name,
                       (float)(ustime() - start) / 1000000);
@@ -1945,7 +2320,7 @@ int loadAppendOnlyFiles(aofManifest *am) {
             updateLoadingFileName(aof_name);
             last_file = ++aof_num == total_num;
             start = ustime();
-            ret = loadSingleAppendOnlyFile(aof_name);
+            ret = loadSingleAppendOnlyFile(aof_name, ai->file_fmt);
             if (ret == AOF_OK || (ret == AOF_TRUNCATED && last_file)) {
                 serverLog(LL_NOTICE, "DB loaded from incr file %s: %.3f seconds", aof_name,
                           (float)(ustime() - start) / 1000000);
@@ -2930,6 +3305,8 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             sds temp_incr_filepath = makePath(server.aof_dirname, temp_incr_aof_name);
             /* Get next new incr aof name. */
             sds new_incr_filename = getNewIncrAofName(temp_am);
+            /* vkevo binaof: the renamed file keeps the format it was written in. */
+            ((aofInfo *)listNodeValue(listLast(temp_am->incr_aof_list)))->file_fmt = server.aof_fd_fmt;
             new_incr_filepath = makePath(server.aof_dirname, new_incr_filename);
             latencyStartMonitor(latency);
             if (rename(temp_incr_filepath, new_incr_filepath) == -1) {

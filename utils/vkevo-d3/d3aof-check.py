@@ -39,6 +39,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 d3 = __import__("d3-check")
+import aofcompact  # noqa: E402  (D3-all-g11-binaof: compact incr files)
 Conn, Err, key_slot, check, info, ostat = d3.Conn, d3.Err, d3.key_slot, d3.check, d3.info, d3.ostat
 
 ARGS = None
@@ -93,7 +94,7 @@ class Server:
     def incr_path(self):
         d = os.path.join(self.dir, "appendonlydir")
         man = [f for f in os.listdir(d) if f.endswith(".manifest")][0]
-        incr = [l.split()[1] for l in open(os.path.join(d, man)) if l.split()[-1] == "i"][-1]
+        incr = [l.split()[1] for l in open(os.path.join(d, man)) if " type i" in l][-1]  # g11: + "format compact"
         return os.path.join(d, incr)
 
 
@@ -131,7 +132,10 @@ PXAT = re.compile(rb"(\$4\r\nPXAT\r\n\$\d+\r\n)\d+", re.I)
 
 
 def parse_aof(data):
-    """-> (records as lists of args, annotation count). Asserts the file is well-formed RESP."""
+    """-> (records as lists of args, annotation count). Asserts the file is well-formed RESP (or, from
+    D3-all-g11-binaof, well-formed compact records, decoded to the same argv)."""
+    if aofcompact.is_compact(data):
+        return aofcompact.parse_any(data)
     recs, ann, i = [], 0, 0
     while i < len(data):
         if data[i:i + 1] == b"#":
@@ -252,10 +256,24 @@ def bytes_identical():
     recs, _ = parse_aof(b["data"])
     sel = sum(1 for r in recs if r[0].upper() == b"SELECT")
     multi = sum(1 for r in recs if r[0].upper() == b"MULTI")
-    check("aof.bytes_identical", a["masked"] == b["masked"] and len(b["data"]) > 0,
-          "%d / %d bytes, %d records (%d SELECT, %d MULTI), first diff at %s %r / %r" % (
-              len(a["data"]), len(b["data"]), len(recs), sel, multi, diff,
-              a["masked"][diff - 40:diff + 40] if diff is not None else b"", b["masked"][diff - 40:diff + 40] if diff is not None else b""))
+    if aofcompact.is_compact(a["data"]) or aofcompact.is_compact(b["data"]):
+        # D3-all-g11-binaof: a compact file holds other bytes by design; its records must decode to the
+        # ref's argv, record for record (PXAT times masked), and the file must be well-formed compact.
+        def mrec(data):
+            return [[b"X" if j and r[j - 1].upper() == b"PXAT" else x for j, x in enumerate(r)]
+                    for r in parse_aof(data)[0]]
+        ra, rb = mrec(a["data"]), mrec(b["data"])
+        rd = next((j for j in range(min(len(ra), len(rb))) if ra[j] != rb[j]), None)
+        check("aof.bytes_identical", ra == rb and len(b["data"]) > 0,
+              "SEMANTIC (compact): %d / %d bytes, %d / %d records (%d SELECT, %d MULTI) decode equal; first diff "
+              "%s %r / %r" % (len(a["data"]), len(b["data"]), len(ra), len(rb), sel, multi, rd,
+                              ra[rd] if rd is not None and rd < len(ra) else None,
+                              rb[rd] if rd is not None and rd < len(rb) else None))
+    else:
+        check("aof.bytes_identical", a["masked"] == b["masked"] and len(b["data"]) > 0,
+              "%d / %d bytes, %d records (%d SELECT, %d MULTI), first diff at %s %r / %r" % (
+                  len(a["data"]), len(b["data"]), len(recs), sel, multi, diff,
+                  a["masked"][diff - 40:diff + 40] if diff is not None else b"", b["masked"][diff - 40:diff + 40] if diff is not None else b""))
     check("aof.offset_identical", a["off"] == b["off"], "master_repl_offset %d / %d" % (a["off"], b["off"]))
     # A WAITAOF that blocks (everysec: no fsync yet) has main send REPLCONF GETACK, which steps the offset
     # once with no replicas (replicationFeedReplicas) and writes no AOF record; under always none blocks.

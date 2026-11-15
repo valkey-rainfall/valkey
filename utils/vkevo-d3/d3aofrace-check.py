@@ -49,6 +49,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 veto = __import__("d3veto-check")
+import aofcompact  # noqa: E402
 d3 = veto.d3
 Conn, Err, check, info, ostat = d3.Conn, d3.Err, d3.check, d3.info, d3.ostat
 owner_ranges, owner_tags, keys_of, pipeline, wait_rewrite = (veto.owner_ranges, veto.owner_tags, veto.keys_of,
@@ -94,10 +95,11 @@ class AofView:
         base, incrs = None, []
         for line in open(os.path.join(self.dir, man)):
             p = line.split()
-            if p and p[-1] == "b":
-                base = p[1]
-            elif p and p[-1] == "i":
-                incrs.append(p[1])
+            kv = dict(zip(p[0::2], p[1::2]))  # D3-all-g11-binaof: a compact line ends "format compact"
+            if kv.get("type") == "b":
+                base = kv["file"]
+            elif kv.get("type") == "i":
+                incrs.append(kv["file"])
         return base, incrs
 
     def base_values(self, name):
@@ -118,6 +120,8 @@ class AofView:
             f.seek(len(ent[0]))
             ent[0] += f.read()
         pat = self.pats[key]
+        if aofcompact.is_compact(ent[0]):  # D3-all-g11-binaof: the compact record of the same INCR
+            pat = aofcompact.encode(("INCR", key))
         cnt, upto = ent[1].get(key, (0, 0))
         cnt += ent[0].count(pat, max(0, upto - len(pat) + 1))  # records ending past `upto` are new
         ent[1][key] = (cnt, len(ent[0]))
@@ -135,6 +139,8 @@ class AofView:
 
 
 def parse_aof(data):
+    if aofcompact.is_compact(data):  # D3-all-g11-binaof: a compact incr file decodes to the same argv
+        return aofcompact.parse_any(data)[0]
     recs, i = [], 0
     while i < len(data):
         if data[i:i + 1] == b"#":

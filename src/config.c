@@ -107,6 +107,11 @@ configEnum aof_fsync_enum[] = {
     {"no", AOF_FSYNC_NO},
     {NULL, 0}};
 
+configEnum aof_incr_format_enum[] = {
+    {"resp", AOF_FMT_RESP},
+    {"compact", AOF_FMT_COMPACT},
+    {NULL, 0}};
+
 configEnum copy_avoid_mode_enum[] = {
     {"static", COPY_AVOID_MODE_STATIC},
     {"adaptive", COPY_AVOID_MODE_ADAPTIVE},
@@ -3634,6 +3639,8 @@ standardConfig static_configs[] = {
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),
+    /* vkevo binaof: the record format of the NEXT new incr AOF file (the open one keeps its own). */
+    createEnumConfig("aof-incr-format", NULL, MODIFIABLE_CONFIG, aof_incr_format_enum, server.aof_incr_format, AOF_FMT_COMPACT, NULL, NULL),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, 0, NULL, NULL),
     createEnumConfig("enable-protected-configs", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_protected_configs, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),
