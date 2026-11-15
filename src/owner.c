@@ -1372,6 +1372,10 @@ static __attribute__((noinline)) int ownerRefAdd(client *c, robj *val, const cha
     owner *o = own_self;
     int min = server.owner_bigreply_min;
     if (min <= 0 || len < (size_t)min || len > UINT32_MAX || !sdsEncodedObject(val)) return 0;
+    /* D3-all-g13-fold: never under maxmemory, even inside a roomy memory lease (D3-all-g11-maxmem): a value a
+     * reply still holds stays allocated after an overwrite in the same window, and the lease bounds count
+     * no such bytes. GET bursts and rings are off under maxmemory anyway; this keeps it so. */
+    if (own_mm) return 0;
     if (objectGetRefcount(val) >= OBJ_FIRST_SPECIAL_REFCOUNT) return 0;
     if (c->owner_nrefs >= OWN_REF_MAX || c->owner_ref_bytes + len > OWN_REF_BYTES_MAX) return 0;
     if (listLength(c->reply) || server.debug_client_enforce_reply_list || c->flag.close_after_reply ||

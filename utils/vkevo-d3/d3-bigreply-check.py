@@ -46,7 +46,8 @@ each case added. Suites (each on a fresh pair of servers):
   aof        appendonly yes everysec: SET then GET of big values in one pipeline (replies that wait for the AOF:
              copied before they wait), sizes, overwrite, ix_*, ixbp_* forward
   aofalways  appendonly yes always: the same but ixbp_*
-  mm         maxmemory 1gb allkeys-lru: sizes, overwrite, ix_* (no references, no SET bursts)
+  mm         maxmemory 1gb allkeys-lru: sizes, overwrite, ix_* (no references; SET bursts run inside the owners'
+             memory leases since D3-all-g11-maxmem, so ix_* want owner_setburst_commands to grow and refs to stay 0)
 Usage: d3-bigreply-check.py --bin <tree>/src/valkey-server --ref-bin <parent>/src/valkey-server --dir D
                             --port P --owner-port OP [--cpus 8-11] [--main-cpu 16] [--cachecannon PATH --cc-cpus 0-7]
 Prints PASS/FAIL/INFO lines and BIGREPLYCHECK {checks, fails}; exit 1 on any FAIL.
@@ -318,7 +319,10 @@ def interact_cases(p, rng, tag, want_refs, want_sb):
         for form in ("one", "chunks", "single"):
             p.setup([("SET", k, v) for k, v in init.items()])
             name = "ix_%s_%s_%s" % (tag, kind, form)
-            sb = want_sb if (form == "one" and "setsmall" in kind) else None
+            # A SET burst runs where a read starts at a plain SET frame, or (GET bursts on) after the GET burst
+            # before it; under maxmemory GET bursts are off, so only a pipeline that starts with the SET bursts.
+            sb_kind = kind == "setsmall_get" if tag == "mm" else "setsmall" in kind
+            sb = want_sb if (form == "one" and sb_kind) else None
             wr = want_refs if (form == "one" and kind.startswith("get_")) else None
             if form == "one":
                 p.case(name, data, len(frames), want_refs=wr, want_sb=sb)
@@ -704,7 +708,7 @@ def suite_cfg(a, rng, tag, extra, want_refs):
     p = Pair(a, tag, extra)
     ks, vals = sizes_cases(p, rng, tag, want_refs)
     overwrite_case(p, rng, tag)
-    interact_cases(p, rng, tag, want_refs, want_refs)  # SET bursts run under appendonly, not under maxmemory
+    interact_cases(p, rng, tag, want_refs, True)  # SET bursts run under appendonly and (D3-all-g11-maxmem) maxmemory
     if tag == "aof":
         interact_backpressure(p, rng, tag, False)
     # writes then reads of the same big keys in one pipeline: under appendonly the GET replies wait for the AOF

@@ -194,6 +194,13 @@ Files here:
   read after every GET ran (3 x 200 interactions on 200 keys); replies (also against a model), cmdstat_set,
   owner_setburst_commands, the keyspace (type, encoding, value, PTTL, DEBUG DIGEST-VALUE) equal,
   OBJECT REFCOUNT 1; and 2 writers of plain small SETs in the concurrent run.
+  D3-all-g13-fold: under maxmemory the ix_* cases expect SET bursts (memory leases, D3-all-g11-maxmem) and
+  still no reference (owner.c ownerRefAdd refuses under maxmemory).
+- `d3-maxmem-check.py` (D3-all-g11-maxmem) and `d3-compactaof-check.py` (D3-all-g11-binaof): see their
+  docstrings. D3-all-g13-fold adds to d3-compactaof-check the parts mm (the stream under maxmemory +
+  appendonly, compact records decoded and resp bytes, SET bursts in the leases) and mmswitch
+  (aof-incr-format flipped at 6 rewrites under SET-burst load inside the leases; every incr and history
+  file has its manifest's format and decodes; each key its writer's last acknowledged value).
 
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):

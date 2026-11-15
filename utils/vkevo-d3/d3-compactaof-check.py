@@ -28,6 +28,14 @@ Starts its own servers (owner-threads N, loopback 127.0.0.1, ports < 32768, --di
                    file; a rewrite killed mid-way leaves RESP incr + compact incr in one manifest; more writes;
                    LOADAOF / restart digests equal live; check-aof ok; a clean rewrite then leaves one compact
                    incr; the ref (RESP-only) refuses to load a compact incr file
+  cx.mm.*, cx.mmresp.*  (D3-all-g13-fold) the stream under maxmemory 1gb + appendonly everysec, where the owners
+                   run SET bursts inside their memory leases (D3-all-g11-maxmem): compact records decode to the
+                   ref's; with aof-incr-format resp the incr file is the ref's byte for byte; SET bursts and lease
+                   windows ran, nothing evicted
+  cx.mmswitch.*    (D3-all-g13-fold) aof-incr-format flipped resp / compact at 6 rewrites while 2 writers per owner
+                   pipeline SET bursts inside the leases: every incr and history file has its manifest's format and
+                   decodes whole, the open format follows the config at each rewrite, each key = its writer's last
+                   acknowledged value, live / LOADAOF / restart digests equal, check-aof ok
 
 Usage: d3-compactaof-check.py --bin <tree>/src/valkey-server --ref-bin <parent>/src/valkey-server --dir /tmp/x
        --n 4 --port 23379 --owner-port 23400 --cpus a-b --main-cpu m [--seed 11] [--ops 3000] [--cuts 24]
@@ -341,6 +349,7 @@ def part_stream(tag, extra, bin_extra=()):
         d_live = digest(adm)
         fr = file_records(srv)
         o = ostat(adm)
+        evicted = int(info(adm, "stats").get("evicted_keys", 0))
         fmt_open = p.get("aof_incr_format_open")
         adm.cmd("DEBUG", "LOADAOF")
         d_load = digest(adm)
@@ -355,6 +364,8 @@ def part_stream(tag, extra, bin_extra=()):
         srv.stop()
         res[side] = dict(srv=srv, replies=replies, live=live, d=(d_live, d_load, d_restart), rest=rest, fr=fr,
                          native=o.get("owner_native_commands", 0), aof_ops=o.get("owner_aof_ops", 0), crash=crash,
+                         setburst=o.get("owner_setburst_commands", 0), lease_w=o.get("owner_mm_lease_windows", 0),
+                         evicted=evicted,
                          fmt_open=fmt_open, size=sum(os.path.getsize(os.path.join(srv.aofdir(), n))
                                                      for n, _ in srv.incr_files()))
     a, b = res["ref"], res["bin"]
@@ -381,17 +392,162 @@ def part_stream(tag, extra, bin_extra=()):
     return res, stream
 
 
-def part_resp_bytes():
+def part_resp_bytes(tag="resp", extra=("--appendfsync", "everysec")):
     """--bin with aof-incr-format resp: the incr file is the ref's byte for byte (expire times masked)."""
-    res, _ = part_stream("resp", ["--appendfsync", "everysec"], ["--aof-incr-format", "resp"])
+    res, _ = part_stream(tag, list(extra), ["--aof-incr-format", "resp"])
     da = b"".join(open(os.path.join(res["ref"]["srv"].aofdir(), n), "rb").read() for n, _ in res["ref"]["srv"].incr_files())
     db = b"".join(open(os.path.join(res["bin"]["srv"].aofdir(), n), "rb").read() for n, _ in res["bin"]["srv"].incr_files())
     ra, _ = ac.parse_resp(da)
     rb, _ = ac.parse_resp(db)
     same_shape = [len(x) for x in ra] == [len(x) for x in rb] and \
         [[len(y) for y in x] for x in mask(ra)] == [[len(y) for y in x] for x in mask(rb)]
-    check("cx.resp.bytes_identical", (da == db or (mask(ra) == mask(rb) and same_shape)) and not ac.is_compact(db),
+    check("cx.%s.bytes_identical" % tag, (da == db or (mask(ra) == mask(rb) and same_shape)) and not ac.is_compact(db),
           "%d / %d bytes%s" % (len(da), len(db), "" if da == db else " (equal after masking expire times)"))
+    return res
+
+
+MM = ["--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
+
+
+def part_mm():
+    """D3-all-g13-fold: the stream under maxmemory + appendonly everysec, where the owners run SET bursts inside
+    their memory leases (D3-all-g11-maxmem): compact records decode to the ref's RESP records (part_stream's
+    checks), and with aof-incr-format resp the incr file is the ref's byte for byte; in both, SET bursts and lease
+    windows ran on --bin and nothing was evicted."""
+    res, _ = part_stream("mm", ["--appendfsync", "everysec"] + MM)
+    res2 = part_resp_bytes("mmresp", ["--appendfsync", "everysec"] + MM)
+    for tag, r in (("mm", res), ("mmresp", res2)):
+        b = r["bin"]
+        check("cx.%s.leases" % tag, b["setburst"] > 0 and b["lease_w"] > 0 and b["evicted"] == 0,
+              "owner_setburst_commands %d owner_mm_lease_windows %d evicted %d" % (b["setburst"], b["lease_w"], b["evicted"]))
+
+
+def manifest_all(dirpath):
+    """[(file name, type, 'compact'|'resp')] of every line of the AOF dir's manifest (base, history, incr)."""
+    man = [f for f in os.listdir(dirpath) if f.endswith(".manifest")][0]
+    out = []
+    for l in open(os.path.join(dirpath, man)):
+        p = l.split()
+        kv = dict(zip(p[0::2], p[1::2]))
+        if "file" in kv:
+            out.append((kv["file"], kv.get("type"), kv.get("format", "resp")))
+    return out
+
+
+def part_mmswitch():
+    """D3-all-g13-fold: aof-incr-format switched at each of 6 rewrites (resp, compact, ...) while 2 writers per owner
+    pipeline plain 16 B SETs (SET bursts) under maxmemory 1gb + appendonly everysec, i.e. inside the owners' memory
+    leases. History files are kept (aof-disable-auto-gc yes) so every incr file the run opened can be read: each one
+    has the format its manifest line names (a compact one starts with the header) and decodes whole; the open format
+    after each rewrite is the one configured before it; every key holds its writer's last acknowledged value; live
+    == LOADAOF == restart digests; valkey-check-aof ok; SET bursts and lease windows ran; nothing evicted."""
+    srv = Server("mmswitch", ARGS.bin, ["--appendfsync", "everysec", "--aof-disable-auto-gc", "yes"] + MM)
+    adm = srv.conn()
+    rng = owner_ranges(adm)
+    o0 = ostat(adm)
+    stop = threading.Event()
+    nw = 2 * ARGS.n
+    errs, counts, last = [], [0] * nw, [dict() for _ in range(nw)]
+
+    def writer(w):
+        o = w % ARGS.n
+        try:
+            c = srv.conn(o)
+            tag = next(b"s%d-%d" % (w, i) for i in range(10 ** 6) if owner_of(rng, b"{s%d-%d}" % (w, i)) == o)
+            j = 0
+            while not stop.is_set():
+                kv = []
+                for _ in range(48):
+                    j += 1
+                    kv.append((b"{%s}k%d" % (tag, j % 3000), b"v%015d" % j))
+                c.send([("SET", k, v) for k, v in kv])
+                for k, v in kv:
+                    r = c.read()
+                    if r == "OK":
+                        last[w][k] = v
+                    elif len(errs) < 5:
+                        errs.append((k, r))
+                counts[w] += len(kv)
+            c.close()
+        except Exception as e:  # noqa
+            errs.append(repr(e))
+
+    th = [threading.Thread(target=writer, args=(w,)) for w in range(nw)]
+    for t in th:
+        t.start()
+    want, seen = ["resp", "compact", "resp", "compact", "resp", "compact"], []
+    for f in want:
+        time.sleep(0.4)
+        adm.cmd("CONFIG", "SET", "aof-incr-format", f)
+        for _ in range(400):
+            p = info(adm, "persistence")
+            if p.get("aof_rewrite_in_progress") == "0" and p.get("aof_rewrite_scheduled") == "0":
+                break
+            time.sleep(0.02)
+        adm.cmd("BGREWRITEAOF")
+        for _ in range(1000):
+            p = info(adm, "persistence")
+            if p.get("aof_rewrite_in_progress") == "0" and p.get("aof_rewrite_scheduled") == "0":
+                break
+            time.sleep(0.02)
+        seen.append(p.get("aof_incr_format_open"))
+    time.sleep(0.4)
+    stop.set()
+    for t in th:
+        t.join()
+    p = drain(adm)
+    o1 = ostat(adm)
+    st = info(adm, "stats")
+    check("cx.mmswitch.load", not errs and sum(counts) > 0, "%d SETs, errors %s" % (sum(counts), errs[:2]))
+    sb = o1.get("owner_setburst_commands", 0) - o0.get("owner_setburst_commands", 0)
+    lw = o1.get("owner_mm_lease_windows", 0) - o0.get("owner_mm_lease_windows", 0)
+    check("cx.mmswitch.leases", sb > sum(counts) // 2 and lw > 0 and st.get("evicted_keys") == "0",
+          "owner_setburst_commands +%d of %d SETs, owner_mm_lease_windows +%d, evicted %s" % (
+              sb, sum(counts), lw, st.get("evicted_keys")))
+    check("cx.mmswitch.switches", seen == want and p.get("aof_last_bgrewrite_status") == "ok" and
+          p.get("aof_last_write_status") == "ok" and int(p.get("aof_rewrites", 0)) >= len(want),
+          "open format after each rewrite %s (want %s), rewrites %s, status %s / %s" % (
+              seen, want, p.get("aof_rewrites"), p.get("aof_last_bgrewrite_status"), p.get("aof_last_write_status")))
+    files, bad, nrec, fmts = [x for x in manifest_all(srv.aofdir()) if x[1] in ("h", "i") and ".base." not in x[0]], [], 0, []
+    for name, typ, fmt in files:
+        path = os.path.join(srv.aofdir(), name)
+        if not os.path.exists(path):
+            continue
+        data = open(path, "rb").read()
+        try:
+            if (fmt == "compact") != ac.is_compact(data) and data:
+                raise ValueError("manifest says %s, header says %s" % (fmt, "compact" if ac.is_compact(data) else "resp"))
+            recs, _ = ac.parse_any(data)
+            nrec += len(recs)
+            fmts.append(fmt)
+        except Exception as e:  # noqa
+            bad.append((name, typ, fmt, repr(e)[:120]))
+    check("cx.mmswitch.files", not bad and "compact" in fmts and "resp" in fmts and nrec > 0,
+          "%d incr/history files (%s), %d records decoded, bad %s" % (len(fmts), "".join(f[0] for f in fmts), nrec, bad[:2]))
+    got_bad = 0
+    for w in range(nw):
+        ks = list(last[w])
+        for i in range(0, len(ks), 500):
+            part = ks[i:i + 500]
+            adm.send([("GET", k) for k in part])
+            vals = [adm.read() for _ in part]
+            got_bad += sum(1 for k, v in zip(part, vals) if v != last[w][k])
+    check("cx.mmswitch.model", got_bad == 0 and sum(len(x) for x in last) > 0,
+          "%d keys, %d not their last acknowledged value" % (sum(len(x) for x in last), got_bad))
+    d_live = digest(adm)
+    adm.cmd("DEBUG", "LOADAOF")
+    d_load = digest(adm)
+    adm.close()
+    srv.stop()
+    rc, out = check_aof_tool(srv.aofdir(), False)
+    check("cx.mmswitch.check_aof", rc == 0, out.strip().splitlines()[-1:] if out else rc)
+    srv.start()
+    adm = srv.conn()
+    d_restart = digest(adm)
+    adm.close()
+    crash = srv.crashed()
+    srv.stop()
+    check("cx.mmswitch.digests", d_live == d_load == d_restart and crash == 0, (d_live, d_load, d_restart, crash))
 
 
 def replay_digest(recs):
@@ -702,7 +858,7 @@ def main():
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--ops", type=int, default=3000)
     ap.add_argument("--cuts", type=int, default=24)
-    ap.add_argument("--parts", default="stream,resp,always,trunc,rewrite,mixed")
+    ap.add_argument("--parts", default="stream,resp,always,trunc,rewrite,mixed,mm,mmswitch")
     ARGS = ap.parse_args()
     os.makedirs(ARGS.dir, exist_ok=True)
     parts = ARGS.parts.split(",")
@@ -717,6 +873,10 @@ def main():
         part_rewrite()
     if "mixed" in parts:
         part_mixed(stream)
+    if "mm" in parts:
+        part_mm()
+    if "mmswitch" in parts:
+        part_mmswitch()
     shutil.rmtree(ARGS.dir, ignore_errors=True)
     r = d3.RESULTS
     fails = [x["check"] for x in r if not x["ok"]]
