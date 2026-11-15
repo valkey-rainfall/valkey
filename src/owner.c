@@ -64,6 +64,23 @@
  * measured), plus a bound on what the step can add, stays under maxmemory. Then the stock code
  * would neither evict nor refuse before that command, and native skipping it changes nothing. A
  * step that does not fit goes to main, whose processCommand evicts or refuses as stock does.
+ * Each owner's share of the headroom is its memory lease for the period (one main sleep): main
+ * splits maxmemory minus used memory (less OWN_MM_SLACK) across the owners when it resumes them, and
+ * an owner checks only its own allocation counter against its lease, never the global sum.
+ *
+ * Memory leases (owner-mm-lease yes, the default; D3-all-g11-maxmem): while an owner's lease has room
+ * for a whole read batch (OWN_MM_LEASE_ROOM), it batches its reads through io_uring and runs SET bursts
+ * under maxmemory too. Each read queued in a batch reserves OWN_MM_READ from the lease until its turn
+ * (o->mm_resv), and every check in between (commands, table resizes, the next reads) counts the
+ * reservations, so a batched read finds the room the unbatched path checked for right before it. A
+ * SET burst checks each SET against the same bound the parser's path checks it against (ownerMmCmdFits)
+ * before the SET allocates, and ends at the first one that does not fit: the parser takes it, and
+ * ownerNativeKind sends it to main. Below OWN_MM_LEASE_ROOM, and with owner-mm-lease no, the owner
+ * takes g10's exact path (reads one at a time, no SET bursts). Bound: as before, between two of main's
+ * readings every owner stays within its lease, so used memory stays at or below maxmemory minus
+ * OWN_MM_SLACK, except that one read's parse can overshoot its OWN_MM_READ estimate (a big argument);
+ * that read sets own_mm_over and every owner sends its work to main until main looks again. Leases add
+ * no overshoot of their own.
  *
  * shortcut: one global stop for every main iteration, and a client that falls back returns to its
  * owner as soon as it is idle (no hysteresis). Fine while main is mostly idle (cluster clients on
@@ -81,8 +98,9 @@
  * read or write, which sets the connection state as before. A read batch's replies go out after the
  * whole batch ran: each was queued only when ownerReplyOut would have written it right away (no
  * unflushed AOF ops then), and one connection's replies stay in order. Main stopping the world ends
- * the window after the batch in hand. Under maxmemory the reads are not batched (each read's headroom
- * check must follow the commands before it). With owner-uring-deep N > 0 a client whose last read ran
+ * the window after the batch in hand. Under maxmemory the reads are batched only inside a memory lease
+ * with room for the batch (see above); otherwise one at a time, each read's headroom check following
+ * the commands before it. With owner-uring-deep N > 0 a client whose last read ran
  * N commands or more is read, run and answered at once, as without io_uring; the default is 0 (D3-all-
  * g9-fold): every read is batched, deep pipelines included (fleet W=32 K1 +4.8%, K2 +2.7% vs 32).
  *
@@ -155,6 +173,11 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
 /* Below this headroom per owner the native path is vetoed: near the limit main serves everything (and
  * evicts or refuses), else a client whose read does not fit would bounce between owner and main. */
 #define OWN_MM_TIGHT (2 << 20)
+/* Memory leases (D3-all-g11-maxmem): a window batches its reads and runs SET bursts under maxmemory only
+ * while this owner's lease has this much room: a full batch's read reservations, twice over. */
+#define OWN_MM_LEASE_ROOM (2 * OWN_URING_BATCH * OWN_MM_READ)
+/* A SET burst's slow commandlog entries, made after its last SET: per SET (the entry, its key and value). */
+#define OWN_MM_SETBURST_LOG 1024
 
 typedef struct ownerPropUnit {
     client *c; /* whose command it was: its woff is set when the records are appended (WAITAOF) */
@@ -253,6 +276,11 @@ typedef struct owner {
     /* maxmemory: this owner's zmalloc counter when the period (one main sleep) began. */
     size_t mm_base;
     unsigned long long mm_period;
+    /* Memory leases: OWN_MM_READ for each read queued in this window's read batch and not run yet
+     * (ownerMmFits counts it as used). 0 outside a batch. */
+    size_t mm_resv;
+    int mm_roomy; /* this window: no maxmemory, or a lease with OWN_MM_LEASE_ROOM to spare (batch, SET bursts) */
+    long long mm_lease_windows, mm_exact_windows; /* windows under maxmemory: batched in the lease, or exact */
     /* Totals for INFO, never cleared. */
     long long native_total, handoffs_total, adopted_total, windows_total;
     long long held_total, mm_refused_total;
@@ -317,6 +345,7 @@ static int own_mm = 0;                    /* maxmemory: native steps check their
 static long long own_mm_slice = 0;        /* bytes each owner may add this period */
 static unsigned long long own_mm_period = 0;
 static _Atomic int own_mm_over = 0;       /* an owner went over its slice: every owner sends work to main */
+static int own_mm_lease = 0;              /* maxmemory and owner-mm-lease: batched reads and SET bursts in the lease */
 static long long own_aof_ops = 0;         /* main: ops folded into the AOF */
 /* GET bursts (ownerGetBurst): the command a "GET"/"get" frame resolves to, when that is getCommand under
  * its own name (rename-command can move it); NULL turns bursts off. The shared name objects stand in
@@ -798,6 +827,7 @@ static void ownerReleaseHeld(void) {
  * again. Used memory is read now, with the owners stopped; each owner measures what it adds. */
 static void ownerMmPlan(void) {
     own_mm = server.maxmemory != 0;
+    own_mm_lease = own_mm && server.owner_mm_lease;
     if (!own_mm) return;
     own_mm_slice = ownerMmHeadroom() / own_n;
     own_mm_period++;
@@ -1557,7 +1587,8 @@ static void ownerWriteDone(owner *o, client *c, ssize_t res, size_t len) {
 
 /* io_uring in this window (D3-all-g9-fold): the ring is up, owner-uring is on, and appendonly is off
  * unless owner-uring-aof yes. Under appendonly the owners read and write as D3-all-g7-rwchild did (the
- * K13 SET tail); under maxmemory only the reads stay unbatched (ownerThreadMain). own_aof changes only
+ * K13 SET tail); under maxmemory the reads are batched only inside a memory lease with room
+ * (ownerThreadMain). own_aof changes only
  * while the owners are stopped, so one window sees one answer. */
 static inline int ownerUringOn(owner *o) {
     return o->uring && server.owner_uring && (!own_aof || server.owner_uring_aof);
@@ -1782,18 +1813,20 @@ static long long ownerMmGrowth(owner *o) {
     return (long long)(now - o->mm_base);
 }
 
-/* Whether a step that may add `need` bytes fits this owner's slice. */
+/* Whether a step that may add `need` bytes fits this owner's slice, with the reads its batch still
+ * has queued counted as their OWN_MM_READ each (o->mm_resv). */
 static int ownerMmFits(owner *o, size_t need) {
     if (atomic_load_explicit(&own_mm_over, memory_order_relaxed)) return 0;
     long long g = ownerMmGrowth(o);
-    return g != LLONG_MAX && g + (long long)need <= own_mm_slice;
+    return g != LLONG_MAX && g + (long long)need + (long long)o->mm_resv <= own_mm_slice;
 }
 
 /* Owner: after a read and its parse, which can allocate more than any bound before it (a big
- * argument's buffer). Over the slice: every owner sends its work to main until main has looked. */
+ * argument's buffer). Over the slice (the batch's queued reads counted): every owner sends its work
+ * to main until main has looked. */
 static void ownerMmAfterRead(owner *o) {
     long long g = ownerMmGrowth(o);
-    if (g == LLONG_MAX || g > own_mm_slice) {
+    if (g == LLONG_MAX || g + (long long)o->mm_resv > own_mm_slice) {
         atomic_store_explicit(&own_mm_over, 1, memory_order_relaxed);
         o->wake_main = 1;
     }
@@ -1860,6 +1893,17 @@ static int ownerMmCmdFits(owner *o, client *c, int kind) {
         b += ownerMmExecBound(o, c);
     else
         b += ownerReplyValuesLen(c, c->parsed_cmd, c->argv, c->argc, c->slot);
+    return ownerMmFits(o, b);
+}
+
+/* Memory leases: whether the next SET of a SET burst fits, bounded as ownerMmCmdFits bounds that SET on
+ * the parser's path (argv_len = its three arguments' bytes; a plain SET's reply holds no stored value),
+ * plus the slow commandlog entries of the burst's SETs so far and this one, which ownerSetBurstEnd makes
+ * after the last of them. */
+static int ownerMmSetBurstFits(owner *o, size_t argv_len, int ran) {
+    size_t b = OWN_MM_CMD + 2 * argv_len + 64 * 3 + 2 * ownerArraysBytes(o) + (size_t)(ran + 1) * OWN_MM_SETBURST_LOG;
+    if (server.latency_tracking_enabled && !o->cs[OWN_SET].hist) b += OWN_MM_HISTOGRAM;
+    if (own_aof) b += 4 * (argv_len + 32 * 3 + 64);
     return ownerMmFits(o, b);
 }
 
@@ -2588,7 +2632,9 @@ static int ownerBurstReady(client *c) {
 #ifdef LOG_REQ_RES
     return 0; /* the request/response log records each reply's offset */
 #endif
-    if (!own_burst_cmd || own_mm || (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL)) return 0;
+    if (!own_burst_cmd || (own_mm && !own_self->mm_roomy) ||
+        (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL))
+        return 0;
     if (c->argc || c->multibulklen || c->cmd_queue.len || c->reqtype == PROTO_REQ_INLINE || c->original_argv)
         return 0;
     if (c->read_flags & (READ_FLAGS_AUTH_REQUIRED | READ_FLAGS_REPLICATED)) return 0;
@@ -2790,6 +2836,9 @@ static void ownerBurstEnd(owner *o, client *c, int n, monotime start, const owne
 /* Owner, after a read (ownerBurstReady): answer the GET frames at the start of the unparsed input, up to
  * OWN_BURST_MAX, and step the parser position past them. Returns how many it answered. */
 static int ownerGetBurst(owner *o, client *c) {
+    /* shortcut: none under maxmemory (a burst's replies are not bounded against the lease; as the GET
+     * runs, ownerTryNative). Upgrade: check each reply's value length against the lease first. */
+    if (own_mm) return 0;
     long long req_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
     long long reply_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
     size_t key_max = OWN_BURST_KEY_MAX;
@@ -2889,7 +2938,8 @@ static int ownerGetBurst(owner *o, client *c) {
  * no per-command reset: one run's accounting per burst (ownerSetBurstEnd, as ownerBurstEnd).
  * A burst takes only what ownerNativeKind would run as OWN_SET with no veto of any kind (ownerBurstReady
  * and ownerSetBurstReady: no MULTI, no reply mode, an unrestricted user, no notifications, tracking,
- * replicas, modules, maxmemory, disk error) and ends before the first frame it cannot run: another
+ * replicas, modules, disk error; under maxmemory only in a window whose memory lease has room, each SET
+ * checked against the lease before it allocates) and ends before the first frame it cannot run: another
  * command or a SET with options, a key over OWN_BURST_KEY_MAX bytes, a value over OWN_SETBURST_VAL_MAX,
  * another owner's key, a value the parser would not prebuild (an integer, too long to embed), a request
  * the large-request commandlog records, an expired key (lookupKeyWrite's lazy delete propagates). The
@@ -3087,6 +3137,9 @@ static int ownerSetBurst(owner *o, client *c) {
     monotime start = ownerBurstBegin(c);
     for (int k = 0; k < n; k++) {
         ownerSetEntry *e = &ents[k];
+        /* Under maxmemory (a memory lease with room): this SET must fit as on the parser's path, before it
+         * allocates; else the burst ends here and the parser's path sends it to main (ownerNativeKind). */
+        if (own_mm && !ownerMmSetBurstFits(o, 3 + (size_t)e->key.len + e->val_len, ran)) break;
         /* The parser's value for this frame: built only when it would build it (else setCommand runs it). */
         robj *val = tryCreatePrebuiltStringEntry(qb + e->val_off, e->val_len, e->key.buf);
         if (!val) break;
@@ -3307,6 +3360,12 @@ static int ownerReadBatch(owner *o, int m) {
     for (int j = 0; j < m; j++) {
         ownerUringOp *op = &ops[j];
         client *c = op->c;
+        /* Memory leases: this read's reservation ends as its bytes go into its query buffer and parse;
+         * what they really add is measured from here (ownerMmAfterRead after the parse). */
+        if (own_mm) {
+            serverAssert(o->mm_resv >= OWN_MM_READ);
+            o->mm_resv -= OWN_MM_READ;
+        }
         if (op->res > 0) {
             c->nread = op->res;
             size_t readlen = op->len;
@@ -3395,11 +3454,19 @@ static void *ownerThreadMain(void *arg) {
         /* owner-uring: the readable clients' reads are batched, OWN_URING_BATCH per io_uring_enter, and
          * run in event order once the batch has read; the replies follow in batches too. Main stopping
          * the world ends the window after the batch in hand (its bytes are read: they run now).
-         * shortcut: not under maxmemory, where every read checks the headroom left after the commands
-         * before it ran (a batch would check its reads before those commands). Upgrade: reserve
-         * OWN_MM_READ per queued read in the command checks too. Not under appendonly either, unless
-         * owner-uring-aof yes (ownerUringOn). */
-        int batch = ownerUringOn(o) && !own_mm;
+         * Under maxmemory only inside a memory lease with OWN_MM_LEASE_ROOM to spare (owner-mm-lease,
+         * D3-all-g11-maxmem): each queued read reserves OWN_MM_READ (o->mm_resv) until its turn, and every
+         * headroom check counts the reservations, so a read still finds the room the unbatched path checks
+         * for right before it; with less room the reads go one at a time (g10's exact path). Not under
+         * appendonly either, unless owner-uring-aof yes (ownerUringOn). */
+        o->mm_roomy = !own_mm || (own_mm_lease && ownerMmFits(o, OWN_MM_LEASE_ROOM));
+        if (own_mm) {
+            if (o->mm_roomy)
+                o->mm_lease_windows++;
+            else
+                o->mm_exact_windows++;
+        }
+        int batch = ownerUringOn(o) && o->mm_roomy;
         int m = 0, stop = 0;
         for (int k = 0; k < n && !stop; k++) {
             uint64_t d = evs[k].data.u64;
@@ -3425,6 +3492,7 @@ static void *ownerThreadMain(void *arg) {
                     if (r != OWN_READ_GO) {
                         handed |= r;
                     } else if (ownerReadQueue(o, c, m)) {
+                        if (own_mm) o->mm_resv += OWN_MM_READ; /* the lease's room for it, until its turn */
                         if (++m == OWN_URING_BATCH) {
                             handed |= ownerReadBatch(o, m);
                             m = 0;
@@ -3439,6 +3507,7 @@ static void *ownerThreadMain(void *arg) {
             if (atomic_load_explicit(&own_stop, memory_order_relaxed)) stop = 1;
         }
         if (m) handed |= ownerReadBatch(o, m);
+        serverAssert(o->mm_resv == 0); /* every queued read ran, and gave its reservation back */
         /* This window's AOF records: written here (everysec, no), unless main is stopping the world,
          * which folds them first thing and writes them with its own. */
         if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
@@ -3578,6 +3647,7 @@ int ownerClusterCommand(client *c) {
 
 void ownerInfo(sds *info) {
     long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
+    long long mm_lease_w = 0, mm_exact_w = 0;
     long long burst = 0, bursts = 0, setburst = 0, setbursts = 0;
     long long u_enters = 0, u_reads = 0, u_writes = 0, u_short = 0, u_redo = 0;
     long long r_replies = 0, r_bytes = 0, r_writes = 0, r_copied = 0, r_copied_bytes = 0;
@@ -3593,6 +3663,8 @@ void ownerInfo(sds *info) {
         windows += owners[i].windows_total;
         held += owners[i].held_total;
         mm_refused += owners[i].mm_refused_total;
+        mm_lease_w += owners[i].mm_lease_windows;
+        mm_exact_w += owners[i].mm_exact_windows;
         resident += owners[i].nclients;
         u_enters += owners[i].uring_enters;
         u_reads += owners[i].uring_reads;
@@ -3619,6 +3691,12 @@ void ownerInfo(sds *info) {
                          "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
                          "owner_maxmemory_to_main:%lld\r\n",
                          own_aof_ops, own_aof_drains, held, mm_refused);
+    /* D3-all-g11-maxmem: memory leases. owner_mm_lease_bytes = each owner's lease this period (0: no
+     * maxmemory); windows under maxmemory that batched inside the lease, or took the exact path. */
+    *info = sdscatprintf(*info,
+                         "owner_mm_lease:%s\r\nowner_mm_lease_bytes:%lld\r\nowner_mm_lease_windows:%lld\r\n"
+                         "owner_mm_exact_windows:%lld\r\n",
+                         server.owner_mm_lease ? "yes" : "no", own_mm ? own_mm_slice : 0LL, mm_lease_w, mm_exact_w);
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
     *info = sdscatprintf(*info, "owner_set_burst:%s\r\nowner_setburst_commands:%lld\r\nowner_setbursts:%lld\r\n",
                          server.owner_set_burst && own_setburst_cmd ? "yes" : "no", setburst, setbursts);
@@ -3630,7 +3708,7 @@ void ownerInfo(sds *info) {
     /* D3-all-g9-fold: whether the owners batch now (ownerUringOn): yes, or why not. */
     const char *batching = !server.owner_uring || !u_on                  ? "off"
                            : own_aof && !server.owner_uring_aof         ? "aof"
-                           : own_mm                                     ? "maxmemory"
+                           : own_mm && !own_mm_lease                    ? "maxmemory"
                                                                         : "yes";
     *info = sdscatprintf(*info, "owner_uring_batching:%s\r\nowner_uring_deep:%d\r\nowner_uring_aof:%s\r\n", batching,
                          server.owner_uring_deep, server.owner_uring_aof ? "yes" : "no");
