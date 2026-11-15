@@ -1189,6 +1189,29 @@ proc read_compact_varint {fp} {
     }
 }
 
+proc aof_is_compact {path} {
+    set fp [open $path r]
+    fconfigure $fp -translation binary
+    set m [read $fp 8]
+    close $fp
+    return [expr {$m eq $::aofc_magic}]
+}
+
+# The text of a compact incr file's first record if it is an annotation, else "".
+proc compact_aof_first_annotation {path} {
+    set fp [open $path r]
+    fconfigure $fp -translation binary
+    read $fp 8
+    set b [read $fp 1]
+    set t ""
+    if {$b ne ""} {
+        binary scan $b cu op
+        if {$op == 4} {set t [read $fp [read_compact_varint $fp]]}
+    }
+    close $fp
+    return $t
+}
+
 proc read_from_compact_aof {fp} {
     while 1 {
         set b [read $fp 1]

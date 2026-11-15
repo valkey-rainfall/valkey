@@ -187,8 +187,8 @@ class AofFile:
             with open(self.path, "rb") as f:
                 f.seek(len(self.data))
                 self.data += f.read()
-            if aofcompact.is_compact(self.data):  # D3-all-g11-binaof: the same records, compact
-                pat = aofcompact.resp_to_compact(pat)
+            if aofcompact.is_compact(self.data):  # D3-all-g11-binaof: count in the records decoded to RESP
+                return aofcompact.to_resp(bytes(self.data)).count(pat)
             cnt, upto = self.seen.get(pat, (0, 0))
             # matches ending past `upto` are the new ones; records never overlap
             cnt += bytes(self.data[max(0, upto - len(pat) + 1):]).count(pat)

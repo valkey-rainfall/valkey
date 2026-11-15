@@ -175,6 +175,26 @@ def resp_to_compact(resp):
     return b"".join(encode(r) for r in recs)
 
 
+def resp_encode(args):
+    return b"*%d\r\n" % len(args) + b"".join(b"$%d\r\n%s\r\n" % (len(a), a) for a in args)
+
+
+def to_resp(data, partial=True):
+    """A compact incr file's whole records (and annotations) as the RESP bytes a RESP file would hold, so a
+    checker's RESP byte patterns can search it. partial: drop a truncated last record (a file being written)."""
+    out, i = [], len(MAGIC)
+    while i < len(data):
+        try:
+            kind, p, j = decode_one(data, i)
+        except Truncated:
+            if partial:
+                break
+            raise
+        out.append(b"#" + p + b"\r\n" if kind == "ann" else resp_encode(p))
+        i = j
+    return b"".join(out)
+
+
 def manifest_incr(dirpath):
     """[(file name, 'compact'|'resp')] of the incr files in the AOF dir's manifest, in order."""
     import os

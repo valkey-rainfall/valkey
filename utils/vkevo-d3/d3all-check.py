@@ -116,6 +116,8 @@ def aof_checks():
     af = AofFile(srv)
     af.count(b"x")
     data = af.data
+    if veto.aofcompact.is_compact(data):  # D3-all-g11-binaof: search the records decoded to RESP
+        data = veto.aofcompact.to_resp(bytes(data))
     bad = []
     for path, recs, want in shapes:
         found, wrapped = wrap_shape(data, recs)

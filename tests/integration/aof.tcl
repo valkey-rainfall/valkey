@@ -397,7 +397,12 @@ tags {"aof external:skip logreqres:skip"} {
             set aof [get_last_incr_aof_path r]
 
             r set foo bar
-            assert_match "#TS:*" [exec head -n 1 $aof]
+            # vkevo D3-all-g11-binaof: a compact incr file holds the annotation as a record (its text)
+            if {[aof_is_compact $aof]} {
+                assert_match "TS:*" [compact_aof_first_annotation $aof]
+            } else {
+                assert_match "#TS:*" [exec head -n 1 $aof]
+            }
 
             r bgrewriteaof
             waitForBgrewriteaof r
