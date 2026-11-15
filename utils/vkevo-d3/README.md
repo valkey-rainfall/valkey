@@ -98,6 +98,17 @@ Engine change in `src/owner.c` (hooks in networking.c, server.c, db.c, cluster.c
   the rest; replies go out through the batch's sends or the write path. `INFO owners`:
   `owner_uring_batching` (`yes`, or why not: `off`, `aof`, `maxmemory`), `owner_uring_deep`,
   `owner_uring_aof`.
+- D3-all-g11-bigreply: an owner sends a GET value of `owner-bigreply-min` bytes or more (hidden, default
+  2048, 0 = copy every value) from where it is stored instead of copying it into the reply, as D0's fast
+  reads do for values over 1 KB (fastget.c `fastGetWriteBulkReply`, fastpath.c `fpSend`): `c->buf` gets
+  the `$<len>\r\n` and `\r\n`, the client a counted reference to the object, and the write is one
+  writev of `c->buf` cut around the values. The owner drops the references in the window that took them:
+  once written, or after copying what the socket did not take into a reply block, which also happens
+  before replies wait for the AOF, before a handoff to main and for any client still holding references
+  at the end of the window. Main never sees a reference. GET bursts and GET rings use it; MGET, getCommand
+  and maxmemory (no bursts or rings) copy as before. At K7 (4 KB, P10) on loopback W=8 the owners' user
+  cycles per GET fell from ~2,550 to ~1,180 (the memcpy and the reply blocks). `INFO owners`:
+  `owner_bigreply_min`, `owner_ref_replies|bytes|writes`, `owner_ref_copied|copied_bytes`.
 - `CLUSTER SLOTS|SHARDS|NODES|INFO|MYID|KEYSLOT` on such a server announce the
   owners as cluster nodes (IP = `owner-announce-ip`, else the address the client connected to).
   D3 never answers MOVED or CROSSSLOT. Port 6379 stays the stock main path.
@@ -168,6 +179,16 @@ Files here:
   Suites where no SET burst may run (owner_setburst_commands +0, same replies and keyspace):
   maxmemory, notify-keyspace-events (same event bytes), a replica attached (same DEBUG DIGEST),
   rename-command set, owner-set-burst no.
+- `d3-bigreply-check.py` (D3-all-g11-bigreply): GET values sent by reference against the parent's copies
+  (`--ref-bin`), both servers started here on loopback: values of 0 B-3 MB around every threshold in one
+  write, split reads and single GETs; owner-bigreply-min changed at run time; 300 GETs per read; SET, DEL,
+  APPEND, SETRANGE, EXPIRE, GETDEL right after a GET in the same pipeline; MGET spills; handoffs; RESP3,
+  CLIENT REPLY, MULTI, commandlog, ACL; a 4 KB receive buffer with the keys overwritten before the
+  replies are read; RST mid-reply; reply bytes, hits/misses, cmdstat_get and total_net_output_bytes
+  equal; OBJECT REFCOUNT 1 and DEBUG DIGEST equal at the end; then (tree only) 8 readers and 4 writers
+  on the same keys (every value whole) and a 4 KB cachecannon load (used_memory back after FLUSHALL).
+  Suites plain, AOF everysec and always (replies that wait for the AOF), maxmemory (no references).
+
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):
 

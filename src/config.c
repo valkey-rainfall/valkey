@@ -3569,6 +3569,7 @@ standardConfig static_configs[] = {
     createBoolConfig("owner-uring", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_uring, 1, NULL, NULL),
     createBoolConfig("owner-uring-aof", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_uring_aof, 0, NULL, NULL), /* vkevo g9-fold: owners batch under appendonly too */
     createBoolConfig("owner-set-burst", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_set_burst, 1, NULL, NULL), /* vkevo g10-setburst: plain SET frames answered off the query buffer */
+    createIntConfig("owner-bigreply-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_bigreply_min, 2048, INTEGER_CONFIG, NULL, NULL), /* vkevo g11-bigreply: 0 = copy every value */
     createIntConfig("owner-uring-deep", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_uring_deep, 0, INTEGER_CONFIG, NULL, NULL), /* vkevo g9-fold: 0 = batch deep pipelines too */
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),

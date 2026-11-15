@@ -502,6 +502,9 @@ client *createClient(connection *conn) {
     c->owner_deep = 0;
     c->owner_held = 0;
     c->owner_guest_node = NULL;
+    c->owner_refs = NULL;
+    c->owner_nrefs = c->owner_refs_cap = c->owner_refc_at = 0;
+    c->owner_ref_bytes = 0;
     return c;
 }
 
@@ -2506,6 +2509,10 @@ int freeClient(client *c) {
     /* An owner thread's client comes back to main first; owners are stopped while main runs. */
     if (c->owner_tid != OWNER_ON_MAIN) ownerReclaim(c);
     if (c->owner_guest_node) ownerClientFreed(c);
+    /* Value references never outlive the owner window that made them (owner.c ownerRefsSettle). */
+    serverAssert(c->owner_nrefs == 0 && c->owner_refc_at == 0);
+    zfree(c->owner_refs);
+    c->owner_refs = NULL;
 
     /* repl-stream-sender: ensure the sender thread holds no reference to this client
      * before we free it. Takes the sender mutex, so after this returns the sender has

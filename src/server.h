@@ -1656,6 +1656,12 @@ typedef struct client {
     unsigned owner_deep : 1;     /* Its last owner read had owner-uring-deep commands or more: not batched (owner.c). */
     int owner_held;              /* Its replies wait for the AOF: index + 1 in its owner's held list, else 0. */
     listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
+    /* D3-all-g11-bigreply: values its owner sends from where they are stored, cut into c->buf (owner.c
+     * ownerRefAdd). Only inside its owner's window: written or copied out before the window ends. */
+    struct ownerRef *owner_refs;
+    int owner_nrefs, owner_refs_cap;
+    int owner_refc_at;      /* index + 1 in its owner's list of clients with references, else 0 */
+    size_t owner_ref_bytes; /* the referenced values' bytes */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -2155,6 +2161,7 @@ struct valkeyServer {
     int owner_uring_deep;                     /* owner-uring-deep: a client whose last read had this many commands skips the batch (0: none). */
     int owner_uring_aof;                      /* owner-uring-aof: owners batch under appendonly too (default no: the syscall path). */
     int owner_set_burst;                      /* owner-set-burst: owners answer plain SET frames off the query buffer (default yes). */
+    int owner_bigreply_min;                   /* owner-bigreply-min: owners send GET values of this many bytes or more from where they are (default 2048; 0: copy all). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */

@@ -186,6 +186,20 @@ typedef struct ownerUringOp {
     int res;     /* the CQE's result */
 } ownerUringOp;
 
+/* D3-all-g11-bigreply: a GET value an owner sends from where it is stored instead of copying it into the
+ * reply (ownerRefAdd). Its bytes go out at offset `at` of c->buf, between the "$<len>\r\n" before it and the
+ * "\r\n" after it, which are in c->buf. The reference holds the object (refcount); the owner drops it in
+ * the window that took it, once the bytes are written or copied into a reply block (ownerRefsMaterialize). */
+typedef struct ownerRef {
+    robj *o;
+    const char *s; /* the value's bytes, as they were when the reference was taken */
+    uint32_t len;
+    uint32_t at;
+} ownerRef;
+#define OWN_REF_FLOOR 64 /* a cheap first test; owner-bigreply-min decides */
+#define OWN_REF_MAX 256                 /* references per client and window; more values are copied */
+#define OWN_REF_BYTES_MAX (1024 * 1024) /* referenced bytes per client and window; more are copied */
+
 typedef struct owner {
     _Atomic int active; /* inside a window: written by the owner, read by main */
     char pad0[CACHE_LINE_SIZE - sizeof(int)];
@@ -249,6 +263,11 @@ typedef struct owner {
     int nwq, wq_cap;
     long long uring_enters, uring_reads, uring_writes; /* INFO, never cleared */
     long long uring_short, uring_redo; /* sends that moved less than asked; ops redone by the syscall path */
+    /* D3-all-g11-bigreply: the clients whose replies hold value references (ownerRefAdd), none outside a
+     * window; and INFO totals, never cleared. */
+    client **refc;
+    int nrefc, refc_cap;
+    long long ref_replies, ref_bytes, ref_writes, ref_copied, ref_copied_bytes;
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -1144,9 +1163,12 @@ static inline uint64_t ownerTag(client *c) {
 }
 
 static int ownerWrite(owner *o, client *c);
+static void ownerRefsMaterialize(owner *o, client *c, size_t skip);
 
 /* Owner, in a window: leave a client to main. It is off this owner's loop when this returns. */
 static int ownerHandOff(owner *o, client *c, int why) {
+    /* Main gets plain reply bytes: no reference leaves the owner (ownerRefAdd). */
+    if (c->owner_nrefs) ownerRefsMaterialize(o, c, 0);
     int fd = c->conn->fd;
     epoll_ctl(o->epfd, EPOLL_CTL_DEL, fd, NULL);
     if (fd < o->fdmap_cap && o->fdmap[fd] == c) o->fdmap[fd] = NULL;
@@ -1221,8 +1243,215 @@ static void ownerSetWantOut(owner *o, client *c, int on) {
     c->owner_wantout = on;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * Large GET values sent from where they are stored (D3-all-g11-bigreply)
+ *
+ * A GET reply copied each value into c->buf, then into reply blocks once the 16 KB buffer was full: a
+ * 4 KB value cost a user-space copy (memcpy, from a cold value) plus a block allocation every few
+ * replies, before the kernel copied it again into the socket. As D0's fast reads (fastget.c
+ * fastGetWriteBulkReply, fastpath.c fpSend), a value of owner-bigreply-min bytes or more (default 2048) is
+ * now sent from the object: c->buf gets its "$<len>\r\n" and "\r\n", the client a reference, and the write is
+ * one writev of c->buf cut around the values. D0 needs no reference count because main changes no value
+ * during its read phase; on an owner, later commands of the same window may overwrite or delete the
+ * key, so the reference holds the object (incrRefCount: a shared value is copied before any change, as
+ * for any value with a second reference). Every reference count change is the owner's own, inside its
+ * window: the owner drops the references once the bytes are written, and copies what the socket did
+ * not take into a reply block (ownerRefsMaterialize). That copy also runs before a client's replies
+ * wait for the AOF (ownerHold), before it goes to main (ownerHandOff), and for any client still holding
+ * references when the window ends (ownerRefsSettle). So main, which only touches owner clients and
+ * values with the owners stopped, never sees a reference, and a reply's bytes and order are those of
+ * the copying path.
+ * Why 2048 and not D0's 1024: on loopback at W=8, GET P10 with every value sent by reference ran -17% at
+ * 256 B, -9% at 1 KB, -8% at 1.5 KB, +2% at 2 KB, +12% at 3 KB and +24% at 4 KB against copying: a
+ * reference adds iovec segments and the kernel copies the value cold, which costs more than the user
+ * copy saves below ~2 KB.
+ * ---------------------------------------------------------------------------------------------- */
+
+/* Drop the client's references (its reply no longer needs them). */
+static void ownerRefsRelease(owner *o, client *c) {
+    for (int i = 0; i < c->owner_nrefs; i++) decrRefCount(c->owner_refs[i].o);
+    c->owner_nrefs = 0;
+    c->owner_ref_bytes = 0;
+    if (c->owner_refc_at) {
+        int k = c->owner_refc_at - 1;
+        serverAssert(k < o->nrefc && o->refc[k] == c);
+        client *last = o->refc[--o->nrefc];
+        o->refc[k] = last;
+        last->owner_refc_at = k + 1;
+        c->owner_refc_at = 0;
+    }
+}
+
+/* The client's reply with its references is c->buf with each value's bytes at its offset: the
+ * part from byte skip on (the bytes before went out) becomes one plain reply block at the head of
+ * the reply list, before what spilled there after the references; c->buf is then empty and the
+ * references are dropped. The next write starts at that block. */
+static void ownerRefsMaterialize(owner *o, client *c, size_t skip) {
+    size_t total = (size_t)c->bufpos + c->owner_ref_bytes;
+    serverAssert(skip <= total && c->io_last_written.data_len == 0);
+    size_t rem = total - skip;
+    if (rem) {
+        size_t usable, size = rem < PROTO_REPLY_CHUNK_BYTES ? PROTO_REPLY_CHUNK_BYTES : rem;
+        clientReplyBlock *b = zmalloc_usable(size + sizeof(clientReplyBlock), &usable);
+        b->size = usable - sizeof(clientReplyBlock);
+        b->used = 0;
+        b->flag.buf_encoded = 0;
+        b->last_header = NULL;
+        size_t pos = 0, prev = 0; /* pos: offset in the reply; prev: in c->buf */
+        for (int i = 0; i <= c->owner_nrefs; i++) {
+            const char *seg[2];
+            size_t segl[2];
+            int ns = 0;
+            size_t at = i < c->owner_nrefs ? c->owner_refs[i].at : (size_t)c->bufpos;
+            seg[ns] = c->buf + prev, segl[ns++] = at - prev;
+            if (i < c->owner_nrefs) seg[ns] = c->owner_refs[i].s, segl[ns++] = c->owner_refs[i].len;
+            prev = at;
+            for (int j = 0; j < ns; j++) {
+                size_t l = segl[j], from = 0;
+                if (pos + l <= skip) {
+                    pos += l;
+                    continue;
+                }
+                if (pos < skip) from = skip - pos;
+                memcpy(b->buf + b->used, seg[j] + from, l - from);
+                b->used += l - from;
+                pos += l;
+            }
+        }
+        serverAssert(b->used == rem);
+        listAddNodeHead(c->reply, b);
+        c->reply_bytes += b->size;
+    }
+    ownerRefsRelease(o, c);
+    c->bufpos = 0;
+    c->flag.buf_encoded = 0;
+    c->last_header = NULL;
+    resetLastWrittenBuf(c);
+    o->ref_copied++;
+    o->ref_copied_bytes += rem;
+    if (rem) closeClientOnOutputBufferLimitReached(c, 1);
+}
+
+/* Reply to a GET with the bulk string of val (s, len: its bytes) by reference: the header and the trailing
+ * CRLF into c->buf, the value's bytes left where they are. Returns 0, having done nothing, when the
+ * value is copied as before: below owner-bigreply-min, not an sds string, a reply already in the
+ * reply list or partly written, a reply mode other than the plain one, or no room. */
+static int ownerRefAdd(client *c, robj *val, const char *s, size_t len) {
+    owner *o = own_self;
+    int min = server.owner_bigreply_min;
+    if (min <= 0 || len < (size_t)min || len > UINT32_MAX || !sdsEncodedObject(val)) return 0;
+    if (objectGetRefcount(val) >= OBJ_FIRST_SPECIAL_REFCOUNT) return 0;
+    if (c->owner_nrefs >= OWN_REF_MAX || c->owner_ref_bytes + len > OWN_REF_BYTES_MAX) return 0;
+    if (listLength(c->reply) || server.debug_client_enforce_reply_list || c->flag.close_after_reply ||
+        c->flag.pushing || isDeferredReplyEnabled(c) || c->conn == NULL || c->conn->type != connectionTypeTcp())
+        return 0;
+    /* A write that left part of c->buf: the reply goes on as bytes until it is out. */
+    if (c->io_last_written.buf || c->io_last_written.data_len) return 0;
+    if (!c->bufpos)
+        c->flag.buf_encoded = 0; /* as _addReplyToBuffer starts a buffer for an owner client */
+    else if (c->flag.buf_encoded)
+        return 0;
+    char hdr[LONG_STR_SIZE + 3];
+    hdr[0] = '$';
+    size_t hl = 1 + (size_t)ll2string(hdr + 1, LONG_STR_SIZE, (long long)len);
+    hdr[hl++] = '\r';
+    hdr[hl++] = '\n';
+    if (c->buf_usable_size - (size_t)c->bufpos < hl + 2) return 0;
+    if (c->owner_nrefs == c->owner_refs_cap) {
+        c->owner_refs_cap = c->owner_refs_cap ? c->owner_refs_cap * 2 : 16;
+        c->owner_refs = zrealloc(c->owner_refs, sizeof(ownerRef) * c->owner_refs_cap);
+    }
+    if (!c->owner_nrefs) {
+        if (o->nrefc == o->refc_cap) {
+            o->refc_cap = o->refc_cap ? o->refc_cap * 2 : 64;
+            o->refc = zrealloc(o->refc, sizeof(client *) * o->refc_cap);
+        }
+        o->refc[o->nrefc++] = c;
+        c->owner_refc_at = o->nrefc;
+    }
+    memcpy(c->buf + c->bufpos, hdr, hl);
+    c->bufpos += hl;
+    incrRefCount(val);
+    c->owner_refs[c->owner_nrefs++] = (ownerRef){.o = val, .s = s, .len = (uint32_t)len, .at = (uint32_t)c->bufpos};
+    c->owner_ref_bytes += len;
+    memcpy(c->buf + c->bufpos, "\r\n", 2);
+    c->bufpos += 2;
+    if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
+    c->flag.buffered_reply = 1; /* as prepareClientToWrite for an owner client */
+    c->net_output_bytes_curr_cmd += hl + len + 2;
+    o->ref_replies++;
+    o->ref_bytes += len;
+    return 1;
+}
+
+/* ownerWriteOnce for a client whose reply holds references, all of it in c->buf (nothing in the reply
+ * list): writev of c->buf cut around the values, in reply order, until it is out or the socket is
+ * full; what is left is copied into a reply block, so no reference outlives this call. */
+static void ownerRefsWrite(owner *o, client *c) {
+    struct iovec iov[2 * OWN_REF_MAX + 1];
+    int n = 0;
+    size_t prev = 0;
+    for (int i = 0; i < c->owner_nrefs; i++) {
+        ownerRef *r = &c->owner_refs[i];
+        if (r->at > prev) iov[n++] = (struct iovec){.iov_base = c->buf + prev, .iov_len = r->at - prev};
+        iov[n++] = (struct iovec){.iov_base = (void *)r->s, .iov_len = r->len};
+        prev = r->at;
+    }
+    if ((size_t)c->bufpos > prev) iov[n++] = (struct iovec){.iov_base = c->buf + prev, .iov_len = (size_t)c->bufpos - prev};
+    size_t total = (size_t)c->bufpos + c->owner_ref_bytes, sent = 0;
+    c->write_flags = 0;
+    for (int k = 0; k < n;) {
+        int w = connWritev(c->conn, iov + k, n - k);
+        if (w <= 0) {
+            c->write_flags |= WRITE_FLAGS_WRITE_ERROR;
+            break;
+        }
+        sent += (size_t)w;
+        size_t left = (size_t)w;
+        while (k < n && left >= iov[k].iov_len) left -= iov[k++].iov_len;
+        if (k < n && left) {
+            iov[k].iov_base = (char *)iov[k].iov_base + left;
+            iov[k].iov_len -= left;
+        }
+    }
+    c->nwritten = (ssize_t)sent;
+    o->writes++;
+    o->ref_writes++;
+    if (sent == total) {
+        ownerRefsRelease(o, c);
+        c->bufpos = 0;
+        c->last_header = NULL;
+        resetLastWrittenBuf(c);
+    } else {
+        ownerRefsMaterialize(o, c, sent);
+    }
+    if (sent > 0) {
+        ownerCountNetOut((long long)sent);
+        c->net_output_bytes += sent;
+        c->last_interaction = server.unixtime;
+    }
+}
+
+/* Owner, at the end of its window: the clients that still hold references (replies waiting for the AOF,
+ * or not written in this window) get their replies copied out; those not waiting write them on their
+ * next writable event. */
+static void ownerRefsSettle(owner *o) {
+    while (o->nrefc) {
+        client *c = o->refc[o->nrefc - 1];
+        ownerRefsMaterialize(o, c, 0);
+        if (!c->owner_held && c->owner_onloop) ownerSetWantOut(o, c, 1);
+    }
+}
+
 /* Write what the client has, as an IO thread would (the snapshot below stands for main's). */
 static void ownerWriteOnce(owner *o, client *c) {
+    if (c->owner_nrefs) {
+        if (!listLength(c->reply)) {
+            ownerRefsWrite(o, c);
+            return;
+        }
+        ownerRefsMaterialize(o, c, 0); /* replies spilled into the list after the references */
+    }
     c->io_last_reply_block = listLast(c->reply);
     if (c->io_last_reply_block)
         c->io_last_bufpos = ((clientReplyBlock *)listNodeValue(c->io_last_reply_block))->used;
@@ -1295,7 +1524,7 @@ static void ownerUringRun(owner *o, int n) {
 /* The reply bytes a write of c would send, when they are all plain bytes in c->buf (no reply blocks,
  * no references to values): what _writeToClient's connWrite branch sends. 0 otherwise. */
 static int ownerPlainSpan(client *c, char **buf, size_t *len) {
-    if (listLength(c->reply) || c->flag.buf_encoded || c->bufpos <= 0) return 0;
+    if (c->owner_nrefs || listLength(c->reply) || c->flag.buf_encoded || c->bufpos <= 0) return 0;
     if (c->conn->type != connectionTypeTcp()) return 0;
     serverAssert(c->io_last_written.data_len == 0 || c->io_last_written.buf == c->buf);
     if ((size_t)c->bufpos <= c->io_last_written.data_len) return 0;
@@ -1395,6 +1624,7 @@ static int ownerFlushWrites(owner *o) {
 
 /* Owner: the client's replies wait until main has written the AOF (ownerReleaseHeld). */
 static void ownerHold(owner *o, client *c) {
+    if (c->owner_nrefs) ownerRefsMaterialize(o, c, 0); /* the replies outlive the window */
     if (o->nheld == o->held_cap) {
         o->held_cap = o->held_cap ? o->held_cap * 2 : 64;
         o->held = zrealloc(o->held, sizeof(client *) * o->held_cap);
@@ -1959,6 +2189,12 @@ static int ownerGetReply(client *c, ownerRingEntry *e, long long reply_threshold
     }
     if (!c->flag.no_touch && !server.key_touch_paused) val->lru = lrulfu_touch(val->lru);
     ectx->stat_keyspace_hits++;
+    if (sdsEncodedObject(val)) {
+        size_t len = sdslen(objectGetVal(val));
+        /* A large value by reference (ownerRefAdd), when addReplyBulk would add the reply at all. */
+        if (len >= OWN_REF_FLOOR && prepareClientToWrite(c) == C_OK && ownerRefAdd(c, val, objectGetVal(val), len))
+            return 1;
+    }
     addReplyBulk(c, val);
     return 1;
 }
@@ -2460,6 +2696,7 @@ static int ownerBurstReply(client *c, ownerBurstEntry *e, long long reply_thresh
     if (reply_threshold >= 0 && (long long)(1 + digits10(len) + 2 + len + 2) >= reply_threshold) return 0;
     if (!c->flag.no_touch && !server.key_touch_paused) val->lru = lrulfu_touch(val->lru);
     ectx->stat_keyspace_hits++;
+    if (len >= OWN_REF_FLOOR && ownerRefAdd(c, val, s, len)) return 1; /* a large value: by reference */
     if (!ownerBurstRoom(c, 1 + LONG_STR_SIZE + 2 + len + 2)) {
         addReplyBulk(c, val);
         return 1;
@@ -3200,6 +3437,7 @@ static void *ownerThreadMain(void *arg) {
          * which folds them first thing and writes them with its own. */
         if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
             ownerDrainAof(o);
+        ownerRefsSettle(o); /* no value reference outlives the window */
         ownerLeave(o);
         if (handed || o->wake_main) {
             uint64_t one = 1;
@@ -3336,6 +3574,7 @@ void ownerInfo(sds *info) {
     long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
     long long burst = 0, bursts = 0, setburst = 0, setbursts = 0;
     long long u_enters = 0, u_reads = 0, u_writes = 0, u_short = 0, u_redo = 0;
+    long long r_replies = 0, r_bytes = 0, r_writes = 0, r_copied = 0, r_copied_bytes = 0;
     int resident = 0, u_on = 0;
     for (int i = 0; i < own_n; i++) {
         native += owners[i].native_total;
@@ -3355,6 +3594,11 @@ void ownerInfo(sds *info) {
         u_short += owners[i].uring_short;
         u_redo += owners[i].uring_redo;
         u_on += owners[i].uring;
+        r_replies += owners[i].ref_replies;
+        r_bytes += owners[i].ref_bytes;
+        r_writes += owners[i].ref_writes;
+        r_copied += owners[i].ref_copied;
+        r_copied_bytes += owners[i].ref_copied_bytes;
     }
     *info = sdscatprintf(*info,
                          "owner_threads:%d\r\nowner_port:%d\r\nowner_veto:%s\r\nowner_native_commands:%lld\r\n"
@@ -3384,6 +3628,12 @@ void ownerInfo(sds *info) {
                                                                         : "yes";
     *info = sdscatprintf(*info, "owner_uring_batching:%s\r\nowner_uring_deep:%d\r\nowner_uring_aof:%s\r\n", batching,
                          server.owner_uring_deep, server.owner_uring_aof ? "yes" : "no");
+    /* D3-all-g11-bigreply: GET values sent from where they are (ownerRefAdd); copied = replies whose
+     * referenced rest was copied into a reply block (socket full, AOF wait, handoff, window end). */
+    *info = sdscatprintf(*info,
+                         "owner_bigreply_min:%d\r\nowner_ref_replies:%lld\r\nowner_ref_bytes:%lld\r\n"
+                         "owner_ref_writes:%lld\r\nowner_ref_copied:%lld\r\nowner_ref_copied_bytes:%lld\r\n",
+                         server.owner_bigreply_min, r_replies, r_bytes, r_writes, r_copied, r_copied_bytes);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,
