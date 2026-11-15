@@ -196,9 +196,15 @@ typedef struct ownerRef {
     uint32_t len;
     uint32_t at;
 } ownerRef;
-#define OWN_REF_FLOOR 64 /* a cheap first test; owner-bigreply-min decides */
 #define OWN_REF_MAX 256                 /* references per client and window; more values are copied */
 #define OWN_REF_BYTES_MAX (1024 * 1024) /* referenced bytes per client and window; more are copied */
+
+/* The size test the GET paths make before they try a reference (ownerRefAdd, kept out of line so the
+ * small-value loops stay as they were). */
+static inline int ownerRefWanted(size_t len) {
+    int min = server.owner_bigreply_min;
+    return min > 0 && len >= (size_t)min;
+}
 
 typedef struct owner {
     _Atomic int active; /* inside a window: written by the owner, read by main */
@@ -1286,7 +1292,7 @@ static void ownerRefsRelease(owner *o, client *c) {
  * part from byte skip on (the bytes before went out) becomes one plain reply block at the head of
  * the reply list, before what spilled there after the references; c->buf is then empty and the
  * references are dropped. The next write starts at that block. */
-static void ownerRefsMaterialize(owner *o, client *c, size_t skip) {
+static __attribute__((noinline)) void ownerRefsMaterialize(owner *o, client *c, size_t skip) {
     size_t total = (size_t)c->bufpos + c->owner_ref_bytes;
     serverAssert(skip <= total && c->io_last_written.data_len == 0);
     size_t rem = total - skip;
@@ -1336,7 +1342,7 @@ static void ownerRefsMaterialize(owner *o, client *c, size_t skip) {
  * CRLF into c->buf, the value's bytes left where they are. Returns 0, having done nothing, when the
  * value is copied as before: below owner-bigreply-min, not an sds string, a reply already in the
  * reply list or partly written, a reply mode other than the plain one, or no room. */
-static int ownerRefAdd(client *c, robj *val, const char *s, size_t len) {
+static __attribute__((noinline)) int ownerRefAdd(client *c, robj *val, const char *s, size_t len) {
     owner *o = own_self;
     int min = server.owner_bigreply_min;
     if (min <= 0 || len < (size_t)min || len > UINT32_MAX || !sdsEncodedObject(val)) return 0;
@@ -1387,7 +1393,7 @@ static int ownerRefAdd(client *c, robj *val, const char *s, size_t len) {
 /* ownerWriteOnce for a client whose reply holds references, all of it in c->buf (nothing in the reply
  * list): writev of c->buf cut around the values, in reply order, until it is out or the socket is
  * full; what is left is copied into a reply block, so no reference outlives this call. */
-static void ownerRefsWrite(owner *o, client *c) {
+static __attribute__((noinline)) void ownerRefsWrite(owner *o, client *c) {
     struct iovec iov[2 * OWN_REF_MAX + 1];
     int n = 0;
     size_t prev = 0;
@@ -1435,7 +1441,7 @@ static void ownerRefsWrite(owner *o, client *c) {
 /* Owner, at the end of its window: the clients that still hold references (replies waiting for the AOF,
  * or not written in this window) get their replies copied out; those not waiting write them on their
  * next writable event. */
-static void ownerRefsSettle(owner *o) {
+static __attribute__((noinline)) void ownerRefsSettle(owner *o) {
     while (o->nrefc) {
         client *c = o->refc[o->nrefc - 1];
         ownerRefsMaterialize(o, c, 0);
@@ -2192,7 +2198,7 @@ static int ownerGetReply(client *c, ownerRingEntry *e, long long reply_threshold
     if (sdsEncodedObject(val)) {
         size_t len = sdslen(objectGetVal(val));
         /* A large value by reference (ownerRefAdd), when addReplyBulk would add the reply at all. */
-        if (len >= OWN_REF_FLOOR && prepareClientToWrite(c) == C_OK && ownerRefAdd(c, val, objectGetVal(val), len))
+        if (ownerRefWanted(len) && prepareClientToWrite(c) == C_OK && ownerRefAdd(c, val, objectGetVal(val), len))
             return 1;
     }
     addReplyBulk(c, val);
@@ -2696,7 +2702,7 @@ static int ownerBurstReply(client *c, ownerBurstEntry *e, long long reply_thresh
     if (reply_threshold >= 0 && (long long)(1 + digits10(len) + 2 + len + 2) >= reply_threshold) return 0;
     if (!c->flag.no_touch && !server.key_touch_paused) val->lru = lrulfu_touch(val->lru);
     ectx->stat_keyspace_hits++;
-    if (len >= OWN_REF_FLOOR && ownerRefAdd(c, val, s, len)) return 1; /* a large value: by reference */
+    if (ownerRefWanted(len) && ownerRefAdd(c, val, s, len)) return 1; /* a large value: by reference */
     if (!ownerBurstRoom(c, 1 + LONG_STR_SIZE + 2 + len + 2)) {
         addReplyBulk(c, val);
         return 1;
@@ -3437,7 +3443,7 @@ static void *ownerThreadMain(void *arg) {
          * which folds them first thing and writes them with its own. */
         if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
             ownerDrainAof(o);
-        ownerRefsSettle(o); /* no value reference outlives the window */
+        if (o->nrefc) ownerRefsSettle(o); /* no value reference outlives the window */
         ownerLeave(o);
         if (handed || o->wake_main) {
             uint64_t one = 1;
