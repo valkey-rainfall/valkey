@@ -237,6 +237,7 @@ typedef struct owner {
     long long native_total, handoffs_total, adopted_total, windows_total;
     long long held_total, mm_refused_total;
     long long burst_total, bursts_total; /* GETs answered by bursts, and the bursts (ownerGetBurst) */
+    long long setburst_total, setbursts_total; /* SETs answered by SET bursts, and those bursts (ownerSetBurst) */
     /* io_uring (owner-uring): the owner's own ring, used only by the owner thread, inside its windows.
      * Every op is MSG_DONTWAIT and completes inside the io_uring_enter that submits it, so no op is in
      * flight outside a window and main never sees one: the sockets, query buffers and replies are
@@ -297,6 +298,9 @@ static long long own_aof_ops = 0;         /* main: ops folded into the AOF */
  * for the frame's argv[0] in slow commandlog entries. */
 static struct serverCommand *own_burst_cmd = NULL;
 static robj *own_burst_name[2]; /* "GET", "get" */
+/* SET bursts (ownerSetBurst, D3-all-g10-setburst): the same for "SET"/"set" frames and setCommand. */
+static struct serverCommand *own_setburst_cmd = NULL;
+static robj *own_setburst_name[2]; /* "SET", "set" */
 
 int ownerThreadsEnabled(void) {
     return own_n > 0;
@@ -486,6 +490,12 @@ void ownerThreadsInit(void) {
         own_burst_cmd = get;
         own_burst_name[0] = makeObjectShared(createStringObject("GET", 3));
         own_burst_name[1] = makeObjectShared(createStringObject("get", 3));
+    }
+    struct serverCommand *set = lookupCommandByCString("set");
+    if (set && set == own_cmds[OWN_SET] && set->proc == setCommand) {
+        own_setburst_cmd = set;
+        own_setburst_name[0] = makeObjectShared(createStringObject("SET", 3));
+        own_setburst_name[1] = makeObjectShared(createStringObject("set", 3));
     }
     own_main_wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (own_main_wakefd == -1 ||
@@ -2621,6 +2631,262 @@ static int ownerGetBurst(owner *o, client *c) {
     return answered;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * SET bursts: plain SET frames straight off the query buffer (D3-all-g10-setburst)
+ * ---------------------------------------------------------------------------------------------- */
+
+/* The write side of the GET bursts. A read whose unparsed input starts with plain "SET key value" frames
+ * (three arguments, no option) runs them before anything is parsed: each frame is matched in the query
+ * buffer, its key copied out as an sds8 and its slot hashed; the keys' finds run as one ring (prefetch
+ * only: every find ends before the first write, which may resize a table); then the SETs run in order,
+ * each as setCommand would run it (setKeyPlainOrFail: setGenericCommand from lookupKeyWrite to setKey,
+ * on the store-ready value the parser would build), each one's AOF record appended to this owner's
+ * records as ownerTakeProp appends it (the frame's own bytes: catAppendOnlyGenericCommand writes exactly
+ * those for this argv), and each +OK written into c->buf. No argv, no command lookup, no alsoPropagate,
+ * no per-command reset: one run's accounting per burst (ownerSetBurstEnd, as ownerBurstEnd).
+ * A burst takes only what ownerNativeKind would run as OWN_SET with no veto of any kind (ownerBurstReady
+ * and ownerSetBurstReady: no MULTI, no reply mode, an unrestricted user, no notifications, tracking,
+ * replicas, modules, maxmemory, disk error) and ends before the first frame it cannot run: another
+ * command or a SET with options, a key over OWN_BURST_KEY_MAX bytes, a value over OWN_SETBURST_VAL_MAX,
+ * another owner's key, a value the parser would not prebuild (an integer, too long to embed), a request
+ * the large-request commandlog records, an expired key (lookupKeyWrite's lazy delete propagates). The
+ * parser takes that frame and the rest as before, so the commands run in order and the replies keep it. */
+#define OWN_SETBURST_MAX OWN_RING_MAX /* SETs one burst runs; the next burst picks up after them */
+#define OWN_SETBURST_VAL_MAX 99       /* a value length of one or two digits */
+
+typedef struct ownerSetEntry {
+    hashtableIncrementalFindState find;
+    int done;
+    int slot;
+    hashtable *ht;                 /* the key's table, NULL when there is none yet (no find) */
+    uint32_t frame_off, frame_len; /* from the burst's start in the query buffer */
+    uint32_t val_off;
+    uint8_t val_len, lower;
+    ownerBurstKey key;
+} ownerSetEntry;
+
+/* The SET frame at b, "*3\r\n$3\r\nSET\r\n$<k>\r\n<key>\r\n$<v>\r\n<value>\r\n" with the name all upper or all
+ * lower case, 1 <= k <= key_max and 1 <= v <= val_max (val_max <= 99) in short length headers (no sign,
+ * no leading zero), complete in the avail bytes there. Returns its length and sets the key's and the
+ * value's offsets and lengths and the spelling; 0 for anything else. */
+static inline size_t ownerSetFrame(const char *b, size_t avail, size_t key_max, size_t val_max, size_t *key_off,
+                                   size_t *key_len, size_t *val_off, size_t *val_len, int *lower) {
+    if (avail < 27) return 0; /* the shortest: a 1-byte key and a 1-byte value */
+    uint64_t head, head_want;
+    uint32_t name, name_up, name_low;
+    memcpy(&head, b, 8);
+    memcpy(&head_want, "*3\r\n$3\r\n", 8);
+    memcpy(&name, b + 8, 4);
+    memcpy(&name_up, "SET\r", 4);
+    memcpy(&name_low, "set\r", 4);
+    if (head != head_want || b[12] != '\n') return 0;
+    if (name == name_up)
+        *lower = 0;
+    else if (name == name_low)
+        *lower = 1;
+    else
+        return 0;
+    /* the key: b[13..15] are in the 27 bytes */
+    if (b[13] != '$' || b[14] < '1' || b[14] > '9') return 0;
+    size_t klen = (size_t)(b[14] - '0'), pos = 15;
+    if (b[15] >= '0' && b[15] <= '9') {
+        klen = klen * 10 + (size_t)(b[15] - '0');
+        pos = 16;
+    }
+    if (klen > key_max || avail < pos + 2 + klen + 2 + 4) return 0;
+    if (b[pos] != '\r' || b[pos + 1] != '\n') return 0;
+    size_t koff = pos + 2;
+    pos = koff + klen;
+    if (b[pos] != '\r' || b[pos + 1] != '\n') return 0;
+    pos += 2;
+    /* the value: pos + 4 <= avail, so its header's first three bytes are there */
+    if (b[pos] != '$' || b[pos + 1] < '1' || b[pos + 1] > '9') return 0;
+    size_t vlen = (size_t)(b[pos + 1] - '0');
+    pos += 2;
+    if (b[pos] >= '0' && b[pos] <= '9') {
+        vlen = vlen * 10 + (size_t)(b[pos] - '0');
+        pos++;
+    }
+    if (vlen > val_max || avail < pos + 2 + vlen + 2) return 0;
+    if (b[pos] != '\r' || b[pos + 1] != '\n') return 0;
+    size_t voff = pos + 2;
+    pos = voff + vlen;
+    if (b[pos] != '\r' || b[pos + 1] != '\n') return 0;
+    *key_off = koff;
+    *key_len = klen;
+    *val_off = voff;
+    *val_len = vlen;
+    return pos + 2;
+}
+
+/* What a SET burst needs beyond ownerBurstReady: the burst on, setCommand under its own name, no veto at
+ * all (a write veto sends SETs to main), the parser's value prebuild on (the burst builds that value),
+ * and nothing that drops the record's AOF or REPL target (ownerCall's propagation flags). */
+static inline int ownerSetBurstReady(client *c) {
+    return own_setburst_cmd && server.owner_set_burst && !parse_defer_value_prebuild &&
+           !atomic_load_explicit(&own_veto, memory_order_relaxed) && !c->flag.prevent_aof_prop &&
+           !c->flag.prevent_repl_prop && !c->flag.module_prevent_aof_prop && !c->flag.module_prevent_repl_prop;
+}
+
+/* ownerBurstEnd for a SET burst that ran n SETs: their commandstats, latency histogram and slow
+ * commandlog entries (one per command at the average, its arguments from the entry's key and the value
+ * still in the query buffer at qb), the burst counts, then the one reset after the last of them. */
+static void ownerSetBurstEnd(owner *o, client *c, int n, monotime start, const ownerSetEntry *ents, const char *qb) {
+    c->flag.executing_command = 0;
+    c->net_output_bytes_curr_cmd = 0;
+    exitExecutionUnit();
+    long long usec = (long long)(getMonotonicUs() - start);
+    if (n) {
+        ownerCmdStat *cs = &o->cs[OWN_SET];
+        cs->calls += n;
+        cs->usec += usec;
+        if (server.latency_tracking_enabled)
+            updateCommandLatencyHistogramCount(&cs->hist, usec * 1000 / n > 0 ? usec * 1000 / n : 1, n);
+        long long slow = ownerLogThreshold(COMMANDLOG_TYPE_SLOW);
+        if (slow >= 0 && usec / n >= slow) {
+            for (int k = 0; k < n; k++) {
+                const ownerSetEntry *e = &ents[k];
+                void *entries[3];
+                int types[3];
+                robj *argv[3] = {own_setburst_name[e->lower], createStringObject(e->key.buf, e->key.len),
+                                 createStringObject(qb + e->val_off, e->val_len)};
+                c->argv = argv;
+                c->argc = 3;
+                c->duration = usec / n;
+                c->net_input_bytes_curr_cmd = 0;
+                ownerKeepLogs(o, entries, types, commandlogPrepareCurrentCommand(c, own_setburst_cmd, entries, types));
+                decrRefCount(argv[1]);
+                decrRefCount(argv[2]);
+            }
+            c->argv = NULL;
+            c->argc = 0;
+            c->duration = 0;
+        }
+        c->commands_processed += n;
+        ectx->stat_numcommands += n;
+        o->native_total += n;
+        o->setburst_total += n;
+        o->setbursts_total++;
+    }
+    ectx->in_call--;
+    ectx->executing_client = NULL;
+    if (n) {
+        c->cmd = c->lastcmd = c->realcmd = own_setburst_cmd;
+        commandProcessed(c); /* the reset after the burst's last command */
+    }
+    ectx->current_client = NULL;
+}
+
+/* Owner, after a read (ownerBurstReady, ownerSetBurstReady): run the plain SET frames at the start of the
+ * unparsed input, up to OWN_SETBURST_MAX, and step the parser position past them. Returns how many ran. */
+static int ownerSetBurst(owner *o, client *c) {
+    long long req_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    long long reply_threshold = ownerLogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && 5 >= reply_threshold) return 0; /* the large-reply log records +OK */
+    size_t key_max = OWN_BURST_KEY_MAX, val_max = OWN_SETBURST_VAL_MAX;
+    if ((long long)key_max > server.proto_max_bulk_len) key_max = (size_t)server.proto_max_bulk_len;
+    if ((long long)val_max > server.proto_max_bulk_len) val_max = (size_t)server.proto_max_bulk_len;
+    unsigned depth = server.prefetch_batch_max_size < 1 ? 1 : (unsigned)server.prefetch_batch_max_size;
+    if (depth > OWN_RING_MAX) depth = OWN_RING_MAX;
+    ownerSetEntry ents[OWN_SETBURST_MAX];
+    const char *qb = c->querybuf + c->qb_pos;
+    size_t avail = sdslen(c->querybuf) - c->qb_pos, pos = 0;
+    kvstore *keys = c->db->keys;
+    int n = 0;
+    /* Match: the leading frames, while they are plain SETs of this owner's keys. */
+    while (n < OWN_SETBURST_MAX) {
+        size_t koff = 0, klen = 0, voff = 0, vlen = 0;
+        int lower = 0;
+        size_t flen = ownerSetFrame(qb + pos, avail - pos, key_max, val_max, &koff, &klen, &voff, &vlen, &lower);
+        if (!flen || (req_threshold >= 0 && (long long)flen >= req_threshold)) break;
+        ownerSetEntry *e = &ents[n];
+        const char *k = qb + pos + koff;
+        if (pos + koff + klen + 8 <= avail) {
+            /* whole words, all in the buffer: the bytes past the key are overwritten next */
+            for (size_t i = 0; i < klen; i += 8) memcpy(e->key.buf + i, k + i, 8);
+        } else {
+            memcpy(e->key.buf, k, klen);
+        }
+        memset(e->key.buf + klen, 0, 8);
+        e->key.len = e->key.alloc = (uint8_t)klen;
+        e->key.flags = SDS_TYPE_8;
+        int slot = ownerBurstSlot(&e->key);
+        if (slot < o->slot_lo || slot > o->slot_hi) break;
+        e->slot = slot;
+        e->ht = kvstoreGetHashtable(keys, OWNER_TABLE_OF_SLOT(slot));
+        e->frame_off = (uint32_t)pos;
+        e->frame_len = (uint32_t)flen;
+        e->val_off = (uint32_t)(pos + voff);
+        e->val_len = (uint8_t)vlen;
+        e->lower = (uint8_t)lower;
+        n++;
+        pos += flen;
+    }
+    if (!n) return 0;
+    /* Prefetch: the finds as one ring, depth in flight, each run to its end before anything is written
+     * (a write may add a key and resize a table under a find). Their results are not used. */
+    unsigned head = 0, tail = 0;
+    while (head < (unsigned)n) {
+        while (tail < (unsigned)n && tail - head < depth) {
+            ownerSetEntry *e = &ents[tail++];
+            e->done = e->ht == NULL;
+            if (e->ht) hashtableIncrementalFindInit(&e->find, e->ht, e->key.buf);
+        }
+        for (unsigned s = head; s < tail; s++) {
+            ownerSetEntry *e = &ents[s];
+            if (!e->done) e->done = !hashtableIncrementalFindStep(&e->find);
+        }
+        while (head < tail && ents[head].done) head++;
+    }
+    /* Run: each SET in order, as setCommand. */
+    int saved_slot = c->slot, ran = 0;
+    size_t done = 0;
+    monotime start = ownerBurstBegin(c);
+    for (int k = 0; k < n; k++) {
+        ownerSetEntry *e = &ents[k];
+        /* The parser's value for this frame: built only when it would build it (else setCommand runs it). */
+        robj *val = tryCreatePrebuiltStringEntry(qb + e->val_off, e->val_len, e->key.buf);
+        if (!val) break;
+        robj key;
+        initStaticStringObject(key, e->key.buf);
+        c->slot = e->slot;
+        if (!setKeyPlainOrFail(c, c->db, &key, &val, OWNER_TABLE_OF_SLOT(e->slot))) {
+            decrRefCount(val);
+            break;
+        }
+        ectx->dirty++;
+        if (own_aof) {
+            if (!ran) ownerAofSelect(o, c->db->id);
+            o->aofbuf = sdscatlen(o->aofbuf, qb + e->frame_off, e->frame_len);
+        }
+        if (ownerBurstRoom(c, 5)) {
+            memcpy(c->buf + c->bufpos, "+OK\r\n", 5);
+            ownerBurstWrote(c, 5);
+        } else {
+            addReply(c, shared.ok);
+        }
+        ran++;
+        done = e->frame_off + e->frame_len;
+        /* An output buffer limit closes the client: run nothing more, as processInputBuffer. */
+        if (c->flag.close_asap) break;
+    }
+    if (ran && own_aof) {
+        /* ownerTakeProp's unit for these records: each SET one op with the AOF and REPL targets. */
+        if (o->nunits == o->units_cap) {
+            o->units_cap = o->units_cap ? o->units_cap * 2 : 256;
+            o->units = zrealloc(o->units, sizeof(ownerPropUnit) * o->units_cap);
+        }
+        o->units[o->nunits++] = (ownerPropUnit){.c = c, .n = ran, .repl = ran};
+        o->unflushed = 1;
+        if (!own_aof_drain) o->wake_main = 1; /* else this owner writes them at the end of its window */
+    }
+    if (!ran) c->slot = saved_slot;
+    c->qb_pos += done;
+    c->qb_applied = c->qb_pos;
+    ownerSetBurstEnd(o, c, ran, start, ents, qb);
+    return ran;
+}
+
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
 static int ownerTryNative(client *c) {
     owner *o = own_self;
@@ -2712,9 +2978,13 @@ static int ownerReadPost(owner *o, client *c, int batch) {
     /* GET frames at the start of the input: answered off the buffer (ownerGetBurst); what follows the
      * last of them is parsed and run as before. The burst's GETs count toward owner_deep too. */
     long long ran = o->native_total;
-    if (ownerBurstReady(c)) {
-        while (ownerGetBurst(o, c) == OWN_BURST_MAX && !c->flag.close_asap && c->qb_pos < sdslen(c->querybuf)) {
-        }
+    /* Plain SET frames likewise (ownerSetBurst): GET and SET bursts take turns while either runs one. */
+    while (ownerBurstReady(c)) {
+        int g = ownerGetBurst(o, c), s = 0;
+        if (c->flag.close_asap || c->qb_pos >= sdslen(c->querybuf)) break;
+        if (g == OWN_BURST_MAX) continue;
+        if (ownerSetBurstReady(c)) s = ownerSetBurst(o, c);
+        if (!s || c->flag.close_asap || c->qb_pos >= sdslen(c->querybuf)) break;
     }
     int to_main = 0;
     if (!c->flag.close_asap && c->qb_pos < sdslen(c->querybuf)) {
@@ -3064,13 +3334,15 @@ int ownerClusterCommand(client *c) {
 
 void ownerInfo(sds *info) {
     long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
-    long long burst = 0, bursts = 0;
+    long long burst = 0, bursts = 0, setburst = 0, setbursts = 0;
     long long u_enters = 0, u_reads = 0, u_writes = 0, u_short = 0, u_redo = 0;
     int resident = 0, u_on = 0;
     for (int i = 0; i < own_n; i++) {
         native += owners[i].native_total;
         burst += owners[i].burst_total;
         bursts += owners[i].bursts_total;
+        setburst += owners[i].setburst_total;
+        setbursts += owners[i].setbursts_total;
         handoffs += owners[i].handoffs_total;
         adopted += owners[i].adopted_total;
         windows += owners[i].windows_total;
@@ -3098,6 +3370,8 @@ void ownerInfo(sds *info) {
                          "owner_maxmemory_to_main:%lld\r\n",
                          own_aof_ops, own_aof_drains, held, mm_refused);
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
+    *info = sdscatprintf(*info, "owner_set_burst:%s\r\nowner_setburst_commands:%lld\r\nowner_setbursts:%lld\r\n",
+                         server.owner_set_burst && own_setburst_cmd ? "yes" : "no", setburst, setbursts);
     *info = sdscatprintf(*info,
                          "owner_uring:%s\r\nowner_uring_rings:%d\r\nowner_uring_enters:%lld\r\n"
                          "owner_uring_reads:%lld\r\nowner_uring_writes:%lld\r\nowner_uring_short_writes:%lld\r\n"

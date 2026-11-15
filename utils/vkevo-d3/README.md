@@ -156,6 +156,18 @@ Files here:
   on concurrent connections reply for reply, a client with a 4 KB receive buffer that reads nothing
   for 1 s (partial sends, EAGAIN, EPOLLOUT), 1 MB and 8 MB arguments in pieces, 200 abrupt closes
   (half RST), and CONFIG SET owner-uring flipped every 20 ms under pipelines.
+- `d3-setburst-check.py` (D3-all-g10-setburst): the owners' SET bursts against the parent's owner path
+  (`--ref-bin`, D3-all-g9-fold), both servers started here on loopback: the same bytes to owner 0 of
+  each (keys 1-65 B, values 0-120 B, integer and non-canonical number values, three spellings, fresh
+  slots with no table, 100-250-frame rounds, split reads, duplicate keys in a burst, random pipelines
+  mixing SET with options and other commands, other types and TTL keys overwritten, an expired key,
+  WATCH aborts, MULTI, CLIENT REPLY, RESP3, ACL users, another owner's keys, tracking pushes, slow,
+  large-request and large-reply commandlog entries): reply bytes, hits/misses, cmdstat_set/get calls
+  and dirty equal; then every key's type, encoding, PEXPIRETIME, MEMORY USAGE and DEBUG DIGEST-VALUE
+  equal, and under appendonly always/everysec the incr AOF bytes equal, also after DEBUG LOADAOF.
+  Suites where no SET burst may run (owner_setburst_commands +0, same replies and keyspace):
+  maxmemory, notify-keyspace-events (same event bytes), a replica attached (same DEBUG DIGEST),
+  rename-command set, owner-set-burst no.
 
 Bench host (W worker CPUs 0..W-1, bio + fork children on the OS core 63, NIC IRQs on 64-95):
 

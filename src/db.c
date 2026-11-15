@@ -493,6 +493,38 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
 }
 
+/* D3-all-g10-setburst (owner.c ownerSetBurst): what setGenericCommand() does for a plain "SET key value"
+ * (no option) from its lookupKeyWrite() to its setKey(), with one key lookup instead of two. The value is
+ * the store-ready one the parser builds (tryCreatePrebuiltStringEntry). dict_index: the key's table.
+ * Returns 0, having changed nothing, when the key is there and expired: lookupKeyWrite() would delete
+ * it and propagate the delete, so the caller leaves that SET to setCommand(). Otherwise it has
+ * lookupKeyWrite()'s effects on what it found (the access-time touch; LOOKUP_WRITE counts no hit or
+ * miss and fires no keymiss event; a valid key is left as it is) and then setKey()'s with no flag: the
+ * value stored (dbSetValue over a key of any type, dbAdd for a new one), the expire removed, the key
+ * signalled as modified (WATCH, tracking). */
+int setKeyPlainOrFail(client *c, serverDb *db, robj *key, robj **valref, int dict_index) {
+    void **oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
+    if (oldref) {
+        robj *old = *oldref;
+        if (objectGetExpire(old) != EXPIRY_NONE && objectIsExpired(old)) return 0;
+        /* lookupKey()'s touch: its NOTOUCH condition for a SET run by the client itself. */
+        int notouch = ectx->current_client && ectx->current_client->flag.no_touch && ectx->executing_client;
+        if (!server.key_touch_paused && !notouch) {
+            serverAssert(old->refcount != OBJ_SHARED_REFCOUNT);
+            old->lru = lrulfu_touch(old->lru);
+        }
+        hotkeysRecordLookup(key, db->id, LOOKUP_WRITE);
+        dbSetValue(db, key, valref, 1, oldref);
+    } else {
+        hotkeysRecordLookup(key, db->id, LOOKUP_WRITE);
+        dbAdd(db, key, valref);
+    }
+    bgIteration_dbEntryModified(*valref);
+    removeExpire(db, key);
+    signalModifiedKey(c, db, key);
+    return 1;
+}
+
 /* Return a random key, in form of an Object.
  * If there are no keys, NULL is returned.
  *
