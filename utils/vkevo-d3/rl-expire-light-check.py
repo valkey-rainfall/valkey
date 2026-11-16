@@ -23,6 +23,7 @@ ap.add_argument('--n', type=int, default=4)
 ap.add_argument('--cpus', required=True)
 ap.add_argument('--main-cpu', required=True)
 ap.add_argument('--bg-cpu', required=True)
+ap.add_argument('--debug', action='store_true')
 a = ap.parse_args()
 RES = []
 
@@ -70,6 +71,7 @@ class R:
         return [self.read() for _ in cmds]
 
     def close(self):
+        self.f.close()  # the makefile holds the socket open until it is closed too
         self.s.close()
 
 
@@ -153,8 +155,19 @@ try:
         'keys.expire', 'owner_active_expire %s, expired_keys +%d (want 500), owner_expired_keys %s, %s' % (
             i2.get('owner_active_expire'), int(st['expired_keys']) - e0, i2.get('owner_expired_keys'), ks.split(',avg')[0]))
     say(why(i2) - why(i1) == 0 and light(i2) - light(i1) >= 20, 'keys.no_expire_stops',
-        'in 4 s: light ticks +%d, expire stops +%d (want 0)' % (light(i2) - light(i1), why(i2) - why(i1)))
+        'in 4 s: light ticks +%d, expire stops +%d (want 0); iterations +%d, full +%d, full why %s / %s, stops wake %s / %s, '
+        'file %s / %s' % (light(i2) - light(i1), why(i2) - why(i1),
+                          int(i2['owner_light_iterations']) - int(i1['owner_light_iterations']),
+                          int(i2['owner_light_full']) - int(i1['owner_light_full']), i1['owner_light_full_why'],
+                          i2['owner_light_full_why'], i1['owner_stop_wake'], i2['owner_stop_wake'], i1['owner_stop_file'],
+                          i2['owner_stop_file']))
     # fields: main's field job, the field bound
+    if a.debug:
+        r_ = R(a.port)
+        print('DEBUG client list:', r_.do('CLIENT', 'LIST').decode().replace('\n', ' | ')[:3000], flush=True)
+        r_.close()
+        oi = owners_info()
+        print('DEBUG owners:', {k: v for k, v in oi.items() if 'resident' in k or 'guest' in k or 'handoffs' in k}, flush=True)
     m = R(a.port)
     r = m.do('HSETEX', 'hf', 'PX', '300', 'FIELDS', '3', 'a', '1', 'b', '2', 'c', '3')
     m.do('HSET', 'hf', 'keep', 'x')
