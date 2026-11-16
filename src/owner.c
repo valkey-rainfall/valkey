@@ -533,6 +533,8 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE, OWN_WHY_AC
  * io_uring batches; a direct read of at least OWN_TLS_BIG_READ bytes starts the count again. */
 #define OWN_TLS_DIRECT 15
 #define OWN_TLS_BIG_READ 4096
+/* RL-g2s: ready events a wakeup needs before its TLS clients use the io_uring batches (ownerThreadMain). */
+#define OWN_TLS_BATCH_MIN 8
 
 /* Native-path vetoes (own_veto). */
 #define OWN_VETO_ALL 1
@@ -6155,6 +6157,13 @@ static void *ownerThreadMain(void *arg) {
                 o->mm_exact_windows++;
         }
         int batch = ownerUringOn(o) && o->mm_roomy;
+        /* RL-g2s: TLS clients join the io_uring batches only when this wakeup brought enough of them to share
+         * the batch's system calls. At a low rate a wakeup brings one or two (1.4 commands per wakeup at 10k
+         * commands per second per owner): batching then saves no system call, holds each reply until the
+         * batch's reads have run and adds an io_uring round trip for the read and one for the reply (the fleet
+         * saw TLS p99 at that rate go from 0.35 to 0.53 ms). Such clients read and reply straight through
+         * OpenSSL's socket calls, as RL-1 does; busy wakeups keep the batches. */
+        int tls_batch = batch && n >= OWN_TLS_BATCH_MIN;
         int m = 0, stop = 0;
         for (int k = 0; k < n && !stop; k++) {
             uint64_t d = evs[k].data.u64;
@@ -6185,7 +6194,7 @@ static void *ownerThreadMain(void *arg) {
                 continue;
             }
             if (e & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
-                if (c->owner_tls && (!batch || c->owner_deep || c->owner_tls_direct || !connIOOwnerBatchReady(c->conn))) {
+                if (c->owner_tls && (!tls_batch || c->owner_deep || c->owner_tls_direct || !connIOOwnerBatchReady(c->conn))) {
                     handed |= ownerReadTls(o, c);
                 } else if (!c->owner_tls && (!batch || c->owner_deep)) {
                     /* A deep pipeline (owner-uring-deep commands or more in its last read) already shares
