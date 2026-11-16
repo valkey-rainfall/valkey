@@ -3363,6 +3363,7 @@ static int ownerRunEnd(owner *o, client *c, struct serverCommand *cmd, int kind,
         c->commands_processed += n;
         ectx->stat_numcommands += n;
         o->native_total += n;
+        o->fam_total[OWN_FAM_STRING] += n;
     }
     ectx->in_call--;
     ectx->executing_client = NULL;
@@ -3853,6 +3854,7 @@ static void ownerBurstEnd(owner *o, client *c, int n, monotime start, const owne
         c->commands_processed += n;
         ectx->stat_numcommands += n;
         o->native_total += n;
+        o->fam_total[OWN_FAM_STRING] += n;
         o->burst_total += n;
         o->bursts_total++;
     }
@@ -4090,6 +4092,7 @@ static void ownerSetBurstEnd(owner *o, client *c, int n, monotime start, const o
         c->commands_processed += n;
         ectx->stat_numcommands += n;
         o->native_total += n;
+        o->fam_total[OWN_FAM_STRING] += n;
         o->setburst_total += n;
         o->setbursts_total++;
     }
