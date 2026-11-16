@@ -244,12 +244,21 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 }
 
 /* Returns which dict index should be used with kvstore for a given key, computed from the key itself. */
-/* Standalone shard of a key. Nothing depends on it beyond being stable per key, so it skips
- * hash tags and hashes a word at a time. */
+/* Standalone shard of a key: stable per key, and keys with the same hash tag ({...}, as keyHashSlot reads it)
+ * share a shard, so a primary's transaction over one tag (a script's GET / INCRBY / EXPIRE / SET on {t}:a and
+ * {t}:b) touches one shard and a replica can apply it whole on one lane. Hashes a word at a time. */
 static int keyspaceShard(sds key) {
     if (key == repl_apply_key) return repl_apply_shard;
     const unsigned char *s = (const unsigned char *)key;
     size_t len = sdslen(key);
+    const unsigned char *open = memchr(s, '{', len);
+    if (open) {
+        const unsigned char *close = memchr(open + 1, '}', len - (size_t)(open + 1 - s));
+        if (close && close > open + 1) {
+            s = open + 1;
+            len = (size_t)(close - s);
+        }
+    }
     uint64_t h = 0x9e3779b97f4a7c15ULL ^ len;
     while (len >= 8) {
         uint64_t w;
