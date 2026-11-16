@@ -1240,6 +1240,14 @@ static inline int tlsPreLeft(tls_connection *conn) {
     return conn->pre_off < conn->pre_len;
 }
 
+/* RL-g3c: OpenSSL wants the thread's error queue empty before an SSL I/O call (SSL_get_error reads it).
+ * ERR_clear_error clears all 16 slots, with two OPENSSL_free calls each, even when the queue is empty, which
+ * it is on almost every call: clear only when an error is waiting. Exact: ERR_peek_error is 0 only when the
+ * queue holds no error, and an empty queue is what the clear would leave. */
+static inline void tlsClearErrors(void) {
+    if (ERR_peek_error()) ERR_clear_error();
+}
+
 /* Fetch the latest OpenSSL error and store it in the connection */
 static void updateTLSError(tls_connection *conn) {
     conn->c.last_errno = 0;
@@ -1620,7 +1628,7 @@ user *tlsGetPeerUser(connection *conn_, sds *cert_username) {
 
 static void TLSAccept(void *_conn) {
     tls_connection *conn = (tls_connection *)_conn;
-    ERR_clear_error();
+    tlsClearErrors();
     int ret = SSL_accept(conn->ssl);
     if (ret > 0) {
         conn->flags |= TLS_CONN_FLAG_ACCEPT_SUCCESS;
@@ -1639,7 +1647,7 @@ static void tlsHandleEvent(tls_connection *conn, int mask) {
             conn->c.last_errno = conn_error;
             conn->c.state = CONN_STATE_ERROR;
         } else {
-            ERR_clear_error();
+            tlsClearErrors();
             if (!(conn->flags & TLS_CONN_FLAG_FD_SET)) {
                 SSL_set_fd(conn->ssl, conn->c.fd);
                 conn->flags |= TLS_CONN_FLAG_FD_SET;
@@ -1845,7 +1853,7 @@ static int connTLSConnect(connection *conn_,
 
     if (conn->c.state != CONN_STATE_NONE) return C_ERR;
     if (addr == NULL) return C_ERR;
-    ERR_clear_error();
+    tlsClearErrors();
 
     /* Check whether addr is an IP address, if not, use the value for Server Name Indication */
     if (inet_pton(AF_INET, addr, addr_buf) != 1 && inet_pton(AF_INET6, addr, addr_buf) != 1) {
@@ -2143,7 +2151,7 @@ static size_t tlsCollect(tls_connection *conn, const char *data, size_t data_len
     a->cstart = a->used;
     conn->collect = 1;
     while (pt < data_len && conn->nrec < TLS_GATHER_MAXREC) {
-        ERR_clear_error();
+        tlsClearErrors();
         *ret = SSL_write(conn->ssl, data + pt, data_len - pt);
         if (*ret <= 0) break;
         pt += (size_t)*ret;
@@ -2316,7 +2324,7 @@ static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
         errno = EAGAIN;
         return -1;
     }
-    ERR_clear_error();
+    tlsClearErrors();
     /* In case when last write failed due to some internal reason, retry has to provide
      * at least the same amount of bytes (https://docs.openssl.org/master/man3/SSL_write).
      * If that condition is not met, OpenSSL will return "SSL routines::bad length".
@@ -2415,7 +2423,7 @@ static int connTLSRead(connection *conn_, void *buf, size_t buf_len) {
     int ret;
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
-    ERR_clear_error();
+    tlsClearErrors();
     /* A read served from OpenSSL's buffer says nothing of the socket, which may have received more
      * since the last socket read; only a socket read that comes back short shows it drained. */
     if (conn->flags & TLS_CONN_FLAG_READ_AHEAD) conn->socket_read_full = 1;
@@ -2562,7 +2570,7 @@ static int connTLSBlockingConnect(connection *conn_, const char *addr, int port,
      * which means the specified timeout will not be enforced accurately. */
     SSL_set_fd(conn->ssl, conn->c.fd);
     setBlockingTimeout(conn, timeout);
-    ERR_clear_error();
+    tlsClearErrors();
     if ((ret = SSL_connect(conn->ssl)) <= 0) {
         conn->c.state = CONN_STATE_ERROR;
         return C_ERR;
@@ -2589,7 +2597,7 @@ static ssize_t connTLSSyncWrite(connection *conn_, char *ptr, ssize_t size, long
     }
 #endif
     SSL_clear_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
-    ERR_clear_error();
+    tlsClearErrors();
     int ret = SSL_write(conn->ssl, ptr, size);
     ret = updateStateAfterSSLIO(conn, ret, 0);
     SSL_set_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
@@ -2607,7 +2615,7 @@ static ssize_t connTLSSyncRead(connection *conn_, char *ptr, ssize_t size, long 
     tls_connection *conn = (tls_connection *)conn_;
     int blocking = isBlocking(conn);
     setBlockingTimeout(conn, timeout);
-    ERR_clear_error();
+    tlsClearErrors();
     int ret = SSL_read(conn->ssl, ptr, size);
     updateSSLPendingFlag(conn);
     ret = updateStateAfterSSLIO(conn, ret, 0);
@@ -2632,7 +2640,7 @@ static ssize_t connTLSSyncReadLine(connection *conn_, char *ptr, ssize_t size, l
     while (size) {
         char c;
 
-        ERR_clear_error();
+        tlsClearErrors();
         int ret = SSL_read(conn->ssl, &c, 1);
         updateSSLPendingFlag(conn);
         ret = updateStateAfterSSLIO(conn, ret, 0);
