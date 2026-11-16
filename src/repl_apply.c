@@ -91,6 +91,7 @@ typedef struct rpEntry {
     int shard;    /* lane entries: the keyspace hashtable of all its keys */
     int lane;     /* -1: a barrier */
     uint32_t seg; /* barriers before it in its chunk */
+    int marker;   /* RL-g2l: the MULTI or EXEC of a transaction its lane applies whole; the lane drops it */
 } rpEntry;
 
 /* What a command leaves for the next ones' classification. */
@@ -110,6 +111,9 @@ typedef struct __attribute__((aligned(64))) rpChunk {
     int *bpos; /* plan positions of its barriers */
     int nb, bcap;
     uint32_t base; /* barriers of the chunks before it */
+    /* RL-g2l: a MULTI this chunk opened, its plan positions so far; placed at its EXEC (rpTxnEnd) */
+    int *txn;
+    int txn_n, txn_cap, txn_open, txn_ok, txn_shard;
 } rpChunk;
 
 /* Lane l's place in the plan: a chunk and a position in that chunk's vector for l. */
@@ -181,6 +185,52 @@ static void rpTrack(rpState *st, const char *name, size_t nlen, const char *arg,
     }
 }
 
+/* Place the command at plan position idx in its chunk: on a lane (lane >= 0), or as a barrier. */
+static void rpPlace(rpChunk *k, int idx, int lane, int marker) {
+    rpEntry *e = &rp.e[idx];
+    e->seg = (uint32_t)k->nb;
+    e->lane = lane;
+    e->marker = marker;
+    if (lane >= 0) {
+        RP_GROW(k->lane_idx[lane], k->lane_n[lane], k->lane_cap[lane], 256);
+        k->lane_idx[lane][k->lane_n[lane]++] = idx;
+        return;
+    }
+    e->shard = -1;
+    RP_GROW(k->bpos, k->nb, k->bcap, 16);
+    k->bpos[k->nb++] = idx;
+}
+
+static void rpTrackArgv(rpChunk *k, robj **argv, int argc) {
+    if (argc > 0 && sdsEncodedObject(argv[0])) {
+        int a = argc > 1 && sdsEncodedObject(argv[1]);
+        rpTrack(&k->st, objectGetVal(argv[0]), sdslen(objectGetVal(argv[0])), a ? objectGetVal(argv[1]) : NULL,
+                a ? sdslen(objectGetVal(argv[1])) : 0, argc);
+    }
+}
+
+/* RL-g2l-repl-speed: the transaction the chunk opened ends (at its EXEC: whole = 1; at a DISCARD, or the
+ * chunk's end: 0). When every command in it is a lane command of one shard, all of it goes to that shard's
+ * lane, which runs the commands in order inside one APPLY phase and drops the MULTI and the EXEC: nothing
+ * else touches that shard during the phase and nothing reads the keyspace until it ends, so the transaction
+ * is applied atomically, and the segment around it stays whole. Otherwise every command of it is a barrier,
+ * as before: main runs the transaction as the primary client. */
+static void rpTxnEnd(rpChunk *k, int whole) {
+    int lane = whole && k->txn_ok && k->txn_shard >= 0 ? k->txn_shard % rp.nlanes : -1;
+    for (int i = 0; i < k->txn_n; i++) {
+        int idx = k->txn[i];
+        if (lane >= 0) rp.e[idx].shard = k->txn_shard;
+        rpPlace(k, idx, lane, lane >= 0 && (i == 0 || i == k->txn_n - 1));
+    }
+    k->txn_n = 0;
+    k->txn_open = 0;
+}
+
+static void rpTxnAdd(rpChunk *k, int idx) {
+    RP_GROW(k->txn, k->txn_n, k->txn_cap, 16);
+    k->txn[k->txn_n++] = idx;
+}
+
 /* The lane of the command at plan position idx, or a barrier. */
 static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **argv, int argc, int read_flags, int slot, size_t qb_end) {
     rpEntry *e = &rp.e[idx];
@@ -188,27 +238,45 @@ static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **ar
     e->db = k->st.db;
     e->shard = -1;
     e->lane = -1;
+    e->marker = 0;
     e->seg = (uint32_t)k->nb;
-    if (!k->st.stop && !k->st.in_multi && cmd && cmd->write_lane &&
-        !(read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
-        int shard = fastpathKeysShard(k->st.db, cmd, argv, argc, slot);
-        if (shard >= 0) {
-            e->shard = shard;
-            e->lane = shard % rp.nlanes;
+    int shard = -1;
+    if (!k->st.stop && cmd && cmd->write_lane && !(read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)))
+        shard = fastpathKeysShard(k->st.db, cmd, argv, argc, slot);
+    sds name = argc > 0 && sdsEncodedObject(argv[0]) ? objectGetVal(argv[0]) : NULL;
+    size_t nlen = name ? sdslen(name) : 0;
+    if (k->txn_open) {
+        /* In a transaction this chunk opened: decided at its EXEC. Classified as the barriers they were. */
+        rpTxnAdd(k, idx);
+        int exec = name && rpNameIs(name, nlen, "exec");
+        if (exec) {
+            if (argc != 1) k->txn_ok = 0;
+        } else if (shard < 0 || (k->txn_shard >= 0 && shard != k->txn_shard)) {
+            k->txn_ok = 0;
+        } else {
+            k->txn_shard = shard;
         }
-    }
-    if (e->lane >= 0) {
-        RP_GROW(k->lane_idx[e->lane], k->lane_n[e->lane], k->lane_cap[e->lane], 256);
-        k->lane_idx[e->lane][k->lane_n[e->lane]++] = idx;
+        rpTrackArgv(k, argv, argc);
+        if (exec || !k->st.in_multi) rpTxnEnd(k, exec);
         return;
     }
-    RP_GROW(k->bpos, k->nb, k->bcap, 16);
-    k->bpos[k->nb++] = idx;
-    if (argc > 0 && sdsEncodedObject(argv[0])) {
-        int a = argc > 1 && sdsEncodedObject(argv[1]);
-        rpTrack(&k->st, objectGetVal(argv[0]), sdslen(objectGetVal(argv[0])), a ? objectGetVal(argv[1]) : NULL,
-                a ? sdslen(objectGetVal(argv[1])) : 0, argc);
+    if (!k->st.in_multi && shard >= 0) {
+        e->shard = shard;
+        rpPlace(k, idx, shard % rp.nlanes, 0);
+        return;
     }
+    if (server.replica_parallel_apply_multi && idx > 0 && !k->st.stop && !k->st.in_multi && argc == 1 && name &&
+        rpNameIs(name, nlen, "multi")) {
+        k->txn_open = 1;
+        k->txn_ok = 1;
+        k->txn_shard = -1;
+        k->txn_n = 0;
+        rpTxnAdd(k, idx);
+        rpTrackArgv(k, argv, argc);
+        return;
+    }
+    rpPlace(k, idx, -1, 0);
+    rpTrackArgv(k, argv, argc);
 }
 
 /* A RESP integer ending at the next \r\n of [p, end). Returns the position after the \n, or 0 when the
@@ -301,11 +369,14 @@ static void rpParseChunk(int t) {
         p += rpParseOne(c->querybuf, p, pc);
         rpClassify(k, idx, pc->cmd, pc->argv, pc->argc, pc->read_flags, pc->slot, p);
     }
+    if (k->txn_open) rpTxnEnd(k, 0); /* its EXEC is in a later chunk or read: main runs it */
 }
 
 static void rpResetChunk(rpChunk *k) {
     for (int l = 0; l < rp.nlanes; l++) k->lane_n[l] = 0;
     k->nb = 0;
+    k->txn_n = 0;
+    k->txn_open = 0;
 }
 
 void replApplyPlanRead(client *c) {
@@ -384,6 +455,11 @@ static void rpRunLane(int lane) {
                 repl_apply_plan_lane = 1;
                 entered = 1;
             }
+            if (e->marker) { /* RL-g2l: a whole transaction's MULTI or EXEC (never position 0) */
+                parsedCommand *p = &c->cmd_queue.cmds[idx - 1];
+                fastpathStreamLaneDrop(lane, p->argv, p->argc, p->argv_len, p->argv_len_sum);
+                continue;
+            }
             if (idx == 0) {
                 fastpathStreamLaneCall(lane, e->db, c->parsed_cmd, c->argv, c->argc, c->argv_len, c->argv_len_sum,
                                        c->net_input_bytes_curr_cmd, e->shard, (uint64_t)idx);
@@ -444,6 +520,9 @@ static void rpConsume(client *c, int from, int to) {
     }
     c->qb_applied = rp.e[to - 1].qb_end;
     c->commands_processed += to - from;
+    int markers = 0;
+    for (int idx = from; idx < to; idx++) markers += rp.e[idx].marker;
+    server.stat_repl_lane_txns += markers / 2;
     rpAdvance(c);
 }
 

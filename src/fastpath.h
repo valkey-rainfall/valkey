@@ -195,6 +195,9 @@ void fastpathStreamLanesPrepare(int nlanes, int main_lane);
 void fastpathStreamLaneEnter(int lane);
 void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, int shard, uint64_t pos);
 void fastpathStreamLaneLeave(void);
+/* Lane thread (RL-g2l-repl-speed): the MULTI or EXEC of a transaction the lane applies whole: not run, its
+ * arguments freed as a run command's are. */
+void fastpathStreamLaneDrop(int lane, robj **argv, int argc, int argv_len, size_t argv_len_sum);
 /* Main, after an APPLY phase of the stream: fold what lanes [0, nlanes) accumulated. */
 void fastpathStreamLanesMerge(int nlanes);
 

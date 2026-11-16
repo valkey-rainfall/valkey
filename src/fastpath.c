@@ -3385,6 +3385,15 @@ void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, r
     ectx->current_client = NULL;
 }
 
+void fastpathStreamLaneDrop(int lane, robj **argv, int argc, int argv_len, size_t argv_len_sum) {
+    client *ec = fp_lanes[lane].sec;
+    ec->argv = argv;
+    ec->argc = argc;
+    ec->argv_len = argv_len;
+    ec->argv_len_sum = argv_len_sum;
+    freeClientArgv(ec);
+}
+
 void fastpathStreamLaneLeave(void) {
     exec_lane = 0;
     fp_cur_lane = NULL;

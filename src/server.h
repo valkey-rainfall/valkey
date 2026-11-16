@@ -2207,6 +2207,7 @@ struct valkeyServer {
     int owner_repl_sender;                    /* owner-repl-sender: with owner threads, repl-stream-sender starts as append (default yes). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
+    int replica_parallel_apply_multi;         /* Hidden (RL-g2l): a primary's MULTI/EXEC on one shard rides a lane. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
@@ -2275,6 +2276,7 @@ struct valkeyServer {
     long long stat_repl_lane_plan_usec;            /* Main's time running those plans, APPLY phases included */
     long long stat_repl_lane_apply_usec;           /* Of which APPLY phases */
     long long stat_repl_lane_barriers;             /* Commands of those plans main ran in their place */
+    long long stat_repl_lane_txns;                 /* RL-g2l: transactions of those plans a lane applied whole */
     long long stat_numconnections;                 /* Number of connections received */
     double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
     double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */
