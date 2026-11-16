@@ -1782,6 +1782,14 @@ static int connTLSAccept(connection *_conn, ConnectionCallbackFunc accept_handle
     /* We're in IO thread - just call accept and return, the main thread will handle the rest */
     if (!inMainThread()) {
         TLSAccept(conn);
+        /* An owner thread drives the handshake itself (connIOOwnerBegin before it): the state says when
+         * it is done, and its caller hands the connection to main for the accept handler. */
+        if (conn->flags & TLS_CONN_FLAG_IO_OWNED) {
+            if (conn->flags & TLS_CONN_FLAG_ACCEPT_SUCCESS)
+                conn->c.state = CONN_STATE_CONNECTED;
+            else if (conn->flags & TLS_CONN_FLAG_ACCEPT_ERROR)
+                conn->c.state = CONN_STATE_ERROR;
+        }
         return C_OK;
     }
 
@@ -1952,7 +1960,8 @@ static long tlsSocketReadCallback(BIO *b, int oper, const char *argp, size_t len
 static int connTLSIOOwnerBegin(connection *conn_) {
 #ifdef TLS_IO_OWNER_SUPPORTED
     tls_connection *conn = (tls_connection *)conn_;
-    if (conn->c.state != CONN_STATE_CONNECTED || !conn->ssl) return -1;
+    /* ACCEPTING: an owner thread runs the handshake too (connTLSAccept off main). */
+    if ((conn->c.state != CONN_STATE_CONNECTED && conn->c.state != CONN_STATE_ACCEPTING) || !conn->ssl) return -1;
     BIO *rbio = SSL_get_rbio(conn->ssl);
     if (!rbio) return -1;
     /* A write OpenSSL must retry with the same bytes finishes on main. Otherwise no write is
@@ -1987,7 +1996,13 @@ static int connTLSIOOwnerBegin(connection *conn_) {
 /* Main thread: the socket is the main thread's again. The caller sets the handlers it needs and
  * calls connUpdateState, which registers the events and the pending data. */
 static void connTLSIOOwnerEnd(connection *conn_) {
-    ((tls_connection *)conn_)->flags &= ~TLS_CONN_FLAG_IO_OWNED;
+    tls_connection *conn = (tls_connection *)conn_;
+    conn->flags &= ~TLS_CONN_FLAG_IO_OWNED;
+#ifdef TLS_IO_OWNER_SUPPORTED
+    /* Records read ahead off the socket (behind a handshake the owner ran, too) raise no event on main
+     * either: connUpdateState puts the connection on the pending list. */
+    if (conn->ssl && (SSL_pending(conn->ssl) > 0 || SSL_has_pending(conn->ssl))) conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
+#endif
 }
 
 static int connTLSIOOwnerState(connection *conn_) {

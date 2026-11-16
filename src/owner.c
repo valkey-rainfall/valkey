@@ -289,8 +289,14 @@ static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
     [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash"};
 
-/* Why an owner handed a client to main (client->owner_why). */
-enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
+/* Why an owner handed a client to main (client->owner_why). OWN_WHY_ACCEPTED: its TLS handshake ended
+ * on the owner (done or failed); main runs the accept handler (RL-g1d). */
+enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE, OWN_WHY_ACCEPTED };
+
+/* RL-g1d owner TLS ports: a listener's accept-handler data is the owner id, | OWN_LISTEN_TLS for its TLS twin. */
+#define OWN_LISTEN_TLS 0x10000
+/* A TLS read returns at most one record; reads in a row while OpenSSL may hold more input (ownerReadTls). */
+#define OWN_TLS_READS 16
 
 /* Native-path vetoes (own_veto). */
 #define OWN_VETO_ALL 1
@@ -375,6 +381,14 @@ typedef struct owner {
     int port; /* 0: no listener */
     int lfd[CONFIG_BINDADDR_MAX];
     int nlfd;
+    int tls_port; /* RL-g1d: its TLS twin (owner-tls-port + id); 0: none */
+    int tlfd[CONFIG_BINDADDR_MAX];
+    int ntlfd;
+    /* RL-g1d: TLS clients (ownerTag) whose input OpenSSL may hold where no event reports it, read in the
+     * next window (ownerTlsPending); stale entries are skipped as stale epoll events are. */
+    uint64_t *tlsp;
+    int ntlsp, tlsp_cap;
+    long long tls_handshakes, tls_reads; /* INFO, never cleared */
     pthread_t thread;
     int epfd, wakefd;
     client **fdmap; /* fd -> resident client; written by the owner in a window, by main under the stop */
@@ -616,6 +630,16 @@ int ownerValidateConfig(const char **err) {
         *err = "owner-port + owner-threads - 1 must be a valid port";
         return C_ERR;
     }
+    if (server.owner_tls_port) {
+        if (server.owner_tls_port + server.owner_threads - 1 > 65535) {
+            *err = "owner-tls-port + owner-threads - 1 must be a valid port";
+            return C_ERR;
+        }
+        if (!server.tls_port) {
+            *err = "owner-tls-port needs tls-port (the server's TLS context)";
+            return C_ERR;
+        }
+    }
     return C_OK;
 }
 
@@ -642,6 +666,9 @@ static int ownerCpuOf(int i) {
 
 static void ownerAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void clientAcceptHandler(connection *conn); /* networking.c: the rest of an accept after the transport's */
+static void ownerTlsRelease(client *c);
+static void ownerTlsOnMain(client *c);
 
 /* The slot hash of the owner hot path: keyHashSlot() (the slot a cluster client routes a key by),
  * with its CRC16 taken 8 bytes per step instead of 1. own_crc16[k][v] is the CRC16 of 8 bytes with
@@ -775,10 +802,36 @@ void ownerThreadsInit(void) {
                 }
             }
         }
+        /* RL-g1d: its TLS twin, with the server's TLS context (one SSL_CTX, an SSL object per connection,
+         * made on main at accept; CONFIG SET of the TLS files reaches new connections here as on tls-port). */
+        if (server.owner_tls_port) {
+            connListener l = {0};
+            l.bindaddr = server.bindaddr;
+            l.bindaddr_count = server.bindaddr_count;
+            l.port = server.owner_tls_port + i;
+            l.ct = connectionTypeTls();
+            if (!l.ct || listenToPort(&l) == C_ERR) {
+                serverLog(LL_WARNING, "owner threads: failed listening on TLS port %d for owner %d", l.port, i);
+                exit(1);
+            }
+            o->tls_port = l.port;
+            o->ntlfd = l.count;
+            for (int j = 0; j < l.count; j++) {
+                o->tlfd[j] = l.fd[j];
+                if (aeCreateFileEvent(server.el, l.fd[j], AE_READABLE, ownerAcceptHandler,
+                                      (void *)(intptr_t)(i | OWN_LISTEN_TLS)) == AE_ERR) {
+                    serverLog(LL_WARNING, "owner threads: cannot watch owner %d's TLS listener", i);
+                    exit(1);
+                }
+            }
+        }
     }
     serverLog(LL_NOTICE, "owner threads: %d owners, ports %d-%d, slots split %d ways%s", own_n, server.owner_port,
               server.owner_port ? server.owner_port + own_n - 1 : 0, own_n,
               server.owner_adopt_all ? ", every TCP client adopted" : "");
+    if (server.owner_tls_port)
+        serverLog(LL_NOTICE, "owner threads: TLS ports %d-%d (handshake, reads and writes on the owners)",
+                  server.owner_tls_port, server.owner_tls_port + own_n - 1);
 #endif
 }
 
@@ -1186,7 +1239,19 @@ static void ownerTakeOne(client *c) {
     int why = c->owner_why;
     c->owner_why = 0;
     own_takes++;
+    ownerTlsRelease(c);
     watchMoveToMain(c); /* main serves only stock watchers */
+    if (why == OWN_WHY_ACCEPTED) {
+        /* Its TLS handshake ended on the owner: the rest of the stock accept (an error is logged and the
+         * client freed there), which adopts it again. createClient's read handler, for a guest. */
+        if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+            freeClientAsync(c);
+            return;
+        }
+        clientAcceptHandler(c->conn);
+        if (c->owner_tid == OWNER_ON_MAIN) ownerTlsOnMain(c);
+        return;
+    }
     if (c->flag.close_asap) {
         /* The owner asked for the close (output buffer limit); main's queue frees it. */
         c->flag.close_asap = 0;
@@ -1206,6 +1271,7 @@ static void ownerTakeOne(client *c) {
         freeClientAsync(c);
         return;
     }
+    ownerTlsOnMain(c);
     if (c->owner_home >= 0) ownerGuestAdd(c);
     if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
     if (why == OWN_WHY_QBLIMIT) {
@@ -1241,10 +1307,16 @@ static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int ma
     ownerTakeHandoffs();
 }
 
-/* Main, world held: give a client to its home owner. */
-static void ownerSendToOwner(client *c) {
+/* Main, world held: give a client to its home owner. Returns 0 when it cannot go (a TLS connection whose
+ * transport cannot leave main's event loop now): it stays where it is. */
+static int ownerSendToOwner(client *c) {
     serverAssert(own_held && c->owner_tid == OWNER_ON_MAIN && c->owner_home >= 0 && c->owner_home < own_n);
     owner *o = &owners[c->owner_home];
+    /* RL-g1d: a TLS client's OpenSSL runs on its owner from now on; its socket leaves main's event loop. */
+    if (connIsTLS(c->conn)) {
+        if (connIOOwnerBegin(c->conn) != 0) return 0;
+        c->owner_tls = 1;
+    }
     connSetReadHandler(c->conn, NULL);
     connSetWriteHandler(c->conn, NULL);
     c->owner_tid = o->id;
@@ -1254,6 +1326,19 @@ static void ownerSendToOwner(client *c) {
     uint64_t one = 1;
     if (write(o->wakefd, &one, sizeof(one)) == -1) { /* counter full: a wakeup is pending anyway */
     }
+    return 1;
+}
+
+/* Main: the socket of a TLS client an owner had is main's event loop's again. */
+static void ownerTlsRelease(client *c) {
+    if (!c->owner_tls) return;
+    c->owner_tls = 0;
+    connIOOwnerEnd(c->conn);
+}
+
+/* Main, after a TLS client came back: register its events and any input OpenSSL already holds. */
+static void ownerTlsOnMain(client *c) {
+    if (connIsTLS(c->conn) && connGetState(c->conn) == CONN_STATE_CONNECTED) connUpdateState(c->conn);
 }
 
 /* Returns 1 when an owner took the client, 0 when it stays on main as a guest (it goes home later). */
@@ -1261,12 +1346,22 @@ int ownerAdoptAccepted(client *c) {
     /* Main is inside a long command (busy script, loading): owners stay stopped until it ends, so
      * the new client stays on main, where it can get BUSY or send SCRIPT KILL. Same while the
      * owners sleep under io-threads > 1. */
-    if (ProcessingEventsWhileBlocked || own_dormant || (ownerComputeVeto() & OWN_VETO_ALL)) {
+    if (ProcessingEventsWhileBlocked || own_dormant || (ownerComputeVeto() & OWN_VETO_ALL) || !ownerSendToOwner(c)) {
         ownerGuestAdd(c);
         return 0;
     }
-    ownerSendToOwner(c);
     return 1;
+}
+
+/* acceptCommonHandler (main, world held), a client of an owner TLS port: its owner runs the TLS handshake
+ * on its own thread and hands it back when it ends (OWN_WHY_ACCEPTED), and main runs clientAcceptHandler,
+ * which adopts it again. Returns 0 when main accepts it the stock way instead (it is adopted after). */
+int ownerAdoptHandshake(client *c) {
+    if (ProcessingEventsWhileBlocked || own_dormant || (ownerComputeVeto() & OWN_VETO_ALL)) return 0;
+    c->owner_hs = 1;
+    if (ownerSendToOwner(c)) return 1;
+    c->owner_hs = 0;
+    return 0;
 }
 
 /* Main, world held: take a client back from its owner (freeClient), or out of main's own queue of
@@ -1281,6 +1376,7 @@ void ownerReclaim(client *c) {
         c->owner_tid = OWNER_ON_MAIN;
         c->owner_why = 0;
         if (c->flag.close_asap) c->flag.close_asap = 0; /* the owner's request; freeClient follows */
+        ownerTlsRelease(c);
         return;
     }
     serverAssert(own_held && c->owner_tid >= 0 && c->owner_tid < own_n);
@@ -1302,6 +1398,7 @@ void ownerReclaim(client *c) {
         pthread_mutex_unlock(&o->inbox_mu);
     }
     c->owner_tid = OWNER_ON_MAIN;
+    ownerTlsRelease(c);
 }
 
 /* A guest may go home when nothing about it needs main: no input or output in flight, no
@@ -1332,11 +1429,10 @@ static void ownerReturnGuests(void) {
     listRewind(own_guests, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
-        if (!ownerGuestIdle(c)) continue;
+        if (!ownerGuestIdle(c) || !ownerSendToOwner(c)) continue;
         listDelNode(own_guests, ln);
         c->owner_guest_node = NULL;
         own_returns++;
-        ownerSendToOwner(c);
     }
 }
 
@@ -1349,6 +1445,13 @@ static void ownerTakeToMain(client *c) {
         freeClientAsync(c);
         return;
     }
+    if (c->owner_hs) {
+        /* Its TLS handshake goes on on main, as the stock accept (clientAcceptHandler adopts it after). */
+        c->owner_hs = 0;
+        if (connAccept(c->conn, clientAcceptHandler) == C_ERR) freeClientAsync(c);
+        return;
+    }
+    ownerTlsOnMain(c);
     ownerGuestAdd(c);
     if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
 }
@@ -1374,6 +1477,15 @@ static void ownerTakeReadable(void) {
             if (!c || (uint32_t)c->id != (uint32_t)(d >> 32) || !c->owner_onloop) continue;
             ownerTakeToMain(c);
         }
+        /* TLS clients whose input OpenSSL holds (no event reports it). */
+        for (int k = 0; k < o->ntlsp; k++) {
+            uint64_t d = o->tlsp[k];
+            int fd = (int)(uint32_t)d;
+            client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
+            if (!c || (uint32_t)c->id != (uint32_t)(d >> 32) || !c->owner_onloop) continue;
+            ownerTakeToMain(c);
+        }
+        o->ntlsp = 0;
     }
 }
 
@@ -1431,7 +1543,8 @@ void ownerBeforeSleepEnd(void) {
 static void ownerAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);
-    int cport, cfd, max = server.max_new_conns_per_cycle;
+    int home = (int)((intptr_t)privdata & (OWN_LISTEN_TLS - 1)), tls = ((intptr_t)privdata & OWN_LISTEN_TLS) != 0;
+    int cport, cfd, max = tls ? server.max_new_tls_conns_per_cycle : server.max_new_conns_per_cycle;
     char cip[NET_IP_STR_LEN];
     struct ClientFlags flags = {0};
     while (max--) {
@@ -1441,10 +1554,12 @@ static void ownerAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask
             if (errno != EWOULDBLOCK) serverLog(LL_WARNING, "Accepting client connection: %s", server.neterr);
             return;
         }
-        serverLog(LL_VERBOSE, "Accepted %s:%d (owner %d)", cip, cport, (int)(intptr_t)privdata);
+        serverLog(LL_VERBOSE, "Accepted %s:%d (owner %d%s)", cip, cport, home, tls ? ", TLS" : "");
         if (server.tcpkeepalive) anetKeepAlive(NULL, cfd, server.tcpkeepalive);
-        owner_accept_home = (int)(intptr_t)privdata;
-        acceptCommonHandler(connCreateAccepted(connectionTypeTcp(), cfd, NULL), flags, cip);
+        owner_accept_home = home;
+        acceptCommonHandler(tls ? connCreateAccepted(connectionTypeTls(), cfd, &server.tls_auth_clients)
+                                : connCreateAccepted(connectionTypeTcp(), cfd, NULL),
+                            flags, cip);
         owner_accept_home = -1;
     }
 }
@@ -1491,6 +1606,15 @@ static int ownerHandOff(owner *o, client *c, int why) {
     return 1;
 }
 
+/* RL-g1d: a TLS client to read again in the next window: OpenSSL may hold input no event reports. */
+static void ownerTlsPend(owner *o, client *c) {
+    if (o->ntlsp == o->tlsp_cap) {
+        o->tlsp_cap = o->tlsp_cap ? o->tlsp_cap * 2 : 64;
+        o->tlsp = zrealloc(o->tlsp, sizeof(uint64_t) * o->tlsp_cap);
+    }
+    o->tlsp[o->ntlsp++] = ownerTag(c);
+}
+
 static void ownerRegister(owner *o, client *c) {
     int fd = c->conn->fd;
     if (fd >= o->fdmap_cap) {
@@ -1511,6 +1635,8 @@ static void ownerRegister(owner *o, client *c) {
         ownerHandOff(o, c, OWN_WHY_CLOSE);
         return;
     }
+    /* TLS: the handshake's ClientHello raises EPOLLIN; input OpenSSL took off the socket on main does not. */
+    if (c->owner_tls && !c->owner_hs && (connIOOwnerState(c->conn) & CONN_IO_BUFFERED_INPUT)) ownerTlsPend(o, c);
     if (clientHasPendingReplies(c)) ownerWrite(o, c);
 }
 
@@ -3666,6 +3792,58 @@ static int ownerRead(owner *o, client *c) {
     return ownerReadPost(o, c, 0);
 }
 
+/* RL-g1d, owner TLS ports: one step of a client's TLS handshake, on its owner (connAccept off main runs
+ * SSL_accept and nothing else). Done or failed, main runs the rest of the accept (OWN_WHY_ACCEPTED).
+ * Returns 1 when the client left the owner. */
+static int ownerHandshake(owner *o, client *c) {
+    connAccept(c->conn, NULL);
+    if (connGetState(c->conn) == CONN_STATE_ACCEPTING) {
+        /* OpenSSL waits for the socket: readable (EPOLLIN, always on), or writable */
+        ownerSetWantOut(o, c, (connIOOwnerState(c->conn) & CONN_IO_READ_WANTS_WRITE) != 0);
+        return 0;
+    }
+    c->owner_hs = 0;
+    o->tls_handshakes++;
+    return ownerHandOff(o, c, OWN_WHY_ACCEPTED);
+}
+
+/* RL-g1d: a TLS client's read (syscalls: OpenSSL reads the socket itself). A read returns at most one
+ * record, and records OpenSSL already took off the socket (read-ahead) raise no event, so it reads again
+ * while some may wait, OWN_TLS_READS times, then in the next window (ownerTlsPend). Its replies go out
+ * after each read, in order (ownerReplyOut). A read that needs the socket writable waits for EPOLLOUT.
+ * Returns 1 when the client left the owner. */
+static int ownerReadTls(owner *o, client *c) {
+    for (int k = 0; k < OWN_TLS_READS; k++) {
+        int r = ownerReadPre(o, c);
+        if (r != OWN_READ_GO) return r;
+        readToQueryBuf(c);
+        int got = c->nread > 0;
+        o->tls_reads++;
+        if (ownerReadPost(o, c, 0)) return 1;
+        int st = connIOOwnerState(c->conn);
+        if (st & CONN_IO_READ_WANTS_WRITE) ownerSetWantOut(o, c, 1);
+        if (!got || !(st & CONN_IO_BUFFERED_INPUT)) return 0;
+    }
+    ownerTlsPend(o, c);
+    return 0;
+}
+
+/* RL-g1d: the TLS clients ownerTlsPend left for this window (main is not waiting). Returns 1 when any
+ * left the owner. Clients pended again go to the next window. */
+static int ownerTlsPending(owner *o) {
+    int n = o->ntlsp, left = 0;
+    for (int k = 0; k < n; k++) {
+        uint64_t d = o->tlsp[k];
+        int fd = (int)(uint32_t)d;
+        client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
+        if (!c || (uint32_t)c->id != (uint32_t)(d >> 32) || !c->owner_onloop || !c->owner_tls || c->owner_hs) continue;
+        left |= ownerReadTls(o, c);
+    }
+    memmove(o->tlsp, o->tlsp + n, sizeof(uint64_t) * (o->ntlsp - n));
+    o->ntlsp -= n;
+    return left;
+}
+
 /* owner-uring: a read of c joins the batch as o->uops[m] when it can go through io_uring (a TCP
  * client): returns 1 then. Into the client's own query buffer when it has one, else into the slot's
  * scratch, copied into the thread's shared query buffer when the batch runs (one client at a time
@@ -3782,7 +3960,7 @@ static void *ownerThreadMain(void *arg) {
 
     struct epoll_event evs[OWNER_EVENTS];
     for (;;) {
-        int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, -1);
+        int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, o->ntlsp ? 0 : -1);
         if (n < 0) {
             if (errno != EINTR) serverLog(LL_WARNING, "owner %d: epoll_wait: %s", o->id, strerror(errno));
             continue;
@@ -3825,12 +4003,20 @@ static void *ownerThreadMain(void *arg) {
             client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
             if (!c || (uint32_t)c->id != (uint32_t)(d >> 32)) continue; /* stale: main took it back */
             uint32_t e = evs[k].events;
+            if (c->owner_hs) { /* RL-g1d: its TLS handshake, on this owner */
+                handed |= ownerHandshake(o, c);
+                continue;
+            }
+            /* RL-g1d: a TLS read that needed the socket writable goes on now */
+            if (c->owner_tls && (e & EPOLLOUT) && (connIOOwnerState(c->conn) & CONN_IO_READ_WANTS_WRITE)) e |= EPOLLIN;
             if ((e & EPOLLOUT) && !c->owner_held && ownerWrite(o, c)) {
                 handed = 1;
                 continue;
             }
             if (e & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
-                if (!batch || c->owner_deep) {
+                if (c->owner_tls) {
+                    handed |= ownerReadTls(o, c);
+                } else if (!batch || c->owner_deep) {
                     /* A deep pipeline (owner-uring-deep commands or more in its last read) already shares
                      * its syscalls among its commands: read, run and reply at once, as without io_uring. */
                     handed |= ownerRead(o, c);
@@ -3854,6 +4040,8 @@ static void *ownerThreadMain(void *arg) {
             if (atomic_load_explicit(&own_stop, memory_order_relaxed)) stop = 1;
         }
         if (m) handed |= ownerReadBatch(o, m);
+        /* RL-g1d: TLS clients whose input OpenSSL may hold (none while main waits: next window). */
+        if (o->ntlsp && !atomic_load_explicit(&own_stop, memory_order_relaxed)) handed |= ownerTlsPending(o);
         serverAssert(o->mm_resv == 0); /* every queued read ran, and gave its reservation back */
         /* This window's AOF records: written here (everysec, no), unless main is stopping the world,
          * which folds them first thing and writes them with its own. */
@@ -3898,6 +4086,8 @@ static void ownerAnnounceIp(client *c, char *ip, size_t len) {
 }
 
 static int ownerOfPort(int port) {
+    if (server.owner_tls_port && port >= server.owner_tls_port && port < server.owner_tls_port + own_n)
+        return port - server.owner_tls_port;
     if (!server.owner_port || port < server.owner_port || port >= server.owner_port + own_n) return -1;
     return port - server.owner_port;
 }
@@ -3911,6 +4101,9 @@ int ownerClusterCommand(client *c) {
     char lip[NET_IP_STR_LEN];
     if (c->conn) connAddrSockName(c->conn, lip, sizeof(lip), &myport);
     int me = ownerOfPort(myport);
+    /* RL-g1d: a TLS client gets the owners' TLS ports (as tls-cluster nodes answer TLS clients), plain
+     * clients the plain ones; CLUSTER SHARDS lists both, as stock does. */
+    int tls = server.owner_tls_port && c->conn && connIsTLS(c->conn);
     if (!strcasecmp(sub, "slots") && c->argc == 2) {
         addReplyArrayLen(c, own_n);
         for (int i = 0; i < own_n; i++) {
@@ -3921,7 +4114,7 @@ int ownerClusterCommand(client *c) {
             addReplyLongLong(c, o->slot_hi);
             addReplyArrayLen(c, 4);
             addReplyBulkCString(c, ip);
-            addReplyLongLong(c, o->port);
+            addReplyLongLong(c, tls ? o->tls_port : o->port);
             addReplyBulkCBuffer(c, id, CLUSTER_NAMELEN);
             addReplyMapLen(c, 0);
         }
@@ -3939,11 +4132,15 @@ int ownerClusterCommand(client *c) {
             addReplyLongLong(c, o->slot_hi);
             addReplyBulkCString(c, "nodes");
             addReplyArrayLen(c, 1);
-            addReplyMapLen(c, 7);
+            addReplyMapLen(c, o->tls_port ? 8 : 7);
             addReplyBulkCString(c, "id");
             addReplyBulkCBuffer(c, id, CLUSTER_NAMELEN);
             addReplyBulkCString(c, "port");
             addReplyLongLong(c, o->port);
+            if (o->tls_port) {
+                addReplyBulkCString(c, "tls-port");
+                addReplyLongLong(c, o->tls_port);
+            }
             addReplyBulkCString(c, "ip");
             addReplyBulkCString(c, ip);
             addReplyBulkCString(c, "endpoint");
@@ -3962,8 +4159,8 @@ int ownerClusterCommand(client *c) {
         for (int i = 0; i < own_n; i++) {
             owner *o = &owners[i];
             ownerNodeId(i, id);
-            s = sdscatprintf(s, "%s %s:%d@%d %s - 0 0 %d connected %d-%d\n", id, ip, o->port, o->port + 10000,
-                             i == me ? "myself,master" : "master", i + 1, o->slot_lo, o->slot_hi);
+            s = sdscatprintf(s, "%s %s:%d@%d %s - 0 0 %d connected %d-%d\n", id, ip, tls ? o->tls_port : o->port,
+                             o->port + 10000, i == me ? "myself,master" : "master", i + 1, o->slot_lo, o->slot_hi);
         }
         addReplyVerbatim(c, s, sdslen(s), "txt");
         sdsfree(s);
@@ -4051,6 +4248,14 @@ void ownerInfo(sds *info) {
         for (int i = 0; i < own_n; i++) n += owners[i].fam_total[f];
         *info = sdscatprintf(*info, "owner_%s_commands:%lld\r\n", own_fam_names[f], n);
     }
+    /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
+    long long tls_hs = 0, tls_rd = 0;
+    for (int i = 0; i < own_n; i++) {
+        tls_hs += owners[i].tls_handshakes;
+        tls_rd += owners[i].tls_reads;
+    }
+    *info = sdscatprintf(*info, "owner_tls_port:%d\r\nowner_tls_handshakes:%lld\r\nowner_tls_reads:%lld\r\n",
+                         server.owner_tls_port, tls_hs, tls_rd);
     *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
                          server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
     /* D3-all-g14-fold: owner_repl_split: the owners encode each record twice (compact AOF, RESP stream). */

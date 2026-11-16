@@ -500,6 +500,8 @@ client *createClient(connection *conn) {
     c->owner_onloop = 0;
     c->owner_wantout = 0;
     c->owner_deep = 0;
+    c->owner_tls = 0;
+    c->owner_hs = 0;
     c->owner_held = 0;
     c->owner_guest_node = NULL;
     c->owner_refs = NULL;
@@ -2031,10 +2033,11 @@ void clientAcceptHandler(connection *conn) {
     server.stat_numconnections++;
     moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
 
-    /* A connection on an owner port (or any TCP client under owner-adopt-all) is served by its
+    /* A connection on an owner port (or any TCP or TLS client under owner-adopt-all) is served by its
      * owner thread from now on. */
     if (!c->flag.close_asap && ownerThreadsEnabled()) {
-        if (c->owner_home < 0 && server.owner_adopt_all && connGetType(conn) == CONN_TYPE_SOCKET)
+        if (c->owner_home < 0 && server.owner_adopt_all &&
+            (connGetType(conn) == CONN_TYPE_SOCKET || connGetType(conn) == CONN_TYPE_TLS))
             c->owner_home = (int)(c->id % (uint64_t)server.owner_threads);
         if (c->owner_home >= 0 && ownerAdoptAccepted(c)) return;
     }
@@ -2271,6 +2274,12 @@ void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
 
     /* Last chance to keep flags */
     if (flags.unix_socket) c->flag.unix_socket = 1;
+
+    /* A TLS client of an owner TLS port does its handshake on its owner thread (owner.c); under
+     * owner-adopt-all (debug) every TLS client does (RL-g1d), as every TCP client is adopted. */
+    if (c->owner_home < 0 && server.owner_adopt_all && ownerThreadsEnabled() && connIsTLS(conn))
+        c->owner_home = (int)(c->id % (uint64_t)server.owner_threads);
+    if (c->owner_home >= 0 && connIsTLS(conn) && ownerAdoptHandshake(c)) return;
 
     /* Initiate accept.
      *

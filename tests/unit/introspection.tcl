@@ -1332,6 +1332,7 @@ start_server {tags {"introspection"}} {
             keyspace-shard-bits
             owner-threads
             owner-port
+            owner-tls-port
             owner-cpulist
             owner-adopt-all
             acl-offload

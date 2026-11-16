@@ -30,6 +30,7 @@ void ownerBeforeSleepEnd(void); /* main: return idle guests, resume the world */
 
 /* Hooks from networking.c / server.c. */
 int ownerAdoptAccepted(struct client *c); /* clientAcceptHandler: 1 when an owner took the client */
+int ownerAdoptHandshake(struct client *c); /* acceptCommonHandler: 1 when an owner runs the TLS handshake */
 void ownerIOThreadsChanged(void);         /* CONFIG SET io-threads: owners sleep while it is > 1 */
 void ownerReclaim(struct client *c);       /* freeClient on main: take the client back from its owner */
 void ownerClientFreed(struct client *c);   /* freeClient on main: drop it from the guest list */

@@ -1654,6 +1654,8 @@ typedef struct client {
     unsigned owner_onloop : 1;   /* Registered in its owner's epoll set. */
     unsigned owner_wantout : 1;  /* Its owner waits for EPOLLOUT. */
     unsigned owner_deep : 1;     /* Its last owner read had owner-uring-deep commands or more: not batched (owner.c). */
+    unsigned owner_tls : 1;      /* TLS: its owner thread runs OpenSSL for it (connIOOwnerBegin; owner.c). */
+    unsigned owner_hs : 1;       /* TLS: its handshake runs on its owner thread (owner TLS ports). */
     int owner_held;              /* Its replies wait for the AOF: index + 1 in its owner's held list, else 0. */
     listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
     /* D3-all-g11-bigreply: values its owner sends from where they are stored, cut into c->buf (owner.c
@@ -2174,6 +2176,7 @@ struct valkeyServer {
     int keyspace_shard_bits_config;           /* Configured value: -1 means auto (resolve at startup from cluster mode). */
     int owner_threads;                        /* owner-threads: D3 owner threads, 0 = off (owner.c). */
     int owner_port;                           /* owner-port: owner i listens on owner_port + i; 0 = no owner ports. */
+    int owner_tls_port;                       /* owner-tls-port: owner i takes TLS clients on owner_tls_port + i; 0 = off (RL-g1d). */
     char *owner_cpulist;                      /* owner-cpulist: owner i is pinned to the i-th CPU of the list. */
     char *owner_announce_ip;                  /* owner-announce-ip: address CLUSTER SLOTS announces. */
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */
