@@ -389,11 +389,15 @@ def suite(name):
     check("%s.commandstats_equal_parent" % name, not bad, bad if bad else "%d commands' calls / rejected / failed" % len(da))
     hand = s1["owner_handoffs_to_main"] - s0["owner_handoffs_to_main"]
     stops = max(1, s1["owner_world_stops"] - s0["owner_world_stops"])
-    home = s1.get("owner_returns_with_replies", 0) - s0.get("owner_returns_with_replies", 0)
+    # RL-1b: with RL-g1g in the tree, a client with input left goes home by RL-g1g's resume (the rest of its
+    # input and main's replies, at the end of beforeSleep) before ownerGoHomeNow can take it: both count.
+    wr = s1.get("owner_returns_with_replies", 0) - s0.get("owner_returns_with_replies", 0)
+    rs = s1.get("owner_pipeline_resumes", 0) - s0.get("owner_pipeline_resumes", 0)
+    home = wr + rs
     want_home = name != "aof"
-    check("%s.handoffs_went_home" % name, hand > 1000 and ((home > 0.5 * hand) if want_home else home == 0),
-          "handoffs %d (%.1f per stop), home with replies %d, returns %d" %
-          (hand, hand / stops, home, s1["owner_returns_from_main"] - s0["owner_returns_from_main"]))
+    check("%s.handoffs_went_home" % name, hand > 1000 and ((home > 0.5 * hand) if want_home else wr == 0),
+          "handoffs %d (%.1f per stop), home with replies %d + pipeline resumes %d, returns %d" %
+          (hand, hand / stops, wr, rs, s1["owner_returns_from_main"] - s0["owner_returns_from_main"]))
     keys = sorted(set(k for o in out.values() for k in o["keys"])) + [shared]
     sa, sr = snapshot(a.port, keys), snapshot(r.port, keys)
     badk = [(k, sa.get(k), sr.get(k)) for k in set(sa) | set(sr)
