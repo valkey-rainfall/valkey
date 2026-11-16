@@ -2211,6 +2211,7 @@ struct valkeyServer {
     int owner_busy_poll_budget;               /* vkevo RL-g2p: packets per busy-poll round (0: the kernel's default, 8; at most 64). */
     int owner_busy_poll_prefer;               /* vkevo RL-g2p: prefer_busy_poll (yes: the kernel lets the poller take the queue from the softirq). */
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
+    int owner_evict;                          /* owner-evict: RL-g6d, at maxmemory each owner evicts from its own slots (default no). */
     int owner_cron;                           /* owner-cron (RL-g2c): owners run the per-client cron of the clients they serve (default yes). */
     int owner_light_cron;                     /* owner-light-cron (RL-g3b): timer wakes with no owner-state work leave the owners running (default yes). */
     int lazy_malloc_stats;                    /* lazy-malloc-stats (RL-g7e): cron_malloc_stats sampled by INFO / MEMORY when 100 ms old, not by serverCron (default yes). */
@@ -4704,6 +4705,13 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms);
 
 /* evict.c -- maxmemory handling and LRU eviction. */
 void evictionPoolAlloc(void);
+/* RL-g6d-cache-eviction: an owner's pool, choice and delete (owner.c ownerEvict). */
+struct evictionPoolEntry *evictionPoolNew(void);
+int evictionPoolPopulateIndex(serverDb *db, kvstore *samplekvs, int slot, struct evictionPoolEntry *pool);
+int evictionPickInTables(struct evictionPoolEntry *pool, int t0, int nt, unsigned int *seed, int *dbidp,
+                         int *didxp, robj **keyobj);
+long long evictKeyInTable(serverDb *db, robj *keyobj, int didx);
+int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index);
 #define EVICT_OK 0
 #define EVICT_RUNNING 1
 #define EVICT_FAIL 2

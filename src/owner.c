@@ -106,6 +106,23 @@
  * that read sets own_mm_over and every owner sends its work to main until main looks again. Leases add
  * no overshoot of their own.
  *
+ * RL-g6d-cache-eviction (owner-evict yes; default no): a cache sits at maxmemory, where the headroom above is
+ * ~0 and the OWN_MM_TIGHT veto sent every command to main (RL-2d: 4.1M -> 0.2M ops/s at W=16). With
+ * owner-evict and an evicting policy, nothing is vetoed for that: main gives each owner its share of
+ * maxmemory minus used memory (stock's count: without the AOF and replica buffers), which is negative when
+ * memory is over the limit, and before a native command (the point where stock's processCommand
+ * runs performEvictions) an owner whose share is used up looks at the whole server's memory (every thread's
+ * counter): below the limit it takes a new share of what is left and evicts nothing, as stock; at the limit it
+ * evicts keys from its own tables (its part of the overage plus OWN_EVICT_CHUNK), with its own pool and the
+ * policy's choice (evict.c evictionPickInTables), deleting each as evictSingleKey does and taking its DEL /
+ * UNLINK into its records like a native command's. Bound: stock's (evict before a command, which may then go
+ * over by what it adds; reads reserve nothing and are not checked), per owner: windows batch with no lease
+ * room, so the cache keeps its memory instead of a 32 MB lease room per owner. A command bigger
+ * than OWN_MM_TIGHT, a pick that finds nothing (volatile-* with no TTL keys in the owner's slots, an empty
+ * owner) or OWN_EVICT_MAX keys that did not make room send the work to main, whose processCommand evicts or
+ * refuses as stock does. Off (the default), with noeviction, or while main's eviction timer runs, the
+ * owners do as before.
+ *
  * shortcut: one global stop for every main iteration, and a client that falls back returns to its
  * owner as soon as it is idle (no hysteresis). Fine while main is mostly idle (cluster clients on
  * owner ports); a heavy plain-client load on 6379 or many cross-owner commands stop owners often.
@@ -810,6 +827,12 @@ typedef struct owner {
     size_t mm_resv;
     int mm_roomy; /* this window: no maxmemory, or a lease with OWN_MM_LEASE_ROOM to spare (batch, SET bursts) */
     long long mm_lease_windows, mm_exact_windows; /* windows under maxmemory: batched in the lease, or exact */
+    /* RL-g6d (owner-evict): this owner's eviction pool and random state (owner thread only); keys it evicted
+     * since main last folded them into stat_evictedkeys; INFO totals, never cleared. */
+    struct evictionPoolEntry *evpool;
+    unsigned int evseed;
+    long long mm_slice; /* owner-evict: this owner's share this period (own_mm_slice, renewed by ownerEvictRoom) */
+    long long evicted, evicted_total, evict_runs, evict_fails, room_takes;
     /* Totals for INFO, never cleared. */
     long long native_total, handoffs_total, adopted_total, windows_total;
     long long flow_skipped_total, flow_naps_total; /* RL-g3h: reads left in the socket, naps after such a window */
@@ -1042,6 +1065,18 @@ static _Atomic long long own_drain_combined = 0, own_drain_combines = 0;
 #define OWN_AOF_FSYNC_BYTES (32LL << 20) /* everysec: an owner drain starts an fsync once this much is unsynced */
 static int own_mm = 0;                    /* maxmemory: native steps check their headroom */
 static long long own_mm_slice = 0;        /* bytes each owner may add this period */
+/* RL-g6d (owner-evict): this period the owners evict from their own slots instead of the OWN_MM_TIGHT veto;
+ * own_mm_slice is then each owner's share of maxmemory minus used memory, negative when over the limit. */
+static int own_evict = 0;
+static long long own_mm_notcounted = 0; /* owner-evict: freeMemoryGetNotCountedMemory() when main planned the period */
+/* owner-evict: an owner could not make room (nothing of its own to evict for the policy, or OWN_EVICT_MAX keys did not
+ * do it): main keeps the OWN_MM_TIGHT veto for OWN_EVICT_RETRY_MS from when it saw that, so it serves (evicts or
+ * refuses) as stock instead of clients bouncing between an owner that cannot read and main sending them back home. */
+static _Atomic int own_evict_stuck = 0;
+static long long own_evict_stuck_at = -1;
+#define OWN_EVICT_RETRY_MS 100
+#define OWN_EVICT_MAX 1024            /* keys one step may evict before it gives up and goes to main */
+#define OWN_EVICT_CHUNK (8 * 1024)   /* room an owner makes (or takes) at a time beyond the step: amortizes the look */
 static unsigned long long own_mm_period = 0;
 static _Atomic int own_mm_over = 0;       /* an owner went over its slice: every owner sends work to main */
 static int own_mm_lease = 0;              /* maxmemory and owner-mm-lease: batched reads and SET bursts in the lease */
@@ -1751,6 +1786,15 @@ static long long ownerMmHeadroom(void) {
     return (long long)(server.maxmemory - used - OWN_MM_SLACK);
 }
 
+/* RL-g6d: whether the owners may evict from their own slots this period (owner-evict, an evicting policy, main's
+ * time-limited eviction not running, not an import-mode primary: performEvictions' own conditions). */
+static int ownerEvictCan(void) {
+    if (atomic_exchange_explicit(&own_evict_stuck, 0, memory_order_relaxed)) own_evict_stuck_at = server.mstime;
+    if (own_evict_stuck_at >= 0 && server.mstime - own_evict_stuck_at < OWN_EVICT_RETRY_MS) return 0;
+    return server.owner_evict && server.maxmemory && server.maxmemory_policy != MAXMEMORY_NO_EVICTION &&
+           !server.stat_last_eviction_exceeded_time && !(iAmPrimary() && server.import_mode);
+}
+
 static int ownerComputeVeto(void) {
     /* AOF on is served natively (ownerFoldProp); turning it on (AOF_WAIT_REWRITE) is not. Replicas and
      * the backlog of a top-level primary are served natively too (D3-all-g11-repl: ownerAofAppend
@@ -1764,7 +1808,7 @@ static int ownerComputeVeto(void) {
      * OWN_MM_TIGHT; client eviction and batched eviction decide on main between commands from state
      * owners change. */
     if (server.maxmemory_clients || (server.maxmemory && server.maxmemory_eviction_batch)) return OWN_VETO_ALL;
-    if (server.maxmemory && ownerMmHeadroom() / own_n < OWN_MM_TIGHT) return OWN_VETO_ALL;
+    if (server.maxmemory && !ownerEvictCan() && ownerMmHeadroom() / own_n < OWN_MM_TIGHT) return OWN_VETO_ALL;
     if (listLength(server.monitors) || !trackingIsIdle() || server.notify_keyspace_events) return OWN_VETO_ALL;
     if (server.watching_clients) return OWN_VETO_ALL;
     if (moduleCountLoaded() || moduleObservesWrites() || server.blocked_clients_by_type[BLOCKED_MODULE] ||
@@ -1885,8 +1929,17 @@ static void ownerReleaseHeld(void) {
 static void ownerMmPlan(void) {
     own_mm = server.maxmemory != 0;
     own_mm_lease = own_mm && server.owner_mm_lease;
+    own_evict = own_mm && ownerEvictCan();
     if (!own_mm) return;
-    own_mm_slice = ownerMmHeadroom() / own_n;
+    if (own_evict) {
+        /* RL-g6d: each owner's share of maxmemory minus used memory as performEvictions counts it, less the slack;
+         * negative when over the limit (each owner then evicts its share of the overage first). */
+        own_mm_notcounted = (long long)freeMemoryGetNotCountedMemory();
+        long long used = (long long)zmalloc_used_memory() - own_mm_notcounted;
+        own_mm_slice = ((long long)server.maxmemory - used - OWN_MM_SLACK) / own_n;
+    } else {
+        own_mm_slice = ownerMmHeadroom() / own_n;
+    }
     own_mm_period++;
     atomic_store_explicit(&own_mm_over, 0, memory_order_relaxed);
 }
@@ -2015,6 +2068,8 @@ static void ownerFoldStats(void) {
         m->stat_expiredkeys += e->stat_expiredkeys;
         m->stat_expiredfields += e->stat_expiredfields;
         m->stat_total_error_replies += e->stat_total_error_replies;
+        server.stat_evictedkeys += o->evicted; /* RL-g6d: owner evictions */
+        o->evicted = 0;
         e->dirty = e->stat_numcommands = e->stat_keyspace_hits = e->stat_keyspace_misses = 0;
         e->stat_expiredkeys = e->stat_expiredfields = e->stat_total_error_replies = 0;
         for (int k = 0; k < OWN_NCMDS; k++) {
@@ -3716,13 +3771,79 @@ static long long ownerMmGrowth(owner *o) {
 static int ownerMmFits(owner *o, size_t need) {
     if (atomic_load_explicit(&own_mm_over, memory_order_relaxed)) return 0;
     long long g = ownerMmGrowth(o);
-    return g != LLONG_MAX && g + (long long)need + (long long)o->mm_resv + ownerMmStreamDue(o) <= own_mm_slice;
+    /* RL-g6d: evicting owners keep stock's bound (evict before a step), so queued reads reserve nothing. */
+    long long resv = own_evict ? 0 : (long long)o->mm_resv;
+    long long slice = own_evict ? o->mm_slice : own_mm_slice;
+    return g != LLONG_MAX && g + (long long)need + resv + ownerMmStreamDue(o) <= slice;
+}
+
+/* RL-g6d (owner-evict): this owner's share is used up (a step that may add `need` does not fit). Look at the whole
+ * server now (every thread's counter, less what eviction does not count as main measured it for the period):
+ * - under the limit with room for the step: take a new share of what is left (step + an equal part of the rest),
+ *   with no eviction, as stock evicts nothing below the limit;
+ * - else evict keys of this owner's own tables, by the policy, until this owner freed its part of the overage plus
+ *   OWN_EVICT_CHUNK (or the whole server has room again), each delete as evictSingleKey makes it, its DEL / UNLINK into
+ *   this owner's records; then take a share that fits the step and the chunk.
+ * At most OWN_EVICT_MAX keys a step; a pick that finds nothing (volatile-* with no TTL key here, no keys) gives up:
+ * the step goes to main, whose processCommand evicts or refuses as stock. Only where stock's processCommand would
+ * evict (before a command), never inside one (a table resize asks ownerMmFits). */
+static int ownerEvictRoom(owner *o, size_t need) {
+    long long g = ownerMmGrowth(o);
+    if (g == LLONG_MAX) return 0;
+    long long step = (long long)need + ownerMmStreamDue(o);
+    long long limit = (long long)server.maxmemory - OWN_MM_SLACK;
+    long long head = limit - ((long long)zmalloc_used_memory() - own_mm_notcounted);
+    if (head >= step) {
+        o->mm_slice = g + step + (head - step) / own_n;
+        o->room_takes++;
+        return 1;
+    }
+    if (ectx->also_propagate.numops) return 0; /* a step's ops are pending: not a point between steps */
+    if (!o->evpool) {
+        o->evpool = evictionPoolNew();
+        o->evseed = (unsigned int)(o->id * 2654435761u) ^ (unsigned int)ustime();
+    }
+    o->evict_runs++;
+    long long part = (step - head) / own_n + OWN_EVICT_CHUNK, freed = 0;
+    int n = 0;
+    while (freed < part && n < OWN_EVICT_MAX) {
+        int dbid, didx;
+        robj *keyobj;
+        if (!evictionPickInTables(o->evpool, o->exp_t0, o->exp_ntables, &o->evseed, &dbid, &didx, &keyobj)) break;
+        freed += evictKeyInTable(server.db[dbid], keyobj, didx);
+        decrRefCount(keyobj);
+        if (ectx->also_propagate.numops) ownerTakeProp(o, NULL); /* one op: no MULTI around it */
+        o->evicted++;
+        o->evicted_total++;
+        n++;
+        if ((n & 15) == 0 && limit - ((long long)zmalloc_used_memory() - own_mm_notcounted) >= step + OWN_EVICT_CHUNK)
+            break; /* the server has room again (other owners evicted too) */
+    }
+    if (freed < part && limit - ((long long)zmalloc_used_memory() - own_mm_notcounted) < step) {
+        o->evict_fails++;
+        atomic_store_explicit(&own_evict_stuck, 1, memory_order_relaxed); /* main serves for a while (ownerEvictCan) */
+        o->wake_main = 1;
+        return 0;
+    }
+    g = ownerMmGrowth(o);
+    o->mm_slice = g + step + OWN_EVICT_CHUNK;
+    return 1;
+}
+
+/* A step that may add `need` fits this owner's share, after evicting for it when the owners evict (RL-g6d). */
+static int ownerMmEnsure(owner *o, size_t need) {
+    if (ownerMmFits(o, need)) return 1;
+    if (!own_evict || need > OWN_MM_TIGHT || atomic_load_explicit(&own_mm_over, memory_order_relaxed) ||
+        atomic_load_explicit(&own_veto, memory_order_relaxed)) /* vetoed writes: main evicts, as stock */
+        return 0;
+    return ownerEvictRoom(o, need);
 }
 
 /* Owner: after a read and its parse, which can allocate more than any bound before it (a big
  * argument's buffer). Over the slice (the batch's queued reads counted): every owner sends its work
- * to main until main has looked. */
+ * to main until main has looked. RL-g6d: evicting owners make room before their next step instead. */
 static void ownerMmAfterRead(owner *o) {
+    if (own_evict) return;
     long long g = ownerMmGrowth(o);
     if (g == LLONG_MAX || g + (long long)o->mm_resv + ownerMmStreamDue(o) > own_mm_slice) {
         atomic_store_explicit(&own_mm_over, 1, memory_order_relaxed);
@@ -3904,6 +4025,21 @@ static size_t ownerMmExecBound(owner *o, client *c) {
     return b;
 }
 
+/* RL-2s (RL-g6d with RL-g6h): what an evicting owner evicts for before EXEC: the queued commands' own data, sized
+ * as one command's (ownerMmCmdFits under owner-evict). Stock reserves nothing for EXEC either; ownerMmExecBound's
+ * per-command blocks (OWN_MM_CMD each) would make every EXEC at the limit evict tens of KB more than stock. */
+static size_t ownerMmExecOwn(client *c) {
+    multiState *ms = c->mstate;
+    size_t b = 2 * ms->argv_len_sums;
+    for (int j = 0; j < ms->count; j++) {
+        multiCmd *mc = ms->commands + j;
+        size_t more = ownerMmMore(c, mc->cmd, mc->argv, mc->argc, mc->slot, ownerKindOf(mc->cmd));
+        if (more == SIZE_MAX) return SIZE_MAX;
+        b += 64 * (size_t)mc->argc + more;
+    }
+    return b;
+}
+
 /* Whether native command `kind` fits: a bound on what it can add (the value, objects and entries, the
  * reply and a reply block, commandlog entries, a first latency histogram, the ops kept for the AOF and
  * a lazy-expire DEL's, an array doubling; for EXEC its queued commands too) on top of what the owner
@@ -3915,6 +4051,14 @@ static int ownerMmCmdFits(owner *o, client *c, int kind) {
     size_t more = own_kinds[kind].mm == OWN_MM_EXEC ? ownerMmExecBound(o, c)
                                                     : ownerMmMore(c, c->parsed_cmd, c->argv, c->argc, c->slot, kind);
     if (more == SIZE_MAX) return 0;
+    if (own_evict) {
+        /* RL-g6d: stock's rule, as processCommand runs it: evict until memory is under the limit, then run; no
+         * room is reserved for what the command may add (its own data only sizes the eviction). A command whose
+         * data is bigger than OWN_MM_TIGHT runs on main, as before. */
+        size_t own = 2 * c->argv_len_sum + 64 * (size_t)c->argc + more;
+        if (own_kinds[kind].mm == OWN_MM_EXEC) own = ownerMmExecOwn(c); /* RL-2s: not ownerMmExecBound's reserve */
+        return own <= OWN_MM_TIGHT && ownerMmEnsure(o, own);
+    }
     return ownerMmFits(o, b + more);
 }
 
@@ -3923,6 +4067,7 @@ static int ownerMmCmdFits(owner *o, client *c, int kind) {
  * plus the slow commandlog entries of the burst's SETs so far and this one, which ownerSetBurstEnd makes
  * after the last of them. */
 static int ownerMmSetBurstFits(owner *o, size_t argv_len, int ran) {
+    if (own_evict) return ownerMmFits(o, 2 * argv_len + 64 * 3); /* RL-g6d: as ownerMmCmdFits sizes a SET then */
     size_t b = OWN_MM_CMD + 2 * argv_len + 64 * 3 + 2 * ownerArraysBytes(o) + (size_t)(ran + 1) * OWN_MM_SETBURST_LOG;
     if (server.latency_tracking_enabled && !o->cs[OWN_SET].hist) b += OWN_MM_HISTOGRAM;
     if (own_keep) b += OWN_MM_REC * (argv_len + 32 * 3 + 64); /* g14: records for the stream too (g11-repl) */
@@ -4703,8 +4848,12 @@ static int ownerNativeKind(owner *o, client *c) {
     case OWN_EVAL:
         /* RL-g1f-owner-evalsha: RESP2 (RL-g6g: and RESP3) callers outside MULTI, no maxmemory (no bound on a
          * script's growth), no WATCHed keys on this owner (an aborted run's writes would have touched them), and
-         * a script this owner has from main's cache (ownerScriptReady). */
-        if (c->flag.multi || own_mm || (c->resp != 2 && c->resp != 3) || c->flag.lua_debug ||
+         * a script this owner has from main's cache (ownerScriptReady). RL-2s (RL-g6g with RL-g6d): with the
+         * owners evicting (own_evict) the bound is stock's, which a script keeps: ownerMmCmdFits below evicts for the
+         * script's own data before the run, as processCommand does before an EVAL, and the run may then go over by
+         * what it adds; so scripts run natively at maxmemory then. An owner that cannot make room hands it to main,
+         * where the script's write commands get the stock OOM error (pre_command_oom_state). */
+        if (c->flag.multi || (own_mm && !own_evict) || (c->resp != 2 && c->resp != 3) || c->flag.lua_debug ||
             (veto & (OWN_VETO_ALL | OWN_VETO_WRITE)) || ((veto & OWN_VETO_BLOCKED) && ownerSlotBlocked(c->slot)) ||
             c->slot < o->slot_lo || c->slot > o->slot_hi || o->watchers || !ownerScriptReady(o, c))
             return -1;
@@ -6638,7 +6787,8 @@ static int ownerReadPre(owner *o, client *c) {
     /* Under maxmemory a read must fit the headroom too (query buffer, argv objects; a big argument's
      * buffer is allocated when its header is parsed: ownerMmAfterRead). Otherwise main reads it, as
      * the stock server; a slice this small is the OWN_MM_TIGHT veto, which keeps the client there. */
-    if (own_mm && !ownerMmFits(o, OWN_MM_READ)) {
+    /* RL-g6d: evicting owners read as stock reads (no check: a command evicts before it runs). */
+    if (own_mm && !own_evict && !ownerMmFits(o, OWN_MM_READ)) {
         o->mm_refused_total++;
         return ownerHandOff(o, c, OWN_WHY_IDLE);
     }
@@ -7436,6 +7586,7 @@ static void *ownerThreadMain(void *arg) {
             /* A new period: what this owner adds is measured from here (it allocates only in windows). */
             if (!zmalloc_thread_used_memory(&o->mm_base)) o->mm_base = 0;
             o->mm_period = own_mm_period;
+            o->mm_slice = own_mm_slice; /* RL-g6d: this owner's own share, renewed by ownerEvictRoom */
         }
         hashtableSetResizeAskAlways(own_mm); /* under maxmemory every table allocation asks */
         int handed = 0;
@@ -7447,7 +7598,9 @@ static void *ownerThreadMain(void *arg) {
          * headroom check counts the reservations, so a read still finds the room the unbatched path checks
          * for right before it; with less room the reads go one at a time (g10's exact path). Not under
          * appendonly either, unless owner-uring-aof yes (ownerUringOn). */
-        o->mm_roomy = !own_mm || (own_mm_lease && ownerMmFits(o, OWN_MM_LEASE_ROOM));
+        /* RL-g6d: evicting owners keep stock's bound (reads reserve nothing; a command evicts first), so their
+         * windows batch: the room a read takes is checked before the command it carries. */
+        o->mm_roomy = !own_mm || (own_mm_lease && (own_evict || ownerMmFits(o, OWN_MM_LEASE_ROOM)));
         if (own_mm) {
             if (o->mm_roomy)
                 o->mm_lease_windows++;
@@ -7843,6 +7996,19 @@ void ownerInfo(sds *info) {
                          "owner_mm_lease:%s\r\nowner_mm_lease_bytes:%lld\r\nowner_mm_lease_windows:%lld\r\n"
                          "owner_mm_exact_windows:%lld\r\n",
                          server.owner_mm_lease ? "yes" : "no", own_mm ? own_mm_slice : 0LL, mm_lease_w, mm_exact_w);
+    /* RL-g6d: owner eviction: on this period, keys the owners evicted, steps that evicted, steps that went to
+     * main because eviction did not make room. */
+    long long ev_keys = 0, ev_runs = 0, ev_fails = 0, ev_takes = 0;
+    for (int i = 0; i < own_n; i++) {
+        ev_keys += owners[i].evicted_total;
+        ev_runs += owners[i].evict_runs;
+        ev_fails += owners[i].evict_fails;
+        ev_takes += owners[i].room_takes;
+    }
+    *info = sdscatprintf(*info,
+                         "owner_evict:%s\r\nowner_evicting:%d\r\nowner_evicted_keys:%lld\r\nowner_evict_runs:%lld\r\n"
+                         "owner_evict_fails:%lld\r\nowner_evict_room_takes:%lld\r\n",
+                         server.owner_evict ? "yes" : "no", own_evict, ev_keys, ev_runs, ev_fails, ev_takes);
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
     /* RL-1: native commands by family (own_kinds[].family). */
     for (int f = 0; f < OWN_NFAM; f++) {

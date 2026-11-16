@@ -92,6 +92,11 @@ static struct evictionPoolEntry *EvictionPoolLRU;
 
 /* Create a new eviction pool. */
 void evictionPoolAlloc(void) {
+    EvictionPoolLRU = evictionPoolNew();
+}
+
+/* A pool of EVPOOL_SIZE entries (main's, or an owner's: RL-g6d). */
+struct evictionPoolEntry *evictionPoolNew(void) {
     struct evictionPoolEntry *ep;
     int j;
 
@@ -102,7 +107,94 @@ void evictionPoolAlloc(void) {
         ep[j].cached = sdsnewlen(NULL, EVPOOL_CACHED_SDS_SIZE);
         ep[j].dbid = 0;
     }
-    EvictionPoolLRU = ep;
+    return ep;
+}
+
+/* RL-g6d-cache-eviction (owner-evict): performEvictions' choice of the next key, restricted to the kvstore
+ * tables [t0, t0 + nt) (an owner's own slots, on its own thread), with the caller's pool: the same policies
+ * and the same sampling (maxmemory-samples keys per table visited, from tables picked at random among the
+ * range's non-empty ones; the best of the pool, ghosts skipped). Returns 1 with the key's db, table and a new
+ * string object for its name; 0 when the range has no candidate (no keys, or none with a TTL for volatile-*). */
+int evictionPickInTables(struct evictionPoolEntry *pool, int t0, int nt, unsigned int *seed, int *dbidp,
+                         int *didxp, robj **keyobj) {
+    int allkeys = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) != 0;
+    if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
+        server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+        for (int round = 0; round < 4; round++) {
+            unsigned long total_keys = 0;
+            for (int i = 0; i < server.dbnum; i++) {
+                serverDb *db = server.db[i];
+                if (db == NULL) continue;
+                kvstore *kvs = allkeys ? db->keys : db->expires;
+                unsigned long n = 0;
+                for (int t = 0; t < nt; t++) n += kvstoreHashtableSize(kvs, t0 + t);
+                if (n == 0) continue;
+                total_keys += n;
+                unsigned long sampled = 0;
+                for (int tries = 0; tries < 2 * nt && sampled < (unsigned long)server.maxmemory_samples; tries++) {
+                    int didx = t0 + (int)(rand_r(seed) % (unsigned)nt);
+                    if (!kvstoreHashtableSize(kvs, didx)) continue;
+                    sampled += evictionPoolPopulateIndex(db, kvs, didx, pool);
+                    if (n < (unsigned long)server.maxmemory_samples * 10) break;
+                }
+            }
+            if (!total_keys) return 0;
+            for (int k = EVPOOL_SIZE - 1; k >= 0; k--) {
+                if (pool[k].key == NULL) continue;
+                int dbid = pool[k].dbid, didx = pool[k].slot;
+                kvstore *kvs = allkeys ? server.db[dbid]->keys : server.db[dbid]->expires;
+                void *entry = NULL;
+                /* A pool entry outside the range cannot be there (only this range was sampled into it). */
+                bool found = didx >= t0 && didx < t0 + nt && kvstoreHashtableFind(kvs, didx, pool[k].key, &entry);
+                if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
+                pool[k].key = NULL;
+                pool[k].idle = 0;
+                if (found) {
+                    sds key = objectGetKey((robj *)entry);
+                    *keyobj = createStringObject(key, sdslen(key));
+                    *dbidp = dbid;
+                    *didxp = didx;
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+    /* volatile-random and allkeys-random */
+    for (int tries = 0; tries < 4 * nt; tries++) {
+        int i = (int)(rand_r(seed) % (unsigned)server.dbnum);
+        serverDb *db = server.db[i];
+        if (db == NULL) continue;
+        kvstore *kvs = allkeys ? db->keys : db->expires;
+        int didx = t0 + (int)(rand_r(seed) % (unsigned)nt);
+        void *entry;
+        if (kvstoreHashtableSize(kvs, didx) && kvstoreHashtableRandomEntry(kvs, didx, &entry)) {
+            sds key = objectGetKey((robj *)entry);
+            *keyobj = createStringObject(key, sdslen(key));
+            *dbidp = i;
+            *didxp = didx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* RL-g6d: evictSingleKey for a key evictionPickInTables chose, on an owner thread: the delete with the key's
+ * table, its notifications and its DEL / UNLINK into the caller's ectx->also_propagate (the owner takes it into
+ * its records). Not counted in server.stat_evictedkeys (main folds the owner's own count). Returns the bytes this
+ * thread's counter dropped by. */
+long long evictKeyInTable(serverDb *db, robj *keyobj, int didx) {
+    size_t before = 0, after = 0;
+    int have = zmalloc_thread_used_memory(&before);
+    enterExecutionUnit(0, 0);
+    int deleted = dbGenericDeleteWithDictIndex(db, keyobj, server.lazyfree_lazy_eviction, DB_FLAG_KEY_EVICTED, didx);
+    serverAssertWithInfo(NULL, keyobj, deleted);
+    signalModifiedKey(NULL, db, keyobj);
+    notifyKeyspaceEvent(NOTIFY_EVICTED, "evicted", keyobj, db->id);
+    propagateDeletion(db, keyobj, server.lazyfree_lazy_eviction, didx);
+    exitExecutionUnit();
+    if (have && zmalloc_thread_used_memory(&after)) return (long long)before - (long long)after;
+    return 0;
 }
 
 /* This is a helper function for performEvictions(), it is used in order
@@ -114,12 +206,17 @@ void evictionPoolAlloc(void) {
  * idle time are on the left, and keys with the higher idle time on the
  * right. */
 int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEntry *pool) {
-    int j, k, count;
-    void *samples[server.maxmemory_samples];
-
     int slot = kvstoreGetFairRandomHashtableIndex(samplekvs);
     /* We may get not found if there are no keys */
     if (slot == KVSTORE_INDEX_NOT_FOUND) return 0;
+    return evictionPoolPopulateIndex(db, samplekvs, slot, pool);
+}
+
+/* evictionPoolPopulate's sampling of one table (RL-g6d: owners sample only their own tables). */
+int evictionPoolPopulateIndex(serverDb *db, kvstore *samplekvs, int slot, struct evictionPoolEntry *pool) {
+    int j, k, count;
+    void *samples[server.maxmemory_samples];
+
     count = kvstoreHashtableSampleEntries(samplekvs, slot, &samples[0], server.maxmemory_samples);
     for (j = 0; j < count; j++) {
         unsigned long long idle;

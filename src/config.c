@@ -3596,6 +3596,7 @@ standardConfig static_configs[] = {
     createIntConfig("owner-busy-poll-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 64, server.owner_busy_poll_budget, 0, INTEGER_CONFIG, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll: 0 = the kernel's 8 */
     createBoolConfig("owner-busy-poll-prefer", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_busy_poll_prefer, 0, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll */
     createBoolConfig("owner-mm-lease", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_mm_lease, 1, NULL, NULL), /* vkevo g11-maxmem: batched reads and SET bursts inside each owner's memory lease */
+    createBoolConfig("owner-evict", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_evict, 0, NULL, NULL), /* vkevo RL-g6d: at maxmemory each owner evicts from its own slots (owner.c ownerEvict) */
     createBoolConfig("owner-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_cron, 1, NULL, NULL), /* vkevo RL-g2c: owners run their own clients' cron */
     createBoolConfig("owner-light-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_light_cron, 1, NULL, NULL), /* vkevo RL-g3b: timer wakes without owner-state work do not stop the owners */
     createBoolConfig("lazy-malloc-stats", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.lazy_malloc_stats, 1, NULL, NULL), /* vkevo RL-g7e-idle-cpu: INFO / MEMORY sample the allocator stats, not serverCron */
