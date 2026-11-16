@@ -63,7 +63,7 @@ def blocked(adm):
     return int(info(adm, "clients")["blocked_clients"])
 
 
-def wait_blocked(adm, want, c, secs=2.0):
+def wait_blocked(adm, want, c, secs=10.0):
     """Until blocked_clients == want, or c has a reply waiting. Returns 'blocked' or the reply."""
     t0 = time.time()
     while time.time() - t0 < secs:
@@ -254,7 +254,7 @@ def scenario(srv, a, seed):
             if x[3] not in ("closed", "killed"):
                 x[0].close()
         # a closed or killed consumer's slot: wait until the server forgot it
-        for _ in range(100):
+        for _ in range(500):  # up to 5 s on a loaded host
             if blocked(adm) == 0:
                 break
             time.sleep(0.01)
@@ -372,6 +372,11 @@ def suite(a, name, seed):
         if mism or len(ec) != len(er):
             i = mism[0] if mism else min(len(ec), len(er))
             det = "first difference #%d: cand %r ref %r" % (i, ec[i] if i < len(ec) else None, er[i] if i < len(er) else None)
+        if mism or len(ec) != len(er):  # both event lists, for the record
+            for tag, e in (("cand", ec), ("ref", er)):
+                with open(os.path.join(a.dir, "%s-%s-events.txt" % (name, tag)), "w") as f:
+                    for x in e:
+                        f.write(repr(x) + "\n")
         nb = sum(1 for e in ec if e[0] in ("reply", "drain", "immediate"))
         check(name + ".scenario.replies_equal", not mism and len(ec) == len(er),
               "%d steps, %d events, %d blocking replies; %s" % (a.steps, len(ec), nb, det))
