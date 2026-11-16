@@ -20,6 +20,8 @@
  * expiry (keys_with_volatile_items): field expiry, its HSETEX rewrites and its tracking are main's.
  * RL-g2o-long-tail: the real-world long tail of single-key and single-slot data commands too (GETEX ...
  * TOUCH, OWN_K_TAIL rows), each by its stock proc; under maxmemory APPEND, SETRANGE and SMOVE go to main.
+ * RL-g6c-native-streams: the non-blocking stream commands too (XADD ... XSETID, OWN_FAM_STREAM rows) when all
+ * their keys are in one slot, each by its stock proc; XREAD / XREADGROUP with BLOCK stay main's.
  * MULTI/EXEC too, while every queued command is a queueable one (OWN_K_TXN) on the
  * owner's keys: the owner
  * queues them and runs EXEC within one window. WATCH/UNWATCH of its own keys too: an owner keeps its
@@ -346,6 +348,32 @@ enum {
     OWN_BZPOPMAX,
     OWN_BLMPOP,
     OWN_BZMPOP,
+    /* RL-g6c-native-streams: the stream commands that do not block, by their stock procs (t_stream.c keeps
+     * nothing shared: dirty and the command time go through ectx, propagation through ectx->also_propagate,
+     * the node limits are configs). XREAD / XREADGROUP with BLOCK, XGROUP HELP and XINFO HELP stay main's. */
+    OWN_XADD,
+    OWN_XLEN,
+    OWN_XRANGE,
+    OWN_XREVRANGE,
+    OWN_XDEL,
+    OWN_XDELEX,
+    OWN_XTRIM,
+    OWN_XREAD,
+    OWN_XREADGROUP,
+    OWN_XACK,
+    OWN_XACKDEL,
+    OWN_XPENDING,
+    OWN_XCLAIM,
+    OWN_XAUTOCLAIM,
+    OWN_XGROUP_CREATE,
+    OWN_XGROUP_SETID,
+    OWN_XGROUP_DESTROY,
+    OWN_XGROUP_CREATECONSUMER,
+    OWN_XGROUP_DELCONSUMER,
+    OWN_XINFO_STREAM,
+    OWN_XINFO_GROUPS,
+    OWN_XINFO_CONSUMERS,
+    OWN_XSETID,
     OWN_NCMDS
 };
 /* RL-g2o-long-tail: every kind a script may run (OWN_K_SCRIPT) is below OWN_DECRBY + 1, so a script run's
@@ -371,7 +399,8 @@ enum {
     OWN_KEYS_NUMKEYS, /* RL-g3g: numkeys at argv[1], then that many keys (SINTERCARD, ZUNION, LMPOP, ...), one slot */
     OWN_KEYS_ARG2,    /* RL-g3g: the key at argv[2] (OBJECT ENCODING key) */
     OWN_KEYS_BUTLAST, /* RL-g4c: argv[1 .. argc-2], the timeout last (BLPOP, BRPOP, BZPOPMIN, BZPOPMAX), one slot */
-    OWN_KEYS_NUMKEYS2 /* RL-g4c: timeout at argv[1], numkeys at argv[2], the keys after it (BLMPOP, BZMPOP), one slot */
+    OWN_KEYS_NUMKEYS2, /* RL-g4c: timeout at argv[1], numkeys at argv[2], the keys after it (BLMPOP, BZMPOP), one slot */
+    OWN_KEYS_STREAMS  /* RL-g6c: XREAD / XREADGROUP: the keys after STREAMS (half of the rest), one slot; no BLOCK */
 };
 /* own_kinds[].mm: what the command can add under maxmemory beyond its arguments and a reply block,
  * which ownerMmCmdFits counts for every command (ownerMmMore). */
@@ -394,7 +423,8 @@ enum {
                     * destination): under maxmemory main runs it */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
-enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_FAM_SCRIPT, OWN_NFAM };
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_FAM_SCRIPT,
+       OWN_FAM_STREAM, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -551,11 +581,39 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_BZPOPMAX] = {"bzpopmax", OWN_K_BLOCK, OWN_KEYS_BUTLAST, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
     [OWN_BLMPOP] = {"blmpop", OWN_K_BLOCK, OWN_KEYS_NUMKEYS2, OWN_MM_UNBOUND, OWN_FAM_LIST},
     [OWN_BZMPOP] = {"bzmpop", OWN_K_BLOCK, OWN_KEYS_NUMKEYS2, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    /* RL-g6c-native-streams: as RL-g2o's rows (not queued natively in MULTI, not run by an owner's script, any veto
+     * sends them to main; a stream blocked client on main vetoes everything, so XADD wakes nobody). Effects are the
+     * stock procs': XADD propagates with its generated ID and its trim rewritten exactly (= and the threshold it kept),
+     * XREADGROUP as XCLAIM per delivered entry and XGROUP SETID, XCLAIM / XAUTOCLAIM as XCLAIM rewrites, XACKDEL /
+     * XDELEX as XACK / XDEL. Under maxmemory every one that can grow memory or reply a range runs on main. */
+    [OWN_XADD] = {"xadd", 0, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XLEN] = {"xlen", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XRANGE] = {"xrange", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XREVRANGE] = {"xrevrange", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XDEL] = {"xdel", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XDELEX] = {"xdelex", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XTRIM] = {"xtrim", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XREAD] = {"xread", OWN_K_READ, OWN_KEYS_STREAMS, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XREADGROUP] = {"xreadgroup", 0, OWN_KEYS_STREAMS, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XACK] = {"xack", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XACKDEL] = {"xackdel", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XPENDING] = {"xpending", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XCLAIM] = {"xclaim", 0, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XAUTOCLAIM] = {"xautoclaim", 0, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XGROUP_CREATE] = {"xgroup|create", 0, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XGROUP_SETID] = {"xgroup|setid", 0, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XGROUP_DESTROY] = {"xgroup|destroy", 0, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XGROUP_CREATECONSUMER] = {"xgroup|createconsumer", 0, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XGROUP_DELCONSUMER] = {"xgroup|delconsumer", 0, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XINFO_STREAM] = {"xinfo|stream", OWN_K_READ, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XINFO_GROUPS] = {"xinfo|groups", OWN_K_READ, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XINFO_CONSUMERS] = {"xinfo|consumers", OWN_K_READ, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XSETID] = {"xsetid", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
     [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash", [OWN_FAM_SETZSET] = "setzset",
-    [OWN_FAM_SCRIPT] = "script"};
+    [OWN_FAM_SCRIPT] = "script", [OWN_FAM_STREAM] = "stream"};
 
 /* Why an owner handed a client to main (client->owner_why). OWN_WHY_ACCEPTED: its TLS handshake ended
  * on the owner (done or failed); main runs the accept handler (RL-g1d). */
@@ -3628,6 +3686,36 @@ static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int re
             if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
         }
         return slot;
+    }
+    case OWN_KEYS_STREAMS: {
+        /* RL-g6c: XREAD / XREADGROUP, options as xreadCommand parses them: BLOCK (main's: it may block), COUNT n,
+         * GROUP g c, NOACK, then STREAMS k1 .. kn id1 .. idn. The keys all in one slot; anything xreadCommand would
+         * refuse (an unknown option, an odd tail, no STREAMS) goes to main, which replies the error. */
+        for (int i = 1; i < argc; i++) {
+            int more = argc - i - 1;
+            const char *opt = objectGetVal(argv[i]);
+            if (!strcasecmp(opt, "COUNT") && more) {
+                i++;
+            } else if (!strcasecmp(opt, "GROUP") && more >= 2) {
+                i += 2;
+            } else if (!strcasecmp(opt, "NOACK")) {
+                continue;
+            } else if (!strcasecmp(opt, "STREAMS") && more) {
+                int n = argc - i - 1;
+                if (n % 2) return -1;
+                n /= 2;
+                sds key = objectGetVal(argv[i + 1]);
+                int slot = ownerKeyHashSlot(key, sdslen(key));
+                for (int j = i + 2; j <= i + n; j++) {
+                    key = objectGetVal(argv[j]);
+                    if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
+                }
+                return slot;
+            } else {
+                return -1; /* BLOCK, or an error */
+            }
+        }
+        return -1;
     }
     default: return -1;
     }
