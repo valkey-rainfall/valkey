@@ -2237,6 +2237,13 @@ struct valkeyServer {
                                                * REPL_STREAM_SENDER_* (no/iteration/append). Default no. */
     int repl_stream_sender_wake_bytes;        /* Hidden: in append mode, wake the parked sender only after this
                                                * many bytes were published since its last wake (0 = every append). */
+    long long repl_flow_control_bytes;        /* RL-g3h: replica flow control, the bound B in bytes on what a replica
+                                               * the repl-stream-sender feeds has published and not been sent (its
+                                               * socket is full: the replica applies slower than the stream). Over
+                                               * B/4 owner threads pace their input (a nap after each window, growing
+                                               * with the excess); over B they take no new input. 0 (default) = off. */
+    int repl_flow_control_delay_us;           /* Hidden (RL-g3h): an owner's nap per window at the top of the pacing
+                                               * range (unsent bytes = B). */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
@@ -2555,6 +2562,14 @@ struct valkeyServer {
     _Atomic(long long) stat_repl_sender_wakeups;      /* Times the sender ran its replica loop. */
     _Atomic(long long) stat_repl_sender_write_errors; /* Write errors the sender saw. */
     _Atomic(long long) stat_repl_sender_main_wakes;   /* cond_signal calls main issued to the sender. */
+    /* RL-g3h replica flow control: written by the sender thread only (each pass), read by owners and INFO. */
+    _Atomic int repl_flow_throttled;                  /* 1: owners take no new client input (unsent > bound) */
+    _Atomic int repl_flow_level;                      /* 0..1000: owners' pacing (nap = level x delay / 1000) */
+    _Atomic(long long) stat_repl_flow_hard_events;    /* times it went over the bound (no input at all) */
+    _Atomic(long long) repl_flow_unsent;              /* the worst replica's unsent bytes at the last pass */
+    _Atomic(long long) stat_repl_flow_events;         /* times flow control turned on */
+    _Atomic(long long) stat_repl_flow_us;             /* microseconds it was on (closed periods) */
+    _Atomic(long long) repl_flow_since;               /* monotonic us when the current period began (0: off) */
     long long second_replid_offset;                   /* Accept offsets up to this for replid2. */
     _Atomic(long long) fsynced_reploff_pending;       /* Largest replication offset to
                                                        * potentially have been fsynced, applied to

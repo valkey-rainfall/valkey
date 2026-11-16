@@ -7844,6 +7844,17 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                                           "repl_sender_main_wakes:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_main_wakes, memory_order_acquire),
                                           "repl_sender_write_errors:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_write_errors, memory_order_acquire),
                                           "repl_sender_main_queued:%lld\r\n", sender_main_queued));
+            /* RL-g3h replica flow control */
+            long long fsince = atomic_load_explicit(&server.repl_flow_since, memory_order_relaxed);
+            info = sdscatprintf(info, FMTARGS(
+                                          "repl_flow_control_bytes:%lld\r\n", server.repl_flow_control_bytes,
+                                          "repl_flow_throttled:%d\r\n", atomic_load_explicit(&server.repl_flow_throttled, memory_order_acquire),
+                                          "repl_flow_level:%d\r\n", atomic_load_explicit(&server.repl_flow_level, memory_order_acquire),
+                                          "repl_flow_hard_events:%lld\r\n", atomic_load_explicit(&server.stat_repl_flow_hard_events, memory_order_relaxed),
+                                          "repl_flow_unsent_bytes:%lld\r\n", atomic_load_explicit(&server.repl_flow_unsent, memory_order_relaxed),
+                                          "repl_flow_events:%lld\r\n", atomic_load_explicit(&server.stat_repl_flow_events, memory_order_relaxed),
+                                          "repl_flow_us:%lld\r\n", atomic_load_explicit(&server.stat_repl_flow_us, memory_order_relaxed) +
+                                                                         (fsince ? (long long)getMonotonicUs() - fsince : 0)));
         }
     }
 

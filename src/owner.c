@@ -183,6 +183,8 @@
 /* io_uring (owner-uring, D3-all-g8): reads and writes per io_uring_enter. Each read slot has a
  * PROTO_IOBUF_LEN scratch buffer (mmap: only touched pages count, and not toward used_memory). */
 #define OWN_URING_BATCH 64
+/* RL-g3h replica flow control: an owner that left readable sockets unread naps this long before it looks again. */
+#define OWN_FLOW_NAP_US 50
 
 /* Native command kinds. The order means nothing: every property of a kind is in its own_kinds[] row,
  * looked up by name, so a kind can be added anywhere without changing another kind's meaning. */
@@ -722,6 +724,8 @@ typedef struct owner {
     long long mm_lease_windows, mm_exact_windows; /* windows under maxmemory: batched in the lease, or exact */
     /* Totals for INFO, never cleared. */
     long long native_total, handoffs_total, adopted_total, windows_total;
+    long long flow_skipped_total, flow_naps_total; /* RL-g3h: reads left in the socket, naps after such a window */
+    long long flow_paced_total, flow_paced_us_total; /* RL-g3h: pacing naps after a window, their planned us */
     long long held_total, mm_refused_total;
     long long burst_total, bursts_total; /* GETs answered by bursts, and the bursts (ownerGetBurst) */
     long long setburst_total, setbursts_total; /* SETs answered by SET bursts, and those bursts (ownerSetBurst) */
@@ -6796,6 +6800,11 @@ static void *ownerThreadMain(void *arg) {
         o->left_early = 0;
         o->windows_total++;
         o->wake_main = 0;
+        /* RL-g3h: a replica fell repl-flow-control-bytes behind: take no new client input this window. Writes,
+         * clients main hands back, held replies, TLS handshakes and closing connections still go on. */
+        int flow = atomic_load_explicit(&server.repl_flow_throttled, memory_order_acquire);
+        int flow_level = atomic_load_explicit(&server.repl_flow_level, memory_order_acquire);
+        int flow_skipped = 0;
         if (o->release) ownerWriteHeld(o);
         if (own_mm && o->mm_period != own_mm_period) {
             /* A new period: what this owner adds is measured from here (it allocates only in windows). */
@@ -6856,6 +6865,10 @@ static void *ownerThreadMain(void *arg) {
                 handed = 1;
                 continue;
             }
+            if (flow && (e & EPOLLIN) && !(e & (EPOLLERR | EPOLLHUP))) {
+                flow_skipped++; /* level-triggered: it comes back with the next epoll_wait */
+                continue;
+            }
             if (e & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
                 if (c->owner_tls && (!tls_batch || c->owner_deep || c->owner_tls_direct || !connIOOwnerBatchReady(c->conn))) {
                     handed |= ownerReadTls(o, c);
@@ -6893,7 +6906,7 @@ static void *ownerThreadMain(void *arg) {
         }
         if (m) handed |= ownerReadBatch(o, m);
         /* RL-g1d: TLS clients whose input OpenSSL may hold (none while main waits: next window). */
-        if (o->ntlsp && !atomic_load_explicit(&own_stop, memory_order_relaxed)) handed |= ownerTlsPending(o);
+        if (o->ntlsp && !flow && !atomic_load_explicit(&own_stop, memory_order_relaxed)) handed |= ownerTlsPending(o);
         serverAssert(o->mm_resv == 0); /* every queued read ran, and gave its reservation back */
         /* RL-g4c-blocking-native: parked clients whose timeout passed get the null array; the clients served or
          * timed out in this window get their replies out and the rest of their input run. */
@@ -6936,6 +6949,28 @@ static void *ownerThreadMain(void *arg) {
         if (handed || o->wake_main) {
             uint64_t one = 1;
             if (write(own_main_wakefd, &one, sizeof(one)) == -1) { /* a wakeup is pending anyway */
+            }
+        }
+        if (flow_skipped || (flow && o->ntlsp)) {
+            /* RL-g3h: the skipped sockets are still readable, so epoll_wait would return at once: nap outside
+             * the window (main may stop the world meanwhile) until the sender clears the flag, at most
+             * OWN_FLOW_NAP_US, then look again. */
+            o->flow_skipped_total += flow_skipped;
+            o->flow_naps_total++;
+            struct timespec nap = {0, OWN_FLOW_NAP_US * 1000};
+            nanosleep(&nap, NULL);
+        } else if (flow_level > 0) {
+            /* RL-g3h pacing: a nap of level x repl-flow-control-delay-us / 1000 after the window (outside it), in
+             * steps of OWN_FLOW_NAP_US so it ends early once the sender lowers the level to 0. */
+            long long us = (long long)flow_level * server.repl_flow_control_delay_us / 1000;
+            o->flow_paced_total++;
+            o->flow_paced_us_total += us;
+            while (us > 0) {
+                long long step = us < OWN_FLOW_NAP_US ? us : OWN_FLOW_NAP_US;
+                struct timespec nap = {0, step * 1000};
+                nanosleep(&nap, NULL);
+                us -= step;
+                if (!atomic_load_explicit(&server.repl_flow_level, memory_order_relaxed)) break;
             }
         }
     }
@@ -7103,6 +7138,7 @@ void ownerInfo(sds *info) {
     long long native = 0, handoffs = 0, adopted = 0, windows = 0, held = 0, mm_refused = 0;
     long long mm_lease_w = 0, mm_exact_w = 0;
     long long burst = 0, bursts = 0, setburst = 0, setbursts = 0;
+    long long flow_skipped = 0, flow_naps = 0, flow_paced = 0, flow_paced_us = 0;
     long long u_enters = 0, u_reads = 0, u_writes = 0, u_short = 0, u_redo = 0;
     long long r_replies = 0, r_bytes = 0, r_writes = 0, r_copied = 0, r_copied_bytes = 0;
     int resident = 0, u_on = 0;
@@ -7115,6 +7151,10 @@ void ownerInfo(sds *info) {
         handoffs += owners[i].handoffs_total;
         adopted += owners[i].adopted_total;
         windows += owners[i].windows_total;
+        flow_skipped += owners[i].flow_skipped_total;
+        flow_naps += owners[i].flow_naps_total;
+        flow_paced += owners[i].flow_paced_total;
+        flow_paced_us += owners[i].flow_paced_us_total;
         held += owners[i].held_total;
         mm_refused += owners[i].mm_refused_total;
         mm_lease_w += owners[i].mm_lease_windows;
@@ -7151,6 +7191,9 @@ void ownerInfo(sds *info) {
                          atomic_load_explicit(&own_early_leaves, memory_order_relaxed),
                          atomic_load_explicit(&own_inbox_left, memory_order_relaxed),
                          atomic_load_explicit(&own_reads_left, memory_order_relaxed));
+    /* RL-g3h: reads left unread while replica flow control was on, and the naps after such windows. */
+    *info = sdscatprintf(*info, "owner_flow_skipped_reads:%lld\r\nowner_flow_naps:%lld\r\nowner_flow_paced:%lld\r\n"
+                         "owner_flow_paced_us:%lld\r\n", flow_skipped, flow_naps, flow_paced, flow_paced_us);
     *info = sdscatprintf(*info,
                          "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
                          "owner_maxmemory_to_main:%lld\r\n",

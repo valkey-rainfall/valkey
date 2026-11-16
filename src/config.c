@@ -3612,6 +3612,8 @@ standardConfig static_configs[] = {
     createEnumConfig("io-threads-epoll-thread", NULL, MODIFIABLE_CONFIG, io_threads_epoll_thread_enum, server.io_threads_epoll_thread, IO_THREADS_EPOLL_THREAD_AUTO, NULL, applyIOThreadsEpollThread),
     createEnumConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, repl_stream_sender_enum, server.repl_stream_sender, REPL_STREAM_SENDER_NO, NULL, NULL),
     createIntConfig("repl-stream-sender-wake-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.repl_stream_sender_wake_bytes, 16384, INTEGER_CONFIG, NULL, NULL),
+    createLongLongConfig("repl-flow-control-bytes", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.repl_flow_control_bytes, 0, MEMORY_CONFIG, NULL, NULL), /* RL-g3h: 0 = off */
+    createIntConfig("repl-flow-control-delay-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 1000000, server.repl_flow_control_delay_us, 2000, INTEGER_CONFIG, NULL, NULL), /* RL-g3h */
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
     createBoolConfig("io-threads-speculation-replica-only", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_replica_only, 0, NULL, NULL),
 

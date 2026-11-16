@@ -43,6 +43,38 @@ static _Atomic(long long) repl_sender_wake_offset;      /* stable offset last pu
 static _Atomic(long long) repl_sender_last_wake_offset; /* stable offset at the sender's last append-mode wake */
 static _Atomic int repl_sender_idle;                    /* 1 while the sender is parked in cond_wait */
 
+/* RL-g3h replica flow control. After each pass the sender knows, for every replica it feeds, how many published
+ * bytes it has not been able to send (stable offset minus the replica's sent offset): a replica that applies slower
+ * than the stream stops reading, its socket fills and that number grows. With repl-flow-control-bytes B, above B/4
+ * it sets a pacing level 0..1000 proportional to how far the worst replica is into [B/4, B]: each owner then naps
+ * level x repl-flow-control-delay-us / 1000 after a window, so the primary's input slows smoothly until it matches
+ * the replica's drain (a proportional controller: it settles where the nap makes the stream equal the drain). Above
+ * B the owners take no new client input at all (repl_flow_throttled) until it is back at B. With no replica left,
+ * the option at 0 or the sender stopped, both clear. Replication itself is never held: the sender keeps sending,
+ * main keeps serving the replica's ACKs and every client on its own port. */
+static void replFlowDecide(long long worst) {
+    long long bound = server.repl_flow_control_bytes;
+    int level = 0, hard = 0;
+    if (bound > 0 && worst > bound / 4) {
+        long long lo = bound / 4;
+        hard = worst > bound;
+        level = hard ? 1000 : (int)(1000 * (worst - lo) / (bound - lo));
+    }
+    atomic_store_explicit(&server.repl_flow_unsent, worst, memory_order_relaxed);
+    int was = atomic_load_explicit(&server.repl_flow_level, memory_order_relaxed);
+    if (hard && !atomic_load_explicit(&server.repl_flow_throttled, memory_order_relaxed))
+        atomic_fetch_add_explicit(&server.stat_repl_flow_hard_events, 1, memory_order_relaxed);
+    atomic_store_explicit(&server.repl_flow_throttled, hard, memory_order_release);
+    atomic_store_explicit(&server.repl_flow_level, level, memory_order_release);
+    if (!was && level) {
+        atomic_store_explicit(&server.repl_flow_since, (long long)getMonotonicUs(), memory_order_relaxed);
+        atomic_fetch_add_explicit(&server.stat_repl_flow_events, 1, memory_order_relaxed);
+    } else if (was && !level) {
+        long long since = atomic_exchange_explicit(&server.repl_flow_since, 0, memory_order_relaxed);
+        if (since) atomic_fetch_add_explicit(&server.stat_repl_flow_us, (long long)getMonotonicUs() - since, memory_order_relaxed);
+    }
+}
+
 /* True if this replica can be streamed by the sender thread. */
 int replStreamSenderEligible(client *replica) {
     if (!server.repl_stream_sender) return 0;
@@ -186,14 +218,21 @@ static void *replStreamSenderMain(void *arg) {
         /* Writes happen with the mutex dropped. send_node/send_pos are sender-owned and
          * only mutated here; main seeds them under the mutex but only while send_busy is 0
          * (it waits), so there is no concurrent writer. */
+        long long worst = 0; /* RL-g3h: the most unsent bytes of any replica, after this pass */
         for (size_t i = 0; i < n; i++) {
             client *replica = snapshot[i];
             if (replStreamSendOne(replica, stable) == C_ERR) {
                 atomic_fetch_add_explicit(&server.stat_repl_sender_write_errors, 1, memory_order_relaxed);
                 atomic_store_explicit(&replica->repl_data->send_error, 1, memory_order_release);
+            } else if (server.repl_flow_control_bytes > 0) {
+                /* Read while send_busy still pins the replica. A replica in error is about to be closed. */
+                long long unsent = atomic_load_explicit(&server.repl_stable_offset, memory_order_acquire) -
+                                   atomic_load_explicit(&replica->repl_data->sent_offset, memory_order_relaxed);
+                if (unsent > worst) worst = unsent;
             }
             atomic_store_explicit(&replica->repl_data->send_busy, 0, memory_order_release);
         }
+        replFlowDecide(worst);
 
         pthread_mutex_lock(&repl_sender_mutex);
         /* RL-2d: with no replica to send to, sleep until main adds one (replStreamSenderAdd signals) or stops the
@@ -569,6 +608,7 @@ void replStreamSenderStop(void) {
     pthread_cond_signal(&repl_sender_cond);
     pthread_mutex_unlock(&repl_sender_mutex);
     pthread_join(repl_sender_thread, NULL);
+    replFlowDecide(0); /* RL-g3h: no sender, no flow control: owners read again */
     /* Hand every owned replica back to the main path. The thread is gone, so no
      * replica is busy. Advance main's cursor to what the sender really sent, clear
      * the ownership, and queue a write so main sends the rest (and the final flush in
