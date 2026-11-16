@@ -452,122 +452,123 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_LLEN] = {"llen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
     [OWN_LRANGE] = {"lrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
     [OWN_LINDEX] = {"lindex", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
-    /* RL-g1c-native-keyspace: not queued natively (inside MULTI main queues them); TTL, PTTL, EXISTS
+    /* RL-g1c-native-keyspace (RL-g6h: queued natively in MULTI now, OWN_K_TXN); TTL, PTTL, EXISTS
      * and TYPE only read; EXISTS with several keys in one slot, as DEL. RL-g1f: scripts on an owner run
      * EXPIRE, PEXPIRE, TTL, PTTL and EXISTS too (one entry each: shared stats). */
-    [OWN_EXPIRE] = {"expire", OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PEXPIRE] = {"pexpire", OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_EXPIREAT] = {"expireat", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PEXPIREAT] = {"pexpireat", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PERSIST] = {"persist", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_TTL] = {"ttl", OWN_K_READ | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PTTL] = {"pttl", OWN_K_READ | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_EXISTS] = {"exists", OWN_K_READ | OWN_K_SCRIPT, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_TYPE] = {"type", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    /* RL-g1a-native-hash: not queued natively; HGET ... HGETALL only read. ownerNativeKind sends a
+    [OWN_EXPIRE] = {"expire", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIRE] = {"pexpire", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_EXPIREAT] = {"expireat", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIREAT] = {"pexpireat", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PERSIST] = {"persist", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TTL] = {"ttl", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PTTL] = {"pttl", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_EXISTS] = {"exists", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TYPE] = {"type", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    /* RL-g1a-native-hash (RL-g6h: queued natively in MULTI, OWN_K_TXN; ownerTxnNative re-checks the field-expiry
+     * veto at EXEC); HGET ... HGETALL only read. ownerNativeKind sends a
      * table's hash commands to main while any hash in it has fields with their own expiry. */
-    [OWN_HSET] = {"hset", 0, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HMSET] = {"hmset", 0, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HINCRBY] = {"hincrby", 0, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HDEL] = {"hdel", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_HGET] = {"hget", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HMGET] = {"hmget", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HEXISTS] = {"hexists", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_HLEN] = {"hlen", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_HGETALL] = {"hgetall", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    /* RL-g1e-native-set-zset: not queued natively; SISMEMBER, SMEMBERS, SCARD, ZRANGE, ZSCORE and ZCARD
+    [OWN_HSET] = {"hset", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HMSET] = {"hmset", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HINCRBY] = {"hincrby", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HDEL] = {"hdel", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HGET] = {"hget", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HMGET] = {"hmget", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HEXISTS] = {"hexists", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HLEN] = {"hlen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HGETALL] = {"hgetall", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    /* RL-g1e-native-set-zset (RL-g6h: queued natively in MULTI, OWN_K_TXN); SISMEMBER, SMEMBERS, SCARD, ZRANGE, ZSCORE and ZCARD
      * only read. */
-    [OWN_SADD] = {"sadd", 0, OWN_KEYS_ONE, OWN_MM_SET_W, OWN_FAM_SETZSET},
-    [OWN_SREM] = {"srem", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_SISMEMBER] = {"sismember", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_SMEMBERS] = {"smembers", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_SCARD] = {"scard", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZADD] = {"zadd", 0, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
-    [OWN_ZREM] = {"zrem", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZRANGE] = {"zrange", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZSCORE] = {"zscore", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZCARD] = {"zcard", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZINCRBY] = {"zincrby", 0, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
+    [OWN_SADD] = {"sadd", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_SET_W, OWN_FAM_SETZSET},
+    [OWN_SREM] = {"srem", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SISMEMBER] = {"sismember", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SMEMBERS] = {"smembers", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_SCARD] = {"scard", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZADD] = {"zadd", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
+    [OWN_ZREM] = {"zrem", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZRANGE] = {"zrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZSCORE] = {"zscore", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZCARD] = {"zcard", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZINCRBY] = {"zincrby", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
     /* RL-g1f-owner-evalsha: EVALSHA / EVAL write (any veto sends them to main: ownerNativeKind); INCRBY,
      * DECR and DECRBY only inside an owner's script. */
     [OWN_EVALSHA] = {"evalsha", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
     [OWN_EVAL] = {"eval", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
     /* RL-g2o-long-tail: a client's own INCRBY, DECR and DECRBY run natively too (incrDecrCommand, as INCR). */
-    [OWN_INCRBY] = {"incrby", OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_DECR] = {"decr", OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_DECRBY] = {"decrby", OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    /* RL-g2o-long-tail: not queued natively (inside MULTI main queues them), not run by an owner's script.
+    [OWN_INCRBY] = {"incrby", OWN_K_TXN | OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_DECR] = {"decr", OWN_K_TXN | OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_DECRBY] = {"decrby", OWN_K_TXN | OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    /* RL-g2o-long-tail (RL-g6h: queued natively in MULTI now, OWN_K_TXN), not run by an owner's script.
      * Reads (OWN_K_READ) only read their keys. Writes propagate as their stock procs rewrite them (GETEX:
      * PEXPIREAT or PERSIST; GETDEL: DEL; SETEX, PSETEX: SET PXAT; INCRBYFLOAT, HINCRBYFLOAT: SET KEEPTTL,
      * HSET; ZPOPMIN, ZPOPMAX as they are); a push wakes nobody (any blocked client vetoes the native path,
      * as for LPUSH). */
-    [OWN_GETEX] = {"getex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_GETDEL] = {"getdel", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_GETSET] = {"getset", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_SETNX] = {"setnx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_SETEX] = {"setex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_PSETEX] = {"psetex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_APPEND] = {"append", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
-    [OWN_STRLEN] = {"strlen", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_GETRANGE] = {"getrange", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_SUBSTR] = {"substr", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_SETRANGE] = {"setrange", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
-    [OWN_INCRBYFLOAT] = {"incrbyfloat", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_MSETNX] = {"msetnx", OWN_K_TAIL, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_HSETNX] = {"hsetnx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HINCRBYFLOAT] = {"hincrbyfloat", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HKEYS] = {"hkeys", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HVALS] = {"hvals", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HSTRLEN] = {"hstrlen", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_LPUSHX] = {"lpushx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_RPUSHX] = {"rpushx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LSET] = {"lset", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LINSERT] = {"linsert", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LREM] = {"lrem", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LTRIM] = {"ltrim", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LPOS] = {"lpos", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_RPOPLPUSH] = {"rpoplpush", OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_LMOVE] = {"lmove", OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_SMISMEMBER] = {"smismember", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_SMOVE] = {"smove", OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    [OWN_ZREVRANGE] = {"zrevrange", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZRANGEBYSCORE] = {"zrangebyscore", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZREVRANGEBYSCORE] = {"zrevrangebyscore", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZRANGEBYLEX] = {"zrangebylex", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZREVRANGEBYLEX] = {"zrevrangebylex", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZRANK] = {"zrank", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZREVRANK] = {"zrevrank", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZCOUNT] = {"zcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZLEXCOUNT] = {"zlexcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZMSCORE] = {"zmscore", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZPOPMIN] = {"zpopmin", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZPOPMAX] = {"zpopmax", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZREMRANGEBYSCORE] = {"zremrangebyscore", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZREMRANGEBYRANK] = {"zremrangebyrank", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZREMRANGEBYLEX] = {"zremrangebylex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_EXPIRETIME] = {"expiretime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PEXPIRETIME] = {"pexpiretime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_UNLINK] = {"unlink", OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_TOUCH] = {"touch", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    /* RL-g3g-long-tail-rand: as RL-g2o's rows (not queued natively, not run by a script, a veto sends them to main).
+    [OWN_GETEX] = {"getex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_GETDEL] = {"getdel", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_GETSET] = {"getset", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SETNX] = {"setnx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_SETEX] = {"setex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_PSETEX] = {"psetex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_APPEND] = {"append", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
+    [OWN_STRLEN] = {"strlen", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_GETRANGE] = {"getrange", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SUBSTR] = {"substr", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SETRANGE] = {"setrange", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
+    [OWN_INCRBYFLOAT] = {"incrbyfloat", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_MSETNX] = {"msetnx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_HSETNX] = {"hsetnx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HINCRBYFLOAT] = {"hincrbyfloat", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HKEYS] = {"hkeys", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HVALS] = {"hvals", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HSTRLEN] = {"hstrlen", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_LPUSHX] = {"lpushx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_RPUSHX] = {"rpushx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LSET] = {"lset", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LINSERT] = {"linsert", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LREM] = {"lrem", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LTRIM] = {"ltrim", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LPOS] = {"lpos", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_RPOPLPUSH] = {"rpoplpush", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LMOVE] = {"lmove", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_SMISMEMBER] = {"smismember", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SMOVE] = {"smove", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGE] = {"zrevrange", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANGEBYSCORE] = {"zrangebyscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGEBYSCORE] = {"zrevrangebyscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANGEBYLEX] = {"zrangebylex", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGEBYLEX] = {"zrevrangebylex", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANK] = {"zrank", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREVRANK] = {"zrevrank", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZCOUNT] = {"zcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZLEXCOUNT] = {"zlexcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZMSCORE] = {"zmscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZPOPMIN] = {"zpopmin", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZPOPMAX] = {"zpopmax", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYSCORE] = {"zremrangebyscore", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYRANK] = {"zremrangebyrank", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYLEX] = {"zremrangebylex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_EXPIRETIME] = {"expiretime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIRETIME] = {"pexpiretime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_UNLINK] = {"unlink", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TOUCH] = {"touch", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    /* RL-g3g-long-tail-rand: as RL-g2o's rows (RL-g6h: queued natively in MULTI, OWN_K_TXN; not run by a script, a veto sends them to main).
      * SPOP propagates as its stock proc makes it: SREM (one element, or batches of them), or DEL / UNLINK when it
      * pops the whole set; the other random commands only read. HRANDFIELD keeps the hash rule (main while the table
      * has field expiry). ZUNION, ZINTER, ZDIFF, LMPOP and ZMPOP reply up to whole collections: main under maxmemory. */
-    [OWN_SPOP] = {"spop", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
-    [OWN_SRANDMEMBER] = {"srandmember", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
-    [OWN_HRANDFIELD] = {"hrandfield", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_HASH},
-    [OWN_ZRANDMEMBER] = {"zrandmember", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
-    [OWN_SINTERCARD] = {"sintercard", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZINTERCARD] = {"zintercard", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZUNION] = {"zunion", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    [OWN_ZINTER] = {"zinter", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    [OWN_ZDIFF] = {"zdiff", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    [OWN_LMPOP] = {"lmpop", OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_LIST},
-    [OWN_ZMPOP] = {"zmpop", OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    [OWN_OBJECT_ENCODING] = {"object|encoding", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_OBJECT_REFCOUNT] = {"object|refcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_OBJECT_IDLETIME] = {"object|idletime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_OBJECT_FREQ] = {"object|freq", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_SPOP] = {"spop", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
+    [OWN_SRANDMEMBER] = {"srandmember", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
+    [OWN_HRANDFIELD] = {"hrandfield", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_HASH},
+    [OWN_ZRANDMEMBER] = {"zrandmember", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
+    [OWN_SINTERCARD] = {"sintercard", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZINTERCARD] = {"zintercard", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZUNION] = {"zunion", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_ZINTER] = {"zinter", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_ZDIFF] = {"zdiff", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_LMPOP] = {"lmpop", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_ZMPOP] = {"zmpop", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_OBJECT_ENCODING] = {"object|encoding", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_OBJECT_REFCOUNT] = {"object|refcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_OBJECT_IDLETIME] = {"object|idletime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_OBJECT_FREQ] = {"object|freq", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     /* RL-g3i-accept-storm: CLUSTER SLOTS, keyless, answered from the owners' fixed map (ownerClusterCommand). */
     [OWN_CLUSTER_SLOTS] = {"cluster|slots", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_STRING},
     /* RL-g4c-blocking-native: not queued natively in MULTI (main queues them; EXEC runs them as non-blocking), not
@@ -581,34 +582,34 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_BZPOPMAX] = {"bzpopmax", OWN_K_BLOCK, OWN_KEYS_BUTLAST, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
     [OWN_BLMPOP] = {"blmpop", OWN_K_BLOCK, OWN_KEYS_NUMKEYS2, OWN_MM_UNBOUND, OWN_FAM_LIST},
     [OWN_BZMPOP] = {"bzmpop", OWN_K_BLOCK, OWN_KEYS_NUMKEYS2, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    /* RL-g6c-native-streams: as RL-g2o's rows (not queued natively in MULTI, not run by an owner's script, any veto
+    /* RL-g6c-native-streams: as RL-g2o's rows (RL-g6h: queued natively in MULTI, OWN_K_TXN; not run by an owner's script; any veto
      * sends them to main; a stream blocked client on main vetoes everything, so XADD wakes nobody). Effects are the
      * stock procs': XADD propagates with its generated ID and its trim rewritten exactly (= and the threshold it kept),
      * XREADGROUP as XCLAIM per delivered entry and XGROUP SETID, XCLAIM / XAUTOCLAIM as XCLAIM rewrites, XACKDEL /
      * XDELEX as XACK / XDEL. Under maxmemory every one that can grow memory or reply a range runs on main. */
-    [OWN_XADD] = {"xadd", 0, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XLEN] = {"xlen", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XRANGE] = {"xrange", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XREVRANGE] = {"xrevrange", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XDEL] = {"xdel", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XDELEX] = {"xdelex", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XTRIM] = {"xtrim", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XREAD] = {"xread", OWN_K_READ, OWN_KEYS_STREAMS, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XREADGROUP] = {"xreadgroup", 0, OWN_KEYS_STREAMS, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XACK] = {"xack", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XACKDEL] = {"xackdel", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XPENDING] = {"xpending", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XCLAIM] = {"xclaim", 0, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XAUTOCLAIM] = {"xautoclaim", 0, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XGROUP_CREATE] = {"xgroup|create", 0, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XGROUP_SETID] = {"xgroup|setid", 0, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XGROUP_DESTROY] = {"xgroup|destroy", 0, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XGROUP_CREATECONSUMER] = {"xgroup|createconsumer", 0, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XGROUP_DELCONSUMER] = {"xgroup|delconsumer", 0, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
-    [OWN_XINFO_STREAM] = {"xinfo|stream", OWN_K_READ, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XINFO_GROUPS] = {"xinfo|groups", OWN_K_READ, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XINFO_CONSUMERS] = {"xinfo|consumers", OWN_K_READ, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
-    [OWN_XSETID] = {"xsetid", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XADD] = {"xadd", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XLEN] = {"xlen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XRANGE] = {"xrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XREVRANGE] = {"xrevrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XDEL] = {"xdel", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XDELEX] = {"xdelex", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XTRIM] = {"xtrim", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XREAD] = {"xread", OWN_K_READ | OWN_K_TXN, OWN_KEYS_STREAMS, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XREADGROUP] = {"xreadgroup", OWN_K_TXN, OWN_KEYS_STREAMS, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XACK] = {"xack", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XACKDEL] = {"xackdel", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XPENDING] = {"xpending", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XCLAIM] = {"xclaim", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XAUTOCLAIM] = {"xautoclaim", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XGROUP_CREATE] = {"xgroup|create", OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XGROUP_SETID] = {"xgroup|setid", OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XGROUP_DESTROY] = {"xgroup|destroy", OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XGROUP_CREATECONSUMER] = {"xgroup|createconsumer", OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XGROUP_DELCONSUMER] = {"xgroup|delconsumer", OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_STREAM},
+    [OWN_XINFO_STREAM] = {"xinfo|stream", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XINFO_GROUPS] = {"xinfo|groups", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XINFO_CONSUMERS] = {"xinfo|consumers", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
+    [OWN_XSETID] = {"xsetid", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
@@ -801,6 +802,7 @@ typedef struct owner {
     long long rerun_timeout; /* the original timeout of the parked command being run again */
     long long park_next;     /* the earliest parked deadline (0: none), for epoll_wait (set in the window) */
     int serving;        /* in ownerServeReady */
+    long long txn_total;           /* RL-g6h: commands run inside an owner's EXEC (ownerCall top=0; in native_total too) */
     /* io_uring (owner-uring): the owner's own ring, used only by the owner thread, inside its windows.
      * Every op is MSG_DONTWAIT and completes inside the io_uring_enter that submits it, so no op is in
      * flight outside a window and main never sees one: the sockets, query buffers and replies are
@@ -4338,6 +4340,14 @@ static int ownerTxnNative(owner *o, client *c) {
         int kind = ownerKindOf(mc->cmd);
         if (kind < 0 || !(own_kinds[kind].flags & OWN_K_TXN)) return 0;
         if (kind != OWN_PING && (mc->slot < o->slot_lo || mc->slot > o->slot_hi)) return 0;
+        /* RL-g6h-multi-native: a queued command's veto is re-checked here because main runs between an
+         * owner's queue and its EXEC (several client reads): a hash whose table gained fields that expire
+         * on their own (HEXPIRE on main) is main's again, as ownerNativeKind's keyed path sends it. The
+         * maxmemory bound of the whole EXEC (OWN_MM_EXEC, ownerMmExecBound) and any write veto (the EXEC
+         * case of ownerNativeKind) are checked there, so only the field-expiry veto is re-tested here. */
+        if (own_kinds[kind].family == OWN_FAM_HASH &&
+            kvstoreHashtableSize(c->db->keys_with_volatile_items, OWNER_TABLE_OF_SLOT(mc->slot)))
+            return 0;
     }
     return 1;
 }
@@ -4681,6 +4691,7 @@ static int ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, i
     o->fam_total[own_kinds[kind].family]++;
     if (own_kinds[kind].flags & OWN_K_TAIL) o->tail_total++;
     if (own_kinds[kind].flags & OWN_K_BLOCK) o->block_total++;
+    if (!top) o->txn_total++; /* RL-g6h: a queued command run inside EXEC */
     ectx->in_call--;
     ectx->executing_client = prev_client;
     return 1;
@@ -7487,6 +7498,10 @@ void ownerInfo(sds *info) {
                          "owner_park_timeouts:%lld\r\nowner_parked_to_main:%lld\r\n"
                          "owner_block_scoped:%lld\r\nowner_blocked_slots:%lld\r\n",
                          blk, prk, wk, tmo, own_parked_moved, own_block_scoped, bslots);
+    /* RL-g6h-multi-native: commands run inside an owner's EXEC (queued, run by ownerExec; in native_total too). */
+    long long txn_n = 0;
+    for (int i = 0; i < own_n; i++) txn_n += owners[i].txn_total;
+    *info = sdscatprintf(*info, "owner_txn_commands:%lld\r\n", txn_n);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
     long long tls_hs = 0, tls_rd = 0, tls_la = 0, tls_ur = 0, tls_uw = 0;
     for (int i = 0; i < own_n; i++) {
