@@ -2178,6 +2178,7 @@ struct valkeyServer {
     int owner_threads;                        /* owner-threads: D3 owner threads, 0 = off (owner.c). */
     int owner_port;                           /* owner-port: owner i listens on owner_port + i; 0 = no owner ports. */
     int owner_tls_port;                       /* owner-tls-port: owner i takes TLS clients on owner_tls_port + i; 0 = off (RL-g1d). */
+    _Atomic(long long) stat_tls_write_tails;  /* RL-g2d: gathered TLS writes the socket took only part of (rare) */
     char *owner_cpulist;                      /* owner-cpulist: owner i is pinned to the i-th CPU of the list. */
     char *owner_announce_ip;                  /* owner-announce-ip: address CLUSTER SLOTS announces. */
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */

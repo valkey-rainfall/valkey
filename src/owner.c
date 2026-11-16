@@ -2036,7 +2036,8 @@ static __attribute__((noinline)) int ownerRefAdd(client *c, robj *val, const cha
     if (objectGetRefcount(val) >= OBJ_FIRST_SPECIAL_REFCOUNT) return 0;
     if (c->owner_nrefs >= OWN_REF_MAX || c->owner_ref_bytes + len > OWN_REF_BYTES_MAX) return 0;
     if (listLength(c->reply) || server.debug_client_enforce_reply_list || c->flag.close_after_reply ||
-        c->flag.pushing || isDeferredReplyEnabled(c) || c->conn == NULL || c->conn->type != connectionTypeTcp())
+        c->flag.pushing || isDeferredReplyEnabled(c) || c->conn == NULL ||
+        (c->conn->type != connectionTypeTcp() && !c->owner_tls)) /* RL-g2d: owner TLS writes gather */
         return 0;
     /* A write that left part of c->buf: the reply goes on as bytes until it is out. */
     if (c->io_last_written.buf || c->io_last_written.data_len) return 0;
@@ -5208,6 +5209,8 @@ void ownerInfo(sds *info) {
     }
     *info = sdscatprintf(*info, "owner_tls_port:%d\r\nowner_tls_handshakes:%lld\r\nowner_tls_reads:%lld\r\n",
                          server.owner_tls_port, tls_hs, tls_rd);
+    *info = sdscatprintf(*info, "owner_tls_write_tails:%lld\r\n", /* RL-g2d */
+                         atomic_load_explicit(&server.stat_tls_write_tails, memory_order_relaxed));
     /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
      * have the script for (or had it marked for main). */
     long long s_runs = 0, s_aborts = 0, s_misses = 0;
