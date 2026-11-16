@@ -1899,6 +1899,7 @@ void copyCommand(client *c) {
  * and signal the keys as ready if they are of the right type. See the comment
  * where the function is used for more info. */
 void scanDatabaseForReadyKeys(serverDb *db) {
+    ownerParkedToMain(); /* RL-g4c: clients parked on owners wait in db->blocking_keys from here */
     dictEntry *de;
     dictIterator *di = dictGetSafeIterator(db->blocking_keys);
     while ((de = dictNext(di)) != NULL) {
@@ -1915,6 +1916,7 @@ void scanDatabaseForReadyKeys(serverDb *db) {
  * key was deleted/overwritten we must do the same in case the
  * database was flushed/swapped. */
 void scanDatabaseForDeletedKeys(serverDb *emptied, serverDb *replaced_with) {
+    ownerParkedToMain(); /* RL-g4c */
     dictEntry *de;
     dictIterator *di = dictGetSafeIterator(emptied->blocking_keys);
     while ((de = dictNext(di)) != NULL) {

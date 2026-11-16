@@ -331,6 +331,19 @@ enum {
     /* RL-g3i-accept-storm: CLUSTER SLOTS, which a cluster client sends on each new connection: the owners'
      * map is fixed at startup, so its owner answers it (a connection storm was one trip to main per client). */
     OWN_CLUSTER_SLOTS,
+    /* RL-g4c-blocking-native: blocking pops on one owner's keys. Data there: they run as their non-blocking
+     * forms. None: the client parks on the owner (ownerPark): a write of the owner that makes a key ready
+     * serves its parked clients right after that command, first parked first; a timeout on the owner's
+     * clock replies the null array. Anything main does to a parked client or its keys first makes every
+     * parked client a stock blocked client on main (ownerParkedToMain). */
+    OWN_BLPOP,
+    OWN_BRPOP,
+    OWN_BLMOVE,
+    OWN_BRPOPLPUSH,
+    OWN_BZPOPMIN,
+    OWN_BZPOPMAX,
+    OWN_BLMPOP,
+    OWN_BZMPOP,
     OWN_NCMDS
 };
 /* RL-g2o-long-tail: every kind a script may run (OWN_K_SCRIPT) is below OWN_DECRBY + 1, so a script run's
@@ -344,6 +357,7 @@ enum {
 #define OWN_K_SCRIPT 4 /* RL-g1f: a script on an owner may run it (ownerScriptCommand) */
 #define OWN_K_INNER 8  /* RL-g1f: only inside an owner's script; a client's own command goes to main */
 #define OWN_K_TAIL 16  /* RL-g2o-long-tail: a long-tail kind (INFO owner_tail_commands) */
+#define OWN_K_BLOCK 32 /* RL-g4c: a blocking pop: parks on the owner (INFO owner_block_commands) */
 /* own_kinds[].keys: where the keys are (ownerKeySlot). */
 enum {
     OWN_KEYS_NONE,   /* no key (PING, MULTI, EXEC, ...): no slot */
@@ -353,7 +367,9 @@ enum {
     OWN_KEYS_SCRIPT, /* EVALSHA / EVAL: numkeys at argv[2], the keys after it, all in one slot (at least one) */
     OWN_KEYS_TWO,    /* RL-g2o: argv[1] and argv[2] (source, destination), in the same slot */
     OWN_KEYS_NUMKEYS, /* RL-g3g: numkeys at argv[1], then that many keys (SINTERCARD, ZUNION, LMPOP, ...), one slot */
-    OWN_KEYS_ARG2     /* RL-g3g: the key at argv[2] (OBJECT ENCODING key) */
+    OWN_KEYS_ARG2,    /* RL-g3g: the key at argv[2] (OBJECT ENCODING key) */
+    OWN_KEYS_BUTLAST, /* RL-g4c: argv[1 .. argc-2], the timeout last (BLPOP, BRPOP, BZPOPMIN, BZPOPMAX), one slot */
+    OWN_KEYS_NUMKEYS2 /* RL-g4c: timeout at argv[1], numkeys at argv[2], the keys after it (BLMPOP, BZMPOP), one slot */
 };
 /* own_kinds[].mm: what the command can add under maxmemory beyond its arguments and a reply block,
  * which ownerMmCmdFits counts for every command (ownerMmMore). */
@@ -522,6 +538,17 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_OBJECT_FREQ] = {"object|freq", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     /* RL-g3i-accept-storm: CLUSTER SLOTS, keyless, answered from the owners' fixed map (ownerClusterCommand). */
     [OWN_CLUSTER_SLOTS] = {"cluster|slots", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_STRING},
+    /* RL-g4c-blocking-native: not queued natively in MULTI (main queues them; EXEC runs them as non-blocking), not
+     * run by a script, main's under maxmemory (they may reply whole collections), never for TLS clients. Served,
+     * they propagate as their stock procs rewrite them: LPOP / RPOP [count], LMOVE, ZPOPMIN / ZPOPMAX [count]. */
+    [OWN_BLPOP] = {"blpop", OWN_K_BLOCK, OWN_KEYS_BUTLAST, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_BRPOP] = {"brpop", OWN_K_BLOCK, OWN_KEYS_BUTLAST, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_BLMOVE] = {"blmove", OWN_K_BLOCK, OWN_KEYS_TWO, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_BRPOPLPUSH] = {"brpoplpush", OWN_K_BLOCK, OWN_KEYS_TWO, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_BZPOPMIN] = {"bzpopmin", OWN_K_BLOCK, OWN_KEYS_BUTLAST, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_BZPOPMAX] = {"bzpopmax", OWN_K_BLOCK, OWN_KEYS_BUTLAST, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_BLMPOP] = {"blmpop", OWN_K_BLOCK, OWN_KEYS_NUMKEYS2, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_BZMPOP] = {"bzmpop", OWN_K_BLOCK, OWN_KEYS_NUMKEYS2, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
@@ -699,6 +726,17 @@ typedef struct owner {
     long long setburst_total, setbursts_total; /* SETs answered by SET bursts, and those bursts (ownerSetBurst) */
     long long fam_total[OWN_NFAM]; /* RL-1: native commands by family (own_kinds[].family; in native_total too) */
     long long tail_total;          /* RL-g2o: native long-tail commands (OWN_K_TAIL; in native_total too) */
+    /* RL-g4c-blocking-native: clients parked on this owner. Written by the owner in its windows, by main only with
+     * the world stopped (ownerReclaim, ownerParkedToMain). */
+    dict **park_keys;   /* per db: key -> list of ownerPark, in the order they parked (keylistDictType) */
+    list *parked;       /* every ownerPark, in the order they parked */
+    list *ready;        /* ownerReady: keys a write of this owner made ready, served after its command */
+    list *unparked;     /* clients served or timed out in this window: replies and the rest of their input */
+    rax *park_to;       /* 8-byte big-endian deadline + 8-byte client id -> ownerPark, parked clients with a timeout */
+    long long nparked, nparked_keys, block_total, park_wakes, park_timeouts;
+    long long rerun_timeout; /* the original timeout of the parked command being run again */
+    long long park_next;     /* the earliest parked deadline (0: none), for epoll_wait (set in the window) */
+    int serving;        /* in ownerServeReady */
     /* io_uring (owner-uring): the owner's own ring, used only by the owner thread, inside its windows.
      * Every op is MSG_DONTWAIT and completes inside the io_uring_enter that submits it, so no op is in
      * flight outside a window and main never sees one: the sockets, query buffers and replies are
@@ -783,6 +821,18 @@ typedef struct owner {
 } owner;
 
 _Thread_local owner *own_self = NULL;
+/* RL-g4c-blocking-native: clients parked on every owner, the order they parked in, and how many main made stock
+ * blocked clients. */
+static _Atomic long long own_parked_total = 0;
+static _Atomic long long own_park_seq = 0;
+static long long own_parked_moved = 0;
+static void ownerServeReady(struct owner *o);
+static int ownerParkedRead(struct owner *o, client *c);
+static void ownerUnpark(struct owner *o, client *c);
+static int ownerParkWaitMs(struct owner *o);
+static void ownerParkTimeouts(struct owner *o);
+static int ownerRunUnparked(struct owner *o);
+static long long ownerParkNext(struct owner *o);
 int owner_accept_home = -1;
 
 static owner *owners = NULL;
@@ -1170,6 +1220,12 @@ void ownerThreadsInit(void) {
         pthread_mutex_init(&o->inbox_mu, NULL);
         o->watched = zmalloc(sizeof(dict *) * server.dbnum);
         for (int j = 0; j < server.dbnum; j++) o->watched[j] = dictCreate(&keylistDictType);
+        o->park_keys = zcalloc(sizeof(dict *) * server.dbnum);
+        for (int j = 0; j < server.dbnum; j++) o->park_keys[j] = dictCreate(&keylistDictType);
+        o->parked = listCreate();
+        o->ready = listCreate();
+        o->unparked = listCreate();
+        o->park_to = raxNew();
         o->aofbuf = sdsempty();
         o->replbuf = sdsempty();
         o->sc = createClient(NULL); /* RL-g1f-owner-evalsha: a script's commands run on it */
@@ -1643,6 +1699,12 @@ static void ownerMmPlan(void) {
 static void ownerResumeWorld(void) {
     if (!own_held) return;
     own_last_veto = ownerComputeVeto();
+    /* RL-g4c-blocking-native: a veto (replica role, notifications, pause, ...) or maxmemory: the parked clients
+     * become stock blocked clients on main, which then vetoes the native path until they are served. */
+    if (atomic_load_explicit(&own_parked_total, memory_order_relaxed) && (own_last_veto || server.maxmemory)) {
+        ownerParkedToMain();
+        own_last_veto = ownerComputeVeto();
+    }
     atomic_store_explicit(&own_veto, own_last_veto, memory_order_relaxed);
     own_aof = server.aof_state == AOF_ON;
     own_repl = !(own_last_veto & OWN_VETO_ALL) && server.primary_host == NULL &&
@@ -2075,6 +2137,13 @@ void ownerReclaim(client *c) {
     }
     serverAssert(own_held && c->owner_tid >= 0 && c->owner_tid < own_n);
     owner *o = &owners[c->owner_tid];
+    /* RL-g4c: freeClient() of a parked client (CLIENT KILL, ...): no longer parked. ownerTakeToMain makes every
+     * parked client a stock blocked client before it takes one (ownerParkedToMain). */
+    if (c->owner_park) ownerUnpark(o, c);
+    if (c->owner_unpark_node) {
+        listDelNode(o->unparked, c->owner_unpark_node);
+        c->owner_unpark_node = NULL;
+    }
     if (c->owner_onloop) {
         int fd = c->conn->fd;
         epoll_ctl(o->epfd, EPOLL_CTL_DEL, fd, NULL);
@@ -2145,6 +2214,10 @@ static void ownerReturnGuests(void) {
 
 /* Main, world held: client c of owner o becomes a guest on main. */
 static void ownerTakeToMain(client *c) {
+    if (c->owner_park) { /* RL-g4c: it goes to main as a stock blocked client, with every other parked one */
+        ownerParkedToMain();
+        return;
+    }
     ownerReclaim(c);
     own_takes++;
     watchMoveToMain(c);
@@ -2170,6 +2243,7 @@ static void ownerTakeToMain(client *c) {
  * it itself (BUSY replies, SCRIPT KILL, SHUTDOWN). Level-triggered epoll reports the input to main
  * even if the owner thread has the same event in hand; the owner then finds the client gone. */
 static void ownerTakeReadable(void) {
+    ownerParkedToMain(); /* RL-g4c: main serves them now */
     struct epoll_event evs[OWNER_EVENTS];
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
@@ -2460,6 +2534,16 @@ static int ownerResumeInput(owner *o, client *c);
 
 /* Owner, in a window: leave a client to main. It is off this owner's loop when this returns. */
 static int ownerHandOff(owner *o, client *c, int why) {
+    /* RL-g4c: only a closing client leaves its owner parked (its socket closed, or its query buffer over the
+     * limit); it is no longer parked, as freeClient() unblocks a stock blocked client. */
+    if (c->owner_park) {
+        serverAssert(why == OWN_WHY_CLOSE || why == OWN_WHY_QBLIMIT);
+        ownerUnpark(o, c);
+    }
+    if (c->owner_unpark_node) {
+        listDelNode(o->unparked, c->owner_unpark_node);
+        c->owner_unpark_node = NULL;
+    }
     /* Main gets plain reply bytes: no reference leaves the owner (ownerRefAdd). */
     if (c->owner_nrefs) ownerRefsMaterialize(o, c, 0);
     int fd = c->conn->fd;
@@ -3461,6 +3545,31 @@ static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int re
         sds key = objectGetVal(argv[2]);
         return ownerKeyHashSlot(key, sdslen(key));
     }
+    case OWN_KEYS_BUTLAST: {
+        /* RL-g4c: BLPOP key [key ...] timeout. */
+        if (argc < 3) return -1;
+        sds key = objectGetVal(argv[1]);
+        int slot = ownerKeyHashSlot(key, sdslen(key));
+        for (int j = 2; j < argc - 1; j++) {
+            key = objectGetVal(argv[j]);
+            if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
+        }
+        return slot;
+    }
+    case OWN_KEYS_NUMKEYS2: {
+        /* RL-g4c: BLMPOP timeout numkeys key [key ...] LEFT|RIGHT ...; a bad numkeys: main replies the error. */
+        long long nk;
+        if (argc < 4 || !string2ll(objectGetVal(argv[2]), sdslen(objectGetVal(argv[2])), &nk) || nk < 1 ||
+            nk > argc - 3)
+            return -1;
+        sds key = objectGetVal(argv[3]);
+        int slot = ownerKeyHashSlot(key, sdslen(key));
+        for (int j = 4; j < 3 + nk; j++) {
+            key = objectGetVal(argv[j]);
+            if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
+        }
+        return slot;
+    }
     default: return -1;
     }
     sds key = objectGetVal(argv[1]);
@@ -3988,6 +4097,9 @@ static int ownerNativeKind(owner *o, client *c) {
     default:
         /* RL-g1f: INCRBY, DECR and DECRBY only inside an owner's script. */
         if (own_kinds[kind].flags & OWN_K_INNER) return -1;
+        /* RL-g4c: a TLS client's blocking pop goes to main (shortcut: a parked TLS client's reads are not
+         * merged with ownerReadTls). */
+        if ((own_kinds[kind].flags & OWN_K_BLOCK) && connIsTLS(c->conn)) return -1;
         /* Inside MULTI an owner queues only what ownerExec runs (OWN_K_TXN); main queues the rest. */
         if (c->flag.multi && !(own_kinds[kind].flags & OWN_K_TXN)) return -1;
         keyed = 1;
@@ -4234,6 +4346,12 @@ static int ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, i
     c->flag.force_repl = 0;
     c->flag.prevent_prop = 0;
     if (top && ectx->also_propagate.numops) ownerTakeProp(o, c);
+    if (c->owner_park) {
+        /* RL-g4c: parked, as call() leaves a blocked client: its stats come when it is served or times out. */
+        ectx->in_call--;
+        ectx->executing_client = prev_client;
+        return 1;
+    }
     ownerCmdStat *cs = &o->cs[kind];
     cs->calls++;
     cs->usec += duration;
@@ -4250,6 +4368,7 @@ static int ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, i
     o->native_total++;
     o->fam_total[own_kinds[kind].family]++;
     if (own_kinds[kind].flags & OWN_K_TAIL) o->tail_total++;
+    if (own_kinds[kind].flags & OWN_K_BLOCK) o->block_total++;
     ectx->in_call--;
     ectx->executing_client = prev_client;
     return 1;
@@ -5320,6 +5439,396 @@ static int ownerSetBurst(owner *o, client *c) {
 }
 
 /* ownerRunParsedInput() callback: run the client's current command here if it is native. */
+/* ------------------------------------------------------------------------------------------------
+ * RL-g4c-blocking-native: blocking pops parked on the owner of their keys
+ *
+ * A blocking pop (BLPOP BRPOP BLMOVE BRPOPLPUSH BZPOPMIN BZPOPMAX BLMPOP BZMPOP) whose keys are all in one of
+ * this owner's slots runs here by its stock proc. With data it runs as its non-blocking form. Without, the
+ * proc's blockForKeys() parks the client on the owner (ownerBlockForKeys) instead of main's db->blocking_keys:
+ * this owner's own registry (per db: key -> the clients parked on it, in the order they parked), its own
+ * timeouts (a rax by deadline, run on the owner's clock in its windows), and c->flag.blocked set as for a
+ * stock blocked client (no command of it runs; its input accumulates). Every key a parked client waits on
+ * is in this owner's slots, so only this owner writes it, and signalKeyAsReady() from its own commands
+ * (ownerSignalKeyReady) queues the key; right after that command (ownerTryNative) the parked clients of the
+ * key run their command again, first parked first, as handleClientsBlockedOnKeys() after a stock command:
+ * the served one pops, replies and propagates as its stock proc rewrites it (LPOP / RPOP, LMOVE, ZPOPMIN /
+ * ZPOPMAX, [count]); one that finds nothing parks again at the tails, keeping its original timeout. Its
+ * reply and the rest of its input go out at the end of the window (ownerRunUnparked).
+ * Main never serves a parked client. Whenever main itself would touch one (a write of main to a key one waits
+ * on, a blocking pop main blocks, CLIENT UNBLOCK of one, a veto or maxmemory, a role change, SWAPDB / FLUSHALL,
+ * main taking clients during a long command), it first makes every parked client a stock blocked client on
+ * main (ownerParkedToMain: in the order they parked, with their keys and timeouts), and the stock code does
+ * the rest; that vetoes the native path until they are served, as before this gene. So a parked client and a
+ * stock blocked client never wait at the same time.
+ * ---------------------------------------------------------------------------------------------- */
+
+typedef struct ownerPark {
+    client *c;
+    int nkeys, btype, dbid, slot;
+    robj **keys;        /* its distinct keys (own copies) */
+    listNode **nodes;   /* its node in each key's list of parked clients */
+    listNode *all_node; /* its node in o->parked */
+    long long timeout;  /* absolute, ms; 0: none */
+    long long seq;      /* the order every owner's clients parked in (ownerParkedToMain keeps it) */
+} ownerPark;
+
+typedef struct ownerReady {
+    serverDb *db;
+    robj *key;
+} ownerReady;
+
+static int ownerResumeInput(owner *o, client *c);
+
+static void ownerParkTimeKey(unsigned char *buf, long long timeout, uint64_t id) {
+    uint64_t t = htonu64((uint64_t)timeout);
+    id = htonu64(id);
+    memcpy(buf, &t, 8);
+    memcpy(buf + 8, &id, 8);
+}
+
+static long long ownerParkKeyTime(const unsigned char *buf) {
+    uint64_t t;
+    memcpy(&t, buf, 8);
+    return (long long)ntohu64(t);
+}
+
+static robj *ownerKeyCopy(robj *key) {
+    robj *d = getDecodedObject(key);
+    robj *k = createStringObject(objectGetVal(d), sdslen(objectGetVal(d)));
+    decrRefCount(d);
+    return k;
+}
+
+/* blockForKeys() hook. Owner: park the client here, returns 1. Main: every parked client becomes a stock blocked
+ * client first (the waiters of a key stay in the order they blocked), returns 0. */
+int ownerBlockForKeys(client *c, int btype, robj **keys, int numkeys, long long timeout) {
+    owner *o = own_self;
+    if (!o) {
+        if (own_n && atomic_load_explicit(&own_parked_total, memory_order_relaxed)) ownerParkedToMain();
+        return 0;
+    }
+    serverAssert(btype == BLOCKED_LIST || btype == BLOCKED_ZSET);
+    /* A command run again after a wake keeps the timeout it parked with, as the stock reprocessing does. */
+    if (c->flag.reexecuting_command) timeout = o->rerun_timeout;
+    ownerPark *p = zcalloc(sizeof(*p));
+    p->c = c;
+    p->btype = btype;
+    p->dbid = c->db->id;
+    p->slot = c->slot;
+    p->timeout = timeout;
+    p->seq = atomic_fetch_add_explicit(&own_park_seq, 1, memory_order_relaxed);
+    p->keys = zmalloc(sizeof(robj *) * numkeys);
+    p->nodes = zmalloc(sizeof(listNode *) * numkeys);
+    dict *d = o->park_keys[p->dbid];
+    for (int j = 0; j < numkeys; j++) {
+        int dup = 0;
+        for (int k = 0; k < p->nkeys && !dup; k++) dup = equalStringObjects(p->keys[k], keys[j]);
+        if (dup) continue; /* BLPOP k k 0 waits once on k, as the stock bstate->keys */
+        robj *key = ownerKeyCopy(keys[j]);
+        dictEntry *existing, *de = dictAddRaw(d, key, &existing);
+        list *l;
+        if (de) {
+            incrRefCount(key); /* the registry's reference */
+            l = listCreate();
+            dictSetVal(d, de, l);
+            o->nparked_keys++;
+        } else {
+            l = dictGetVal(existing);
+        }
+        listAddNodeTail(l, p);
+        p->keys[p->nkeys] = key;
+        p->nodes[p->nkeys] = listLast(l);
+        p->nkeys++;
+    }
+    listAddNodeTail(o->parked, p);
+    p->all_node = listLast(o->parked);
+    if (timeout) {
+        unsigned char tk[16];
+        ownerParkTimeKey(tk, timeout, c->id);
+        raxInsert(o->park_to, tk, sizeof(tk), p, NULL);
+    }
+    initClientBlockingState(c);
+    c->bstate->btype = btype;
+    c->bstate->timeout = timeout;
+    c->flag.blocked = 1;
+    c->owner_park = p;
+    o->nparked++;
+    atomic_fetch_add_explicit(&own_parked_total, 1, memory_order_relaxed);
+    return 1;
+}
+
+/* The client is no longer parked (served, timed out, closing, freed, or going to main). Owner in its window, or
+ * main with the world stopped. */
+static void ownerUnpark(owner *o, client *c) {
+    ownerPark *p = c->owner_park;
+    dict *d = o->park_keys[p->dbid];
+    for (int j = 0; j < p->nkeys; j++) {
+        list *l = dictFetchValue(d, p->keys[j]);
+        serverAssert(l != NULL);
+        listDelNode(l, p->nodes[j]);
+        if (listLength(l) == 0) {
+            dictDelete(d, p->keys[j]);
+            o->nparked_keys--;
+        }
+        decrRefCount(p->keys[j]);
+    }
+    if (p->timeout) {
+        unsigned char tk[16];
+        ownerParkTimeKey(tk, p->timeout, c->id);
+        raxRemove(o->park_to, tk, sizeof(tk), NULL);
+    }
+    listDelNode(o->parked, p->all_node);
+    zfree(p->keys);
+    zfree(p->nodes);
+    zfree(p);
+    c->owner_park = NULL;
+    c->flag.blocked = 0;
+    c->bstate->btype = BLOCKED_NONE;
+    c->bstate->timeout = 0;
+    o->nparked--;
+    atomic_fetch_sub_explicit(&own_parked_total, 1, memory_order_relaxed);
+}
+
+static void ownerUnparkedAdd(owner *o, client *c) {
+    if (c->owner_unpark_node) return;
+    listAddNodeTail(o->unparked, c);
+    c->owner_unpark_node = listLast(o->unparked);
+}
+
+/* signalKeyAsReady() hook. Owner: queue the key when clients are parked on it here (served after the command),
+ * returns 1. Main (world stopped): a key a parked client waits on is written by main: every parked client
+ * becomes a stock blocked client, and the stock code goes on (returns 0). A deleted key never wakes a list or
+ * sorted-set waiter (no unblock_on_nokey). */
+int ownerSignalKeyReady(serverDb *db, robj *key, int type, int deleted) {
+    owner *o = own_self;
+    if (o) {
+        if (!o->nparked || deleted || (type != OBJ_LIST && type != OBJ_ZSET)) return 1;
+        if (!dictFind(o->park_keys[db->id], key)) return 1;
+        if (listLength(o->ready) <= 64) {
+            listIter li;
+            listNode *ln;
+            listRewind(o->ready, &li);
+            while ((ln = listNext(&li))) {
+                ownerReady *r = listNodeValue(ln);
+                if (r->db == db && equalStringObjects(r->key, key)) return 1;
+            }
+        }
+        ownerReady *r = zmalloc(sizeof(*r));
+        r->db = db;
+        r->key = ownerKeyCopy(key);
+        listAddNodeTail(o->ready, r);
+        return 1;
+    }
+    if (!own_n || deleted || (type != OBJ_LIST && type != OBJ_ZSET) || !own_held ||
+        !atomic_load_explicit(&own_parked_total, memory_order_relaxed))
+        return 0;
+    int i = ownerOfKey(key);
+    if (i >= 0 && i < own_n && owners[i].park_keys && dictFind(owners[i].park_keys[db->id], key)) ownerParkedToMain();
+    return 0;
+}
+
+/* A parked client run again (a key it waits on is ready): served, or parked again at the tails. */
+static void ownerWake(owner *o, ownerPark *p) {
+    client *c = p->c;
+    long long timeout = p->timeout;
+    int slot = p->slot;
+    ownerUnpark(o, c);
+    o->park_wakes++;
+    o->rerun_timeout = timeout;
+    c->flag.reexecuting_command = 1;
+    c->slot = slot;
+    ownerCall(o, c, c->cmd, ownerKindOf(c->cmd), 1);
+    c->flag.reexecuting_command = 0;
+    ectx->current_client = NULL;
+    if (c->owner_park) return; /* nothing left for it: parked again */
+    commandProcessed(c);
+    ownerUnparkedAdd(o, c);
+}
+
+/* After a command of this owner: serve the clients parked on the keys it made ready, key by key, each key's
+ * clients first parked first, while the key still has something of their type (handleClientsBlockedOnKey). A
+ * served BLMOVE's push can make another key ready: served in the same pass. */
+static void ownerServeReady(owner *o) {
+    if (o->serving) return;
+    o->serving = 1;
+    while (listLength(o->ready)) {
+        listNode *ln = listFirst(o->ready);
+        ownerReady *r = listNodeValue(ln);
+        listDelNode(o->ready, ln);
+        dict *d = o->park_keys[r->db->id];
+        list *l = dictFetchValue(d, r->key);
+        long count = l ? (long)listLength(l) : 0;
+        while (count-- > 0) {
+            l = dictFetchValue(d, r->key);
+            if (!l) break;
+            ownerPark *p = listNodeValue(listFirst(l));
+            listRotateHeadToTail(l);
+            /* As the stock loop: every one of the count is rotated, served only while the key has its type. */
+            robj *v = lookupKeyReadWithFlags(r->db, r->key, LOOKUP_NOEFFECTS);
+            int bt = !v ? -1 : objectGetType(v) == OBJ_LIST ? BLOCKED_LIST : objectGetType(v) == OBJ_ZSET ? BLOCKED_ZSET : -1;
+            if (p->btype == bt) ownerWake(o, p);
+        }
+        decrRefCount(r->key);
+        zfree(r);
+    }
+    o->serving = 0;
+}
+
+/* Owner, in its window: parked clients whose timeout passed (deadline < now, as handleBlockedClientsTimeout) get
+ * the null array, counted once as the stock unblock on timeout counts them. */
+static void ownerParkTimeouts(owner *o) {
+    long long now = mstime();
+    client *due[64];
+    int n = 0;
+    raxIterator ri;
+    raxStart(&ri, o->park_to);
+    raxSeek(&ri, "^", NULL, 0);
+    while (n < 64 && raxNext(&ri)) {
+        if (ownerParkKeyTime(ri.key) >= now) break;
+        due[n++] = ((ownerPark *)ri.data)->c;
+    }
+    raxStop(&ri);
+    for (int k = 0; k < n; k++) {
+        client *c = due[k];
+        if (!c->owner_park) continue;
+        int kind = ownerKindOf(c->cmd);
+        ownerUnpark(o, c);
+        o->park_timeouts++;
+        addReplyNullArray(c);
+        ownerCmdStat *cs = &o->cs[kind];
+        cs->calls++;
+        if (server.latency_tracking_enabled) updateCommandLatencyHistogram(&cs->hist, 1000);
+        c->commands_processed++;
+        ectx->stat_numcommands++;
+        o->native_total++;
+        o->fam_total[own_kinds[kind].family]++;
+        o->block_total++;
+        commandProcessed(c);
+        ownerUnparkedAdd(o, c);
+    }
+}
+
+/* Owner, in its window: the earliest parked deadline (0: none). Kept for the next epoll_wait, which runs outside
+ * the window, where main may change the registries. */
+static long long ownerParkNext(owner *o) {
+    if (!raxSize(o->park_to)) return 0;
+    long long t = 0;
+    raxIterator ri;
+    raxStart(&ri, o->park_to);
+    raxSeek(&ri, "^", NULL, 0);
+    if (raxNext(&ri)) t = ownerParkKeyTime(ri.key);
+    raxStop(&ri);
+    return t;
+}
+
+static int ownerParkWaitMs(owner *o) {
+    if (!o->park_next) return -1;
+    long long d = o->park_next - mstime() + 1;
+    if (d <= 0) return 0;
+    return d > 1000000 ? 1000000 : (int)d;
+}
+
+/* Owner, in its window: the clients served or timed out in it get their replies out and the rest of their
+ * input run (as processUnblockedClients()). Returns 1 when one left the owner. */
+static int ownerRunUnparked(owner *o) {
+    int handed = 0;
+    listNode *ln;
+    while ((ln = listFirst(o->unparked))) {
+        client *c = listNodeValue(ln);
+        listDelNode(o->unparked, ln);
+        c->owner_unpark_node = NULL;
+        if (c->owner_park || !c->owner_onloop) continue;
+        handed |= ownerResumeInput(o, c);
+    }
+    return handed;
+}
+
+/* Owner: input of a parked client accumulates (its socket still reports end of file and errors), as a stock
+ * blocked client's query buffer. Returns 1 when the client left the owner. */
+static int ownerParkedRead(owner *o, client *c) {
+    readToQueryBuf(c);
+    if (c->nread <= 0) {
+        if (c->nread == 0 || connGetState(c->conn) != CONN_STATE_CONNECTED) return ownerHandOff(o, c, OWN_WHY_CLOSE);
+        trimClientQueryBuffer(c);
+        return 0;
+    }
+    o->reads++;
+    o->net_in += c->nread;
+    c->net_input_bytes += c->nread;
+    c->last_interaction = server.unixtime;
+    if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) return ownerHandOff(o, c, OWN_WHY_QBLIMIT);
+    trimClientQueryBuffer(c);
+    return 0;
+}
+
+static int ownerParkSeqCmp(const void *a, const void *b) {
+    long long x = (*(ownerPark *const *)a)->seq, y = (*(ownerPark *const *)b)->seq;
+    return x < y ? -1 : x > y;
+}
+
+/* Main, world stopped: every parked client becomes a stock blocked client on main, in the order they parked,
+ * with its keys and its timeout (blockForKeys); main serves them from here as the stock server does. */
+void ownerParkedToMain(void) {
+    if (!own_n || !atomic_load_explicit(&own_parked_total, memory_order_relaxed)) return;
+    serverAssert(!own_self && own_held);
+    long long n = 0, k = 0;
+    for (int i = 0; i < own_n; i++) n += owners[i].nparked;
+    ownerPark **all = zmalloc(sizeof(*all) * n);
+    for (int i = 0; i < own_n; i++) {
+        listIter li;
+        listNode *ln;
+        listRewind(owners[i].parked, &li);
+        while ((ln = listNext(&li))) all[k++] = listNodeValue(ln);
+    }
+    serverAssert(k == n);
+    qsort(all, n, sizeof(*all), ownerParkSeqCmp);
+    typedef struct {
+        client *c;
+        robj **keys;
+        int nkeys, btype;
+        long long timeout;
+    } moving;
+    moving *mv = zmalloc(sizeof(*mv) * n);
+    for (k = 0; k < n; k++) {
+        ownerPark *p = all[k];
+        mv[k].c = p->c;
+        mv[k].nkeys = p->nkeys;
+        mv[k].btype = p->btype;
+        mv[k].timeout = p->timeout;
+        mv[k].keys = zmalloc(sizeof(robj *) * p->nkeys);
+        for (int j = 0; j < p->nkeys; j++) {
+            mv[k].keys[j] = p->keys[j];
+            incrRefCount(p->keys[j]);
+        }
+    }
+    zfree(all);
+    for (k = 0; k < n; k++) ownerUnpark(&owners[mv[k].c->owner_tid], mv[k].c);
+    for (k = 0; k < n; k++) {
+        client *c = mv[k].c;
+        ownerTakeToMain(c);
+        if (!c->flag.close_asap) {
+            c->flag.pending_command = 1;
+            blockForKeys(c, mv[k].btype, mv[k].keys, mv[k].nkeys, mv[k].timeout, 0);
+        }
+        for (int j = 0; j < mv[k].nkeys; j++) decrRefCount(mv[k].keys[j]);
+        zfree(mv[k].keys);
+    }
+    zfree(mv);
+    own_parked_moved += n;
+}
+
+long long ownerParkedCount(void) {
+    long long n = 0;
+    for (int i = 0; i < own_n; i++) n += owners[i].nparked;
+    return n;
+}
+
+long long ownerParkedKeys(void) {
+    long long n = 0;
+    for (int i = 0; i < own_n; i++) n += owners[i].nparked_keys;
+    return n;
+}
+
 static int ownerTryNative(client *c) {
     owner *o = own_self;
     if (c->slot < 0) c->slot = ownerKeySlot(c->parsed_cmd, c->argv, c->argc, c->read_flags);
@@ -5346,6 +5855,9 @@ static int ownerTryNative(client *c) {
     }
     commandProcessed(c);
     ectx->current_client = NULL;
+    /* RL-g4c-blocking-native: the clients parked on keys this command made ready are served now, before the next
+     * command, as handleClientsBlockedOnKeys() after a stock command. */
+    if (listLength(o->ready)) ownerServeReady(o);
     return 1;
 }
 
@@ -5405,6 +5917,7 @@ void ownerCountNetOut(long long n) {
 #define OWN_READ_GO (-1)
 static int ownerReadPre(owner *o, client *c) {
     if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
+    if (c->owner_park) return ownerParkedRead(o, c); /* RL-g4c: input accumulates, as for a stock blocked client */
     /* Vetoed: main serves the client exactly as the stock server, reads included (query buffer
      * accounting, client eviction, pause), so leave the input unread. */
     if (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL)
@@ -5821,6 +6334,10 @@ static int ownerExpireTimeout(owner *o); /* RL-g2b */
  * rule (spin_ok == bp_ok: a core of its own). owner_epoll_waits counts the waits that could block. */
 static inline int ownerWaitBlocking(owner *o, struct epoll_event *evs) {
     int tmo = ownerCronTimeout(o); /* RL-g2c: cron slices */
+    /* RL-2e: RL-g4c's earliest parked deadline bounds the wait too (its replies are due then; the expire timer,
+     * which ends a cron-less wait, ticks only every 1/hz). */
+    int pt = ownerParkWaitMs(o);
+    if (pt >= 0 && (tmo < 0 || pt < tmo)) tmo = pt;
     if (tmo) o->epoll_waits++;
     return epoll_wait(o->epfd, evs, OWNER_EVENTS, tmo);
 }
@@ -6293,6 +6810,11 @@ static void *ownerThreadMain(void *arg) {
         /* RL-g1d: TLS clients whose input OpenSSL may hold (none while main waits: next window). */
         if (o->ntlsp && !atomic_load_explicit(&own_stop, memory_order_relaxed)) handed |= ownerTlsPending(o);
         serverAssert(o->mm_resv == 0); /* every queued read ran, and gave its reservation back */
+        /* RL-g4c-blocking-native: parked clients whose timeout passed get the null array; the clients served or
+         * timed out in this window get their replies out and the rest of their input run. */
+        if (raxSize(o->park_to)) ownerParkTimeouts(o);
+        if (listLength(o->unparked)) handed |= ownerRunUnparked(o);
+        o->park_next = ownerParkNext(o);
         /* RL-g2b: this owner's active expiry, after its clients' work (a slice; it stops when main waits). */
         int expire = atomic_load_explicit(&own_expire, memory_order_relaxed) &&
                      !atomic_load_explicit(&own_veto, memory_order_relaxed);
@@ -6564,6 +7086,19 @@ void ownerInfo(sds *info) {
     long long tail_n = 0;
     for (int i = 0; i < own_n; i++) tail_n += owners[i].tail_total;
     *info = sdscatprintf(*info, "owner_tail_commands:%lld\r\n", tail_n);
+    /* RL-g4c-blocking-native: blocking pops completed natively, clients parked now, their wakes and timeouts, and the
+     * parked clients main made stock blocked clients (ownerParkedToMain). */
+    long long blk = 0, prk = 0, wk = 0, tmo = 0;
+    for (int i = 0; i < own_n; i++) {
+        blk += owners[i].block_total;
+        prk += owners[i].nparked;
+        wk += owners[i].park_wakes;
+        tmo += owners[i].park_timeouts;
+    }
+    *info = sdscatprintf(*info,
+                         "owner_block_commands:%lld\r\nowner_parked_clients:%lld\r\nowner_park_wakes:%lld\r\n"
+                         "owner_park_timeouts:%lld\r\nowner_parked_to_main:%lld\r\n",
+                         blk, prk, wk, tmo, own_parked_moved);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
     long long tls_hs = 0, tls_rd = 0, tls_la = 0, tls_ur = 0, tls_uw = 0;
     for (int i = 0; i < own_n; i++) {

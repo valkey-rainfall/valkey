@@ -65,6 +65,12 @@ void ownerPublishedStats(long long *cmds, long long *net_in, long long *net_out,
 enum { OWN_FULL_TIMEPROC, OWN_FULL_SHUTDOWN, OWN_FULL_VERBOSE, OWN_FULL_EXPIRE, OWN_FULL_DEFRAG, OWN_FULL_TABLES,
        OWN_FULL_PERSIST, OWN_FULL_CLIENTS, OWN_FULL_TLS, OWN_FULL_HOTKEYS, OWN_FULL_NCOUNT };
 void ownerBusyPollApply(void); /* RL-g2p-busy-poll: owner-busy-poll-* onto every owner's epoll set (main) */
+/* RL-g4c-blocking-native: blocking pops parked on the owner of their keys (owner.c). */
+int ownerBlockForKeys(struct client *c, int btype, struct serverObject **keys, int numkeys, long long timeout);
+int ownerSignalKeyReady(struct serverDb *db, struct serverObject *key, int type, int deleted);
+void ownerParkedToMain(void);       /* main, world stopped: every parked client becomes a stock blocked client */
+long long ownerParkedCount(void);   /* main: parked clients (INFO blocked_clients) */
+long long ownerParkedKeys(void);    /* main: keys parked clients wait on (INFO total_blocking_keys) */
 extern int owner_accept_home; /* createClient: home owner of the connection being accepted */
 
 /* WATCH (multi.c): an owner keeps its own registry (a dict like db->watched_keys) of the keys its

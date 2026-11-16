@@ -71,6 +71,7 @@
 #include "cluster_slot_stats.h"
 #include "io_threads.h"
 #include "module.h"
+#include "owner.h"
 
 /* forward declarations */
 static void unblockClientWaitingData(client *c);
@@ -359,6 +360,8 @@ void disconnectOrRedirectAllBlockedClients(void) {
     listNode *ln;
     listIter li;
 
+    ownerParkedToMain(); /* RL-g4c: clients parked on owners are blocked clients too */
+
     listRewind(server.clients, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
@@ -475,6 +478,11 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
     list *l;
     int j;
 
+    /* RL-g4c-blocking-native: on an owner thread the client parks on its owner (owner.c); on main, every
+     * client parked on an owner becomes a stock blocked client first, so the waiters of each key stay in
+     * the order they blocked. */
+    if (ownerBlockForKeys(c, btype, keys, numkeys, timeout)) return;
+
     initClientBlockingState(c);
 
     if (!c->flag.reexecuting_command) {
@@ -560,6 +568,10 @@ static blocking_type getBlockedTypeByType(int type) {
  * The list will be finally processed by handleClientsBlockedOnKeys() */
 static void signalKeyAsReadyLogic(serverDb *db, robj *key, int type, int deleted) {
     readyList *rl;
+
+    /* RL-g4c-blocking-native: an owner's own write wakes the clients parked on it (owner.c); main's write
+     * of a key a parked client waits on first makes every parked client a stock blocked client. */
+    if (ownerSignalKeyReady(db, key, type, deleted)) return;
 
     /* Quick returns. */
     int btype = getBlockedTypeByType(type);

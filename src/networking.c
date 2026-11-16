@@ -505,6 +505,8 @@ client *createClient(connection *conn) {
     c->owner_tls_direct = 0; /* RL-g2k */
     c->owner_held = 0;
     c->owner_guest_node = NULL;
+    c->owner_park = NULL;        /* RL-g4c */
+    c->owner_unpark_node = NULL; /* RL-g4c */
     c->owner_resume = 0;
     c->owner_refs = NULL;
     c->owner_nrefs = c->owner_refs_cap = c->owner_refc_at = 0;
@@ -6981,6 +6983,8 @@ void clientUnblockCommand(client *c) {
     }
     if (getLongLongFromObjectOrReply(c, c->argv[2], &id, NULL) != C_OK) return;
     struct client *target = lookupClientByID(id);
+    /* RL-g4c: a client parked on its owner becomes a stock blocked client (with every other parked one). */
+    if (target && target->owner_park) ownerParkedToMain();
     /* Note that we never try to unblock a client blocked on a module command,
      * or a client blocked by CLIENT PAUSE or some other blocking type which
      * doesn't have a timeout callback (even in the case of UNBLOCK ERROR).
@@ -8187,6 +8191,9 @@ int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
         } else if (c->argc > 0 && !try_native(c)) {
             return 1;
         }
+        /* RL-g4c-blocking-native: the command parked the client on its owner: the rest of its input waits
+         * until it is served or times out. */
+        if (c->owner_park) return 0;
         c->read_flags = authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
         if (res != PARSE_NEEDMORE && consumeCommandQueue(c)) {
             popped = true;

@@ -1651,6 +1651,8 @@ typedef struct client {
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
     /* Owner threads (owner.c). */
     int owner_tid;               /* Serving thread: owner id, OWNER_ON_MAIN or OWNER_IN_TRANSIT. */
+    void *owner_park;            /* RL-g4c: blocked on its owner (owner.c ownerPark), or NULL */
+    listNode *owner_unpark_node; /* RL-g4c: node in its owner's unparked list (served or timed out this window) */
     int owner_home;              /* Owner of the port the client came in on, -1 for none. */
     int owner_why;               /* Why the owner handed the client to main (owner.c). */
     unsigned owner_onloop : 1;   /* Registered in its owner's epoll set. */
