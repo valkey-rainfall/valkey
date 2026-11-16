@@ -2045,8 +2045,12 @@ int replicaPutOnline(client *replica) {
      * the deferred diskless/ack path this runs before the command stream starts (cursor
      * may be unset); replStreamSenderAdd is idempotent and re-seeds from the cursor once
      * it is set, and replicaStartCommandStream calls it again at stream start. No-op when
-     * the sender is off or the replica is not eligible. */
-    replStreamSenderAdd(replica);
+     * the sender is off or the replica is not eligible. A dual-channel main channel has
+     * been streamed by main since +CONTINUE: take it from main first (RL-g2q-dualchan-fix). */
+    if (command_stream_already_started)
+        replStreamSenderAdoptStreaming(replica);
+    else
+        replStreamSenderAdd(replica);
 
     refreshGoodReplicasCount();
     /* Fire the replica change modules event. */

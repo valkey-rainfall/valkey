@@ -511,6 +511,25 @@ int replStreamSenderAdoptStarted(client *replica) {
     return replica->repl_data->stream_via_sender;
 }
 
+/* Main, replicaPutOnline (RL-g2q-dualchan-fix): the main channel of a dual-channel replica goes ONLINE after its
+ * command stream started at +CONTINUE, so main has been writing it: a write may be queued (pending_write), a write
+ * handler installed, or an IO thread write in flight. replStreamSenderAdd alone seeded the sender from main's
+ * cursor and left that write in place, so main sent the same bytes again (or its in-flight write moved the cursor
+ * after the seed): the replica got duplicated stream bytes. Hand it over as replStreamSenderAdoptOnline does:
+ * unlink the queued write, drop the handler, seed from the settled cursor; a write in flight completes first
+ * (sender_adopt_pending, replStreamSenderAdoptSettled). */
+void replStreamSenderAdoptStreaming(client *replica) {
+    if (!repl_sender_running || replica->repl_data->stream_via_sender) return;
+    if (replica->flag.close_asap || !replStreamSenderEligible(replica)) return;
+    reconcileLazyWrite(replica);
+    if (replica->flag.close_asap) return;
+    if (replica->io_write_state != CLIENT_IDLE) {
+        replica->repl_data->sender_adopt_pending = 1;
+        return;
+    }
+    replStreamSenderTakeFromMain(replica);
+}
+
 /* Main: start the sender thread (idempotent) and adopt the ONLINE replicas. */
 void replStreamSenderInit(void) {
     if (repl_sender_running) return;
@@ -584,6 +603,9 @@ void replStreamSenderAdoptSettled(client *replica) {
 int replStreamSenderAdoptStarted(client *replica) {
     replica->repl_data->stream_ineligible = 0;
     return 0;
+}
+void replStreamSenderAdoptStreaming(client *replica) {
+    UNUSED(replica);
 }
 void replStreamSenderRemove(client *replica) {
     UNUSED(replica);
