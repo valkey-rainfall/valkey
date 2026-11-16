@@ -1658,6 +1658,7 @@ typedef struct client {
     unsigned owner_hs : 1;       /* TLS: its handshake runs on its owner thread (owner TLS ports). */
     int owner_held;              /* Its replies wait for the AOF: index + 1 in its owner's held list, else 0. */
     listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
+    int owner_resume;            /* owner-pipeline-resume: main stopped it between two commands of a pipeline (owner.c). */
     /* D3-all-g11-bigreply: values its owner sends from where they are stored, cut into c->buf (owner.c
      * ownerRefAdd). Only inside its owner's window: written or copied out before the window ends. */
     struct ownerRef *owner_refs;
@@ -2184,6 +2185,7 @@ struct valkeyServer {
     int owner_uring_deep;                     /* owner-uring-deep: a client whose last read had this many commands skips the batch (0: none). */
     int owner_uring_aof;                      /* owner-uring-aof: owners batch under appendonly too (default no: the syscall path). */
     int owner_set_burst;                      /* owner-set-burst: owners answer plain SET frames off the query buffer (default yes). */
+    int owner_pipeline_resume;                /* owner-pipeline-resume N: a guest goes home before N commands in a row its owner runs, or at the end of its input; 0: off (default 4). */
     int owner_bigreply_min;                   /* owner-bigreply-min: owners send GET values of this many bytes or more from where they are (default 2048; 0: copy all). */
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
     int owner_repl_native;                    /* owner-repl-native: owners stay native with replicas / a backlog (g11-repl, default yes). */
@@ -3594,7 +3596,8 @@ void resetSharedQueryBuf(client *c);
 void trimCommandQueue(client *c);
 int _writeToClient(client *c);
 int ownerRunParsedInput(client *c, int (*try_native)(client *c));
-void ownerResumeOnMain(client *c);
+int ownerResumeOnMain(client *c);
+int ownerGuestYield(client *c, int at_end);
 void ownerPostWriteToClient(client *c);
 void ownerCountNetOut(long long n);
 int clientTotalPubSubSubscriptionCount(client *c);

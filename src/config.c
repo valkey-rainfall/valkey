@@ -3575,6 +3575,7 @@ standardConfig static_configs[] = {
     createBoolConfig("owner-uring", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_uring, 1, NULL, NULL),
     createBoolConfig("owner-uring-aof", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_uring_aof, 0, NULL, NULL), /* vkevo g9-fold: owners batch under appendonly too */
     createBoolConfig("owner-set-burst", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_set_burst, 1, NULL, NULL), /* vkevo g10-setburst: plain SET frames answered off the query buffer */
+    createIntConfig("owner-pipeline-resume", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1024, server.owner_pipeline_resume, 4, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g1g: owners resume a pipeline after main ran its non-native command (0 = off; N = the run of native commands ahead that sends a client home) */
     createIntConfig("owner-bigreply-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_bigreply_min, 2048, INTEGER_CONFIG, NULL, NULL), /* vkevo g11-bigreply: 0 = copy every value */
     createBoolConfig("owner-mm-lease", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_mm_lease, 1, NULL, NULL), /* vkevo g11-maxmem: batched reads and SET bursts inside each owner's memory lease */
     createBoolConfig("owner-repl-native", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_native, 1, NULL, NULL), /* vkevo g11-repl: owners native with replicas attached */

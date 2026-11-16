@@ -504,6 +504,7 @@ client *createClient(connection *conn) {
     c->owner_hs = 0;
     c->owner_held = 0;
     c->owner_guest_node = NULL;
+    c->owner_resume = 0;
     c->owner_refs = NULL;
     c->owner_nrefs = c->owner_refs_cap = c->owner_refc_at = 0;
     c->owner_ref_bytes = 0;
@@ -2517,7 +2518,7 @@ int freeClient(client *c) {
 
     /* An owner thread's client comes back to main first; owners are stopped while main runs. */
     if (c->owner_tid != OWNER_ON_MAIN) ownerReclaim(c);
-    if (c->owner_guest_node) ownerClientFreed(c);
+    if (c->owner_guest_node || c->owner_resume) ownerClientFreed(c);
     /* Value references never outlive the owner window that made them (owner.c ownerRefsSettle). */
     serverAssert(c->owner_nrefs == 0 && c->owner_refc_at == 0);
     zfree(c->owner_refs);
@@ -5353,6 +5354,10 @@ static int processInputBufferLoop(client *c) {
         c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
         c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
 
+        /* A guest of an owner thread stops between two commands when its owner can run the next ones: it
+         * goes home with the rest of its input (owner.c, owner-pipeline-resume). */
+        if (c->owner_guest_node && ownerGuestYield(c, 0)) break;
+
         bool popped_from_queue;
         /* If commands are queued up, pop from the queue first */
         if (!consumeCommandQueue(c)) {
@@ -5363,8 +5368,9 @@ static int processInputBufferLoop(client *c) {
             popped_from_queue = true;
         }
 
-        /* Prefetch keys for the next commands in queue, if not already done. */
-        prefetchCommandQueueKeys(c);
+        /* Prefetch keys for the next commands in queue, if not already done (not for a guest that may go
+         * home before them). */
+        if (!c->owner_guest_node || !server.owner_pipeline_resume) prefetchCommandQueueKeys(c);
 
         parseResult res = handleParseResults(c);
         if (res == PARSE_NEEDMORE && popped_from_queue) {
@@ -5406,6 +5412,8 @@ static int processInputBufferLoop(client *c) {
         }
     }
 
+    /* A guest whose input main ran to its end goes home with its replies (owner.c). */
+    if (c->owner_guest_node) ownerGuestYield(c, 1);
     return C_OK;
 }
 
@@ -8191,12 +8199,16 @@ int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
 }
 
 /* Main: go on with a client an owner thread handed over, as processClientIOReadsDone() goes on
- * after a read: its current command first, then the rest of its input. */
-void ownerResumeOnMain(client *c) {
+ * after a read: its current command first, then the rest of its input. Returns 0 when the client
+ * may be gone (its command freed it, or it is closed right after), 1 when it is still there. */
+int ownerResumeOnMain(client *c) {
     parseResult res = handleParseResults(c);
-    if (res == PARSE_ERR) return;
+    if (res == PARSE_ERR) return 1;
     if (res == PARSE_OK && c->argc > 0 && !c->flag.blocked) c->flag.pending_command = 1;
-    if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
+    if (processPendingCommandAndInputBuffer(c) != C_OK) return 0;
+    int alive = !c->flag.close_asap; /* beforeNextClient frees a client closing now */
+    beforeNextClient(c);
+    return alive;
 }
 
 /* Owner thread: the buffer bookkeeping of a write (its bytes count for the owner). */

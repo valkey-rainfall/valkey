@@ -107,6 +107,19 @@
  * owner ports); a heavy plain-client load on 6379 or many cross-owner commands stop owners often.
  * Upgrade: per-owner stop for single-owner fallbacks, or a fallback that runs on the owner.
  *
+ * Pipelines (owner-pipeline-resume N, default 4; RL-g1g): a command its owner cannot run hands the
+ * client to main with the rest of its input, and main runs that command. When the client's next N
+ * commands, parsed whole, are ones the owner runs (data commands, MULTI, EXEC on the home owner's keys),
+ * or its input ends, main stops there (ownerGuestYield) and at the end of beforeSleep sends the client
+ * home with the rest of its input and the replies main made for it (main writes none of them), and the
+ * owner runs the rest first thing (ownerResumeInput) until the next command it cannot run, then writes
+ * all the replies in order. So each such command goes to main on its own and the commands around it
+ * stay native; a run of fewer than N native commands between two others costs main less to run itself
+ * than a trip home. One thread at a time serves a connection, and its replies leave in command order.
+ * A client that cannot go home then (a socket main is writing, replies the AOF still holds, a veto that
+ * came up since) has the rest run by main at its next wakeup, as before (ownerRerunOnMain). With
+ * owner-pipeline-resume 0, main runs the rest of the pipeline, as the parent did.
+ *
  * io_uring (owner-uring yes, the default; D3-all-g8-iouring): epoll still says which sockets are ready,
  * but each owner reads the ready sockets OWN_URING_BATCH at a time with one io_uring_enter on its own
  * ring (recv, MSG_DONTWAIT), runs them in event order, and sends their replies the same way (send of
@@ -452,6 +465,7 @@ typedef struct owner {
     int nclients;
     pthread_mutex_t inbox_mu;
     list *inbox; /* clients main handed over, not yet registered */
+    int inbox_wake; /* main: clients went into the inbox while the world is held; wake the owner at resume */
     execContext ectx;
     /* Written by the owner, folded and cleared by main under the stop. */
     ownerCmdStat cs[OWN_NCMDS];
@@ -558,6 +572,17 @@ static pthread_mutex_t own_main_mu = PTHREAD_MUTEX_INITIALIZER;
 static list *own_main_inbox = NULL; /* clients owners handed to main */
 static int own_main_wakefd = -1;
 static list *own_guests = NULL; /* clients with a home owner, served by main now */
+/* owner-pipeline-resume (RL-g1g), main only: guests main stopped between two commands because their owner
+ * runs the next one (ownerGuestYield), sent home at the end of beforeSleep (ownerResumeYielded); and the
+ * ones that could not go, whose rest main runs at its next wakeup (ownerRerunOnMain). client->owner_resume
+ * says which list a client is in, or that it is on its way home (OWN_RES_HOME: its owner runs the rest). */
+enum { OWN_RES_NONE = 0, OWN_RES_YIELDED, OWN_RES_HOME, OWN_RES_RERUN };
+static list *own_yielded = NULL, *own_rerun = NULL;
+static int own_no_yield = 0; /* main runs a rerun client's whole input itself */
+static long long own_resumes = 0, own_reruns = 0;
+static void ownerResumeYielded(int home);
+static void ownerRerunAdd(client *c);
+static void ownerRerunOnMain(void);
 
 static long long own_stops = 0, own_stop_wait_us = 0, own_stop_wait_max_us = 0;
 static long long own_takes = 0, own_returns = 0;
@@ -807,6 +832,8 @@ void ownerThreadsInit(void) {
     owners = zcalloc(sizeof(owner) * own_n);
     own_main_inbox = listCreate();
     own_guests = listCreate();
+    own_yielded = listCreate();
+    own_rerun = listCreate();
     for (int k = 0; k < OWN_NCMDS; k++) {
         /* By original name: rename-command moves the same command under another name. */
         own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_kinds[k].name);
@@ -1246,6 +1273,14 @@ static void ownerResumeWorld(void) {
         pthread_cond_broadcast(&own_wait_cv);
         pthread_mutex_unlock(&own_wait_mu);
     }
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        if (!o->inbox_wake) continue;
+        o->inbox_wake = 0;
+        uint64_t one = 1;
+        if (write(o->wakefd, &one, sizeof(one)) == -1) { /* counter full: a wakeup is pending anyway */
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -1306,6 +1341,12 @@ static void ownerGuestAdd(client *c) {
 }
 
 void ownerClientFreed(client *c) {
+    if (c->owner_resume == OWN_RES_YIELDED || c->owner_resume == OWN_RES_RERUN) {
+        list *l = c->owner_resume == OWN_RES_YIELDED ? own_yielded : own_rerun;
+        listNode *ln = listSearchKey(l, c);
+        if (ln) listDelNode(l, ln);
+    }
+    c->owner_resume = OWN_RES_NONE;
     if (c->owner_guest_node) {
         listDelNode(own_guests, c->owner_guest_node);
         c->owner_guest_node = NULL;
@@ -1347,7 +1388,11 @@ static void ownerTakeOne(client *c) {
         freeClientAsync(c);
         return;
     }
-    if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+    /* owner-pipeline-resume: a client that came to run a command main sends home again at the end of
+     * beforeSleep (ownerGuestYield), mostly, and needs no read handler on main for that; it gets one once
+     * it stays (below, or ownerRerunAdd). */
+    int lazy = why == OWN_WHY_RUN && c->owner_home >= 0 && server.owner_pipeline_resume && !connIsTLS(c->conn);
+    if (!lazy && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
         freeClientAsync(c);
         return;
     }
@@ -1359,7 +1404,13 @@ static void ownerTakeOne(client *c) {
         return;
     }
     if (why == OWN_WHY_IDLE) return; /* nothing read: main's own read handler takes the input */
-    ownerResumeOnMain(c);
+    if (!lazy) {
+        ownerResumeOnMain(c);
+        return;
+    }
+    if (ownerResumeOnMain(c) && c->owner_tid == OWNER_ON_MAIN && c->owner_resume != OWN_RES_YIELDED &&
+        !connHasReadHandler(c->conn) && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR)
+        freeClientAsync(c);
 }
 
 /* One client at a time: a client's command can run a long script, and main then serves the other
@@ -1403,9 +1454,9 @@ static int ownerSendToOwner(client *c) {
     pthread_mutex_lock(&o->inbox_mu);
     listAddNodeTail(o->inbox, c);
     pthread_mutex_unlock(&o->inbox_mu);
-    uint64_t one = 1;
-    if (write(o->wakefd, &one, sizeof(one)) == -1) { /* counter full: a wakeup is pending anyway */
-    }
+    /* RL-g1g: the owner cannot run before main resumes the world: one wakeup then for all of them
+     * (ownerResumeWorld). */
+    o->inbox_wake = 1;
     return 1;
 }
 
@@ -1481,26 +1532,38 @@ void ownerReclaim(client *c) {
     ownerTlsRelease(c);
 }
 
+/* What keeps a guest on main apart from input and output in flight: a pending close, a command running,
+ * a transaction, watch, block, subscription, tracking, monitor or replication role, or a reply mode main
+ * must honor. */
+static int ownerGuestBound(client *c) {
+    if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command || c->flag.protected) return 1;
+    if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) return 1;
+    if (c->flag.pending_command || c->flag.executing_command || c->argc) return 1;
+    if (c->flag.multi || (c->mstate && listLength(&c->mstate->watched_keys))) return 1;
+    if (c->flag.blocked || c->flag.unblocked || c->flag.throttled || c->flag.pubsub || c->flag.tracking) return 1;
+    if (c->pubsub_data && clientTotalPubSubSubscriptionCount(c)) return 1;
+    if (c->flag.monitor || c->flag.replica || c->flag.primary || c->repl_data || c->slot_migration_job) return 1;
+    if (c->flag.lua_debug || c->flag.fastpath || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next)
+        return 1;
+    if (c->deferred_reply_errors || (c->deferred_reply && listLength(c->deferred_reply))) return 1;
+    if (getClientType(c) != CLIENT_TYPE_NORMAL || authRequired(c)) return 1;
+    return 0;
+}
+
+/* Nothing about a guest's output needs main: its replies are written and no write handler waits. */
+static int ownerGuestFlushed(client *c) {
+    return !c->flag.pending_write && !clientHasPendingReplies(c) && !connHasWriteHandler(c->conn);
+}
+
 /* A guest may go home when nothing about it needs main: no input or output in flight, no
  * transaction, watch, block, subscription, tracking, monitor or replication role, no pending
  * close, and no reply mode main must honor. */
 static int ownerGuestIdle(client *c) {
-    if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command || c->flag.protected) return 0;
-    if (c->flag.pending_write || clientHasPendingReplies(c) || connHasWriteHandler(c->conn)) return 0;
-    if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) return 0;
-    if (c->flag.pending_command || c->flag.executing_command || c->argc || c->cmd_queue.off < c->cmd_queue.len)
-        return 0;
+    if (!ownerGuestFlushed(c)) return 0;
+    if (c->cmd_queue.off < c->cmd_queue.len) return 0;
     if (c->querybuf && sdslen(c->querybuf) > c->qb_pos) return 0;
     if (c->multibulklen || c->bulklen != -1 || c->reqtype) return 0; /* partial request */
-    if (c->flag.multi || (c->mstate && listLength(&c->mstate->watched_keys))) return 0;
-    if (c->flag.blocked || c->flag.unblocked || c->flag.throttled || c->flag.pubsub || c->flag.tracking) return 0;
-    if (c->pubsub_data && clientTotalPubSubSubscriptionCount(c)) return 0;
-    if (c->flag.monitor || c->flag.replica || c->flag.primary || c->repl_data || c->slot_migration_job) return 0;
-    if (c->flag.lua_debug || c->flag.fastpath || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next)
-        return 0;
-    if (c->deferred_reply_errors || (c->deferred_reply && listLength(c->deferred_reply))) return 0;
-    if (getClientType(c) != CLIENT_TYPE_NORMAL || authRequired(c)) return 0;
-    return 1;
+    return !ownerGuestBound(c);
 }
 
 static void ownerReturnGuests(void) {
@@ -1509,7 +1572,7 @@ static void ownerReturnGuests(void) {
     listRewind(own_guests, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
-        if (!ownerGuestIdle(c) || !ownerSendToOwner(c)) continue;
+        if (c->owner_resume || !ownerGuestIdle(c) || !ownerSendToOwner(c)) continue;
         listDelNode(own_guests, ln);
         c->owner_guest_node = NULL;
         own_returns++;
@@ -1534,6 +1597,8 @@ static void ownerTakeToMain(client *c) {
     ownerTlsOnMain(c);
     ownerGuestAdd(c);
     if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+    /* Sent home between two commands of a pipeline and not run there yet: main runs the rest. */
+    if (c->owner_resume == OWN_RES_HOME) ownerRerunAdd(c);
 }
 
 /* Main inside a long command (processEventsWhileBlocked: busy script, loading, module yield): the
@@ -1605,18 +1670,23 @@ void ownerAfterSleep(void) {
         if (own_held) {
             ownerTakeHandoffs(); /* queued behind the command that is running now */
             ownerTakeReadable();
+            ownerRerunOnMain();
         }
         return;
     }
     ownerStopWorld();
     ownerFoldStats();
     ownerTakeHandoffs();
+    ownerRerunOnMain();
 }
 
 void ownerBeforeSleepEnd(void) {
-    if (!own_n || ProcessingEventsWhileBlocked || own_dormant) return;
+    if (!own_n || ProcessingEventsWhileBlocked) return;
     /* While the native path is vetoed, guests stay on main: owners would only hand them back. */
-    if (!(ownerComputeVeto() & OWN_VETO_ALL)) ownerReturnGuests();
+    int home = !own_dormant && !(ownerComputeVeto() & OWN_VETO_ALL);
+    if (listLength(own_yielded)) ownerResumeYielded(home);
+    if (own_dormant) return;
+    if (home) ownerReturnGuests();
     ownerResumeWorld();
 }
 
@@ -1654,6 +1724,7 @@ static inline uint64_t ownerTag(client *c) {
 
 static int ownerWrite(owner *o, client *c);
 static void ownerRefsMaterialize(owner *o, client *c, size_t skip);
+static int ownerResumeInput(owner *o, client *c);
 
 /* Owner, in a window: leave a client to main. It is off this owner's loop when this returns. */
 static int ownerHandOff(owner *o, client *c, int why) {
@@ -1717,6 +1788,13 @@ static void ownerRegister(owner *o, client *c) {
     }
     /* TLS: the handshake's ClientHello raises EPOLLIN; input OpenSSL took off the socket on main does not. */
     if (c->owner_tls && !c->owner_hs && (connIOOwnerState(c->conn) & CONN_IO_BUFFERED_INPUT)) ownerTlsPend(o, c);
+    /* Sent home between two commands of a pipeline (owner-pipeline-resume): run the rest now; the replies
+     * main made for it go out with the ones its commands make here. */
+    if (c->owner_resume == OWN_RES_HOME) {
+        c->owner_resume = OWN_RES_NONE;
+        if (ownerResumeInput(o, c)) o->wake_main = 1;
+        return;
+    }
     if (clientHasPendingReplies(c)) ownerWrite(o, c);
 }
 
@@ -3070,6 +3148,146 @@ static int ownerNativeKind(owner *o, client *c) {
     return kind;
 }
 
+/* One parsed command a guest's owner would run (the tests of ownerNativeKind main can make; the owner makes
+ * them all again and hands back what it cannot run): a native data command on the home owner's keys (a read
+ * under a write veto), PING, MULTI, EXEC or DISCARD. RL-1: by the kind table; inside a MULTI of the run only
+ * the queueable kinds (OWN_K_TXN); not WATCH / UNWATCH, scripts (whether the owner has the script is the
+ * owner's to know) or the script-only kinds. */
+static int ownerGuestNativeNext(owner *o, parsedCommand *p, int veto, int *in_multi) {
+    if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED) || p->argc == 0 || !p->cmd ||
+        (p->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)))
+        return 0;
+    int kind = ownerKindOf(p->cmd);
+    if (kind < 0 || kind == OWN_WATCH || kind == OWN_UNWATCH || own_kinds[kind].family == OWN_FAM_SCRIPT ||
+        (own_kinds[kind].flags & OWN_K_INNER))
+        return 0;
+    if (kind == OWN_MULTI) {
+        if (*in_multi) return 0;
+        *in_multi = 1;
+        return 1;
+    }
+    if (kind == OWN_EXEC || kind == OWN_DISCARD) {
+        int ok = *in_multi;
+        *in_multi = 0;
+        return ok;
+    }
+    if (*in_multi && !(own_kinds[kind].flags & OWN_K_TXN)) return 0;
+    if (kind == OWN_PING) return 1;
+    if (!(own_kinds[kind].flags & OWN_K_READ) && (veto & OWN_VETO_WRITE)) return 0;
+    int slot = ownerKeySlot(p->cmd, p->argv, p->argc, p->read_flags);
+    return slot >= o->slot_lo && slot <= o->slot_hi;
+}
+
+/* Main, in processInputBufferLoop: 1 when a guest stops here and goes home, its owner running the rest of
+ * its input (owner-pipeline-resume N). Between two commands (at_end 0): when the next N commands, parsed
+ * whole in its command queue, are ones its owner runs, or the queue ends after one or more of them (a
+ * shorter run between two other commands costs main less to run itself than a trip home: main runs only
+ * while the owners are stopped). At the end of its input (at_end 1): always. Main already ran the commands
+ * before, so the owner runs the next one after them, and the replies main made go home with the client
+ * (ownerResumeYielded). Never when something about the client needs main (ownerGuestBound): MULTI .. EXEC
+ * that main runs, WATCH through main, blocked, unblocked and throttled clients, pub/sub, tracking, MONITOR,
+ * replication links, CLIENT REPLY OFF / SKIP, Lua debugging, deferred replies, a pending close or kill,
+ * protected clients, a command being parsed; nor for unauthenticated or restricted ACL users, nor under
+ * any veto (client pause, loading, busy scripts, io-threads > 1, ...). */
+int ownerGuestYield(client *c, int at_end) {
+    int need = server.owner_pipeline_resume;
+    if (!need || own_no_yield || c->owner_resume) return 0;
+    /* RL-1: not for TLS clients (RL-g1d's owner TLS ports): main runs the rest of a TLS guest's pipeline, as
+     * the parent did. shortcut: the trip home of a TLS connection (IO ownership, OpenSSL's buffered input) is
+     * not merged with this path yet. */
+    if (connIsTLS(c->conn)) return 0;
+    if (!own_held || own_dormant || ProcessingEventsWhileBlocked || c->owner_home < 0 || c->owner_home >= own_n ||
+        c->owner_tid != OWNER_ON_MAIN)
+        return 0;
+    cmdQueue *q = &c->cmd_queue;
+    if (at_end ? q->off < q->len : q->off >= q->len) return 0;
+    int veto = own_last_veto; /* main's state as the owners last resumed: ownerBeforeSleepEnd checks it again */
+    if (veto & OWN_VETO_ALL) return 0;
+    if (ownerGuestBound(c)) return 0;
+    if ((c->user && (c->user->flags & USER_FLAG_RETIRED)) || !ACLUserUnrestricted(c->user)) return 0;
+    if (!at_end) {
+        owner *o = &owners[c->owner_home];
+        int run = 0, in_multi = 0;
+        for (int i = q->off; i < q->len && run < need; i++, run++)
+            if (!ownerGuestNativeNext(o, &q->cmds[i], veto, &in_multi)) break;
+        if (run < need && (run == 0 || q->off + run < q->len)) return 0;
+    }
+    c->owner_resume = OWN_RES_YIELDED;
+    listAddNodeTail(own_yielded, c);
+    /* Its replies go home with it and its owner writes them with the next ones (ownerResumeYielded): main's
+     * beforeSleep does not write them. */
+    if (c->flag.pending_write) {
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        c->flag.pending_write = 0;
+    }
+    return 1;
+}
+
+/* Main, at the end of beforeSleep (its AOF write done): the guests ownerGuestYield stopped go home with the
+ * rest of their input, which their owner runs first thing (ownerRegister, ownerResumeInput), and with the
+ * replies main made for them, which the owner writes ahead of its own (main's AOF has their writes now:
+ * aofHoldsReplies is 0). The parsed commands go as an owner hands them to main (ownerHandOff): without
+ * main's prefetch marks and slots. One that cannot go now (home 0: a veto or io-threads > 1; a socket main
+ * is writing; replies the AOF still holds; a state ownerGuestBound keeps on main) has the rest run by main. */
+static void ownerResumeYielded(int home) {
+    listNode *ln;
+    while ((ln = listFirst(own_yielded))) {
+        client *c = listNodeValue(ln);
+        listDelNode(own_yielded, ln);
+        c->owner_resume = OWN_RES_NONE;
+        if (!home || !c->owner_guest_node || c->owner_tid != OWNER_ON_MAIN || connHasWriteHandler(c->conn) ||
+            ownerGuestBound(c) || (clientHasPendingReplies(c) && aofHoldsReplies())) {
+            ownerRerunAdd(c);
+            continue;
+        }
+        /* The inbox is the owner's only after main resumes the world, so the bookkeeping below is still
+         * main's. A client that cannot go (RL-g1d: a TLS transport that cannot leave main now) stays. */
+        c->owner_resume = OWN_RES_HOME;
+        if (!ownerSendToOwner(c)) {
+            c->owner_resume = OWN_RES_NONE;
+            ownerRerunAdd(c);
+            continue;
+        }
+        if (c->flag.pending_write) {
+            listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+            c->flag.pending_write = 0;
+        }
+        listDelNode(own_guests, c->owner_guest_node);
+        c->owner_guest_node = NULL;
+        own_returns++;
+        own_resumes++;
+        if (c->querybuf && c->querybuf == thread_shared_qb) trimClientQueryBuffer(c);
+        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+            c->cmd_queue.cmds[i].slot = -1;
+            c->cmd_queue.cmds[i].read_flags &= ~READ_FLAGS_PREFETCHED;
+        }
+    }
+}
+
+/* Main: a guest whose rest of input main runs at its next wakeup (ownerRerunOnMain), as the parent did
+ * (all of it, no stop between commands), with a read handler and its replies in main's write queue. */
+static void ownerRerunAdd(client *c) {
+    c->owner_resume = OWN_RES_RERUN;
+    listAddNodeTail(own_rerun, c);
+    own_reruns++;
+    if (!connHasReadHandler(c->conn) && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) freeClientAsync(c);
+    if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+    aeSetDontWait(server.el, 1);
+}
+
+/* Main, after taking the handed-off clients: run the rest of the input of the guests ownerRerunAdd kept. */
+static void ownerRerunOnMain(void) {
+    listNode *ln;
+    while ((ln = listFirst(own_rerun))) {
+        client *c = listNodeValue(ln);
+        listDelNode(own_rerun, ln);
+        c->owner_resume = OWN_RES_NONE;
+        own_no_yield++;
+        ownerResumeOnMain(c);
+        own_no_yield--;
+    }
+}
+
 /* Keep a native command's commandlog entries for main, which adds them when it folds the stats. */
 static void ownerKeepLogs(owner *o, void **entries, int *types, int n) {
     for (int i = 0; i < n; i++) {
@@ -4254,6 +4472,33 @@ static int ownerTryNative(client *c) {
     return 1;
 }
 
+/* Owner, in a window (owner-pipeline-resume): a client main sent home between two commands of a pipeline
+ * (ownerGuestYield) has the rest of its input in its command queue, the next command parsed whole. Run
+ * it now, as ownerReadPost runs a read's commands, until one needs main again: that one goes to main on
+ * its own, after the replies of the ones run here. Returns 1 when the client left the owner. */
+static int ownerResumeInput(owner *o, client *c) {
+    ectx->cmd_time_snapshot = mstime();
+    c->read_flags = authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+    int to_main = 0;
+    if (consumeCommandQueue(c)) {
+        to_main = ownerRunParsedInput(c, ownerTryNative);
+    } else if (c->querybuf && c->qb_pos < sdslen(c->querybuf)) {
+        parseInputBuffer(c);
+        prepareCommandQueue(c);
+        if (own_mm) ownerMmAfterRead(o);
+        to_main = ownerRunParsedInput(c, ownerTryNative);
+    }
+    trimCommandQueue(c);
+    trimClientQueryBuffer(c);
+    if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
+    if (to_main) {
+        if (clientHasPendingReplies(c) && !c->owner_held && !o->unflushed) ownerWriteOnce(o, c);
+        return ownerHandOff(o, c, OWN_WHY_RUN);
+    }
+    if (clientHasPendingReplies(c)) return ownerReplyOut(o, c);
+    return 0;
+}
+
 /* Error replies of native commands: the counts are kept here, the per-prefix stats fold on main. */
 void ownerErrorReply(client *c, const char *s, size_t len, int flags) {
     owner *o = own_self;
@@ -4802,6 +5047,8 @@ void ownerInfo(sds *info) {
                          own_last_veto == OWN_VETO_ALL ? "all" : own_last_veto == OWN_VETO_WRITE ? "writes" : "none",
                          native, own_takes, own_returns, adopted, windows, resident,
                          own_guests ? listLength(own_guests) : 0UL, own_stops, own_stop_wait_us, own_stop_wait_max_us);
+    *info = sdscatprintf(*info, "owner_pipeline_resume:%d\r\nowner_pipeline_resumes:%lld\r\nowner_pipeline_reruns:%lld\r\n",
+                         server.owner_pipeline_resume, own_resumes, own_reruns);
     *info = sdscatprintf(*info,
                          "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
                          "owner_maxmemory_to_main:%lld\r\n",
