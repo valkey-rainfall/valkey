@@ -622,6 +622,9 @@ typedef struct owner {
     uint64_t *tlsp;
     int ntlsp, tlsp_cap;
     long long tls_handshakes, tls_reads; /* INFO, never cleared */
+    /* RL-g2v: TLS accepts this owner finished itself (no trip to main; INFO, never cleared), and the ones
+     * main has not counted in stat_numconnections yet (folded at the next stop). */
+    long long tls_local_accepts, accepts_unfolded;
     pthread_t thread;
     int epfd, wakefd;
     client **fdmap; /* fd -> resident client; written by the owner in a window, by main under the stop */
@@ -1744,6 +1747,8 @@ static void ownerFoldStats(void) {
             }
             o->exp_fold = 0;
         }
+        server.stat_numconnections += o->accepts_unfolded; /* RL-g2v: accepts the owner finished */
+        o->accepts_unfolded = 0;
     }
     if (ownerExpiresKeys()) { /* RL-g2b: expired_stale_perc over every owner's keys */
         double stale = 0;
@@ -5371,8 +5376,26 @@ static int ownerRead(owner *o, client *c) {
     return ownerReadPost(o, c, 0);
 }
 
+static int ownerReadTls(owner *o, client *c);
+
+/* RL-g2v: whether the owner may finish a TLS accept itself. Main's part of the accept (clientAcceptHandler)
+ * then would only count the connection: no protected-mode refusal is possible, no certificate names a
+ * user, and no module could see the CLIENT_CHANGE event (a loaded or listening module vetoes the owners).
+ * The configs it reads change only on main; a change racing a handshake is as racing a stock accept. */
+static int ownerTlsAcceptLocal(client *c) {
+    if (!server.owner_tls_local_accept || c->flag.close_asap) return 0;
+    if (connGetState(c->conn) != CONN_STATE_CONNECTED) return 0;
+    if (atomic_load_explicit(&own_veto, memory_order_relaxed) & OWN_VETO_ALL) return 0;
+    if (server.protected_mode && (DefaultUser->flags & USER_FLAG_NOPASS)) return 0;
+    if (server.tls_ctx_config.client_auth_user != TLS_CLIENT_FIELD_OFF) return 0;
+    return 1;
+}
+
 /* RL-g1d, owner TLS ports: one step of a client's TLS handshake, on its owner (connAccept off main runs
  * SSL_accept and nothing else). Done or failed, main runs the rest of the accept (OWN_WHY_ACCEPTED).
+ * RL-g2v: unless the owner may finish it itself (ownerTlsAcceptLocal): the client stays here and its
+ * first request runs now, instead of after a trip to main and back (two world stops, and the main
+ * thread's queue during a connection storm: 50-220 ms per new connection on loopback).
  * Returns 1 when the client left the owner. */
 static int ownerHandshake(owner *o, client *c) {
     connAccept(c->conn, NULL);
@@ -5383,6 +5406,15 @@ static int ownerHandshake(owner *o, client *c) {
     }
     c->owner_hs = 0;
     o->tls_handshakes++;
+    if (ownerTlsAcceptLocal(c)) {
+        o->tls_local_accepts++;
+        o->accepts_unfolded++;
+        ownerSetWantOut(o, c, 0);
+        /* The first request may have come with the client's Finished: read-ahead took it off the socket,
+         * where no event reports it. */
+        if (connIOOwnerState(c->conn) & CONN_IO_BUFFERED_INPUT) return ownerReadTls(o, c);
+        return 0;
+    }
     return ownerHandOff(o, c, OWN_WHY_ACCEPTED);
 }
 
@@ -6380,10 +6412,11 @@ void ownerInfo(sds *info) {
     for (int i = 0; i < own_n; i++) tail_n += owners[i].tail_total;
     *info = sdscatprintf(*info, "owner_tail_commands:%lld\r\n", tail_n);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
-    long long tls_hs = 0, tls_rd = 0;
+    long long tls_hs = 0, tls_rd = 0, tls_la = 0;
     for (int i = 0; i < own_n; i++) {
         tls_hs += owners[i].tls_handshakes;
         tls_rd += owners[i].tls_reads;
+        tls_la += owners[i].tls_local_accepts;
     }
     *info = sdscatprintf(*info, "owner_tls_port:%d\r\nowner_tls_handshakes:%lld\r\nowner_tls_reads:%lld\r\n",
                          server.owner_tls_port, tls_hs, tls_rd);
@@ -6404,6 +6437,9 @@ void ownerInfo(sds *info) {
                          "owner_expire_slices:%lld\r\nowner_expired_keys:%lld\r\nowner_expire_sampled:%lld\r\n"
                          "owner_expire_usec:%lld\r\n",
                          ownerExpiresKeys() ? "yes" : "no", ex_cyc, ex_fast, ex_sl, ex_keys, ex_samp, ex_us);
+    /* RL-g2v: TLS accepts the owners finished without a trip to main. */
+    *info = sdscatprintf(*info, "owner_tls_local_accept:%d\r\nowner_tls_local_accepts:%lld\r\n",
+                         server.owner_tls_local_accept, tls_la);
     /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
      * have the script for (or had it marked for main). */
     long long s_runs = 0, s_aborts = 0, s_misses = 0;

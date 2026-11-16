@@ -3576,6 +3576,7 @@ standardConfig static_configs[] = {
     createIntConfig("owner-threads", NULL, IMMUTABLE_CONFIG, 0, 256, server.owner_threads, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("owner-port", NULL, IMMUTABLE_CONFIG, 0, 65535, server.owner_port, 6400, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("owner-tls-port", NULL, IMMUTABLE_CONFIG, 0, 65535, server.owner_tls_port, 0, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g1d: owner i also takes TLS clients on owner-tls-port + i (0: off) */
+    createBoolConfig("owner-tls-local-accept", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_tls_local_accept, 1, NULL, NULL), /* vkevo RL-g2v: the owner finishes a TLS accept itself when main's part would only count it */
     createStringConfig("owner-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.owner_cpulist, NULL, NULL, NULL),
     createStringConfig("owner-announce-ip", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.owner_announce_ip, NULL, NULL, NULL),
     createBoolConfig("owner-adopt-all", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.owner_adopt_all, 0, NULL, NULL),
