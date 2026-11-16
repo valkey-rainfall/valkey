@@ -495,6 +495,9 @@ typedef struct owner {
     int nunits, units_cap;
     int unflushed;  /* ops not written to the AOF yet: this owner's replies wait (ownerReplyOut) */
     int release;    /* main: the AOF has them now, write the held replies (ownerWriteHeld) */
+    int may_leave;    /* RL-g4a: this window may leave work for the next one on a pending stop (ownerStopPending) */
+    int left_early;   /* RL-g4a: this window left work for the next one */
+    int leave_streak; /* RL-g4a: consecutive windows that left work behind (at most OWN_LEAVE_STREAK) */
     client **held;  /* clients whose replies wait for the AOF */
     int nheld, held_cap;
     int wake_main;  /* this window left main something to do (ops to fold, memory over) */
@@ -587,6 +590,8 @@ static void ownerRerunOnMain(void);
 static long long own_stops = 0, own_stop_wait_us = 0, own_stop_wait_max_us = 0;
 static long long own_takes = 0, own_returns = 0;
 static long long own_home_now = 0; /* RL-g2a: handed-over clients sent home right after their command */
+/* RL-g4a: work an owner left for its next window because main asked for the world (ownerStopPending). */
+static _Atomic long long own_early_leaves = 0, own_inbox_left = 0, own_reads_left = 0;
 static int own_last_veto = OWN_VETO_ALL;
 static int own_dormant = 0; /* io-threads > 1: owners sleep, main serves everything */
 
@@ -972,6 +977,18 @@ static void ownerEnter(owner *o) {
 
 static void ownerLeave(owner *o) {
     atomic_store_explicit(&o->active, 0, memory_order_release);
+}
+
+/* RL-g4a-park-early: main asked for the world (ownerStopWorld set own_stop and waits for every active owner).
+ * An owner that sees it in a window takes on no new work: it leaves at the next point where nothing of its own
+ * is half done, and the work it did not start waits for its next window, which begins when main resumes.
+ * Progress: after OWN_LEAVE_STREAK windows in a row that left work behind, the next one does all its work, as
+ * before this gene, so nothing waits more than OWN_LEAVE_STREAK stops (each stop ~0.1-0.5 ms under load). */
+#define OWN_LEAVE_STREAK 4 /* RL-g4a: windows in a row that may leave work for the next one */
+static inline int ownerStopPending(owner *o) {
+    if (!o->may_leave || !atomic_load_explicit(&own_stop, memory_order_relaxed)) return 0;
+    o->left_early = 1;
+    return 1;
 }
 
 /* What native commands propagated on owner o since its records last went to the AOF buffer goes
@@ -1885,6 +1902,25 @@ static void ownerTakeInbox(owner *o) {
         client *c = listNodeValue(ln);
         listDelNode(l, ln);
         ownerRegister(o, c);
+        /* RL-g4a: with a stop pending, the clients not registered yet go back to the inbox, in order, and the
+         * wakeup is armed again, so this owner's next window (after main resumes) takes them first. They are
+         * on no loop until then, as before this window: main finds them in the inbox (ownerReclaim,
+         * ownerTakeReadable, ownerIOThreadsChanged). Main adds to the inbox only with the world held, so the
+         * new inbox is empty here and keeps their order. */
+        if (listLength(l) && ownerStopPending(o)) {
+            long long left = (long long)listLength(l);
+            pthread_mutex_lock(&o->inbox_mu);
+            serverAssert(listLength(o->inbox) == 0);
+            listRelease(o->inbox);
+            o->inbox = l;
+            pthread_mutex_unlock(&o->inbox_mu);
+            uint64_t one = 1;
+            if (write(o->wakefd, &one, sizeof(one)) == -1) { /* counter full: a wakeup is pending anyway */
+            }
+            atomic_fetch_add_explicit(&own_inbox_left, left, memory_order_relaxed);
+            atomic_fetch_add_explicit(&own_early_leaves, 1, memory_order_relaxed);
+            return;
+        }
     }
     listRelease(l);
 }
@@ -4861,6 +4897,9 @@ static void *ownerThreadMain(void *arg) {
             continue;
         }
         ownerEnter(o);
+        o->leave_streak = o->left_early ? o->leave_streak + 1 : 0;
+        o->may_leave = o->leave_streak < OWN_LEAVE_STREAK;
+        o->left_early = 0;
         o->windows_total++;
         o->wake_main = 0;
         if (o->release) ownerWriteHeld(o);
@@ -4933,6 +4972,15 @@ static void *ownerThreadMain(void *arg) {
             }
             /* Main is waiting: the rest are level-triggered and come back with the next epoll_wait. */
             if (atomic_load_explicit(&own_stop, memory_order_relaxed)) stop = 1;
+        }
+        /* RL-g4a: queued reads are not submitted yet (ownerReadQueue only chose each one's buffer): with a stop
+         * pending they are dropped, their memory lease reservations given back, and the next window reads
+         * them (epoll is level-triggered: the sockets are still readable). Nothing was read or run for them. */
+        if (m && ownerStopPending(o)) {
+            if (own_mm) o->mm_resv -= (size_t)m * OWN_MM_READ;
+            atomic_fetch_add_explicit(&own_reads_left, m, memory_order_relaxed);
+            atomic_fetch_add_explicit(&own_early_leaves, 1, memory_order_relaxed);
+            m = 0;
         }
         if (m) handed |= ownerReadBatch(o, m);
         /* RL-g1d: TLS clients whose input OpenSSL may hold (none while main waits: next window). */
@@ -5130,6 +5178,11 @@ void ownerInfo(sds *info) {
                          server.owner_pipeline_resume, own_resumes, own_reruns);
     /* RL-g2a: handed-over clients that went home right after their command, replies unsent (ownerGoHomeNow). */
     *info = sdscatprintf(*info, "owner_returns_with_replies:%lld\r\n", own_home_now);
+    /* RL-g4a: windows left early for a pending stop; inbox clients and queued reads left for the next window. */
+    *info = sdscatprintf(*info, "owner_stop_early_leaves:%lld\r\nowner_stop_inbox_left:%lld\r\nowner_stop_reads_left:%lld\r\n",
+                         atomic_load_explicit(&own_early_leaves, memory_order_relaxed),
+                         atomic_load_explicit(&own_inbox_left, memory_order_relaxed),
+                         atomic_load_explicit(&own_reads_left, memory_order_relaxed));
     *info = sdscatprintf(*info,
                          "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
                          "owner_maxmemory_to_main:%lld\r\n",
