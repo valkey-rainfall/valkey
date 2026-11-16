@@ -3379,6 +3379,7 @@ void resetServerStats(void) {
     server.stat_repl_apply_inline = 0;
     server.stat_repl_lane_spec_reads = 0;
     server.stat_repl_lane_spec_partial = 0;
+    server.stat_repl_lane_queued_select = 0;
     server.stat_repl_lane_reads = 0;
     server.stat_repl_lane_read_usec = 0;
     server.stat_repl_lane_classify_usec = 0;
@@ -7597,6 +7598,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_apply_inline:%lld\r\n", server.stat_repl_apply_inline,
                 "repl_lane_spec_reads:%lld\r\n", server.stat_repl_lane_spec_reads,
                 "repl_lane_spec_partial:%lld\r\n", server.stat_repl_lane_spec_partial,
+                "repl_lane_queued_select:%lld\r\n", server.stat_repl_lane_queued_select,
                 "repl_lane_reads:%lld\r\n", server.stat_repl_lane_reads,
                 "repl_lane_read_usec:%lld\r\n", server.stat_repl_lane_read_usec,
                 "repl_lane_classify_usec:%lld\r\n", server.stat_repl_lane_classify_usec,

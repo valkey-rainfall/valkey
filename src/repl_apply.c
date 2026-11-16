@@ -575,6 +575,16 @@ static void rpSpecFinish(client *c) {
     c->qb_pos = rp.scan_end;
 }
 
+/* RL-g5a: the primary client is inside a MULTI whose queued commands include a SELECT. That SELECT runs only at
+ * EXEC, so c->db is not yet the database the stream's commands after the EXEC are in; a read that starts here
+ * cannot know their database, and is not planned (its commands run the usual way, in order, on main). */
+static int rpQueuedSelect(client *c) {
+    if (!c->flag.multi || !c->mstate) return 0;
+    for (int i = 0; i < c->mstate->count; i++)
+        if (c->mstate->commands[i].cmd && c->mstate->commands[i].cmd->proc == selectCommand) return 1;
+    return 0;
+}
+
 void replApplyPlanRead(client *c) {
     rp.ready = 0;
     if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED) || c->argc == 0 || (c->read_flags & READ_FLAGS_ERROR_MASK))
@@ -585,7 +595,8 @@ void replApplyPlanRead(client *c) {
     for (int t = 0; t < rp.nlanes; t++) rpResetChunk(&rp.ch[t]);
     rpChunk *k0 = &rp.ch[0];
     k0->first = 1;
-    k0->st = (rpState){.db = c->db, .in_multi = c->flag.multi, .stop = 0};
+    k0->st = (rpState){.db = c->db, .in_multi = c->flag.multi, .stop = rpQueuedSelect(c)};
+    if (k0->st.stop) server.stat_repl_lane_queued_select++;
     if (!rp.cap) {
         rp.cap = 1024;
         rp.e = zmalloc(sizeof(rpEntry) * (size_t)rp.cap);

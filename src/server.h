@@ -2279,6 +2279,7 @@ struct valkeyServer {
     long long stat_repl_apply_inline;              /* of those, held-SET flushes main ran itself (too few for a phase) */
     long long stat_repl_lane_spec_reads;           /* RL-g4b: planned reads scanned in parallel */
     long long stat_repl_lane_spec_partial;         /* RL-g4b: of those, reads whose later chunks went the usual way */
+    long long stat_repl_lane_queued_select;        /* RL-g5a: reads not planned: they start in a MULTI with a SELECT queued */
     long long stat_repl_lane_reads;                /* Primary reads whose plan main ran on the write lanes */
     long long stat_repl_lane_read_usec;            /* IO-thread time of those reads: read, parse and plan */
     long long stat_repl_lane_classify_usec;        /* Of which the scan, and the parse of one-chunk reads */
