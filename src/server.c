@@ -4240,7 +4240,7 @@ struct serverCommand *lookupCommandLogic(hashtable *commands, robj **argv, int a
  * valid only while command_table_epoch is unchanged; every change to the
  * command table (rename-command, module commands and subcommands added or
  * removed) bumps the epoch, so a stale or freed command is never returned. */
-#define CMD_LOOKUP_CACHE_SLOTS 8 /* power of two */
+#define CMD_LOOKUP_CACHE_SLOTS 128 /* power of two; a replica stream's dozen names must not evict each other */
 #define CMD_LOOKUP_CACHE_MAXLEN 15
 
 typedef struct cmdLookupCacheEntry {
@@ -4263,8 +4263,12 @@ void commandTableChanged(void) {
 }
 
 static inline unsigned int cmdLookupCacheSlot(const char *name, size_t len) {
-    return (unsigned int)(len + (unsigned char)name[0] * 3 + (unsigned char)name[len - 1]) &
-           (CMD_LOOKUP_CACHE_SLOTS - 1);
+    /* FNV-1a over the whole name (at most CMD_LOOKUP_CACHE_MAXLEN bytes). The old sum of the length and the first
+     * and last letters put SET / HSET, EXEC / ZADD, LPUSH / INCR / SADD, INCRBY / RPOP and MULTI / PEXPIREAT on
+     * shared slots of 8, so a primary's stream missed the cache on most commands. */
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) h = (h ^ (unsigned char)name[i]) * 16777619u;
+    return (h ^ (h >> 16)) & (CMD_LOOKUP_CACHE_SLOTS - 1);
 }
 
 struct serverCommand *lookupCommand(robj **argv, int argc) {
