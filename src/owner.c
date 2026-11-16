@@ -16,7 +16,9 @@
  * slot is its own (multi-key commands: one slot, as hash tags give): no barrier and no cross-core
  * hop. RL-1: also the single-key list, hash, set and sorted-set commands and the key-level commands
  * (EXPIRE ... TYPE, EXISTS), each by its stock proc; own_kinds[] lists every native command and its
- * properties. MULTI/EXEC too, while every queued command is a queueable one (OWN_K_TXN) on the
+ * properties. Hash commands stay main's while any hash in the key's table has fields with their own
+ * expiry (keys_with_volatile_items): field expiry, its HSETEX rewrites and its tracking are main's.
+ * MULTI/EXEC too, while every queued command is a queueable one (OWN_K_TXN) on the
  * owner's keys: the owner
  * queues them and runs EXEC within one window. WATCH/UNWATCH of its own keys too: an owner keeps its
  * own registry of watched keys (multi.c), which only it, or main with the owners stopped, touches;
@@ -195,6 +197,17 @@ enum {
     OWN_PTTL,
     OWN_EXISTS,
     OWN_TYPE,
+    /* RL-g1a-native-hash: single-key hash commands. HSET and HMSET share hsetCommand; ownerKindOf tells
+     * them apart by command (per-command stats). */
+    OWN_HSET,
+    OWN_HMSET,
+    OWN_HINCRBY,
+    OWN_HDEL,
+    OWN_HGET,
+    OWN_HMGET,
+    OWN_HEXISTS,
+    OWN_HLEN,
+    OWN_HGETALL,
     OWN_NCMDS
 };
 
@@ -215,10 +228,13 @@ enum {
     OWN_MM_NONE,   /* nothing more */
     OWN_MM_VALUES, /* its reply holds stored strings (GET, MGET, SET ... GET) */
     OWN_MM_EXEC,   /* its queued commands (ownerMmExecBound) */
-    OWN_MM_LIST    /* its reply holds elements of the list: at most the whole list (ownerStoredListReplyLen) */
+    OWN_MM_LIST,   /* its reply holds elements of the list: at most the whole list (ownerStoredListReplyLen) */
+    OWN_MM_HASH_W, /* a hash write: a listpack may convert to a hashtable (ownerHashBound) */
+    OWN_MM_HASH_R  /* a hash read that replies values: at most the whole listpack; no cheap bound on a
+                    * hashtable (ownerHashBound) */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
-enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_NFAM };
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -257,9 +273,21 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_PTTL] = {"pttl", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_EXISTS] = {"exists", OWN_K_READ, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_TYPE] = {"type", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    /* RL-g1a-native-hash: not queued natively; HGET ... HGETALL only read. ownerNativeKind sends a
+     * table's hash commands to main while any hash in it has fields with their own expiry. */
+    [OWN_HSET] = {"hset", 0, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HMSET] = {"hmset", 0, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HINCRBY] = {"hincrby", 0, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HDEL] = {"hdel", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HGET] = {"hget", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HMGET] = {"hmget", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HEXISTS] = {"hexists", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HLEN] = {"hlen", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HGETALL] = {"hgetall", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
-    [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn", [OWN_FAM_LIST] = "list", [OWN_FAM_KEYSPACE] = "keyspace"};
+    [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
+    [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash"};
 
 /* Why an owner handed a client to main (client->owner_why). */
 enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
@@ -2145,12 +2173,35 @@ static size_t ownerStoredListReplyLen(client *c, int slot, robj *key) {
     return 5 * bytes + 32 * listTypeLength(v) + 64;
 }
 
+/* RL-g1a-native-hash: what a native hash command on this owner's key can add beyond its arguments, or
+ * SIZE_MAX when that has no cheap bound (main runs it). A listpack hash: a write can convert it to a
+ * hashtable (each entry allocated, plus buckets: within 4x the listpack's bytes and 128 B an entry); a
+ * read replies at most every field and value (the listpack's bytes plus 16 B of RESP framing each). A
+ * hashtable hash: writes add their arguments' entries (resizes ask ownerResizeAllowed); the reads that
+ * reply values (HGET, HMGET, HGETALL) are not bounded here. No key or another type: nothing beyond the
+ * command's own bound (a new empty hash, or an error reply). */
+static size_t ownerHashBound(client *c, int slot, robj *key, int write) {
+    void *found;
+    if (slot < 0 || !kvstoreHashtableFind(c->db->keys, OWNER_TABLE_OF_SLOT(slot), objectGetVal(key), &found))
+        return 0;
+    robj *v = found;
+    if (objectGetType(v) != OBJ_HASH) return 0;
+    size_t n = hashTypeLength(v);
+    if (objectGetEncoding(v) == OBJ_ENCODING_LISTPACK) {
+        size_t bytes = lpBytes(objectGetVal(v));
+        return write ? 4 * bytes + 128 * n : 2 * bytes + 16 * n + 64;
+    }
+    return write ? 0 : SIZE_MAX;
+}
+
 /* What native command `kind` can add under maxmemory beyond what ownerMmCmdFits counts for every
  * command, by its own_kinds[].mm bound; SIZE_MAX when nothing cheap bounds it (main runs it). */
 static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int kind) {
     switch (own_kinds[kind].mm) {
     case OWN_MM_VALUES: return ownerReplyValuesLen(c, cmd, argv, argc, slot);
     case OWN_MM_LIST: return ownerStoredListReplyLen(c, slot, argv[1]);
+    case OWN_MM_HASH_W: return ownerHashBound(c, slot, argv[1], 1);
+    case OWN_MM_HASH_R: return ownerHashBound(c, slot, argv[1], 0);
     default: return 0;
     }
 }
@@ -2329,6 +2380,11 @@ static int ownerNativeKind(owner *o, client *c) {
         if (!(own_kinds[kind].flags & OWN_K_READ) && (veto & OWN_VETO_WRITE)) return -1;
         /* The slot ownerTryNative computed: the keys are hashed once per command. */
         if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
+        /* RL-g1a-native-hash: a hash with fields that expire on their own anywhere in this key's table
+         * (only main makes those: HSETEX, HEXPIRE, ...) sends the table's hash commands to main. */
+        if (own_kinds[kind].family == OWN_FAM_HASH &&
+            kvstoreHashtableSize(c->db->keys_with_volatile_items, OWNER_TABLE_OF_SLOT(c->slot)))
+            return -1;
     }
     /* Under maxmemory the stock server may evict or refuse before any command (queued ones and EXEC
      * included): main decides that once the command does not fit this owner's headroom. */
