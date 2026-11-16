@@ -2307,8 +2307,12 @@ static void luaOwnerCat(luaOwnerOut *o, const char *s, size_t n) {
 
 /* luaReplyToServerReply() for a RESP2 caller, into a buffer. Returns 0, or -1 for what an owner does
  * not reply itself (error tables, RESP3-only types, the stack limit). Leaves the stack as it was
- * minus the element only on success; the caller resets the stack either way. */
-static int luaOwnerReply(lua_State *lua, luaOwnerOut *out) {
+ * minus the element only on success; the caller resets the stack either way. RL-g6g-scripts: a RESP3
+ * caller too (resp 3): the script's own RESP stays 2 (server.setresp aborts), as the stock conversion
+ * with call_ctx.resp 2, so only the null differs (ValkeyModule_ReplyWithNull: "_" in RESP3). */
+static int luaOwnerReply(lua_State *lua, luaOwnerOut *out, int resp) {
+    const char *null = resp == 3 ? "_\r\n" : "$-1\r\n";
+    size_t null_len = resp == 3 ? 3 : 5;
     char hdr[64];
     int t = lua_type(lua, -1);
     if (!lua_checkstack(lua, 4)) return -1;
@@ -2324,7 +2328,7 @@ static int luaOwnerReply(lua_State *lua, luaOwnerOut *out) {
         if (lua_toboolean(lua, -1))
             luaOwnerCat(out, ":1\r\n", 4);
         else
-            luaOwnerCat(out, "$-1\r\n", 5);
+            luaOwnerCat(out, null, null_len);
         break;
     case LUA_TNUMBER:
         luaOwnerCat(out, hdr, snprintf(hdr, sizeof(hdr), ":%lld\r\n", (long long)lua_tonumber(lua, -1)));
@@ -2364,11 +2368,11 @@ static int luaOwnerReply(lua_State *lua, luaOwnerOut *out) {
         for (int j = 1; j <= n; j++) {
             lua_pushnumber(lua, j);
             lua_rawget(lua, -2);
-            if (luaOwnerReply(lua, out) != 0) return -1;
+            if (luaOwnerReply(lua, out, resp) != 0) return -1;
         }
         break;
     }
-    default: luaOwnerCat(out, "$-1\r\n", 5);
+    default: luaOwnerCat(out, null, null_len);
     }
     lua_pop(lua, 1);
     return 0;
@@ -2384,6 +2388,7 @@ int luaOwnerCallFunction(lua_State *lua,
                          ValkeyModuleString **args,
                          size_t nargs,
                          void *run,
+                         int resp,
                          char **out,
                          size_t *out_len) {
     static _Thread_local long gc_count = 0;
@@ -2406,7 +2411,7 @@ int luaOwnerCallFunction(lua_State *lua,
         gc_count = 0;
     }
     luaOwnerOut o = {0};
-    int ok = !err && !ownerScriptAborted(run) && luaOwnerReply(lua, &o) == 0;
+    int ok = !err && !ownerScriptAborted(run) && luaOwnerReply(lua, &o, resp) == 0;
     lua_settop(lua, top);
     lua_owner_run = NULL;
     if (!ok) {

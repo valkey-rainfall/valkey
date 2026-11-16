@@ -374,11 +374,13 @@ enum {
     OWN_XINFO_GROUPS,
     OWN_XINFO_CONSUMERS,
     OWN_XSETID,
+    /* RL-g6g-scripts: TIME, only inside an owner's script (a client's own TIME goes to main). */
+    OWN_TIME,
     OWN_NCMDS
 };
-/* RL-g2o-long-tail: every kind a script may run (OWN_K_SCRIPT) is below OWN_DECRBY + 1, so a script run's
- * per-kind stats (ownerScriptRunState) stay as long as the parent's (ownerThreadsInit checks it). */
-#define OWN_SCRIPT_NCMDS (OWN_DECRBY + 1)
+/* RL-g6g-scripts: a script run keeps per-kind stats for every kind (ownerScriptRunState; tk holds kinds in a byte). */
+#define OWN_SCRIPT_NCMDS OWN_NCMDS
+static_assert(OWN_NCMDS <= 256, "ownerScriptRunState.tk");
 
 /* own_kinds[].flags */
 #define OWN_K_READ 1 /* only reads its keys: runs under a write veto (OWN_VETO_WRITE), as GET does */
@@ -445,50 +447,50 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_WATCH] = {"watch", OWN_K_READ, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_TXN},
     [OWN_UNWATCH] = {"unwatch", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
     /* RL-g1b-native-list: queueable in a native MULTI, as SET; LLEN, LRANGE and LINDEX only read. */
-    [OWN_LPUSH] = {"lpush", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_RPUSH] = {"rpush", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LPOP] = {"lpop", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_RPOP] = {"rpop", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_LLEN] = {"llen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LRANGE] = {"lrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_LINDEX] = {"lindex", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LPUSH] = {"lpush", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_RPUSH] = {"rpush", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LPOP] = {"lpop", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_RPOP] = {"rpop", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LLEN] = {"llen", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LRANGE] = {"lrange", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LINDEX] = {"lindex", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
     /* RL-g1c-native-keyspace (RL-g6h: queued natively in MULTI now, OWN_K_TXN); TTL, PTTL, EXISTS
      * and TYPE only read; EXISTS with several keys in one slot, as DEL. RL-g1f: scripts on an owner run
      * EXPIRE, PEXPIRE, TTL, PTTL and EXISTS too (one entry each: shared stats). */
     [OWN_EXPIRE] = {"expire", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_PEXPIRE] = {"pexpire", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_EXPIREAT] = {"expireat", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PEXPIREAT] = {"pexpireat", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PERSIST] = {"persist", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_EXPIREAT] = {"expireat", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIREAT] = {"pexpireat", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PERSIST] = {"persist", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_TTL] = {"ttl", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_PTTL] = {"pttl", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_EXISTS] = {"exists", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_TYPE] = {"type", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TYPE] = {"type", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     /* RL-g1a-native-hash (RL-g6h: queued natively in MULTI, OWN_K_TXN; ownerTxnNative re-checks the field-expiry
      * veto at EXEC); HGET ... HGETALL only read. ownerNativeKind sends a
      * table's hash commands to main while any hash in it has fields with their own expiry. */
-    [OWN_HSET] = {"hset", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HMSET] = {"hmset", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HINCRBY] = {"hincrby", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HDEL] = {"hdel", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_HGET] = {"hget", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HMGET] = {"hmget", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HEXISTS] = {"hexists", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_HLEN] = {"hlen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_HGETALL] = {"hgetall", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HSET] = {"hset", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HMSET] = {"hmset", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HINCRBY] = {"hincrby", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HDEL] = {"hdel", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HGET] = {"hget", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HMGET] = {"hmget", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HEXISTS] = {"hexists", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HLEN] = {"hlen", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_HGETALL] = {"hgetall", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
     /* RL-g1e-native-set-zset (RL-g6h: queued natively in MULTI, OWN_K_TXN); SISMEMBER, SMEMBERS, SCARD, ZRANGE, ZSCORE and ZCARD
      * only read. */
-    [OWN_SADD] = {"sadd", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_SET_W, OWN_FAM_SETZSET},
-    [OWN_SREM] = {"srem", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_SISMEMBER] = {"sismember", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_SMEMBERS] = {"smembers", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_SCARD] = {"scard", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZADD] = {"zadd", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
-    [OWN_ZREM] = {"zrem", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZRANGE] = {"zrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZSCORE] = {"zscore", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZCARD] = {"zcard", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZINCRBY] = {"zincrby", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
+    [OWN_SADD] = {"sadd", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_SET_W, OWN_FAM_SETZSET},
+    [OWN_SREM] = {"srem", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SISMEMBER] = {"sismember", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SMEMBERS] = {"smembers", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_SCARD] = {"scard", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZADD] = {"zadd", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
+    [OWN_ZREM] = {"zrem", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZRANGE] = {"zrange", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZSCORE] = {"zscore", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZCARD] = {"zcard", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZINCRBY] = {"zincrby", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
     /* RL-g1f-owner-evalsha: EVALSHA / EVAL write (any veto sends them to main: ownerNativeKind); INCRBY,
      * DECR and DECRBY only inside an owner's script. */
     [OWN_EVALSHA] = {"evalsha", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
@@ -497,57 +499,58 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_INCRBY] = {"incrby", OWN_K_TXN | OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
     [OWN_DECR] = {"decr", OWN_K_TXN | OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
     [OWN_DECRBY] = {"decrby", OWN_K_TXN | OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    /* RL-g2o-long-tail (RL-g6h: queued natively in MULTI now, OWN_K_TXN), not run by an owner's script.
-     * Reads (OWN_K_READ) only read their keys. Writes propagate as their stock procs rewrite them (GETEX:
+    /* RL-g2o-long-tail (RL-g6h: queued natively in MULTI now, OWN_K_TXN), not run by an owner's script
+     * (RL-g6g-scripts: the OWN_K_SCRIPT rows are, see ownerScriptCommand). Reads (OWN_K_READ) only read their
+     * keys. Writes propagate as their stock procs rewrite them (GETEX:
      * PEXPIREAT or PERSIST; GETDEL: DEL; SETEX, PSETEX: SET PXAT; INCRBYFLOAT, HINCRBYFLOAT: SET KEEPTTL,
      * HSET; ZPOPMIN, ZPOPMAX as they are); a push wakes nobody (any blocked client vetoes the native path,
      * as for LPUSH). */
     [OWN_GETEX] = {"getex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_GETDEL] = {"getdel", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_GETSET] = {"getset", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
-    [OWN_SETNX] = {"setnx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_SETEX] = {"setex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_PSETEX] = {"psetex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_APPEND] = {"append", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
-    [OWN_STRLEN] = {"strlen", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_GETRANGE] = {"getrange", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_GETDEL] = {"getdel", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_GETSET] = {"getset", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SETNX] = {"setnx", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_SETEX] = {"setex", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_PSETEX] = {"psetex", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_APPEND] = {"append", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
+    [OWN_STRLEN] = {"strlen", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_GETRANGE] = {"getrange", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
     [OWN_SUBSTR] = {"substr", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
     [OWN_SETRANGE] = {"setrange", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
-    [OWN_INCRBYFLOAT] = {"incrbyfloat", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_INCRBYFLOAT] = {"incrbyfloat", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
     [OWN_MSETNX] = {"msetnx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_HSETNX] = {"hsetnx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HINCRBYFLOAT] = {"hincrbyfloat", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
-    [OWN_HKEYS] = {"hkeys", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HVALS] = {"hvals", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
-    [OWN_HSTRLEN] = {"hstrlen", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
-    [OWN_LPUSHX] = {"lpushx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_RPUSHX] = {"rpushx", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LSET] = {"lset", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LINSERT] = {"linsert", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LREM] = {"lrem", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LTRIM] = {"ltrim", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
-    [OWN_LPOS] = {"lpos", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_RPOPLPUSH] = {"rpoplpush", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_LMOVE] = {"lmove", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
-    [OWN_SMISMEMBER] = {"smismember", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_HSETNX] = {"hsetnx", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HINCRBYFLOAT] = {"hincrbyfloat", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HKEYS] = {"hkeys", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HVALS] = {"hvals", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HSTRLEN] = {"hstrlen", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_LPUSHX] = {"lpushx", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_RPUSHX] = {"rpushx", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LSET] = {"lset", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LINSERT] = {"linsert", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LREM] = {"lrem", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LTRIM] = {"ltrim", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LPOS] = {"lpos", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_RPOPLPUSH] = {"rpoplpush", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LMOVE] = {"lmove", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_SMISMEMBER] = {"smismember", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
     [OWN_SMOVE] = {"smove", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
-    [OWN_ZREVRANGE] = {"zrevrange", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZRANGEBYSCORE] = {"zrangebyscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZREVRANGEBYSCORE] = {"zrevrangebyscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZRANGEBYLEX] = {"zrangebylex", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZREVRANGEBYLEX] = {"zrevrangebylex", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZRANK] = {"zrank", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZREVRANK] = {"zrevrank", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZCOUNT] = {"zcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZLEXCOUNT] = {"zlexcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZMSCORE] = {"zmscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZPOPMIN] = {"zpopmin", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZPOPMAX] = {"zpopmax", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
-    [OWN_ZREMRANGEBYSCORE] = {"zremrangebyscore", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZREMRANGEBYRANK] = {"zremrangebyrank", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_ZREMRANGEBYLEX] = {"zremrangebylex", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
-    [OWN_EXPIRETIME] = {"expiretime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PEXPIRETIME] = {"pexpiretime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_ZREVRANGE] = {"zrevrange", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANGEBYSCORE] = {"zrangebyscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGEBYSCORE] = {"zrevrangebyscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANGEBYLEX] = {"zrangebylex", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGEBYLEX] = {"zrevrangebylex", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANK] = {"zrank", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREVRANK] = {"zrevrank", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZCOUNT] = {"zcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZLEXCOUNT] = {"zlexcount", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZMSCORE] = {"zmscore", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZPOPMIN] = {"zpopmin", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZPOPMAX] = {"zpopmax", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYSCORE] = {"zremrangebyscore", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYRANK] = {"zremrangebyrank", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYLEX] = {"zremrangebylex", OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_EXPIRETIME] = {"expiretime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIRETIME] = {"pexpiretime", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_UNLINK] = {"unlink", OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_TOUCH] = {"touch", OWN_K_READ | OWN_K_TXN | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     /* RL-g3g-long-tail-rand: as RL-g2o's rows (RL-g6h: queued natively in MULTI, OWN_K_TXN; not run by a script, a veto sends them to main).
@@ -610,6 +613,9 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_XINFO_GROUPS] = {"xinfo|groups", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
     [OWN_XINFO_CONSUMERS] = {"xinfo|consumers", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ARG2, OWN_MM_UNBOUND, OWN_FAM_STREAM},
     [OWN_XSETID] = {"xsetid", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STREAM},
+    /* RL-g6g-scripts: the clock, only inside an owner's script (ownerScriptCommand answers it from the run's own
+     * clock: timeCommand reads main's cached time). */
+    [OWN_TIME] = {"time", OWN_K_READ | OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_SCRIPT},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
@@ -834,6 +840,12 @@ typedef struct owner {
     unsigned long long sans_epoch;
     client *sc;
     long long script_runs, script_aborts, script_misses;
+    /* RL-g6g-scripts: the EVAL-cached scripts this owner ran since the last stop (main takes them), and the
+     * copies of non-string keys its script runs kept (INFO owner_script_copies). */
+    struct ownerScript **stouch;
+    int nstouch, stouch_cap;
+    long long script_copies;
+    struct ownerScriptRunState *srun; /* RL-g6g: the run state ownerScriptRun reuses */
     /* RL-g2c-owner-cron: the cron of this owner's clients (ownerClientsCron), run in its windows. */
     long long cron_next_us; /* monotonic: when the next slice is due */
     int cron_period_ms;     /* 1000 / hz, as of the last slice (epoll timeout outside windows) */
@@ -1265,7 +1277,6 @@ void ownerThreadsInit(void) {
         /* By original name: rename-command moves the same command under another name. */
         own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_kinds[k].name);
         serverAssert(own_cmds[k] != NULL);
-        serverAssert(!(own_kinds[k].flags & OWN_K_SCRIPT) || k < OWN_SCRIPT_NCMDS);
         own_cmds[k]->owner_kind = k + 1; /* ownerKindOf */
     }
     /* A burst takes "GET"/"get" frames for getCommand: only while that name still means it. */
@@ -1314,6 +1325,10 @@ void ownerThreadsInit(void) {
         o->replbuf = sdsempty();
         o->sc = createClient(NULL); /* RL-g1f-owner-evalsha: a script's commands run on it */
         o->sc->flag.script = 1;
+        /* RL-g6g-scripts: fake, as the module temp clients stock scripts call through (VM_Call): a big inner
+         * reply (LRANGE, HGETALL, ZRANGE ... WITHSCORES) goes to its reply list, where the output buffer limits
+         * skip fake clients (closeClientOnOutputBufferLimitReached asserted a connection otherwise). */
+        o->sc->flag.fake = 1;
         o->sc->flag.argv_borrowed = 1; /* as VM_CallArgv's: the vector belongs to the script run */
         o->aof_first_db = -1;
         /* RL-g2b: the tables this owner expires keys in (its own: whole tables) */
@@ -3963,25 +3978,56 @@ static void ownerPrefetch(owner *o, client *c) {
  * work as stock. So SCRIPT KILL never needs to reach an owner, and a script never holds an owner's
  * window (which main waits for to stop the world) longer than the budget.
  *
- * shortcut: off under maxmemory (no bound on a script's growth), RESP2 callers only, EVAL only for
- * loaded scripts (an EVAL-cached script's LRU position moves with every run, on main), no commandlog
- * entries for a script's inner commands. Upgrade: a lease bound per script, RESP3 conversions.
+ * RL-g6g-scripts: the realistic script shapes (job queues over lists, hashes and sorted sets, sliding-window
+ * rate limiters, locks) run here too.
+ * - Inside a script the owner runs every list, hash, set and sorted-set kind of the table that is deterministic
+ *   and not blocking (OWN_K_SCRIPT rows: LPUSH .. LMOVE, HSET .. HSTRLEN, SADD .. SMISMEMBER, ZADD .. ZREMRANGEBYLEX,
+ *   the string and keyspace tail without random or blocking forms) and TIME (OWN_TIME, script only), each by its
+ *   key layout (ONE, TWO, ALL, PAIRS, NONE). A hash command whose table has hashes with field expiry aborts (main's
+ *   keys_with_volatile_items, as for a client's own hash command).
+ * - Before a run's first write of a key the owner keeps a copy of any type (the COPY command's dup functions:
+ *   same encoding): compact encodings up to OWN_SCRIPT_UNDO_COMPACT elements, hashtables and trees up to
+ *   OWN_SCRIPT_UNDO_TREE; a bigger value, a hash with field expiry or another type aborts first (main runs it).
+ * - RESP3 callers: the reply is the stock conversion with the script's RESP2 (server.setresp aborts), so only the
+ *   null differs ("_" for RESP3, as ValkeyModule_ReplyWithNull writes it).
+ * - EVAL of a body nobody SCRIPT LOADed: main caches it at its first EVAL (stock); main then answers its body too
+ *   and marks it owner-held. Its LRU position (stock: moved to the tail at every run) follows the owners' runs:
+ *   an owner notes each such script once between two stops (o->stouch) and main moves it to the tail at the next
+ *   stop, before it runs any command (ownerScriptAnswerAll); main runs every EVAL that caches or evicts, with the
+ *   owners stopped. Evicting or deleting an owner-held script bumps own_script_epoch as SCRIPT FLUSH does.
+ *   An answer for a sha main does not have yet ("absent") makes the owner forget it, so a later call asks again.
+ * shortcut: off under maxmemory (no bound on a script's growth), FCALL stays on main (functions have their own
+ * Lua state and library registry), no commandlog entries for a script's inner commands.
  * ---------------------------------------------------------------------------------------------- */
 #define OWN_SCRIPT_BUDGET_US 2000
 #define OWN_SCRIPT_ABORTS 16
-#define OWN_SCRIPT_UNDO_MAX 64  /* keys one run may write */
-#define OWN_SCRIPT_OPS_MAX 256  /* write ops one run may propagate */
-enum { OWN_SCR_PENDING = 1, OWN_SCR_READY, OWN_SCR_MAIN };
+#define OWN_SCRIPT_DECAY 1024        /* RL-g6g: see ownerScriptRun */
+#define OWN_SCRIPT_BACKOFF_MIN 256     /* RL-g6g: see ownerScriptRun */
+#define OWN_SCRIPT_BACKOFF_MAX 65536
+#define OWN_SCRIPT_UNDO_MAX 64        /* keys one run may write */
+#define OWN_SCRIPT_OPS_MAX 256        /* write ops one run may propagate */
+#define OWN_SCRIPT_UNDO_COMPACT 4096  /* RL-g6g: elements of a listpack / intset / quicklist value an owner copies */
+#define OWN_SCRIPT_UNDO_TREE 512      /* RL-g6g: elements of a hashtable / skiplist value an owner copies */
+/* OWN_SCR_BACKOFF (RL-g6g): main for its next skip calls, then the owner tries again. */
+enum { OWN_SCR_PENDING = 1, OWN_SCR_READY, OWN_SCR_MAIN, OWN_SCR_BACKOFF };
 
 typedef struct ownerScript {
     int state;
     int ref; /* the compiled function in the owner's Lua state (OWN_SCR_READY) */
     int aborts;
+    int runs;        /* RL-g6g: completed runs; runs and aborts halve every OWN_SCRIPT_DECAY runs */
+    int backoff;     /* RL-g6g: calls the last OWN_SCR_BACKOFF sent to main (doubles each time, 0 after it runs) */
+    int skip;        /* RL-g6g: OWN_SCR_BACKOFF calls left */
+    int lru;         /* RL-g6g: an EVAL-cached script (main keeps its LRU position) */
+    int touched;     /* RL-g6g: in o->stouch since the last stop (main clears it) */
+    const char *sha; /* RL-g6g: its key in o->scripts */
 } ownerScript;
 
 typedef struct ownerScriptAnswer {
     sds sha;
-    sds body; /* NULL: owners do not run it (or main has no such script) */
+    sds body;   /* NULL: owners do not run it (or main has no such script) */
+    int absent; /* RL-g6g: main has no such script (yet): the owner forgets the sha */
+    int lru;    /* RL-g6g: an EVAL-cached script */
 } ownerScriptAnswer;
 
 typedef struct ownerUndo {
@@ -3994,20 +4040,26 @@ typedef struct ownerScriptRunState {
     owner *o;
     serverDb *db;
     monotime start;
+    ustime_t now_us; /* RL-g6g: the run's clock for TIME (stock: the cached time call() set for the EVAL) */
     int abort;
     int nundo, nops;
     ownerUndo undo[OWN_SCRIPT_UNDO_MAX];
     int ops[OWN_SCRIPT_OPS_MAX]; /* indices in ectx->also_propagate of the run's write ops */
+    /* RL-g6g: per-kind stats for every kind; the state is the owner's (o->srun, zeroed once), and a run zeroes
+     * only the kinds it touched (tk), so a run neither allocates nor clears the whole table. */
     long long calls[OWN_SCRIPT_NCMDS], usec[OWN_SCRIPT_NCMDS];
+    int ntk;
+    unsigned char tk[OWN_SCRIPT_NCMDS];
 } ownerScriptRunState;
 
-sds evalScriptBodyForOwner(const char *sha);
+sds evalScriptBodyForOwner(const char *sha, int *absent, int *lru);
+void evalScriptTouchForOwner(const char *sha);
 void dictEntryDestructorSdsKeyHeapValue(void *entry);
 void *luaOwnerStateCreate(void);
 int luaOwnerCompile(void *state, const char *code, size_t code_len);
 void luaOwnerStateFree(void *state);
 int luaOwnerCallFunction(void *lua, int function_ref, robj **keys, size_t nkeys, robj **args, size_t nargs, void *run,
-                         char **out, size_t *out_len);
+                         int resp, char **out, size_t *out_len);
 
 static dictType ownerScriptDictType = {
     .entryGetKey = dictEntryGetKey,
@@ -4028,10 +4080,16 @@ static void ownerScriptAnswersFree(owner *o) {
     o->nsans = 0;
 }
 
-/* Main, owners stopped (ownerStopWorld): answer what each owner asked for since the last stop. */
+/* Main, owners stopped (ownerStopWorld): move the EVAL-cached scripts the owners ran since the last stop to the
+ * tail of the LRU list (RL-g6g), then answer what each owner asked for. */
 static void ownerScriptAnswerAll(void) {
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
+        for (int j = 0; j < o->nstouch; j++) {
+            evalScriptTouchForOwner(o->stouch[j]->sha);
+            o->stouch[j]->touched = 0;
+        }
+        o->nstouch = 0;
         if (!o->nswant) continue;
         if (o->sans_epoch != own_script_epoch) ownerScriptAnswersFree(o); /* not taken, and stale */
         o->sans_epoch = own_script_epoch;
@@ -4040,7 +4098,9 @@ static void ownerScriptAnswerAll(void) {
                 o->sans_cap = o->sans_cap ? o->sans_cap * 2 : 8;
                 o->sans = zrealloc(o->sans, sizeof(ownerScriptAnswer) * o->sans_cap);
             }
-            o->sans[o->nsans++] = (ownerScriptAnswer){.sha = o->swant[j], .body = evalScriptBodyForOwner(o->swant[j])};
+            ownerScriptAnswer *a = o->sans + o->nsans++;
+            *a = (ownerScriptAnswer){.sha = o->swant[j]};
+            a->body = evalScriptBodyForOwner(o->swant[j], &a->absent, &a->lru);
         }
         o->nswant = 0;
     }
@@ -4060,7 +4120,12 @@ static void ownerScriptSync(owner *o) {
         dictEntry *de = o->scripts ? dictFind(o->scripts, a->sha) : NULL;
         ownerScript *s = de ? dictGetVal(de) : NULL;
         if (!s || s->state != OWN_SCR_PENDING) continue;
+        if (a->absent) { /* RL-g6g: not in main's cache yet (a first EVAL runs on main): ask again next time */
+            dictDelete(o->scripts, a->sha);
+            continue;
+        }
         s->state = OWN_SCR_MAIN;
+        s->lru = a->lru;
         if (!a->body) continue;
         if (!o->lua) o->lua = luaOwnerStateCreate();
         if (o->lua && (s->ref = luaOwnerCompile(o->lua, a->body, sdslen(a->body))) >= 0) s->state = OWN_SCR_READY;
@@ -4089,12 +4154,15 @@ static int ownerScriptReady(owner *o, client *c) {
             o->cur_script = s;
             return 1;
         }
+        if (s->state == OWN_SCR_BACKOFF && --s->skip <= 0) s->state = OWN_SCR_READY; /* RL-g6g: try again next */
         o->script_misses++;
         return 0;
     }
     ownerScript *s = zcalloc(sizeof(*s));
     s->state = OWN_SCR_PENDING;
-    dictAdd(o->scripts, sdsnew(sha), s);
+    sds key = sdsnew(sha);
+    dictAdd(o->scripts, key, s);
+    s->sha = key;
     if (o->nswant == o->swant_cap) {
         o->swant_cap = o->swant_cap ? o->swant_cap * 2 : 8;
         o->swant = zrealloc(o->swant, sizeof(sds) * o->swant_cap);
@@ -4105,19 +4173,46 @@ static int ownerScriptReady(owner *o, client *c) {
     return 0;
 }
 
+/* RL-g6g-scripts: a copy of val with the same encoding (the COPY command's dup functions), or NULL when an owner
+ * does not keep one: too many elements (compact encodings above OWN_SCRIPT_UNDO_COMPACT, hashtables and trees
+ * above OWN_SCRIPT_UNDO_TREE), a hash with field expiry (main tracks those), or a stream / module value. */
+static robj *ownerUndoCopy(robj *val) {
+    int enc = objectGetEncoding(val);
+    switch (objectGetType(val)) {
+    case OBJ_STRING: return dupStringObject(val);
+    case OBJ_LIST: return listTypeLength(val) <= OWN_SCRIPT_UNDO_COMPACT ? listTypeDup(val) : NULL;
+    case OBJ_SET:
+        return setTypeSize(val) <= (enc == OBJ_ENCODING_HASHTABLE ? OWN_SCRIPT_UNDO_TREE : OWN_SCRIPT_UNDO_COMPACT)
+                   ? setTypeDup(val)
+                   : NULL;
+    case OBJ_ZSET:
+        return zsetLength(val) <= (enc == OBJ_ENCODING_LISTPACK ? OWN_SCRIPT_UNDO_COMPACT : OWN_SCRIPT_UNDO_TREE)
+                   ? zsetDup(val)
+                   : NULL;
+    case OBJ_HASH:
+        if (hashTypeHasVolatileFields(val)) return NULL;
+        return hashTypeLength(val) <= (enc == OBJ_ENCODING_LISTPACK ? OWN_SCRIPT_UNDO_COMPACT : OWN_SCRIPT_UNDO_TREE)
+                   ? hashTypeDup(val)
+                   : NULL;
+    default: return NULL;
+    }
+}
+
 /* Keep key as it is before the run's first write of it (after its lazy expiry, as the write's own
- * lookup would see it). 0: the run cannot keep it (not a string, too many keys): abort. */
+ * lookup would see it). 0: the run cannot keep it (ownerUndoCopy, too many keys): abort. */
 static int ownerUndoKeep(ownerScriptRunState *st, robj *key) {
     sds k = objectGetVal(key);
     for (int i = 0; i < st->nundo; i++)
         if (!sdscmp(objectGetVal(st->undo[i].key), k)) return 1;
     if (st->nundo == OWN_SCRIPT_UNDO_MAX) return 0;
     robj *val = lookupKeyWrite(st->db, key);
-    if (val && objectGetType(val) != OBJ_STRING) return 0;
+    robj *copy = val ? ownerUndoCopy(val) : NULL;
+    if (val && !copy) return 0;
     ownerUndo *u = &st->undo[st->nundo++];
     u->key = createStringObject(k, sdslen(k));
-    u->val = val ? dupStringObject(val) : NULL;
+    u->val = copy;
     u->expire = val ? getExpire(st->db, key) : -1;
+    if (val && objectGetType(val) != OBJ_STRING) st->o->script_copies++;
     return 1;
 }
 
@@ -4198,12 +4293,24 @@ int ownerScriptCommand(void *run, robj **argv, int argc, const ValkeyModuleReply
     if (kind < 0 || !(own_kinds[kind].flags & OWN_K_SCRIPT) || !commandCheckArity(cmd, argc, NULL) ||
         (kind == OWN_MSET && argc % 2 == 0))
         goto abort;
-    int last = own_kinds[kind].keys == OWN_KEYS_ONE ? 1 : argc - 1;
-    int step = own_kinds[kind].keys == OWN_KEYS_PAIRS ? 2 : 1;
+    /* RL-g6g: the keys by the kind's layout (TIME has none; LMOVE, RPOPLPUSH two). */
+    int last, step = 1;
+    switch (own_kinds[kind].keys) {
+    case OWN_KEYS_NONE: last = 0; break;
+    case OWN_KEYS_ONE: last = 1; break;
+    case OWN_KEYS_TWO: last = 2; break;
+    case OWN_KEYS_ALL: last = argc - 1; break;
+    case OWN_KEYS_PAIRS: last = argc - 1; step = 2; break;
+    default: goto abort;
+    }
     for (int j = 1; j <= last; j += step) {
         sds key = objectGetVal(argv[j]);
         int slot = ownerKeyHashSlot(key, sdslen(key));
         if (slot < o->slot_lo || slot > o->slot_hi) goto abort; /* another owner's key: main */
+        /* RL-g6g: a hash command on a table with field-expiry hashes goes to main (as ownerNativeKind's rule). */
+        if (own_kinds[kind].family == OWN_FAM_HASH &&
+            kvstoreHashtableSize(st->db->keys_with_volatile_items, OWNER_TABLE_OF_SLOT(slot)))
+            goto abort;
     }
     if (cmd->flags & CMD_WRITE) {
         if (st->nops == OWN_SCRIPT_OPS_MAX) goto abort;
@@ -4222,7 +4329,13 @@ int ownerScriptCommand(void *run, robj **argv, int argc, const ValkeyModuleReply
     sc->flag.buffered_reply = 0;
     monotime t0 = getMonotonicUs();
     sc->flag.executing_command = 1;
-    cmd->proc(sc);
+    if (kind == OWN_TIME) { /* RL-g6g: timeCommand reads main's cached clock; the run has its own */
+        addReplyArrayLen(sc, 2);
+        addReplyBulkLongLong(sc, st->now_us / 1000000);
+        addReplyBulkLongLong(sc, st->now_us % 1000000);
+    } else {
+        cmd->proc(sc);
+    }
     sc->flag.executing_command = 0;
     ustime_t duration = (ustime_t)(getMonotonicUs() - t0);
     ectx->in_call--;
@@ -4246,7 +4359,7 @@ int ownerScriptCommand(void *run, robj **argv, int argc, const ValkeyModuleReply
         alsoPropagate(sc->db->id, sc->argv, sc->argc, flags, -1);
     }
     sc->flag.force_aof = sc->flag.force_repl = sc->flag.prevent_prop = 0;
-    st->calls[kind]++;
+    if (!st->calls[kind]++) st->tk[st->ntk++] = (unsigned char)kind;
     st->usec[kind] += duration;
     if (server.latency_tracking_enabled) updateCommandLatencyHistogram(&o->cs[kind].hist, duration * 1000);
     if (ectx->current_client) ectx->current_client->commands_processed++;
@@ -4269,13 +4382,13 @@ static int ownerScriptRun(owner *o, client *c) {
     o->cur_script = NULL;
     long long nk = 0;
     string2ll(objectGetVal(c->argv[2]), sdslen(objectGetVal(c->argv[2])), &nk);
-    ownerScriptRunState *st = zmalloc(sizeof(*st));
+    if (!o->srun) o->srun = zcalloc(sizeof(ownerScriptRunState));
+    ownerScriptRunState *st = o->srun;
     st->o = o;
     st->db = c->db;
     st->start = getMonotonicUs();
-    st->abort = st->nundo = st->nops = 0;
-    memset(st->calls, 0, sizeof(st->calls));
-    memset(st->usec, 0, sizeof(st->usec));
+    st->now_us = ustime();
+    st->abort = st->nundo = st->nops = st->ntk = 0;
     long long dirty = ectx->dirty, hits = ectx->stat_keyspace_hits, misses = ectx->stat_keyspace_misses;
     long long errors = ectx->stat_total_error_replies, ncmds = ectx->stat_numcommands;
     long long processed = c->commands_processed;
@@ -4290,22 +4403,39 @@ static int ownerScriptRun(owner *o, client *c) {
     char *out = NULL;
     size_t out_len = 0;
     int r = luaOwnerCallFunction(o->lua, s->ref, c->argv + 3, (size_t)nk, c->argv + 3 + nk, (size_t)(c->argc - 3 - nk),
-                                 st, &out, &out_len);
-    c->slot = slot;
+                                 st, c->resp, &out, &out_len);
     if (r == 0 && !st->abort) {
+        c->slot = slot;
         addReplyProto(c, out, out_len);
         zfree(out);
-        for (int k = 0; k < OWN_SCRIPT_NCMDS; k++) {
+        for (int i = 0; i < st->ntk; i++) {
+            int k = st->tk[i];
             o->cs[k].calls += st->calls[k];
             o->cs[k].usec += st->usec[k];
+            st->calls[k] = st->usec[k] = 0;
         }
         ownerUndoEnd(st, 0);
-        zfree(st);
         c->flag.prevent_prop = 1; /* as scriptPrepareForRun: the script's writes propagate, not the EVALSHA */
         o->script_runs++;
+        if (++s->runs >= OWN_SCRIPT_DECAY) {
+            s->runs /= 2;
+            s->aborts /= 2;
+        }
+        if (s->backoff && s->runs >= 4 * OWN_SCRIPT_ABORTS) s->backoff = 0;
+        if (s->lru && !s->touched) { /* RL-g6g: main moves it to its LRU tail at the next stop */
+            if (o->nstouch == o->stouch_cap) {
+                o->stouch_cap = o->stouch_cap ? o->stouch_cap * 2 : 8;
+                o->stouch = zrealloc(o->stouch, sizeof(ownerScript *) * o->stouch_cap);
+            }
+            o->stouch[o->nstouch++] = s;
+            s->touched = 1;
+        }
         return 1;
     }
+    /* RL-g6g-scripts: put the kept keys back while the lookups still hash each key (c->slot -1): a kept key in
+     * another of this owner's slots went back into the declared keys' table before. */
     ownerUndoEnd(st, 1);
+    c->slot = slot;
     serverOpArray *oa = &ectx->also_propagate;
     int w = 0, k = 0;
     for (int j = 0; j < oa->numops; j++) {
@@ -4326,8 +4456,18 @@ static int ownerScriptRun(owner *o, client *c) {
     ectx->stat_numcommands = ncmds;
     c->commands_processed = processed;
     while (o->nerrors > nerrors) sdsfree(o->errors[--o->nerrors].msg);
-    zfree(st);
-    if (++s->aborts >= OWN_SCRIPT_ABORTS) s->state = OWN_SCR_MAIN;
+    for (int i = 0; i < st->ntk; i++) st->calls[st->tk[i]] = st->usec[st->tk[i]] = 0; /* RL-g6g: o->srun stays */
+    /* RL-g6g-scripts: a script that aborts more than it runs (and at least OWN_SCRIPT_ABORTS times) goes to main
+     * for its next backoff calls, then the owner tries again; the backoff doubles each time (from
+     * OWN_SCRIPT_BACKOFF_MIN to OWN_SCRIPT_BACKOFF_MAX) and resets once it runs again. Before, 16 aborts sent it
+     * to main for good, for every key of this owner (one big list or one field-expiry hash table was enough). */
+    if (++s->aborts >= OWN_SCRIPT_ABORTS && s->aborts > s->runs) {
+        s->backoff = s->backoff ? (s->backoff < OWN_SCRIPT_BACKOFF_MAX ? s->backoff * 2 : s->backoff)
+                                : OWN_SCRIPT_BACKOFF_MIN;
+        s->skip = s->backoff;
+        s->state = OWN_SCR_BACKOFF;
+        s->aborts = s->runs = 0;
+    }
     o->script_aborts++;
     return 0;
 }
@@ -4401,10 +4541,10 @@ static int ownerNativeKind(owner *o, client *c) {
         break;
     case OWN_EVALSHA:
     case OWN_EVAL:
-        /* RL-g1f-owner-evalsha: RESP2 callers outside MULTI, no maxmemory (no bound on a script's
-         * growth), no WATCHed keys on this owner (an aborted run's writes would have touched them), and
+        /* RL-g1f-owner-evalsha: RESP2 (RL-g6g: and RESP3) callers outside MULTI, no maxmemory (no bound on a
+         * script's growth), no WATCHed keys on this owner (an aborted run's writes would have touched them), and
          * a script this owner has from main's cache (ownerScriptReady). */
-        if (c->flag.multi || own_mm || c->resp != 2 || c->flag.lua_debug ||
+        if (c->flag.multi || own_mm || (c->resp != 2 && c->resp != 3) || c->flag.lua_debug ||
             (veto & (OWN_VETO_ALL | OWN_VETO_WRITE)) || ((veto & OWN_VETO_BLOCKED) && ownerSlotBlocked(c->slot)) ||
             c->slot < o->slot_lo || c->slot > o->slot_hi || o->watchers || !ownerScriptReady(o, c))
             return -1;
@@ -7552,14 +7692,16 @@ void ownerInfo(sds *info) {
                          atomic_load_explicit(&server.stat_tls_rec_mismatch, memory_order_relaxed));
     /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
      * have the script for (or had it marked for main). */
-    long long s_runs = 0, s_aborts = 0, s_misses = 0;
+    long long s_runs = 0, s_aborts = 0, s_misses = 0, s_copies = 0;
     for (int i = 0; i < own_n; i++) {
         s_runs += owners[i].script_runs;
         s_aborts += owners[i].script_aborts;
         s_misses += owners[i].script_misses;
+        s_copies += owners[i].script_copies; /* RL-g6g: non-string keys a run kept a copy of */
     }
-    *info = sdscatprintf(*info, "owner_script_runs:%lld\r\nowner_script_aborts:%lld\r\nowner_script_misses:%lld\r\n",
-                         s_runs, s_aborts, s_misses);
+    *info = sdscatprintf(*info, "owner_script_runs:%lld\r\nowner_script_aborts:%lld\r\nowner_script_misses:%lld\r\n"
+                         "owner_script_copies:%lld\r\n",
+                         s_runs, s_aborts, s_misses, s_copies);
     /* RL-g2f: adaptive spinning. owner_spin_owners = owners allowed to spin (pinned, not on main's CPU);
      * waits = times an owner waited for work, spins / hits = idle spins and those that found work;
      * stop_spins / hits / sleeps = waits for main's stop to end; resume_broadcasts = resumes that had to

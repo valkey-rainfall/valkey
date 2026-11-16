@@ -63,6 +63,7 @@ typedef struct evalScript {
     robj *body;
     uint64_t flags;
     listNode *node; /* list node in scripts_lru_list list. */
+    int owner_held; /* RL-g6g-scripts: an EVAL-cached script whose body main gave to an owner */
 } evalScript;
 
 static void dictScriptDestructor(void *val) {
@@ -354,6 +355,7 @@ static void evalCtxDeleteScript(sds sha) {
     if (es->node) {
         scriptsLRUDeleteNode(es->node);
         es->node = NULL;
+        if (es->owner_held) ownerScriptsChanged(); /* RL-g6g-scripts: owners may run it (an eviction too) */
     } else {
         ownerScriptsChanged(); /* RL-g1f-owner-evalsha: owners may run SCRIPT LOADed scripts */
     }
@@ -361,15 +363,34 @@ static void evalCtxDeleteScript(sds sha) {
 }
 
 /* RL-g1f-owner-evalsha (owner.c, main with the owners stopped): the body of a cached script an owner may
- * run itself, or NULL. Only scripts loaded with SCRIPT LOAD (EVAL's cache keeps an LRU order that every
- * run updates, and evicts) and with no shebang (the stock EVAL compatibility mode). */
-sds evalScriptBodyForOwner(const char *sha) {
+ * run itself, or NULL. Only Lua scripts with no shebang (the stock EVAL compatibility mode). RL-g6g-scripts:
+ * also scripts EVAL cached (*lru = 1; marked owner-held: deleting or evicting one bumps the owners' epoch, and
+ * the owners' runs move it in the LRU list through evalScriptTouchForOwner); *absent = 1 when main has no such
+ * script at all (yet). */
+sds evalScriptBodyForOwner(const char *sha, int *absent, int *lru) {
     dictEntry *de = dictFind(evalCtx.scripts, sha);
+    *absent = de == NULL;
+    *lru = 0;
     if (!de) return NULL;
     evalScript *es = dictGetVal(de);
-    if (es->node || es->flags != SCRIPT_FLAG_EVAL_COMPAT_MODE || !sdsEncodedObject(es->body)) return NULL;
+    if (es->flags != SCRIPT_FLAG_EVAL_COMPAT_MODE || !sdsEncodedObject(es->body)) return NULL;
     if (strcasecmp(scriptingEngineGetName(es->engine), "lua")) return NULL;
+    if (es->node) {
+        es->owner_held = 1;
+        *lru = 1;
+    }
     return sdsdup(objectGetVal(es->body));
+}
+
+/* RL-g6g-scripts (owner.c, main with the owners stopped): an owner ran this EVAL-cached script since the last
+ * stop; move it to the tail of the LRU list as evalGenericCommand does after each run. */
+void evalScriptTouchForOwner(const char *sha) {
+    dictEntry *de = dictFind(evalCtx.scripts, sha);
+    if (!de) return;
+    evalScript *es = dictGetVal(de);
+    if (!es->node) return;
+    listUnlinkNode(evalCtx.scripts_lru_list, es->node);
+    listLinkNodeTail(evalCtx.scripts_lru_list, es->node);
 }
 
 /* Add a script to the LRU eviction list, evicting oldest scripts if necessary.
