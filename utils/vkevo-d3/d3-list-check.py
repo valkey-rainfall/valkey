@@ -484,9 +484,14 @@ def suite_blocked():
     rr = [oc.read() for _ in range(200)]
     s1 = d3.ostat(adm)
     veto = d3.info(adm, "owners").get("owner_veto")
-    check("blocked.veto_while_blocked", s1["owner_native_commands"] == s0["owner_native_commands"] and veto == "all"
+    # RL-g5c-block-scope: with the veto scoped to the blocked client's slots ("scoped"), commands on other slots stay
+    # native (all 200 here: k0 / kl are not in q's slot); with the old veto ("all") none of them is native.
+    nat = s1["owner_native_commands"] - s0["owner_native_commands"]
+    ks = lambda k: d3.key_slot(k if isinstance(k, bytes) else k.encode())
+    same_slot = ks(kl) == ks(q) or ks(k0) == ks(q)
+    check("blocked.veto_while_blocked", ((veto == "all" and nat == 0) or (veto == "scoped" and (nat >= 200 or same_slot)))
           and rr[:100] == list(range(1, 101)) and rr[100:] == ["OK"] * 100,
-          "native +%d veto %s" % (s1["owner_native_commands"] - s0["owner_native_commands"], veto))
+          "native +%d veto %s" % (nat, veto))
     pq = d3.Conn("127.0.0.1", p.oport(q), timeout=10)
     pq.cmd("LPUSH", q, "wake")
     v = b.read()
