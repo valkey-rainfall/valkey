@@ -55,6 +55,46 @@ def _conn_close(self):
 
 Conn.close = _conn_close
 
+# RL-g5c-block-scope: a TLS variant. With --tls the client connections go over TLS to the server's TLS ports (the main
+# TLS port and the owner TLS ports, plain port + TLS_OFF), so a consumer's blocking pop is handed to main and blocks
+# there (owners keep TLS blocking pops on main), which is what makes the scoped veto fire. The scenario, stats, keyspace
+# and stress checks are identical; only the transport changes. Used for the plain suite (no replica over TLS here).
+import ssl
+import select
+
+TLS_OFF = 50
+TLS = {"on": False, "ctx": None, "dir": None}
+
+_real_conn_init = Conn.__init__
+
+
+def _conn_init(self, port, timeout=60):
+    if TLS["on"]:
+        raw = socket.create_connection(("127.0.0.1", port + TLS_OFF), timeout=timeout)
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.s = TLS["ctx"].wrap_socket(raw, server_hostname="127.0.0.1")
+        self.f = self.s.makefile("rb", buffering=1 << 20)
+    else:
+        _real_conn_init(self, port, timeout)
+
+
+Conn.__init__ = _conn_init
+
+_real_srv_start = Server.start
+
+
+def _srv_start(self, fresh=True):
+    if TLS["on"] and not any(x == "--tls-port" for x in self.extra):
+        self.extra = list(self.extra) + [
+            "--tls-port", str(self.port + TLS_OFF), "--owner-tls-port", str(self.oport + TLS_OFF),
+            "--tls-cert-file", os.path.join(TLS["dir"], "server.crt"),
+            "--tls-key-file", os.path.join(TLS["dir"], "server.key"),
+            "--tls-ca-cert-file", os.path.join(TLS["dir"], "ca.crt"), "--tls-auth-clients", "no"]
+    return _real_srv_start(self, fresh)
+
+
+Server.start = _srv_start
+
 SUITES = {
     "plain": ["--zset-max-listpack-entries", "16", "--list-max-listpack-size", "8"],
     "aofrepl": ["--appendonly", "yes", "--appendfsync", "everysec"],
@@ -80,16 +120,23 @@ def wait_blocked(adm, want, c, secs=10.0):
     while time.time() - t0 < secs:
         if blocked(adm) >= want:
             return "blocked"
-        c.s.settimeout(0.005)
-        try:
-            data = c.s.recv(1, socket.MSG_PEEK)
-            if data:
+        ready = False
+        if TLS["on"]:
+            # SSLSocket has no MSG_PEEK: check the TLS layer's decrypted buffer and the socket's readability.
+            try:
+                ready = c.s.pending() > 0 or bool(select.select([c.s], [], [], 0.005)[0])
+            except (OSError, ValueError):
+                ready = False
+        else:
+            c.s.settimeout(0.005)
+            try:
+                ready = bool(c.s.recv(1, socket.MSG_PEEK))
+            except (socket.timeout, BlockingIOError):
+                ready = False
+            finally:
                 c.s.settimeout(30)
-                return c.read()
-        except (socket.timeout, BlockingIOError):
-            pass
-        finally:
-            c.s.settimeout(30)
+        if ready:
+            return c.read()
     return "nostate"
 
 
@@ -396,11 +443,20 @@ def suite(a, name, seed):
         check(name + ".stats.blocking_calls_equal", sc == sr, "cand %s ref %s" % (sc, sr))
         check(name + ".stats.no_blocked_left", cc.get("blocked_clients") == "0" and cr.get("blocked_clients") == "0",
               "cand %s ref %s" % (cc.get("blocked_clients"), cr.get("blocked_clients")))
-        check(name + ".native.parked_on_owners", int(oc.get("owner_park_wakes", 0)) > 0 and
-              int(oc.get("owner_block_commands", 0)) > 0,
-              "owner_block_commands %s park_wakes %s park_timeouts %s parked_to_main %s" % (
-                  oc.get("owner_block_commands"), oc.get("owner_park_wakes"), oc.get("owner_park_timeouts"),
-                  oc.get("owner_parked_to_main")))
+        if TLS["on"]:
+            # RL-g5c: over TLS the blocking pops go to main (owners keep TLS blocking on main), so nothing parks
+            # natively; what we check instead is that the scoped veto fired (the owners kept running) and main took
+            # the blocked clients.
+            check(name + ".tls.scoped_veto_fired", int(oc.get("owner_block_scoped", 0)) > 0 and
+                  int(oc.get("owner_parked_to_main", 0)) >= 0,
+                  "owner_block_scoped %s owner_blocked_slots %s owner_parked_to_main %s" % (
+                      oc.get("owner_block_scoped"), oc.get("owner_blocked_slots"), oc.get("owner_parked_to_main")))
+        else:
+            check(name + ".native.parked_on_owners", int(oc.get("owner_park_wakes", 0)) > 0 and
+                  int(oc.get("owner_block_commands", 0)) > 0,
+                  "owner_block_commands %s park_wakes %s park_timeouts %s parked_to_main %s" % (
+                      oc.get("owner_block_commands"), oc.get("owner_park_wakes"), oc.get("owner_park_timeouts"),
+                      oc.get("owner_parked_to_main")))
         okc = stress(cand, a, seed)
         okr = stress(ref, a, seed)
         check(name + ".stress.conservation", okc[0] and okc[1] == 0 and okr[0] and okr[1] == 0,
@@ -466,7 +522,16 @@ def main():
     ap.add_argument("--stress-secs", type=float, default=4)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--suites", default="plain,aofrepl,aofresp")
+    ap.add_argument("--tls", action="store_true", help="RL-g5c: client connections over TLS to the TLS ports")
+    ap.add_argument("--tls-dir", default=None, help="directory with ca.crt, server.crt, server.key")
     a = ap.parse_args()
+    if a.tls:
+        TLS["on"] = True
+        TLS["dir"] = a.tls_dir
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        TLS["ctx"] = ctx
     os.makedirs(a.dir, exist_ok=True)
     t0 = time.time()
     for i, s in enumerate([x for x in a.suites.split(",") if x]):
