@@ -4283,9 +4283,18 @@ static inline int ownerValHasExpire(const robj *val) {
     return val->hasexpire && objectGetExpire(val) != EXPIRY_NONE;
 }
 
+/* RL-g2u-tls-16k: the value's expire has passed at the command's time (commandTimeSnapshot: the read or
+ * resume sets it for every command it runs, getCommand's too, since ownerCall does not move it). Only such
+ * a key needs getCommand / mgetCommand (lookupKey may delete it and propagate the DEL, or keep it by mode).
+ * For any other, expireIfNeeded returns KEY_VALID at once, so lookupKey does exactly what it does for a key
+ * without an expire, and the GET and MGET paths here answer it the same way (big values by reference). */
+static inline int ownerValExpired(const robj *val) {
+    return ownerValHasExpire(val) && timestampIsExpired(objectGetExpire(val));
+}
+
 /* Reply to one GET from its completed find, with getCommand's effects (touch, hit or miss count,
  * the bulk or null reply). Returns 0, having done nothing, when getCommand must run it instead: a
- * key with an expire (it may have to be deleted and the delete propagated), a value that is not a
+ * key whose expire has passed (it may have to be deleted and the delete propagated), a value that is not a
  * string (WRONGTYPE), or a reply the large-reply commandlog records. */
 static int ownerGetReply(client *c, ownerRingEntry *e, long long reply_threshold) {
     void *found = NULL;
@@ -4296,9 +4305,7 @@ static int ownerGetReply(client *c, ownerRingEntry *e, long long reply_threshold
         return 1;
     }
     robj *val = found;
-    /* shortcut: a key with an expire goes to getCommand even while it is valid; answer the valid
-     * ones here (commandTimeSnapshot vs the expire) if TTL-heavy GET loads matter. */
-    if (ownerValHasExpire(val) || objectGetType(val) != OBJ_STRING) return 0;
+    if (ownerValExpired(val) || objectGetType(val) != OBJ_STRING) return 0;
     if (reply_threshold >= 0) {
         size_t len = sdsEncodedObject(val) ? sdslen(objectGetVal(val)) : (size_t)sdigits10((long)objectGetVal(val));
         if ((long long)(1 + digits10(len) + 2 + len + 2) >= reply_threshold) return 0;
@@ -4493,7 +4500,7 @@ static int ownerGetRun(owner *o, client *c) {
 /* Gather one MGET's reply from its n completed finds (ring slots first..first+n-1) into buf in one
  * pass, with mgetCommand's effects: a touch and a keyspace hit per found string, a miss and a null
  * per missing key. Returns the reply's length, or 0, having changed nothing, when mgetCommand must
- * run it instead: a key with an expire (lazy expire stays in lookupKey), a value that is not a
+ * run it instead: a key whose expire has passed (lazy expire stays in lookupKey), a value that is not a
  * string, a reply longer than buf or one the large-reply commandlog records. */
 static size_t ownerMgetReply(client *c, ownerRingEntry *ring, unsigned first, int n, char *buf,
                              long long reply_threshold) {
@@ -4518,7 +4525,7 @@ static size_t ownerMgetReply(client *c, ownerRingEntry *ring, unsigned first, in
             continue;
         }
         robj *val = found;
-        if (ownerValHasExpire(val) || objectGetType(val) != OBJ_STRING) return 0;
+        if (ownerValExpired(val) || objectGetType(val) != OBJ_STRING) return 0;
         char ibuf[LONG_STR_SIZE];
         const char *s = ibuf;
         size_t len;
@@ -4801,7 +4808,7 @@ static int ownerBurstReply(client *c, ownerBurstEntry *e, long long reply_thresh
         return 1;
     }
     robj *val = found;
-    if (ownerValHasExpire(val) || objectGetType(val) != OBJ_STRING) return 0;
+    if (ownerValExpired(val) || objectGetType(val) != OBJ_STRING) return 0;
     char ibuf[LONG_STR_SIZE];
     const char *s;
     size_t len;
