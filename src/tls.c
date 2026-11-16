@@ -1217,13 +1217,28 @@ typedef struct tls_connection {
     /* While an IO thread owns the socket: the last read from the socket filled what OpenSSL asked
      * for, so the socket may hold more that no edge-triggered event will report. */
     int socket_read_full;
-    /* RL-g2d gathered writes (tlsGatherWrite): the filter BIO in front of the socket BIO once installed; the
-     * ciphertext of a gathered write the socket did not take (wtail[wtail_off .. wtail_len)) and the plaintext
-     * bytes behind it that were not reported written yet (wtail_pt). */
+    /* RL-g2d / RL-g2k owner TLS I/O (tlsGatherWrite, io_owner_preread, io_owner_write_prepare): the filter BIO in
+     * front of the socket BIO once installed. A gathered write's records are made in the thread's arena
+     * (tls_arena); obuf[ooff .. olen) holds ciphertext not on the socket yet (what a gathered write's socket write
+     * left, or bytes written behind it); opt: the plaintext behind it that was not reported written yet. rec_*:
+     * the records of the gathered write in hand (plaintext length, end in its ciphertext); pw_*: a prepared
+     * write's plaintext and ciphertext, in flight. pre[pre_off .. pre_len): ciphertext an io_uring recv got that
+     * OpenSSL has not read yet. */
     BIO *gbio;
-    char *wtail;
-    size_t wtail_len, wtail_off, wtail_pt;
+    int collect, nrec, pre_full;
+    char *obuf;
+    size_t olen, ooff, ocap, opt, pw_pt, pw_ctlen;
+    const char *pw_ct;
+    size_t rec_pt[16], rec_end[16];
+    const char *pre;
+    size_t pre_len, pre_off, pre_cap;
+    char *pre_buf;
 } tls_connection;
+
+/* RL-g2k: OpenSSL may hold input no socket event reports: in its buffer, or not read yet from an io_uring recv */
+static inline int tlsPreLeft(tls_connection *conn) {
+    return conn->pre_off < conn->pre_len;
+}
 
 /* Fetch the latest OpenSSL error and store it in the connection */
 static void updateTLSError(tls_connection *conn) {
@@ -1398,7 +1413,7 @@ static void updatePendingData(tls_connection *conn) {
 }
 
 void updateSSLPendingFlag(tls_connection *conn) {
-    if (conn->ssl && SSL_pending(conn->ssl) > 0) {
+    if (conn->ssl && (SSL_pending(conn->ssl) > 0 || tlsPreLeft(conn))) { /* RL-g2k: or pre-read ciphertext */
         conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
     } else {
         conn->flags &= ~TLS_CONN_FLAG_HAS_PENDING;
@@ -1765,12 +1780,15 @@ static void connTLSClose(connection *conn_) {
 
     if (conn->ssl) {
         /* RL-g2d: no close_notify ahead of records still waiting in the tail (they would arrive out of order) */
-        if (conn->c.state == CONN_STATE_CONNECTED && !conn->wtail) SSL_shutdown(conn->ssl);
+        if (conn->c.state == CONN_STATE_CONNECTED && conn->olen <= conn->ooff) SSL_shutdown(conn->ssl);
         SSL_free(conn->ssl);
         conn->ssl = NULL;
     }
-    zfree(conn->wtail);
-    conn->wtail = NULL;
+    zfree(conn->obuf);
+    conn->obuf = NULL;
+    zfree(conn->pre_buf);
+    conn->pre_buf = NULL;
+    conn->pre = NULL;
 
     if (conn->ssl_error) {
         zfree(conn->ssl_error);
@@ -1843,52 +1861,184 @@ static int connTLSConnect(connection *conn_,
     return C_OK;
 }
 
-/* RL-g2d: gathered writes. An IO thread that owns a connection (connIOOwnerBegin) has OpenSSL encrypt all the
- * records of one write (up to NET_MAX_WRITES_PER_EVENT bytes) into a per-thread buffer, through a filter BIO in
- * front of the socket BIO, and hands them to the kernel in one write(): a reply of n records costs one system
- * call (and the peer one wakeup) instead of n. A 16 KB value's reply is two records (16384 + 10 bytes).
- * Only plaintext whose records went out whole is reported written. The rest of the ciphertext stays with the
- * connection (wtail) and goes out first on the next write, on whichever thread has the connection then; that
- * write is the caller's retry of the same unreported bytes (as OpenSSL requires after a short write), so it
- * reports them without encrypting them again. Every other writer (main, sync writes, alerts) passes through. */
+/* RL-g2d / RL-g2k: owner TLS I/O. An IO thread that owns a connection (connIOOwnerBegin) puts a small filter
+ * BIO in front of the socket BIO once the handshake is done, as the SSL's read and write BIO.
+ * - Gathered writes (RL-g2d): every record of one write (up to NET_MAX_WRITES_PER_EVENT bytes; SSL_write makes
+ *   one record per call in partial-write mode) is encrypted into the connection's out buffer, which goes to the
+ *   kernel in one write(): a 16 KB value's reply (16384 + 10 byte records) costs one system call, not two.
+ *   Only plaintext whose records went out whole is reported written. The rest of the ciphertext stays in the
+ *   out buffer (a tail) and goes out first on the next write, on whichever thread has the connection then; that
+ *   write is the caller's retry of the same unreported bytes (as OpenSSL already requires after a short write),
+ *   so it reports them without encrypting them again.
+ * - io_uring batches (RL-g2k): an owner moves the TLS system calls onto its io_uring batches, as for plain
+ *   clients. io_owner_preread hands the filter the ciphertext an io_uring recv got (OpenSSL's next reads take
+ *   it before the socket's); io_owner_write_prepare encrypts a write into the out buffer, the owner sends it
+ *   with the batch, and io_owner_write_done reports what went out, as a gathered write does.
+ * Everyone else (main, sync writes, alerts, close_notify) passes through the filter, behind any tail: bytes
+ * written while ciphertext waits join it, in order. */
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
 #define TLS_GATHER_SUPPORTED 1
 #define TLS_GATHER_MAXREC 16
+#define TLS_BUF_KEEP (32 * 1024) /* an out or pre-read buffer up to this size is kept for the next use */
 
-typedef struct {
-    char *buf;
-    size_t used, cap;
-} tlsGatherBuf;
-
-static __thread tlsGatherBuf tls_gbuf;
 static BIO_METHOD *tls_gather_meth;
 
-/* The filter's data is the thread's gather buffer during tlsGatherWrite, NULL otherwise (pass through). */
+/* RL-g2k: the thread's arena for the records of gathered writes: hot in cache, reused by every write. A batch's
+ * prepared writes stay in it until their sends are done (inflight); a write that needs more room then moves
+ * its own records to a bigger buffer and keeps the old one alive (retired) until nothing is in flight. */
+typedef struct {
+    char *buf;
+    size_t used, cap, cstart; /* cstart: where the records of the write in hand begin */
+    int inflight;
+    char **retired;
+    int nretired, retired_cap;
+} tlsArena;
+static __thread tlsArena tls_arena;
+#define TLS_ARENA_MIN (4 * (NET_MAX_WRITES_PER_EVENT + 4096))
+
+/* Nothing in flight: the arena starts over. */
+static void tlsArenaReset(tlsArena *a) {
+    a->used = a->cstart = 0;
+    for (int i = 0; i < a->nretired; i++) zfree(a->retired[i]);
+    a->nretired = 0;
+}
+
+/* Room for more bytes after used, keeping the write in hand's records [cstart, used) together. */
+static void tlsArenaRoom(tlsArena *a, size_t more) {
+    if (a->used + more <= a->cap) return;
+    size_t keep = a->used - a->cstart, cap = a->cap ? a->cap * 2 : TLS_ARENA_MIN;
+    while (cap < keep + more) cap *= 2;
+    if (!a->inflight) {
+        if (a->cstart && keep) memmove(a->buf, a->buf + a->cstart, keep);
+        a->buf = zrealloc(a->buf, cap);
+    } else {
+        char *nb = zmalloc(cap);
+        if (keep) memcpy(nb, a->buf + a->cstart, keep);
+        if (a->nretired == a->retired_cap) {
+            a->retired_cap = a->retired_cap ? a->retired_cap * 2 : 8;
+            a->retired = zrealloc(a->retired, sizeof(char *) * a->retired_cap);
+        }
+        a->retired[a->nretired++] = a->buf; /* prepared writes still point into it */
+        a->buf = nb;
+    }
+    a->cap = cap;
+    a->used = keep;
+    a->cstart = 0;
+}
+
+static void tlsObufReserve(tls_connection *conn, size_t more) {
+    if (conn->olen + more <= conn->ocap) return;
+    size_t cap = conn->ocap ? conn->ocap * 2 : 4096;
+    while (cap < conn->olen + more) cap *= 2;
+    conn->obuf = zrealloc(conn->obuf, cap);
+    conn->ocap = cap;
+}
+
+/* The out buffer is all on the socket: empty it (a big one is given back). */
+static void tlsObufDrained(tls_connection *conn) {
+    conn->olen = conn->ooff = 0;
+    if (conn->ocap > TLS_BUF_KEEP) {
+        zfree(conn->obuf);
+        conn->obuf = NULL;
+        conn->ocap = 0;
+    }
+}
+
+/* OpenSSL read all of the pre-read ciphertext. */
+static void tlsPreDrained(tls_connection *conn) {
+    conn->pre = NULL;
+    conn->pre_len = conn->pre_off = 0;
+    if (conn->pre_cap > TLS_BUF_KEEP) {
+        zfree(conn->pre_buf);
+        conn->pre_buf = NULL;
+        conn->pre_cap = 0;
+    }
+}
+
+/* Pre-read ciphertext still in the caller's buffer moves into the connection's own. */
+static void tlsPreKeep(tls_connection *conn, size_t more) {
+    size_t left = conn->pre_len - conn->pre_off;
+    if (conn->pre == conn->pre_buf && left + more <= conn->pre_cap - conn->pre_off) return;
+    if (conn->pre == conn->pre_buf && left + more <= conn->pre_cap) {
+        memmove(conn->pre_buf, conn->pre_buf + conn->pre_off, left);
+    } else {
+        size_t cap = conn->pre_cap ? conn->pre_cap : 4096;
+        while (cap < left + more) cap *= 2;
+        char *nb = zmalloc(cap);
+        if (left) memcpy(nb, conn->pre + conn->pre_off, left);
+        zfree(conn->pre_buf);
+        conn->pre_buf = nb;
+        conn->pre_cap = cap;
+    }
+    conn->pre = conn->pre_buf;
+    conn->pre_len = left;
+    conn->pre_off = 0;
+}
+
 static int tlsGatherBioWrite(BIO *b, const char *in, int inl) {
-    tlsGatherBuf *g = BIO_get_data(b);
+    tls_connection *conn = BIO_get_data(b);
     BIO *next = BIO_next(b);
-    if (!g) {
-        if (!next) return -1;
-        BIO_clear_retry_flags(b);
-        int r = BIO_write(next, in, inl);
-        BIO_copy_next_retry(b);
-        return r;
-    }
     if (inl <= 0) return 0;
-    if (g->used + (size_t)inl > g->cap) {
-        size_t cap = g->cap ? g->cap * 2 : 2 * NET_MAX_WRITES_PER_EVENT;
-        while (cap < g->used + (size_t)inl) cap *= 2;
-        g->buf = zrealloc(g->buf, cap);
-        g->cap = cap;
+    if (conn && conn->collect) { /* a gathered write: into the thread's arena */
+        tlsArena *a = &tls_arena;
+        tlsArenaRoom(a, (size_t)inl);
+        memcpy(a->buf + a->used, in, inl);
+        a->used += inl;
+        return inl;
     }
-    memcpy(g->buf + g->used, in, inl);
-    g->used += inl;
-    return inl;
+    if (conn && conn->olen > conn->ooff) { /* behind a tail: after it, in order */
+        tlsObufReserve(conn, (size_t)inl);
+        memcpy(conn->obuf + conn->olen, in, inl);
+        conn->olen += inl;
+        return inl;
+    }
+    if (!next) return -1;
+    BIO_clear_retry_flags(b);
+    int r = BIO_write(next, in, inl);
+    BIO_copy_next_retry(b);
+    return r;
+}
+
+static int tlsGatherBioRead(BIO *b, char *out, int outl) {
+    tls_connection *conn = BIO_get_data(b);
+    BIO *next = BIO_next(b);
+    if (outl <= 0) return 0;
+    if (conn && tlsPreLeft(conn)) {
+        size_t n = conn->pre_len - conn->pre_off;
+        if (n > (size_t)outl) n = (size_t)outl;
+        memcpy(out, conn->pre + conn->pre_off, n);
+        conn->pre_off += n;
+        BIO_clear_retry_flags(b);
+        if (!tlsPreLeft(conn)) {
+            /* as a socket read that came back short (drained) or full (more may wait: read again) */
+            conn->socket_read_full = conn->pre_full;
+            tlsPreDrained(conn);
+        }
+        return (int)n;
+    }
+    if (!next) return -1;
+    BIO_clear_retry_flags(b);
+    int r = BIO_read(next, out, outl);
+    BIO_copy_next_retry(b);
+    return r;
 }
 
 static long tlsGatherBioCtrl(BIO *b, int cmd, long num, void *ptr) {
+    tls_connection *conn = BIO_get_data(b);
     BIO *next = BIO_next(b);
-    if (cmd == BIO_CTRL_FLUSH && BIO_get_data(b)) return 1;
+    long r;
+    switch (cmd) {
+    case BIO_CTRL_FLUSH:
+        if (conn && (conn->collect || conn->olen > conn->ooff)) return 1;
+        break;
+    case BIO_CTRL_PENDING:
+        r = next ? BIO_ctrl(next, cmd, num, ptr) : 0;
+        return r + (conn ? (long)(conn->pre_len - conn->pre_off) : 0);
+    case BIO_CTRL_WPENDING:
+        r = next ? BIO_ctrl(next, cmd, num, ptr) : 0;
+        return r + (conn ? (long)(conn->olen - conn->ooff) : 0);
+    default: break;
+    }
     return next ? BIO_ctrl(next, cmd, num, ptr) : 0;
 }
 
@@ -1908,29 +2058,31 @@ static int tlsGatherBioDestroy(BIO *b) {
 static void tlsGatherInit(void) {
     int idx = BIO_get_new_index();
     if (idx == -1) return;
-    BIO_METHOD *m = BIO_meth_new(idx | BIO_TYPE_FILTER, "valkey gathered writes");
+    BIO_METHOD *m = BIO_meth_new(idx | BIO_TYPE_FILTER, "valkey owner TLS I/O");
     if (!m) return;
-    if (!BIO_meth_set_write(m, tlsGatherBioWrite) || !BIO_meth_set_ctrl(m, tlsGatherBioCtrl) ||
-        !BIO_meth_set_create(m, tlsGatherBioCreate) || !BIO_meth_set_destroy(m, tlsGatherBioDestroy)) {
+    if (!BIO_meth_set_write(m, tlsGatherBioWrite) || !BIO_meth_set_read(m, tlsGatherBioRead) ||
+        !BIO_meth_set_ctrl(m, tlsGatherBioCtrl) || !BIO_meth_set_create(m, tlsGatherBioCreate) ||
+        !BIO_meth_set_destroy(m, tlsGatherBioDestroy)) {
         BIO_meth_free(m);
         return;
     }
     tls_gather_meth = m;
 }
 
-/* Puts the filter in front of the socket BIO, once the handshake is done (no handshake buffer BIO). */
+/* Puts the filter in front of the socket BIO (read and write side), once the handshake is done. */
 static int tlsGatherInstall(tls_connection *conn) {
     if (!tls_gather_meth || !SSL_is_init_finished(conn->ssl) || SSL_in_init(conn->ssl)) return C_ERR;
-    BIO *sock = SSL_get_wbio(conn->ssl);
-    if (!sock || BIO_method_type(sock) != BIO_TYPE_SOCKET) return C_ERR;
+    BIO *sock = SSL_get_rbio(conn->ssl);
+    if (!sock || sock != SSL_get_wbio(conn->ssl) || BIO_method_type(sock) != BIO_TYPE_SOCKET) return C_ERR;
     BIO *f = BIO_new(tls_gather_meth);
     if (!f) return C_ERR;
     if (!BIO_up_ref(sock)) { /* the filter's chain holds its own reference */
         BIO_free(f);
         return C_ERR;
     }
+    BIO_set_data(f, conn);
     BIO_push(f, sock);
-    SSL_set0_wbio(conn->ssl, f); /* drops the write side's reference to sock; the read side keeps its own */
+    SSL_set_bio(conn->ssl, f, f); /* drops the SSL's references to sock; the chain keeps it */
     conn->gbio = f;
     return C_OK;
 }
@@ -1942,12 +2094,12 @@ static int tlsGatherOn(tls_connection *conn) {
     return conn->gbio || tlsGatherInstall(conn) == C_OK;
 }
 
-/* Sends what is left of the tail. Returns 1 when it is all out, 0 when the socket is full, -1 on an error. */
-static int tlsTailFlush(tls_connection *conn) {
-    while (conn->wtail_off < conn->wtail_len) {
-        ssize_t w = write(conn->c.fd, conn->wtail + conn->wtail_off, conn->wtail_len - conn->wtail_off);
+/* Sends the out buffer from ooff. Returns 1 when it is all out, 0 when the socket is full, -1 on an error. */
+static int tlsObufSend(tls_connection *conn) {
+    while (conn->ooff < conn->olen) {
+        ssize_t w = write(conn->c.fd, conn->obuf + conn->ooff, conn->olen - conn->ooff);
         if (w > 0) {
-            conn->wtail_off += (size_t)w;
+            conn->ooff += (size_t)w;
             continue;
         }
         if (w < 0 && errno == EINTR) continue;
@@ -1956,58 +2108,92 @@ static int tlsTailFlush(tls_connection *conn) {
         conn->c.state = CONN_STATE_ERROR;
         return -1;
     }
-    zfree(conn->wtail);
-    conn->wtail = NULL;
-    conn->wtail_len = conn->wtail_off = 0;
     return 1;
 }
 
-/* A write while a tail waits: the caller retries (at least) the wtail_pt bytes not reported yet. Sends the
- * tail; once it is out, reports those bytes (without the data: they are encrypted already). */
-static int tlsTailWrite(tls_connection *conn, size_t data_len) {
-    if (data_len < conn->wtail_pt) {
+/* A write while ciphertext waits: it goes out first. The caller retries (at least) the opt bytes not reported
+ * yet; once the out buffer is all out, they are reported (without the data: they are encrypted already).
+ * Sets *go when nothing was owed and the caller's write should go on as usual. */
+static int tlsTailWrite(tls_connection *conn, size_t data_len, int *go) {
+    if (data_len < conn->opt) {
         errno = EAGAIN;
         return -1;
     }
-    int r = tlsTailFlush(conn);
-    if (r <= 0) {
-        if (r == 0) errno = EAGAIN;
+    int r = tlsObufSend(conn);
+    if (r < 0) return -1;
+    if (r == 0) {
+        errno = EAGAIN;
         return -1;
     }
-    size_t pt = conn->wtail_pt;
-    conn->wtail_pt = 0;
-    return (int)pt;
+    tlsObufDrained(conn);
+    size_t pt = conn->opt;
+    conn->opt = 0;
+    if (pt) return (int)pt;
+    *go = 1;
+    return 0;
 }
 
-/* An IO thread's write of data_len bytes (connected, no tail, no failed write pending): every record
- * OpenSSL makes goes to the thread's buffer, then out in one write(). */
-static int tlsGatherWrite(tls_connection *conn, const char *data, size_t data_len) {
-    tlsGatherBuf *g = &tls_gbuf;
-    size_t ct_end[TLS_GATHER_MAXREC], pt_len[TLS_GATHER_MAXREC], pt = 0;
-    int nrec = 0, ret = 1;
-    if (data_len > NET_MAX_WRITES_PER_EVENT) data_len = NET_MAX_WRITES_PER_EVENT;
-    g->used = 0;
-    BIO_set_data(conn->gbio, g);
-    /* SSL_MODE_ENABLE_PARTIAL_WRITE: each SSL_write makes one record and returns its plaintext length */
-    while (pt < data_len && nrec < TLS_GATHER_MAXREC) {
+/* Encrypts up to data_len bytes into the thread's arena, one record per SSL_write; the record table says where
+ * each ends (from the arena's cstart). Returns the plaintext encrypted; *ret is the last SSL_write's result. */
+static size_t tlsCollect(tls_connection *conn, const char *data, size_t data_len, int *ret) {
+    tlsArena *a = &tls_arena;
+    size_t pt = 0;
+    conn->nrec = 0;
+    *ret = 1;
+    a->cstart = a->used;
+    conn->collect = 1;
+    while (pt < data_len && conn->nrec < TLS_GATHER_MAXREC) {
         ERR_clear_error();
-        ret = SSL_write(conn->ssl, data + pt, data_len - pt);
-        if (ret <= 0) break;
-        pt += (size_t)ret;
-        pt_len[nrec] = (size_t)ret;
-        ct_end[nrec++] = g->used;
+        *ret = SSL_write(conn->ssl, data + pt, data_len - pt);
+        if (*ret <= 0) break;
+        pt += (size_t)*ret;
+        conn->rec_pt[conn->nrec] = (size_t)*ret;
+        conn->rec_end[conn->nrec++] = a->used - a->cstart;
     }
-    BIO_set_data(conn->gbio, NULL);
+    conn->collect = 0;
+    return pt;
+}
+
+/* sent of the ctlen ciphertext bytes ct of a gathered write are on the socket: returns the plaintext of the
+ * records that went out whole; the rest is kept as the connection's tail (opt: its plaintext of the pt_total
+ * encrypted). */
+static size_t tlsReport(tls_connection *conn, size_t pt_total, const char *ct, size_t ctlen, size_t sent) {
+    size_t rep = 0;
+    for (int i = 0; i < conn->nrec && conn->rec_end[i] <= sent; i++) rep += conn->rec_pt[i];
+    conn->nrec = 0;
+    if (sent < ctlen) {
+        serverAssert(conn->olen == conn->ooff);
+        conn->olen = conn->ooff = 0;
+        tlsObufReserve(conn, ctlen - sent);
+        memcpy(conn->obuf, ct + sent, ctlen - sent);
+        conn->olen = ctlen - sent;
+        conn->opt = pt_total - rep;
+        atomic_fetch_add_explicit(&server.stat_tls_write_tails, 1, memory_order_relaxed);
+    }
+    return rep;
+}
+
+/* An IO thread's write of data_len bytes (connected, nothing waiting, no failed write pending): every record
+ * OpenSSL makes goes to the arena (above a batch's prepared writes), then out in one write(). */
+static int tlsGatherWrite(tls_connection *conn, const char *data, size_t data_len) {
+    tlsArena *a = &tls_arena;
+    int ret;
+    if (!a->inflight) tlsArenaReset(a);
+    if (data_len > NET_MAX_WRITES_PER_EVENT) data_len = NET_MAX_WRITES_PER_EVENT;
+    size_t pt = tlsCollect(conn, data, data_len, &ret);
     int ssl_err = ret <= 0 ? SSL_get_error(conn->ssl, ret) : SSL_ERROR_NONE, saved_errno = errno;
-    size_t off = 0;
-    while (off < g->used) { /* the records, and an alert OpenSSL may have added after a failed SSL_write */
-        ssize_t w = write(conn->c.fd, g->buf + off, g->used - off);
+    const char *ct = a->buf + a->cstart;
+    size_t ctlen = a->used - a->cstart, off = 0;
+    a->used = a->cstart; /* the records leave the arena with this call: on the socket, or into the tail */
+    while (off < ctlen) { /* the records, and an alert OpenSSL may have added after a failed SSL_write */
+        ssize_t w = write(conn->c.fd, ct + off, ctlen - off);
         if (w > 0) {
             off += (size_t)w;
             continue;
         }
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        conn->nrec = 0;
         conn->c.last_errno = w < 0 ? errno : EPIPE;
         conn->c.state = CONN_STATE_ERROR;
         return -1;
@@ -2016,24 +2202,97 @@ static int tlsGatherWrite(tls_connection *conn, const char *data, size_t data_le
      * the filter takes everything). */
     if (ret <= 0 && (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ))
         conn->last_failed_write_data_len = data_len - pt;
-    if (!nrec) {
+    size_t rep = tlsReport(conn, pt, ct, ctlen, off);
+    if (!pt) {
         errno = saved_errno;
         if (!conn->last_failed_write_data_len) conn->last_failed_write_data_len = data_len;
         return updateStateAfterSSLIO(conn, ret, 1);
     }
-    size_t rep = 0;
-    for (int i = 0; i < nrec && ct_end[i] <= off; i++) rep += pt_len[i];
-    if (off < g->used) {
-        conn->wtail_len = g->used - off;
-        conn->wtail = zmalloc(conn->wtail_len);
-        memcpy(conn->wtail, g->buf + off, conn->wtail_len);
-        conn->wtail_off = 0;
-        conn->wtail_pt = pt - rep;
-        atomic_fetch_add_explicit(&server.stat_tls_write_tails, 1, memory_order_relaxed);
-    }
     if (rep) return (int)rep;
     errno = EAGAIN;
     return -1;
+}
+
+/* RL-g2k, the owning IO thread: 1 when this connection's reads and writes may go through io_owner_preread
+ * and io_owner_write_prepare (the filter is in place). */
+static int connTLSIOOwnerBatchReady(connection *conn_) {
+    tls_connection *conn = (tls_connection *)conn_;
+    if (conn->c.state != CONN_STATE_CONNECTED || !(conn->flags & TLS_CONN_FLAG_IO_OWNED) || inMainThread()) return 0;
+    return conn->gbio || tlsGatherInstall(conn) == C_OK;
+}
+
+/* RL-g2k: len bytes an io_uring recv got from the socket (full: it filled its buffer, so more may wait). The
+ * next reads take them before the socket's. buf may be the caller's: io_owner_preread_settle keeps what
+ * OpenSSL has not taken. */
+static void connTLSIOOwnerPreread(connection *conn_, const char *buf, size_t len, int full) {
+    tls_connection *conn = (tls_connection *)conn_;
+    serverAssert(conn->gbio);
+    if (tlsPreLeft(conn)) {
+        tlsPreKeep(conn, len);
+        memcpy(conn->pre_buf + conn->pre_len, buf, len);
+        conn->pre_len += len;
+    } else {
+        conn->pre = buf;
+        conn->pre_len = len;
+        conn->pre_off = 0;
+    }
+    conn->pre_full = full;
+}
+
+/* RL-g2k: the caller's buffer is about to be reused: pre-read bytes OpenSSL has not taken move into the
+ * connection's own buffer (OpenSSL takes a whole recv in one read unless its buffer is nearly full). */
+static void connTLSIOOwnerPrereadSettle(connection *conn_) {
+    tls_connection *conn = (tls_connection *)conn_;
+    if (tlsPreLeft(conn) && conn->pre != conn->pre_buf) tlsPreKeep(conn, 0);
+}
+
+/* RL-g2k: encrypts a write of len bytes (up to NET_MAX_WRITES_PER_EVENT) into the out buffer for the caller to
+ * send (*ct, *ctlen) and report with io_owner_write_done. Returns the plaintext encrypted, or -1 when this
+ * write takes the usual path (ciphertext waiting, a failed write pending, OpenSSL wrote no record). */
+static int connTLSIOOwnerWritePrepare(connection *conn_, const char *data, size_t len, const char **ct, size_t *ctlen) {
+    tls_connection *conn = (tls_connection *)conn_;
+    if (conn->c.state != CONN_STATE_CONNECTED || !conn->gbio || !(conn->flags & TLS_CONN_FLAG_IO_OWNED) ||
+        inMainThread() || !len)
+        return -1;
+    if (conn->olen > conn->ooff || conn->opt || conn->last_failed_write_data_len || server.debug_force_tls_write_error)
+        return -1;
+    if (len > NET_MAX_WRITES_PER_EVENT) len = NET_MAX_WRITES_PER_EVENT;
+    tlsArena *a = &tls_arena;
+    if (!a->inflight) tlsArenaReset(a);
+    int ret;
+    size_t pt = tlsCollect(conn, data, len, &ret);
+    const char *c0 = a->buf + a->cstart;
+    size_t clen = a->used - a->cstart;
+    if (!pt) { /* the usual write runs it again behind what OpenSSL put out (an alert: kept as a tail) */
+        a->used = a->cstart;
+        tlsReport(conn, 0, c0, clen, 0);
+        return -1;
+    }
+    if (ret <= 0) {
+        int ssl_err = SSL_get_error(conn->ssl, ret);
+        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) conn->last_failed_write_data_len = len - pt;
+    }
+    a->inflight++;
+    conn->pw_pt = pt;
+    conn->pw_ct = c0;
+    conn->pw_ctlen = clen;
+    *ct = c0;
+    *ctlen = clen;
+    return (int)pt;
+}
+
+/* RL-g2k: the caller's send of the prepared ciphertext took sent bytes (<= 0: none). Returns the plaintext of
+ * the records that went out whole; the rest waits as a tail for the next write. */
+static int connTLSIOOwnerWriteDone(connection *conn_, ssize_t sent) {
+    tls_connection *conn = (tls_connection *)conn_;
+    tlsArena *a = &tls_arena;
+    size_t s = sent > 0 ? (size_t)sent : 0;
+    serverAssert(conn->pw_ct && s <= conn->pw_ctlen && a->inflight > 0);
+    size_t rep = tlsReport(conn, conn->pw_pt, conn->pw_ct, conn->pw_ctlen, s);
+    conn->pw_pt = conn->pw_ctlen = 0;
+    conn->pw_ct = NULL;
+    if (--a->inflight == 0) tlsArenaReset(a);
+    return (int)rep;
 }
 #endif
 
@@ -2043,7 +2302,10 @@ static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
 #ifdef TLS_GATHER_SUPPORTED
-    if (conn->wtail_pt) return tlsTailWrite(conn, data_len);
+    if (conn->olen > conn->ooff || conn->opt) {
+        int go = 0, r = tlsTailWrite(conn, data_len, &go);
+        if (!go) return r;
+    }
     if (data_len && tlsGatherOn(conn)) return tlsGatherWrite(conn, data, data_len);
 #endif
     if (server.debug_force_tls_write_error) {
@@ -2085,7 +2347,10 @@ static int connTLSWritev(connection *conn_, const struct iovec *iov, int iovcnt)
      * (copied together below unless the first buffer alone is that big) into one write. */
     int gather = 0;
     if (conn->c.state == CONN_STATE_CONNECTED) {
-        if (conn->wtail_pt) return tlsTailWrite(conn, total_len);
+        if (conn->olen > conn->ooff || conn->opt) {
+            int go = 0, r = tlsTailWrite(conn, total_len, &go);
+            if (!go) return r;
+        }
         gather = tlsGatherOn(conn);
         if (gather && iov[0].iov_len >= NET_MAX_WRITES_PER_EVENT)
             return tlsGatherWrite(conn, iov[0].iov_base, iov[0].iov_len);
@@ -2190,7 +2455,7 @@ static int connTLSIOOwnerBegin(connection *conn_) {
     tls_connection *conn = (tls_connection *)conn_;
     /* ACCEPTING: an owner thread runs the handshake too (connTLSAccept off main). */
     if ((conn->c.state != CONN_STATE_CONNECTED && conn->c.state != CONN_STATE_ACCEPTING) || !conn->ssl) return -1;
-    BIO *rbio = SSL_get_rbio(conn->ssl);
+    BIO *rbio = conn->gbio ? BIO_next(conn->gbio) : SSL_get_rbio(conn->ssl); /* RL-g2k: the socket BIO */
     if (!rbio) return -1;
     /* A write OpenSSL must retry with the same bytes finishes on main. Otherwise no write is
      * outstanding (main has none queued; a completed handshake leaves the flag set), and a read
@@ -2229,14 +2494,16 @@ static void connTLSIOOwnerEnd(connection *conn_) {
 #ifdef TLS_IO_OWNER_SUPPORTED
     /* Records read ahead off the socket (behind a handshake the owner ran, too) raise no event on main
      * either: connUpdateState puts the connection on the pending list. */
-    if (conn->ssl && (SSL_pending(conn->ssl) > 0 || SSL_has_pending(conn->ssl))) conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
+    if (conn->ssl && (SSL_pending(conn->ssl) > 0 || SSL_has_pending(conn->ssl) || tlsPreLeft(conn)))
+        conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
 #endif
 }
 
 static int connTLSIOOwnerState(connection *conn_) {
     tls_connection *conn = (tls_connection *)conn_;
     int st = 0;
-    if ((conn->flags & TLS_CONN_FLAG_HAS_PENDING) || conn->socket_read_full) st |= CONN_IO_BUFFERED_INPUT;
+    if ((conn->flags & TLS_CONN_FLAG_HAS_PENDING) || conn->socket_read_full || tlsPreLeft(conn))
+        st |= CONN_IO_BUFFERED_INPUT;
     if (conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE) st |= CONN_IO_READ_WANTS_WRITE;
     if (conn->flags & TLS_CONN_FLAG_WRITE_WANT_READ) st |= CONN_IO_WRITE_WANTS_READ;
     return st;
@@ -2312,10 +2579,13 @@ static ssize_t connTLSSyncWrite(connection *conn_, char *ptr, ssize_t size, long
     setBlockingTimeout(conn, timeout);
 #ifdef TLS_GATHER_SUPPORTED
     /* RL-g2d: records still in the tail go out first (their plaintext is reported by the next connTLSWrite) */
-    if (conn->wtail && tlsTailFlush(conn) != 1) {
-        if (!blocking) unsetBlockingTimeout(conn);
-        conn->c.last_errno = errno;
-        return -1;
+    if (conn->olen > conn->ooff) {
+        if (tlsObufSend(conn) != 1) {
+            if (!blocking) unsetBlockingTimeout(conn);
+            conn->c.last_errno = errno;
+            return -1;
+        }
+        tlsObufDrained(conn);
     }
 #endif
     SSL_clear_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
@@ -2510,6 +2780,13 @@ static ConnectionType CT_TLS = {
     .io_owner_begin = connTLSIOOwnerBegin,
     .io_owner_end = connTLSIOOwnerEnd,
     .io_owner_state = connTLSIOOwnerState,
+#ifdef TLS_GATHER_SUPPORTED
+    .io_owner_batch_ready = connTLSIOOwnerBatchReady,
+    .io_owner_preread = connTLSIOOwnerPreread,
+    .io_owner_preread_settle = connTLSIOOwnerPrereadSettle,
+    .io_owner_write_prepare = connTLSIOOwnerWritePrepare,
+    .io_owner_write_done = connTLSIOOwnerWriteDone,
+#endif
 
     /* TLS specified methods */
     .get_peer_cert = connTLSGetPeerCert,

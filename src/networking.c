@@ -502,6 +502,7 @@ client *createClient(connection *conn) {
     c->owner_deep = 0;
     c->owner_tls = 0;
     c->owner_hs = 0;
+    c->owner_tls_direct = 0; /* RL-g2k */
     c->owner_held = 0;
     c->owner_guest_node = NULL;
     c->owner_resume = 0;

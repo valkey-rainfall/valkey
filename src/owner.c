@@ -529,6 +529,10 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE, OWN_WHY_AC
 #define OWN_LISTEN_TLS 0x10000
 /* A TLS read returns at most one record; reads in a row while OpenSSL may hold more input (ownerReadTls). */
 #define OWN_TLS_READS 16
+/* RL-g2k: reads a TLS client whose input filled a batch read makes directly before it goes back to the
+ * io_uring batches; a direct read of at least OWN_TLS_BIG_READ bytes starts the count again. */
+#define OWN_TLS_DIRECT 15
+#define OWN_TLS_BIG_READ 4096
 
 /* Native-path vetoes (own_veto). */
 #define OWN_VETO_ALL 1
@@ -582,6 +586,8 @@ typedef struct ownerUringOp {
     size_t len;
     int scratch; /* read: buf is the slot's scratch; the bytes are copied into the query buffer */
     int res;     /* the CQE's result */
+    int tls;      /* RL-g2k: a TLS client's ciphertext (read: into the scratch; write: buf/len is the record bytes) */
+    size_t ptlen; /* RL-g2k write: the reply bytes ownerTlsSpan gave */
 } ownerUringOp;
 
 /* D3-all-g11-bigreply: a GET value an owner sends from where it is stored instead of copying it into the
@@ -625,6 +631,7 @@ typedef struct owner {
     /* RL-g2v: TLS accepts this owner finished itself (no trip to main; INFO, never cleared), and the ones
      * main has not counted in stat_numconnections yet (folded at the next stop). */
     long long tls_local_accepts, accepts_unfolded;
+    long long tls_uring_reads, tls_uring_writes; /* RL-g2k: TLS reads and writes on the io_uring batches */
     pthread_t thread;
     int epfd, wakefd;
     client **fdmap; /* fd -> resident client; written by the owner in a window, by main under the stop */
@@ -2799,15 +2806,20 @@ static void ownerUringRun(owner *o, int n) {
 #endif
 
 /* The reply bytes a write of c would send, when they are all plain bytes in c->buf (no reply blocks,
- * no references to values): what _writeToClient's connWrite branch sends. 0 otherwise. */
-static int ownerPlainSpan(client *c, char **buf, size_t *len) {
+ * no references to values): what _writeToClient's connWrite branch sends. 0 otherwise. RL-g2k: tls set, the
+ * same for an owner TLS client whose transport takes the batch (ownerWriteMany encrypts them first). */
+static int ownerPlainSpanOf(client *c, char **buf, size_t *len, int tls) {
     if (c->owner_nrefs || listLength(c->reply) || c->flag.buf_encoded || c->bufpos <= 0) return 0;
-    if (c->conn->type != connectionTypeTcp()) return 0;
+    if (tls ? !c->owner_tls : c->conn->type != connectionTypeTcp()) return 0;
     serverAssert(c->io_last_written.data_len == 0 || c->io_last_written.buf == c->buf);
     if ((size_t)c->bufpos <= c->io_last_written.data_len) return 0;
     *buf = c->buf + c->io_last_written.data_len;
     *len = (size_t)c->bufpos - c->io_last_written.data_len;
     return 1;
+}
+
+static int ownerPlainSpan(client *c, char **buf, size_t *len) {
+    return ownerPlainSpanOf(c, buf, len, 0);
 }
 
 /* ownerWriteOnce for a write io_uring made: res > 0 of the len bytes ownerPlainSpan gave went out, as
@@ -2852,6 +2864,28 @@ static int ownerWriteMany(owner *o, client **cs, int n) {
             client *c = cs[i];
             char *buf;
             size_t len;
+#ifdef HAVE_LIBURING
+            /* RL-g2k: an owner TLS client's reply is encrypted into its transport's out buffer and sent with
+             * the batch; what the send left goes out with its next write. */
+            if (use && c->owner_tls && ownerPlainSpanOf(c, &buf, &len, 1)) {
+                const char *ct;
+                size_t ctlen;
+                int dup = 0; /* once per batch: its encrypted reply is in flight */
+                for (int j = 0; j < m && !dup; j++) dup = o->uops[j].c == c;
+                if (dup) continue;
+                if (connIOOwnerWritePrepare(c->conn, buf, len, &ct, &ctlen) <= 0) {
+                    left |= ownerWrite(o, c);
+                    continue;
+                }
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&o->ring);
+                serverAssert(sqe != NULL);
+                io_uring_prep_send(sqe, c->conn->fd, ct, ctlen, MSG_DONTWAIT);
+                io_uring_sqe_set_data64(sqe, (uint64_t)m);
+                o->uops[m] = (ownerUringOp){.c = c, .buf = (char *)ct, .len = ctlen, .tls = 1, .ptlen = len};
+                m++;
+                continue;
+            }
+#endif
             if (!use || !ownerPlainSpan(c, &buf, &len)) {
                 left |= ownerWrite(o, c);
                 continue;
@@ -2871,6 +2905,18 @@ static int ownerWriteMany(owner *o, client **cs, int n) {
         o->uring_writes += m;
         for (int j = 0; j < m; j++) {
             ownerUringOp *op = &o->uops[j];
+            if (op->tls) { /* RL-g2k */
+                int rep = connIOOwnerWriteDone(op->c->conn, op->res);
+                o->tls_uring_writes++;
+                if (rep > 0) {
+                    ownerWriteDone(o, op->c, rep, op->ptlen);
+                    left |= ownerWriteTail(o, op->c);
+                } else {
+                    o->uring_redo++;
+                    left |= ownerWrite(o, op->c);
+                }
+                continue;
+            }
             if ((size_t)op->res != op->len) o->uring_short++;
             if (op->res > 0) {
                 ownerWriteDone(o, op->c, op->res, op->len);
@@ -5430,6 +5476,9 @@ static int ownerReadTls(owner *o, client *c) {
         readToQueryBuf(c);
         int got = c->nread > 0;
         o->tls_reads++;
+        /* RL-g2k: a client reading directly for its big input goes back to the batches once it stays small */
+        if (c->owner_tls_direct && got)
+            c->owner_tls_direct = c->nread >= OWN_TLS_BIG_READ ? OWN_TLS_DIRECT : c->owner_tls_direct - 1;
         if (ownerReadPost(o, c, 0)) return 1;
         int st = connIOOwnerState(c->conn);
         if (st & CONN_IO_READ_WANTS_WRITE) ownerSetWantOut(o, c, 1);
@@ -5437,6 +5486,22 @@ static int ownerReadTls(owner *o, client *c) {
     }
     ownerTlsPend(o, c);
     return 0;
+}
+
+/* RL-g2k: a TLS client's read in an io_uring batch: its ciphertext (if the recv got any) is pre-read, so this
+ * SSL_read makes no system call; what OpenSSL leaves is kept before the scratch is reused. A reply that may
+ * go out now joins the batch's writes, unless more input may wait (then on as ownerReadTls). Returns 1 when
+ * the client left the owner. */
+static int ownerReadTlsBatched(owner *o, client *c) {
+    readToQueryBuf(c);
+    connIOOwnerPrereadSettle(c->conn);
+    int got = c->nread > 0;
+    o->tls_reads++;
+    int st = connIOOwnerState(c->conn);
+    int more = got && (st & CONN_IO_BUFFERED_INPUT);
+    if (ownerReadPost(o, c, !more)) return 1;
+    if (st & CONN_IO_READ_WANTS_WRITE) ownerSetWantOut(o, c, 1);
+    return more ? ownerReadTls(o, c) : 0;
 }
 
 /* RL-g1d: the TLS clients ownerTlsPend left for this window (main is not waiting). Returns 1 when any
@@ -5460,8 +5525,13 @@ static int ownerTlsPending(owner *o) {
  * scratch, copied into the thread's shared query buffer when the batch runs (one client at a time
  * holds it, as with one read at a time). */
 static int ownerReadQueue(owner *o, client *c, int m) {
-    if (c->conn->type != connectionTypeTcp()) return 0;
     ownerUringOp *op = &o->uops[m];
+    if (c->owner_tls) { /* RL-g2k: ciphertext into the slot's scratch; OpenSSL reads it from there */
+        *op = (ownerUringOp){.c = c, .buf = o->uring_scratch + (size_t)m * PROTO_IOBUF_LEN, .len = PROTO_IOBUF_LEN,
+                             .scratch = 1, .tls = 1};
+        return 1;
+    }
+    if (c->conn->type != connectionTypeTcp()) return 0;
     char *dst;
     size_t len;
     if (readToQueryBufPrepare(c, 0, &dst, &len)) {
@@ -5501,6 +5571,19 @@ static int ownerReadBatch(owner *o, int m) {
         if (own_mm) {
             serverAssert(o->mm_resv >= OWN_MM_READ);
             o->mm_resv -= OWN_MM_READ;
+        }
+        if (op->tls) { /* RL-g2k: the next SSL_read takes the bytes from the scratch */
+            o->tls_uring_reads++;
+            if (op->res > 0)
+                connIOOwnerPreread(c->conn, op->buf, (size_t)op->res, (size_t)op->res == op->len);
+            else
+                o->uring_redo++; /* the read again, from the socket: end of file, an error, nothing there */
+            /* Input that fills a batch read (big requests) costs a copy here and a read for the rest of its
+             * record: this client reads directly (OpenSSL into its own buffer) until its input stays small
+             * (OWN_TLS_DIRECT reads in a row; ownerReadTls). */
+            if (op->res > 0 && (size_t)op->res == op->len) c->owner_tls_direct = OWN_TLS_DIRECT;
+            left |= ownerReadTlsBatched(o, c);
+            continue;
         }
         if (op->res > 0) {
             c->nread = op->res;
@@ -6102,9 +6185,9 @@ static void *ownerThreadMain(void *arg) {
                 continue;
             }
             if (e & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
-                if (c->owner_tls) {
+                if (c->owner_tls && (!batch || c->owner_deep || c->owner_tls_direct || !connIOOwnerBatchReady(c->conn))) {
                     handed |= ownerReadTls(o, c);
-                } else if (!batch || c->owner_deep) {
+                } else if (!c->owner_tls && (!batch || c->owner_deep)) {
                     /* A deep pipeline (owner-uring-deep commands or more in its last read) already shares
                      * its syscalls among its commands: read, run and reply at once, as without io_uring. */
                     handed |= ownerRead(o, c);
@@ -6412,12 +6495,15 @@ void ownerInfo(sds *info) {
     for (int i = 0; i < own_n; i++) tail_n += owners[i].tail_total;
     *info = sdscatprintf(*info, "owner_tail_commands:%lld\r\n", tail_n);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
-    long long tls_hs = 0, tls_rd = 0, tls_la = 0;
+    long long tls_hs = 0, tls_rd = 0, tls_la = 0, tls_ur = 0, tls_uw = 0;
     for (int i = 0; i < own_n; i++) {
         tls_hs += owners[i].tls_handshakes;
         tls_rd += owners[i].tls_reads;
         tls_la += owners[i].tls_local_accepts;
+        tls_ur += owners[i].tls_uring_reads;
+        tls_uw += owners[i].tls_uring_writes;
     }
+    *info = sdscatprintf(*info, "owner_tls_uring_reads:%lld\r\nowner_tls_uring_writes:%lld\r\n", tls_ur, tls_uw);
     *info = sdscatprintf(*info, "owner_tls_port:%d\r\nowner_tls_handshakes:%lld\r\nowner_tls_reads:%lld\r\n",
                          server.owner_tls_port, tls_hs, tls_rd);
     *info = sdscatprintf(*info, "owner_tls_write_tails:%lld\r\n", /* RL-g2d */

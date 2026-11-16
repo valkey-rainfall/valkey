@@ -171,6 +171,17 @@ typedef struct ConnectionType {
     void (*io_owner_end)(struct connection *conn);
     /* Called by the owning IO thread: CONN_IO_* bits for what the last read or write left behind. */
     int (*io_owner_state)(struct connection *conn);
+    /* RL-g2k, called by the owning IO thread: the transport's system calls go on the thread's io_uring batches.
+     * batch_ready: 1 when the next four may be used. preread: len bytes a recv of the socket got (full: it
+     * filled its buffer); the next reads take them first; buf is the caller's until preread_settle.
+     * write_prepare: the bytes to send for a write of data (*out, *outlen); returns the data bytes they carry,
+     * or -1 to write as usual. write_done: the send took sent of them (<= 0: none); returns the data bytes
+     * written, as a write would; the rest goes out with the next write. */
+    int (*io_owner_batch_ready)(struct connection *conn);
+    void (*io_owner_preread)(struct connection *conn, const char *buf, size_t len, int full);
+    void (*io_owner_preread_settle)(struct connection *conn);
+    int (*io_owner_write_prepare)(struct connection *conn, const char *data, size_t len, const char **out, size_t *outlen);
+    int (*io_owner_write_done)(struct connection *conn, ssize_t sent);
 
     /* TLS specified methods */
     sds (*get_peer_cert)(struct connection *conn);
@@ -606,6 +617,28 @@ static inline void connIOOwnerEnd(connection *conn) {
 
 static inline int connIOOwnerState(connection *conn) {
     return conn->type->io_owner_state ? conn->type->io_owner_state(conn) : 0;
+}
+
+/* RL-g2k: a transport with its own records (TLS) on an IO thread's io_uring batches. */
+static inline int connIOOwnerBatchReady(connection *conn) {
+    return conn->type->io_owner_batch_ready && conn->type->io_owner_preread && conn->type->io_owner_write_prepare &&
+           conn->type->io_owner_batch_ready(conn);
+}
+
+static inline void connIOOwnerPreread(connection *conn, const char *buf, size_t len, int full) {
+    conn->type->io_owner_preread(conn, buf, len, full);
+}
+
+static inline void connIOOwnerPrereadSettle(connection *conn) {
+    conn->type->io_owner_preread_settle(conn);
+}
+
+static inline int connIOOwnerWritePrepare(connection *conn, const char *data, size_t len, const char **out, size_t *outlen) {
+    return conn->type->io_owner_write_prepare ? conn->type->io_owner_write_prepare(conn, data, len, out, outlen) : -1;
+}
+
+static inline int connIOOwnerWriteDone(connection *conn, ssize_t sent) {
+    return conn->type->io_owner_write_done(conn, sent);
 }
 
 static inline int connIsIntegrityChecked(connection *conn) {

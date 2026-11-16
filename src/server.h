@@ -1658,6 +1658,7 @@ typedef struct client {
     unsigned owner_deep : 1;     /* Its last owner read had owner-uring-deep commands or more: not batched (owner.c). */
     unsigned owner_tls : 1;      /* TLS: its owner thread runs OpenSSL for it (connIOOwnerBegin; owner.c). */
     unsigned owner_hs : 1;       /* TLS: its handshake runs on its owner thread (owner TLS ports). */
+    unsigned owner_tls_direct : 4; /* RL-g2k: reads left to make directly (not on io_uring): big TLS input (owner.c) */
     int owner_held;              /* Its replies wait for the AOF: index + 1 in its owner's held list, else 0. */
     listNode *owner_guest_node;  /* Node in owner.c's guest list while main serves it. */
     int owner_resume;            /* owner-pipeline-resume: main stopped it between two commands of a pipeline (owner.c). */
