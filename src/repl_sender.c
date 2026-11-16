@@ -492,6 +492,11 @@ void replStreamSenderAdoptSettled(client *replica) {
  * replica itself for the whole connection, and with owner threads every owner window that appends
  * to the stream wakes main to stop the world for that write. Returns 1 when the sender owns it. */
 int replStreamSenderAdoptStarted(client *replica) {
+    /* A dual-channel replica keeps the parent's path untouched: with it adopted here, replication.tcl's
+     * "Connect multiple replicas at the same time (issue #141)" dual-channel tests lost a replica's sync. */
+    if ((replica->repl_data->replica_capa & REPLICA_CAPA_DUAL_CHANNEL) || replica->flag.repl_rdb_channel ||
+        replica->flag.protected_rdb_channel)
+        return 0;
     replica->repl_data->stream_ineligible = 0;
     if (!repl_sender_running) return 0; /* replStreamSenderInit adopts it when the sender starts */
     if (replica->repl_data->stream_via_sender) return 1;
