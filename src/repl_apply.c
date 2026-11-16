@@ -10,6 +10,7 @@
 #include "repl_apply.h"
 #include "staged_loop.h"
 #include "fastpath.h"
+#include "memory_prefetch.h"
 #include "hotkeys.h"
 #include "cluster_slot_stats.h"
 #include "hdr_histogram.h"
@@ -435,26 +436,73 @@ static void rpMerge(void) {
     for (int l = 0; l < rp.nlanes; l++) rp_cur[l] = (rpCursor){0, 0};
 }
 
-/* Lane thread, APPLY phase: apply this lane's commands of the current segment, chunk after chunk. */
+/* Lane thread, APPLY phase: apply this lane's commands of the current segment, chunk after chunk. The commands are
+ * taken in windows of the prefetch batch size: the keys of a window are looked up ahead (bucket, entry, value, as
+ * main's and the client lanes' batches do) and its arguments, which the parsing thread left in its own cache,
+ * brought in, before the window runs. */
+#define RP_PF_WINDOW 128
+static void *rp_pf[FP_MAX_LANES];
+
 static void rpRunLane(int lane) {
     client *c = rp.c;
     rpCursor *cur = &rp_cur[lane];
     int entered = 0;
-    while (cur->chunk < rp.nchunks) {
-        rpChunk *k = &rp.ch[cur->chunk];
-        int n = k->lane_n[lane];
-        while (cur->pos < n) {
+    int want = server.prefetch_batch_max_size;
+    int use_pf = server.io_threads_lane_prefetch && want > 1;
+    if (want < 1) want = 1;
+    if (want > RP_PF_WINDOW) want = RP_PF_WINDOW;
+    if (use_pf && (!rp_pf[lane] || prefetchLaneBatchSize(rp_pf[lane]) != server.prefetch_batch_max_size)) {
+        if (rp_pf[lane]) prefetchLaneBatchFree(rp_pf[lane]);
+        rp_pf[lane] = prefetchLaneBatchCreate();
+    }
+    if (!rp_pf[lane]) use_pf = 0;
+    int win[RP_PF_WINDOW];
+    for (;;) {
+        int nwin = 0;
+        while (nwin < want && cur->chunk < rp.nchunks) {
+            rpChunk *k = &rp.ch[cur->chunk];
+            if (cur->pos >= k->lane_n[lane]) {
+                cur->chunk++;
+                cur->pos = 0;
+                continue;
+            }
             int idx = k->lane_idx[lane][cur->pos];
-            rpEntry *e = &rp.e[idx];
-            uint32_t seg = k->base + e->seg;
-            if (seg > rp.seg) goto done;
+            uint32_t seg = k->base + rp.e[idx].seg;
+            if (seg > rp.seg) break; /* the next segment's: stays for its phase */
             cur->pos++;
             if (seg < rp.seg) continue; /* its segment ran on main */
-            if (!entered) {
-                fastpathStreamLaneEnter(lane);
-                repl_apply_plan_lane = 1;
-                entered = 1;
+            win[nwin++] = idx;
+        }
+        if (!nwin) break;
+        if (!entered) {
+            fastpathStreamLaneEnter(lane);
+            repl_apply_plan_lane = 1;
+            entered = 1;
+        }
+        if (use_pf && nwin > 1) {
+            prefetchLaneBatchUse(rp_pf[lane]);
+            getKeysResult result;
+            initGetKeysResult(&result);
+            int room = 1;
+            for (int j = 0; j < nwin && room; j++) {
+                int idx = win[j];
+                if (rp.e[idx].marker || idx == 0) continue;
+                parsedCommand *p = &c->cmd_queue.cmds[idx - 1];
+                if (p->cmd) room = prefetchBatchAddCommand(p->cmd, p->argv, p->argc, rp.e[idx].db, rp.e[idx].shard, &result);
             }
+            getKeysFreeResult(&result);
+            for (int j = 0; j < nwin; j++) {
+                if (win[j] == 0) continue;
+                parsedCommand *p = &c->cmd_queue.cmds[win[j] - 1];
+                for (int a = 1; a < p->argc; a++) valkey_prefetch(p->argv[a]);
+            }
+            prefetchBatchRun();
+            prefetchBatchReset();
+            prefetchLaneBatchUse(NULL);
+        }
+        for (int j = 0; j < nwin; j++) {
+            int idx = win[j];
+            rpEntry *e = &rp.e[idx];
             if (e->marker) { /* RL-g2l: a whole transaction's MULTI or EXEC (never position 0) */
                 parsedCommand *p = &c->cmd_queue.cmds[idx - 1];
                 fastpathStreamLaneDrop(lane, p->argv, p->argc, p->argv_len, p->argv_len_sum);
@@ -469,10 +517,7 @@ static void rpRunLane(int lane) {
                                        p->input_bytes, e->shard, (uint64_t)idx);
             }
         }
-        cur->chunk++;
-        cur->pos = 0;
     }
-done:
     if (entered) {
         repl_apply_plan_lane = 0;
         fastpathStreamLaneLeave();
