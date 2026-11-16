@@ -573,6 +573,7 @@ enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE, OWN_WHY_AC
 /* Native-path vetoes (own_veto). */
 #define OWN_VETO_ALL 1
 #define OWN_VETO_WRITE 2
+#define OWN_VETO_BLOCKED 4 /* RL-g5c-block-scope: clients blocked on main; only commands on their slots go to main */
 
 /* maxmemory: what a native step may add, as a headroom requirement before it runs (what it really
  * adds is measured afterwards from the owner's own zmalloc counter). */
@@ -826,6 +827,18 @@ _Thread_local owner *own_self = NULL;
 static _Atomic long long own_parked_total = 0;
 static _Atomic long long own_park_seq = 0;
 static long long own_parked_moved = 0;
+/* RL-g5c-block-scope: the slots a stock LIST/ZSET/STREAM client is blocked on, so the native path sends only the
+ * commands that write one of those slots (or block there) to main. Written by main at resume (world stopped),
+ * read by the owners in their windows. Published by the own_stop barrier, like own_mm_slice. */
+#define OWN_BLOCKED_WORDS (CLUSTER_SLOTS / 64)
+static uint64_t own_blocked_slots[OWN_BLOCKED_WORDS];
+static int own_blocked_any = 0;        /* main: a bit is set (resume clears the map only when it must) */
+static long long own_block_scoped = 0; /* INFO: resumes with a scoped veto */
+static inline int ownerSlotBlocked(int slot) {
+    if (slot < 0) return 0;
+    return (int)((own_blocked_slots[slot >> 6] >> (slot & 63)) & 1);
+}
+static void ownerParkedToMainSlot(int slot);
 static void ownerServeReady(struct owner *o);
 static int ownerParkedRead(struct owner *o, client *c);
 static void ownerUnpark(struct owner *o, client *c);
@@ -1620,18 +1633,57 @@ static int ownerComputeVeto(void) {
     if (server.maxmemory_clients || (server.maxmemory && server.maxmemory_eviction_batch)) return OWN_VETO_ALL;
     if (server.maxmemory && ownerMmHeadroom() / own_n < OWN_MM_TIGHT) return OWN_VETO_ALL;
     if (listLength(server.monitors) || !trackingIsIdle() || server.notify_keyspace_events) return OWN_VETO_ALL;
-    if (server.watching_clients || server.blocked_clients_by_type[BLOCKED_LIST] ||
-        server.blocked_clients_by_type[BLOCKED_ZSET] || server.blocked_clients_by_type[BLOCKED_STREAM])
-        return OWN_VETO_ALL;
+    if (server.watching_clients) return OWN_VETO_ALL;
     if (moduleCountLoaded() || moduleObservesWrites() || server.blocked_clients_by_type[BLOCKED_MODULE] ||
         server.busy_module_yield_flags)
         return OWN_VETO_ALL;
     if (server.latency_monitor_threshold || hotkeysEnabled() || bgIteration_iterationActive() ||
         throttle_anyThrottlers())
         return OWN_VETO_ALL;
+    int v = 0;
+    /* RL-g5c-block-scope: a client blocked on main no longer vetoes the whole native path; only the commands that
+     * write a slot one of them waits on (or block there) go to main (ownerSlotBlocked, rebuilt at resume). */
+    if (server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
+        server.blocked_clients_by_type[BLOCKED_STREAM])
+        v |= OWN_VETO_BLOCKED;
     if (writeCommandsDeniedByDiskError() != DISK_ERROR_TYPE_NONE || !checkGoodReplicasStatus())
-        return OWN_VETO_WRITE;
-    return 0;
+        v |= OWN_VETO_WRITE;
+    return v;
+}
+
+/* RL-g5c-block-scope: the cluster slot of a key object (its string form). */
+static int ownerKeySlotOf(robj *key) {
+    robj *d = getDecodedObject(key);
+    int slot = ownerKeyHashSlot(objectGetVal(d), sdslen(objectGetVal(d)));
+    decrRefCount(d);
+    return slot;
+}
+
+/* Main, world stopped: set own_blocked_slots to the slots a stock LIST/ZSET/STREAM client is blocked on
+ * (db->blocking_keys of every db), or clear it. The owners read it in their next windows (ownerSlotBlocked). */
+static void ownerRebuildBlockedSlots(int scoped) {
+    if (!scoped) {
+        if (own_blocked_any) {
+            memset(own_blocked_slots, 0, sizeof(own_blocked_slots));
+            own_blocked_any = 0;
+        }
+        return;
+    }
+    memset(own_blocked_slots, 0, sizeof(own_blocked_slots));
+    own_blocked_any = 1;
+    own_block_scoped++;
+    for (int j = 0; j < server.dbnum; j++) {
+        if (!server.db[j]) continue; /* databases are created when first used */
+        dict *bk = server.db[j]->blocking_keys;
+        if (!bk || dictSize(bk) == 0) continue;
+        dictIterator *di = dictGetIterator(bk);
+        dictEntry *de;
+        while ((de = dictNext(di))) {
+            int slot = ownerKeySlotOf(dictGetKey(de));
+            if (slot >= 0) own_blocked_slots[slot >> 6] |= (uint64_t)1 << (slot & 63);
+        }
+        dictReleaseIterator(di);
+    }
 }
 
 /* Owners look commands up concurrently, so no command table may be mid-rehash while they run: a
@@ -1699,13 +1751,16 @@ static void ownerMmPlan(void) {
 static void ownerResumeWorld(void) {
     if (!own_held) return;
     own_last_veto = ownerComputeVeto();
-    /* RL-g4c-blocking-native: a veto (replica role, notifications, pause, ...) or maxmemory: the parked clients
-     * become stock blocked clients on main, which then vetoes the native path until they are served. */
-    if (atomic_load_explicit(&own_parked_total, memory_order_relaxed) && (own_last_veto || server.maxmemory)) {
+    /* RL-g4c-blocking-native: a hard veto (replica role, notifications, pause, ...) or maxmemory makes every parked
+     * client a stock blocked client on main, which then vetoes the native path until they are served.
+     * RL-g5c-block-scope: a scoped veto alone (OWN_VETO_BLOCKED) leaves them parked; their slots are never blocked. */
+    if (atomic_load_explicit(&own_parked_total, memory_order_relaxed) &&
+        ((own_last_veto & OWN_VETO_ALL) || server.maxmemory)) {
         ownerParkedToMain();
         own_last_veto = ownerComputeVeto();
     }
     atomic_store_explicit(&own_veto, own_last_veto, memory_order_relaxed);
+    ownerRebuildBlockedSlots((own_last_veto & OWN_VETO_BLOCKED) != 0); /* RL-g5c-block-scope */
     own_aof = server.aof_state == AOF_ON;
     own_repl = !(own_last_veto & OWN_VETO_ALL) && server.primary_host == NULL &&
                (server.repl_backlog != NULL || listLength(server.replicas) != 0);
@@ -4089,8 +4144,9 @@ static int ownerNativeKind(owner *o, client *c) {
         /* RL-g1f-owner-evalsha: RESP2 callers outside MULTI, no maxmemory (no bound on a script's
          * growth), no WATCHed keys on this owner (an aborted run's writes would have touched them), and
          * a script this owner has from main's cache (ownerScriptReady). */
-        if (c->flag.multi || own_mm || c->resp != 2 || c->flag.lua_debug || veto || c->slot < o->slot_lo ||
-            c->slot > o->slot_hi || o->watchers || !ownerScriptReady(o, c))
+        if (c->flag.multi || own_mm || c->resp != 2 || c->flag.lua_debug ||
+            (veto & (OWN_VETO_ALL | OWN_VETO_WRITE)) || ((veto & OWN_VETO_BLOCKED) && ownerSlotBlocked(c->slot)) ||
+            c->slot < o->slot_lo || c->slot > o->slot_hi || o->watchers || !ownerScriptReady(o, c))
             return -1;
         keyed = 1;
         break;
@@ -4107,6 +4163,10 @@ static int ownerNativeKind(owner *o, client *c) {
     }
     if (keyed) {
         if (!(own_kinds[kind].flags & OWN_K_READ) && (veto & OWN_VETO_WRITE)) return -1;
+        /* RL-g5c-block-scope: while clients are blocked on main, a write to a slot one of them waits on (or a
+         * blocking pop that would block there) goes to main so main serves them in order; reads stay native. */
+        if ((veto & OWN_VETO_BLOCKED) && !(own_kinds[kind].flags & OWN_K_READ) && ownerSlotBlocked(c->slot))
+            return -1;
         /* The slot ownerTryNative computed: the keys are hashed once per command. */
         if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
         /* RL-g1a-native-hash: a hash with fields that expire on their own anywhere in this key's table
@@ -4151,6 +4211,8 @@ static int ownerGuestNativeNext(owner *o, parsedCommand *p, int veto, int *in_mu
     if (kind == OWN_PING) return 1;
     if (!(own_kinds[kind].flags & OWN_K_READ) && (veto & OWN_VETO_WRITE)) return 0;
     int slot = ownerKeySlot(p->cmd, p->argv, p->argc, p->read_flags);
+    /* RL-g5c-block-scope: a write to a blocked slot goes to main, not home to the owner. */
+    if ((veto & OWN_VETO_BLOCKED) && !(own_kinds[kind].flags & OWN_K_READ) && ownerSlotBlocked(slot)) return 0;
     return slot >= o->slot_lo && slot <= o->slot_hi;
 }
 
@@ -5504,7 +5566,10 @@ static robj *ownerKeyCopy(robj *key) {
 int ownerBlockForKeys(client *c, int btype, robj **keys, int numkeys, long long timeout) {
     owner *o = own_self;
     if (!o) {
-        if (own_n && atomic_load_explicit(&own_parked_total, memory_order_relaxed)) ownerParkedToMain();
+        /* RL-g5c-block-scope: main is about to block this client on its keys; the clients parked on those slots
+         * (if any) become stock blocked clients first, so each slot's waiters keep the order they blocked. */
+        if (own_n && atomic_load_explicit(&own_parked_total, memory_order_relaxed))
+            for (int j = 0; j < numkeys; j++) ownerParkedToMainSlot(ownerKeySlotOf(keys[j]));
         return 0;
     }
     serverAssert(btype == BLOCKED_LIST || btype == BLOCKED_ZSET);
@@ -5623,7 +5688,9 @@ int ownerSignalKeyReady(serverDb *db, robj *key, int type, int deleted) {
         !atomic_load_explicit(&own_parked_total, memory_order_relaxed))
         return 0;
     int i = ownerOfKey(key);
-    if (i >= 0 && i < own_n && owners[i].park_keys && dictFind(owners[i].park_keys[db->id], key)) ownerParkedToMain();
+    /* RL-g5c-block-scope: main wrote a key parked clients wait on; convert that slot's parked clients only. */
+    if (i >= 0 && i < own_n && owners[i].park_keys && dictFind(owners[i].park_keys[db->id], key))
+        ownerParkedToMainSlot(ownerKeySlotOf(key));
     return 0;
 }
 
@@ -5768,17 +5835,29 @@ static int ownerParkSeqCmp(const void *a, const void *b) {
 
 /* Main, world stopped: every parked client becomes a stock blocked client on main, in the order they parked,
  * with its keys and its timeout (blockForKeys); main serves them from here as the stock server does. */
-void ownerParkedToMain(void) {
+static void ownerParkedToMainFilter(int only_slot) {
     if (!own_n || !atomic_load_explicit(&own_parked_total, memory_order_relaxed)) return;
     serverAssert(!own_self && own_held);
     long long n = 0, k = 0;
-    for (int i = 0; i < own_n; i++) n += owners[i].nparked;
+    for (int i = 0; i < own_n; i++) {
+        listIter li;
+        listNode *ln;
+        listRewind(owners[i].parked, &li);
+        while ((ln = listNext(&li))) {
+            ownerPark *p = listNodeValue(ln);
+            if (only_slot < 0 || p->slot == only_slot) n++;
+        }
+    }
+    if (!n) return;
     ownerPark **all = zmalloc(sizeof(*all) * n);
     for (int i = 0; i < own_n; i++) {
         listIter li;
         listNode *ln;
         listRewind(owners[i].parked, &li);
-        while ((ln = listNext(&li))) all[k++] = listNodeValue(ln);
+        while ((ln = listNext(&li))) {
+            ownerPark *p = listNodeValue(ln);
+            if (only_slot < 0 || p->slot == only_slot) all[k++] = p;
+        }
     }
     serverAssert(k == n);
     qsort(all, n, sizeof(*all), ownerParkSeqCmp);
@@ -5816,6 +5895,12 @@ void ownerParkedToMain(void) {
     zfree(mv);
     own_parked_moved += n;
 }
+
+/* RL-g4c-blocking-native entry: every parked client (all owners, all slots). */
+void ownerParkedToMain(void) { ownerParkedToMainFilter(-1); }
+/* RL-g5c-block-scope: only the clients parked on one slot (main is about to block a client there, or wrote a key
+ * there), so the parked clients on other slots keep running on their owners. */
+static void ownerParkedToMainSlot(int slot) { ownerParkedToMainFilter(slot); }
 
 long long ownerParkedCount(void) {
     long long n = 0;
@@ -7053,7 +7138,8 @@ void ownerInfo(sds *info) {
                          "owner_windows:%lld\r\nowner_resident_clients:%d\r\nowner_guest_clients:%lu\r\n"
                          "owner_world_stops:%lld\r\nowner_world_stop_wait_us:%lld\r\nowner_world_stop_wait_max_us:%lld\r\n",
                          own_n, server.owner_port,
-                         own_last_veto == OWN_VETO_ALL ? "all" : own_last_veto == OWN_VETO_WRITE ? "writes" : "none",
+                         own_last_veto & OWN_VETO_ALL ? "all" : own_last_veto & OWN_VETO_BLOCKED ? "scoped" :
+                             own_last_veto & OWN_VETO_WRITE ? "writes" : "none",
                          native, own_takes, own_returns, adopted, windows, resident,
                          own_guests ? listLength(own_guests) : 0UL, own_stops, own_stop_wait_us, own_stop_wait_max_us);
     *info = sdscatprintf(*info, "owner_pipeline_resume:%d\r\nowner_pipeline_resumes:%lld\r\nowner_pipeline_reruns:%lld\r\n",
@@ -7095,10 +7181,13 @@ void ownerInfo(sds *info) {
         wk += owners[i].park_wakes;
         tmo += owners[i].park_timeouts;
     }
+    long long bslots = 0;
+    for (int w = 0; w < OWN_BLOCKED_WORDS; w++) bslots += __builtin_popcountll(own_blocked_slots[w]);
     *info = sdscatprintf(*info,
                          "owner_block_commands:%lld\r\nowner_parked_clients:%lld\r\nowner_park_wakes:%lld\r\n"
-                         "owner_park_timeouts:%lld\r\nowner_parked_to_main:%lld\r\n",
-                         blk, prk, wk, tmo, own_parked_moved);
+                         "owner_park_timeouts:%lld\r\nowner_parked_to_main:%lld\r\n"
+                         "owner_block_scoped:%lld\r\nowner_blocked_slots:%lld\r\n",
+                         blk, prk, wk, tmo, own_parked_moved, own_block_scoped, bslots);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
     long long tls_hs = 0, tls_rd = 0, tls_la = 0, tls_ur = 0, tls_uw = 0;
     for (int i = 0; i < own_n; i++) {
