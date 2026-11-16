@@ -24,7 +24,8 @@
  * own registry of watched keys (multi.c), which only it, or main with the owners stopped, touches;
  * a watcher that comes to main has its keys moved to the dbs' registries (watchMoveToMain) and is a
  * stock watcher from then on. Everything else (a key another owner owns, keys in two slots, any
- * other command inside a transaction, scripts, blocking, pub/sub, admin) falls back to the main
+ * other command inside a transaction, scripts (except EVALSHA / EVAL on one owner's keys: ownerScriptRun),
+ * blocking, pub/sub, admin) falls back to the main
  * path: the owner hands the client (socket, parsed input, transaction so far, unsent replies) to
  * main, which runs it as a stock client and hands it back once it is idle again. A client is served
  * by one thread at a time and its replies are appended in command order, so per-connection reply
@@ -139,7 +140,9 @@
 #include "hdr_histogram.h"
 #include "intset.h"
 #include "listpack.h"
+#include "call_reply.h"
 
+#include <ctype.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -224,6 +227,14 @@ enum {
     OWN_ZSCORE,
     OWN_ZCARD,
     OWN_ZINCRBY,
+    /* RL-g1f-owner-evalsha: EVALSHA / EVAL on the owner of their keys (ownerScriptRun), and the commands
+     * only a script runs on an owner (OWN_K_INNER; a client's own INCRBY, DECR or DECRBY goes to main).
+     * EXPIRE, PEXPIRE, TTL, PTTL and EXISTS, which scripts run there too, are RL-g1c's kinds above. */
+    OWN_EVALSHA,
+    OWN_EVAL,
+    OWN_INCRBY,
+    OWN_DECR,
+    OWN_DECRBY,
     OWN_NCMDS
 };
 
@@ -231,12 +242,15 @@ enum {
 #define OWN_K_READ 1 /* only reads its keys: runs under a write veto (OWN_VETO_WRITE), as GET does */
 #define OWN_K_TXN 2  /* queued natively inside MULTI and run by ownerExec; inside MULTI any other kind
                       * goes to main with the transaction */
+#define OWN_K_SCRIPT 4 /* RL-g1f: a script on an owner may run it (ownerScriptCommand) */
+#define OWN_K_INNER 8  /* RL-g1f: only inside an owner's script; a client's own command goes to main */
 /* own_kinds[].keys: where the keys are (ownerKeySlot). */
 enum {
-    OWN_KEYS_NONE, /* no key (PING, MULTI, EXEC, ...): no slot */
-    OWN_KEYS_ONE,  /* argv[1] only (the rest are fields, values, options) */
-    OWN_KEYS_ALL,  /* argv[1..]: every one in the same slot */
-    OWN_KEYS_PAIRS /* argv[1], argv[3], ...: key value pairs, every key in the same slot */
+    OWN_KEYS_NONE,  /* no key (PING, MULTI, EXEC, ...): no slot */
+    OWN_KEYS_ONE,   /* argv[1] only (the rest are fields, values, options) */
+    OWN_KEYS_ALL,   /* argv[1..]: every one in the same slot */
+    OWN_KEYS_PAIRS, /* argv[1], argv[3], ...: key value pairs, every key in the same slot */
+    OWN_KEYS_SCRIPT /* EVALSHA / EVAL: numkeys at argv[2], the keys after it, all in one slot (at least one) */
 };
 /* own_kinds[].mm: what the command can add under maxmemory beyond its arguments and a reply block,
  * which ownerMmCmdFits counts for every command (ownerMmMore). */
@@ -254,7 +268,7 @@ enum {
                     * or a tree (ownerSetZsetBound) */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
-enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_NFAM };
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_FAM_SCRIPT, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -262,13 +276,13 @@ typedef struct ownKind {
 } ownKind;
 
 static const ownKind own_kinds[OWN_NCMDS] = {
-    [OWN_GET] = {"get", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_VALUES, OWN_FAM_STRING},
-    [OWN_SET] = {"set", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_VALUES, OWN_FAM_STRING},
-    [OWN_DEL] = {"del", OWN_K_TXN, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_INCR] = {"incr", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_GET] = {"get", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_VALUES, OWN_FAM_STRING},
+    [OWN_SET] = {"set", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_VALUES, OWN_FAM_STRING},
+    [OWN_DEL] = {"del", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_INCR] = {"incr", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
     [OWN_PING] = {"ping", OWN_K_TXN, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_MGET] = {"mget", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ALL, OWN_MM_VALUES, OWN_FAM_STRING},
-    [OWN_MSET] = {"mset", OWN_K_TXN, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_MGET] = {"mget", OWN_K_READ | OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_ALL, OWN_MM_VALUES, OWN_FAM_STRING},
+    [OWN_MSET] = {"mset", OWN_K_TXN | OWN_K_SCRIPT, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
     [OWN_MULTI] = {"multi", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
     [OWN_EXEC] = {"exec", 0, OWN_KEYS_NONE, OWN_MM_EXEC, OWN_FAM_TXN},
     [OWN_DISCARD] = {"discard", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
@@ -283,15 +297,16 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_LRANGE] = {"lrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
     [OWN_LINDEX] = {"lindex", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
     /* RL-g1c-native-keyspace: not queued natively (inside MULTI main queues them); TTL, PTTL, EXISTS
-     * and TYPE only read; EXISTS with several keys in one slot, as DEL. */
-    [OWN_EXPIRE] = {"expire", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PEXPIRE] = {"pexpire", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+     * and TYPE only read; EXISTS with several keys in one slot, as DEL. RL-g1f: scripts on an owner run
+     * EXPIRE, PEXPIRE, TTL, PTTL and EXISTS too (one entry each: shared stats). */
+    [OWN_EXPIRE] = {"expire", OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIRE] = {"pexpire", OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_EXPIREAT] = {"expireat", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_PEXPIREAT] = {"pexpireat", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_PERSIST] = {"persist", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_TTL] = {"ttl", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_PTTL] = {"pttl", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
-    [OWN_EXISTS] = {"exists", OWN_K_READ, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TTL] = {"ttl", OWN_K_READ | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PTTL] = {"pttl", OWN_K_READ | OWN_K_SCRIPT, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_EXISTS] = {"exists", OWN_K_READ | OWN_K_SCRIPT, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_TYPE] = {"type", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     /* RL-g1a-native-hash: not queued natively; HGET ... HGETALL only read. ownerNativeKind sends a
      * table's hash commands to main while any hash in it has fields with their own expiry. */
@@ -317,10 +332,18 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_ZSCORE] = {"zscore", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
     [OWN_ZCARD] = {"zcard", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
     [OWN_ZINCRBY] = {"zincrby", 0, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
+    /* RL-g1f-owner-evalsha: EVALSHA / EVAL write (any veto sends them to main: ownerNativeKind); INCRBY,
+     * DECR and DECRBY only inside an owner's script. */
+    [OWN_EVALSHA] = {"evalsha", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
+    [OWN_EVAL] = {"eval", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
+    [OWN_INCRBY] = {"incrby", OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_DECR] = {"decr", OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_DECRBY] = {"decrby", OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
-    [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash", [OWN_FAM_SETZSET] = "setzset"};
+    [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash", [OWN_FAM_SETZSET] = "setzset",
+    [OWN_FAM_SCRIPT] = "script"};
 
 /* Why an owner handed a client to main (client->owner_why). OWN_WHY_ACCEPTED: its TLS handshake ended
  * on the owner (done or failed); main runs the accept handler (RL-g1d). */
@@ -491,6 +514,21 @@ typedef struct owner {
     client **refc;
     int nrefc, refc_cap;
     long long ref_replies, ref_bytes, ref_writes, ref_copied, ref_copied_bytes;
+    /* RL-g1f-owner-evalsha (ownerScriptRun): this owner's Lua state and its copy of main's script cache
+     * (both owner only), the shas it asked main for (written by the owner in a window, taken by main
+     * under the stop) and main's answers (written by main under the stop for epoch sans_epoch, taken by
+     * the owner in a window), the client a script's commands run on, and INFO totals. */
+    void *lua;
+    dict *scripts;
+    unsigned long long script_epoch;
+    struct ownerScript *cur_script;
+    sds *swant;
+    int nswant, swant_cap;
+    struct ownerScriptAnswer *sans;
+    int nsans, sans_cap;
+    unsigned long long sans_epoch;
+    client *sc;
+    long long script_runs, script_aborts, script_misses;
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -525,6 +563,11 @@ static long long own_stops = 0, own_stop_wait_us = 0, own_stop_wait_max_us = 0;
 static long long own_takes = 0, own_returns = 0;
 static int own_last_veto = OWN_VETO_ALL;
 static int own_dormant = 0; /* io-threads > 1: owners sleep, main serves everything */
+
+/* RL-g1f-owner-evalsha: bumped by main (owners stopped) whenever a script owners may hold leaves main's
+ * cache (SCRIPT FLUSH, a delete); an owner drops its copies when its cache is for an older epoch. */
+static unsigned long long own_script_epoch = 1;
+static void ownerScriptAnswerAll(void);
 
 /* What the owners' next run must do, set by main when it resumes them (ownerResumeWorld). */
 static int own_aof = 0;                   /* appendonly: native ops are kept for the AOF */
@@ -803,6 +846,9 @@ void ownerThreadsInit(void) {
         for (int j = 0; j < server.dbnum; j++) o->watched[j] = dictCreate(&keylistDictType);
         o->aofbuf = sdsempty();
         o->replbuf = sdsempty();
+        o->sc = createClient(NULL); /* RL-g1f-owner-evalsha: a script's commands run on it */
+        o->sc->flag.script = 1;
+        o->sc->flag.argv_borrowed = 1; /* as VM_CallArgv's: the vector belongs to the script run */
         o->aof_first_db = -1;
         o->fdmap_cap = 1024;
         o->fdmap = zcalloc(sizeof(client *) * o->fdmap_cap);
@@ -1073,6 +1119,7 @@ static void ownerStopWorld(void) {
     /* The tables owners touched report their changes to their kvstores now. */
     dbLanePhaseEnd();
     ownerFoldProp();
+    ownerScriptAnswerAll();
 }
 
 /* maxmemory: the bytes all owners may add before main must look at memory again (0 when an eviction
@@ -2463,6 +2510,20 @@ static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int re
     case OWN_KEYS_ONE: step = 0; break;
     case OWN_KEYS_ALL: step = 1; break;
     case OWN_KEYS_PAIRS: step = 2; break;
+    case OWN_KEYS_SCRIPT: {
+        /* RL-g1f-owner-evalsha: a script's declared keys, all in one slot (at least one key). */
+        long long nk;
+        if (argc < 4 || !string2ll(objectGetVal(argv[2]), sdslen(objectGetVal(argv[2])), &nk) || nk < 1 ||
+            nk > argc - 3)
+            return -1;
+        sds key = objectGetVal(argv[3]);
+        int slot = ownerKeyHashSlot(key, sdslen(key));
+        for (int j = 4; j < 3 + nk; j++) {
+            key = objectGetVal(argv[j]);
+            if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
+        }
+        return slot;
+    }
     default: return -1;
     }
     sds key = objectGetVal(argv[1]);
@@ -2507,6 +2568,415 @@ static void ownerPrefetch(owner *o, client *c) {
     getKeysFreeResult(&result);
     prefetchBatchRun();
     prefetchBatchReset();
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * RL-g1f-owner-evalsha: EVAL / EVALSHA on the owner of their keys
+ *
+ * An owner runs EVALSHA (and EVAL) itself when every declared key is in one slot it owns, the script
+ * was loaded with SCRIPT LOAD and has no shebang (the stock compatibility mode), the caller speaks
+ * RESP2 and is outside MULTI, and nothing vetoes writes (ownerNativeKind). It runs the script in its
+ * own Lua state (engine_lua.c luaOwnerStateCreate: the eval state's API, libraries and locked
+ * globals) inside its window. No other thread touches this owner's keys meanwhile, so the run is
+ * atomic with respect to every other command on those keys, as a script on main is.
+ *
+ * Script cache. Main's cache stays the only authority (SCRIPT LOAD / FLUSH / KILL / EXISTS, FUNCTION
+ * and FCALL stay on main). An owner that lacks a sha asks main for it (o->swant) and hands that call to
+ * main; main answers at its next stop (ownerScriptAnswerAll: the body, or none for a script owners do
+ * not run) and the owner compiles the body into its state once. SCRIPT FLUSH and the delete of a loaded
+ * script bump own_script_epoch (eval.c, main, owners stopped): an owner whose copy is for an older
+ * epoch drops it, Lua state included, before its next script, and ignores answers for an older epoch.
+ *
+ * Inside a script, server.call / pcall run on the owner (ownerScriptCommand) only GET, SET, DEL, INCR,
+ * INCRBY, DECR, DECRBY, EXPIRE, PEXPIRE, TTL, PTTL, EXISTS, MGET and MSET, with every key in a slot of
+ * this owner (any of its slots: a script may touch keys it did not declare, as in standalone mode), on
+ * the owner's script client, as call() runs a script's command: commandstats, dirty, lazy-expire DELs
+ * and effects propagation (each write's argv as the command rewrote it, into this execution unit, so
+ * a script's writes reach the AOF and the replication stream as one MULTI/EXEC block, in this owner's
+ * order with its other writes, as propagatePendingCommands sends them).
+ *
+ * Abort. Before a write touches a key the owner keeps the key as it was (a copy; strings only: a write
+ * to a key of another type aborts first). Anything else (another command, another owner's key, an
+ * error reply, a Lua error, server.log / setresp / set_repl / acl_check_cmd / math.random, a reply
+ * value that is not RESP2's plain types, OWN_SCRIPT_BUDGET_US of run time) aborts the run: the owner
+ * puts every kept key back (value, encoding, expire), drops the run's write ops, stats and error
+ * counts, keeps only the DELs of keys its lookups found expired (they are gone either way) and hands
+ * the client to main with the command unrun, which runs it exactly as the stock server does. The
+ * reply is built only once the run completed, so nothing of an aborted run is visible. A script that
+ * aborted OWN_SCRIPT_ABORTS times goes to main from then on (until the next epoch).
+ *
+ * Time and SCRIPT KILL. An owner script never runs longer than OWN_SCRIPT_BUDGET_US (a count hook
+ * checks): it aborts and main runs it, where the busy-script replies, script timeouts and SCRIPT KILL
+ * work as stock. So SCRIPT KILL never needs to reach an owner, and a script never holds an owner's
+ * window (which main waits for to stop the world) longer than the budget.
+ *
+ * shortcut: off under maxmemory (no bound on a script's growth), RESP2 callers only, EVAL only for
+ * loaded scripts (an EVAL-cached script's LRU position moves with every run, on main), no commandlog
+ * entries for a script's inner commands. Upgrade: a lease bound per script, RESP3 conversions.
+ * ---------------------------------------------------------------------------------------------- */
+#define OWN_SCRIPT_BUDGET_US 2000
+#define OWN_SCRIPT_ABORTS 16
+#define OWN_SCRIPT_UNDO_MAX 64  /* keys one run may write */
+#define OWN_SCRIPT_OPS_MAX 256  /* write ops one run may propagate */
+enum { OWN_SCR_PENDING = 1, OWN_SCR_READY, OWN_SCR_MAIN };
+
+typedef struct ownerScript {
+    int state;
+    int ref; /* the compiled function in the owner's Lua state (OWN_SCR_READY) */
+    int aborts;
+} ownerScript;
+
+typedef struct ownerScriptAnswer {
+    sds sha;
+    sds body; /* NULL: owners do not run it (or main has no such script) */
+} ownerScriptAnswer;
+
+typedef struct ownerUndo {
+    robj *key;
+    robj *val; /* a copy of the value before the run's first write of the key; NULL: no key */
+    long long expire;
+} ownerUndo;
+
+typedef struct ownerScriptRunState {
+    owner *o;
+    serverDb *db;
+    monotime start;
+    int abort;
+    int nundo, nops;
+    ownerUndo undo[OWN_SCRIPT_UNDO_MAX];
+    int ops[OWN_SCRIPT_OPS_MAX]; /* indices in ectx->also_propagate of the run's write ops */
+    long long calls[OWN_NCMDS], usec[OWN_NCMDS];
+} ownerScriptRunState;
+
+sds evalScriptBodyForOwner(const char *sha);
+void dictEntryDestructorSdsKeyHeapValue(void *entry);
+void *luaOwnerStateCreate(void);
+int luaOwnerCompile(void *state, const char *code, size_t code_len);
+void luaOwnerStateFree(void *state);
+int luaOwnerCallFunction(void *lua, int function_ref, robj **keys, size_t nkeys, robj **args, size_t nargs, void *run,
+                         char **out, size_t *out_len);
+
+static dictType ownerScriptDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictCStrCaseHash, /* as main's cache: looked up by a plain C string */
+    .keyCompare = dictSdsKeyCaseCompare,
+    .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
+};
+
+void ownerScriptsChanged(void) {
+    own_script_epoch++;
+}
+
+static void ownerScriptAnswersFree(owner *o) {
+    for (int j = 0; j < o->nsans; j++) {
+        sdsfree(o->sans[j].sha);
+        sdsfree(o->sans[j].body);
+    }
+    o->nsans = 0;
+}
+
+/* Main, owners stopped (ownerStopWorld): answer what each owner asked for since the last stop. */
+static void ownerScriptAnswerAll(void) {
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        if (!o->nswant) continue;
+        if (o->sans_epoch != own_script_epoch) ownerScriptAnswersFree(o); /* not taken, and stale */
+        o->sans_epoch = own_script_epoch;
+        for (int j = 0; j < o->nswant; j++) {
+            if (o->nsans == o->sans_cap) {
+                o->sans_cap = o->sans_cap ? o->sans_cap * 2 : 8;
+                o->sans = zrealloc(o->sans, sizeof(ownerScriptAnswer) * o->sans_cap);
+            }
+            o->sans[o->nsans++] = (ownerScriptAnswer){.sha = o->swant[j], .body = evalScriptBodyForOwner(o->swant[j])};
+        }
+        o->nswant = 0;
+    }
+}
+
+/* Owner: bring its copy of the cache up to date (epoch, main's answers). */
+static void ownerScriptSync(owner *o) {
+    if (o->script_epoch != own_script_epoch) {
+        if (o->scripts) dictEmpty(o->scripts, NULL);
+        if (o->lua) luaOwnerStateFree(o->lua);
+        o->lua = NULL;
+        o->script_epoch = own_script_epoch;
+    }
+    if (!o->nsans) return;
+    for (int j = 0; j < o->nsans && o->sans_epoch == own_script_epoch; j++) {
+        ownerScriptAnswer *a = o->sans + j;
+        dictEntry *de = o->scripts ? dictFind(o->scripts, a->sha) : NULL;
+        ownerScript *s = de ? dictGetVal(de) : NULL;
+        if (!s || s->state != OWN_SCR_PENDING) continue;
+        s->state = OWN_SCR_MAIN;
+        if (!a->body) continue;
+        if (!o->lua) o->lua = luaOwnerStateCreate();
+        if (o->lua && (s->ref = luaOwnerCompile(o->lua, a->body, sdslen(a->body))) >= 0) s->state = OWN_SCR_READY;
+    }
+    ownerScriptAnswersFree(o);
+}
+
+/* ownerNativeKind: the script of this EVALSHA / EVAL is ready on this owner (o->cur_script). If the
+ * owner has never seen the sha it asks main for it; this call goes to main either way. */
+static int ownerScriptReady(owner *o, client *c) {
+    char sha[41];
+    sds a = objectGetVal(c->argv[1]);
+    if (c->parsed_cmd->proc == evalShaCommand) {
+        if (sdslen(a) != 40) return 0;
+        for (int j = 0; j < 40; j++) sha[j] = tolower((unsigned char)a[j]);
+        sha[40] = '\0';
+    } else {
+        sha1hex(sha, a, sdslen(a));
+    }
+    ownerScriptSync(o);
+    if (!o->scripts) o->scripts = dictCreate(&ownerScriptDictType);
+    dictEntry *de = dictFind(o->scripts, sha);
+    if (de) {
+        ownerScript *s = dictGetVal(de);
+        if (s->state == OWN_SCR_READY) {
+            o->cur_script = s;
+            return 1;
+        }
+        o->script_misses++;
+        return 0;
+    }
+    ownerScript *s = zcalloc(sizeof(*s));
+    s->state = OWN_SCR_PENDING;
+    dictAdd(o->scripts, sdsnew(sha), s);
+    if (o->nswant == o->swant_cap) {
+        o->swant_cap = o->swant_cap ? o->swant_cap * 2 : 8;
+        o->swant = zrealloc(o->swant, sizeof(sds) * o->swant_cap);
+    }
+    o->swant[o->nswant++] = sdsnew(sha);
+    o->script_misses++;
+    o->wake_main = 1;
+    return 0;
+}
+
+/* Keep key as it is before the run's first write of it (after its lazy expiry, as the write's own
+ * lookup would see it). 0: the run cannot keep it (not a string, too many keys): abort. */
+static int ownerUndoKeep(ownerScriptRunState *st, robj *key) {
+    sds k = objectGetVal(key);
+    for (int i = 0; i < st->nundo; i++)
+        if (!sdscmp(objectGetVal(st->undo[i].key), k)) return 1;
+    if (st->nundo == OWN_SCRIPT_UNDO_MAX) return 0;
+    robj *val = lookupKeyWrite(st->db, key);
+    if (val && objectGetType(val) != OBJ_STRING) return 0;
+    ownerUndo *u = &st->undo[st->nundo++];
+    u->key = createStringObject(k, sdslen(k));
+    u->val = val ? dupStringObject(val) : NULL;
+    u->expire = val ? getExpire(st->db, key) : -1;
+    return 1;
+}
+
+/* Put every kept key back (restore) or just drop the copies. */
+static void ownerUndoEnd(ownerScriptRunState *st, int restore) {
+    for (int i = st->nundo - 1; i >= 0; i--) {
+        ownerUndo *u = &st->undo[i];
+        if (restore) {
+            dbSyncDelete(st->db, u->key);
+            if (u->val) {
+                robj *v = u->val;
+                dbAdd(st->db, u->key, &v);
+                if (u->expire != -1) setExpire(NULL, st->db, u->key, u->expire);
+                u->val = NULL;
+            }
+        }
+        if (u->val) decrRefCount(u->val);
+        decrRefCount(u->key);
+    }
+    st->nundo = 0;
+}
+
+static void ownerScriptFreeArgv(client *sc, robj **argv, int argc) {
+    /* As a module's borrowed vector (VM_CallArgv): a command that rewrote it made sc->argv its own copy
+     * and kept ours as original_argv; ours is freed here. */
+    if (sc->original_argv) {
+        for (int j = 0; j < sc->argc; j++)
+            if (sc->argv[j]) decrRefCount(sc->argv[j]);
+        zfree(sc->argv);
+    }
+    for (int j = 0; j < argc; j++) decrRefCount(argv[j]);
+    zfree(argv);
+    sc->original_argv = NULL;
+    sc->original_argc = 0;
+    sc->argv = NULL;
+    sc->argc = sc->argv_len = 0;
+    sc->argv_len_sum = 0;
+    sc->cmd = NULL;
+}
+
+static int ownerReplyIsError(client *sc) {
+    if (sc->bufpos) return sc->buf[0] == '-';
+    if (listLength(sc->reply)) {
+        clientReplyBlock *b = listNodeValue(listFirst(sc->reply));
+        return b->used && b->buf[0] == '-';
+    }
+    return 0;
+}
+
+static void ownerScriptDropReply(client *sc) {
+    sc->bufpos = 0;
+    while (listLength(sc->reply)) listDelNode(sc->reply, listFirst(sc->reply));
+    sc->reply_bytes = 0;
+}
+
+void ownerScriptAbort(void *run) {
+    ((ownerScriptRunState *)run)->abort = 1;
+}
+
+int ownerScriptAborted(void *run) {
+    return ((ownerScriptRunState *)run)->abort;
+}
+
+int ownerScriptOverBudget(void *run) {
+    ownerScriptRunState *st = run;
+    return (long long)(getMonotonicUs() - st->start) > OWN_SCRIPT_BUDGET_US;
+}
+
+/* server.call / pcall of a script on an owner (script_lua.c): run argv (owned from here on) as call()
+ * runs a script's command and give its reply to the Lua handlers. -1: abort the run. */
+int ownerScriptCommand(void *run, robj **argv, int argc, const ValkeyModuleReplyHandlers *h, void *hctx) {
+    ownerScriptRunState *st = run;
+    owner *o = st->o;
+    client *sc = o->sc;
+    struct serverCommand *cmd = st->abort ? NULL : lookupCommand(argv, argc);
+    /* The kinds a script may run on an owner (OWN_K_SCRIPT), their keys by the kind's key layout. */
+    int kind = cmd ? ownerKindOf(cmd) : -1;
+    if (kind < 0 || !(own_kinds[kind].flags & OWN_K_SCRIPT) || !commandCheckArity(cmd, argc, NULL) ||
+        (kind == OWN_MSET && argc % 2 == 0))
+        goto abort;
+    int last = own_kinds[kind].keys == OWN_KEYS_ONE ? 1 : argc - 1;
+    int step = own_kinds[kind].keys == OWN_KEYS_PAIRS ? 2 : 1;
+    for (int j = 1; j <= last; j += step) {
+        sds key = objectGetVal(argv[j]);
+        int slot = ownerKeyHashSlot(key, sdslen(key));
+        if (slot < o->slot_lo || slot > o->slot_hi) goto abort; /* another owner's key: main */
+    }
+    if (cmd->flags & CMD_WRITE) {
+        if (st->nops == OWN_SCRIPT_OPS_MAX) goto abort;
+        for (int j = 1; j <= last; j += step)
+            if (!ownerUndoKeep(st, argv[j])) goto abort;
+    }
+    sc->argv = argv;
+    sc->argc = sc->argv_len = argc;
+    sc->cmd = sc->lastcmd = sc->realcmd = cmd;
+    sc->db = st->db;
+    client *prev = ectx->executing_client;
+    ectx->executing_client = sc;
+    ectx->in_call++;
+    long long dirty = ectx->dirty, errors = ectx->stat_total_error_replies;
+    sc->flag.force_aof = sc->flag.force_repl = sc->flag.prevent_prop = 0;
+    sc->flag.buffered_reply = 0;
+    monotime t0 = getMonotonicUs();
+    sc->flag.executing_command = 1;
+    cmd->proc(sc);
+    sc->flag.executing_command = 0;
+    ustime_t duration = (ustime_t)(getMonotonicUs() - t0);
+    ectx->in_call--;
+    ectx->executing_client = prev;
+    dirty = ectx->dirty - dirty;
+    if (ectx->stat_total_error_replies != errors || ownerReplyIsError(sc)) {
+        ownerScriptFreeArgv(sc, argv, argc);
+        ownerScriptDropReply(sc);
+        st->abort = 1;
+        return -1;
+    }
+    /* call()'s propagation of a script's command (the script's run propagates PROPAGATE_AOF |
+     * PROPAGATE_REPL): into this execution unit, after any lazy-expire DEL of its lookups. */
+    int flags = dirty > 0 ? (PROPAGATE_AOF | PROPAGATE_REPL) : PROPAGATE_NONE;
+    if (sc->flag.force_repl) flags |= PROPAGATE_REPL;
+    if (sc->flag.force_aof) flags |= PROPAGATE_AOF;
+    if (sc->flag.prevent_repl_prop || sc->flag.module_prevent_repl_prop) flags &= ~PROPAGATE_REPL;
+    if (sc->flag.prevent_aof_prop || sc->flag.module_prevent_aof_prop) flags &= ~PROPAGATE_AOF;
+    if (!sc->flag.prevent_prop && flags != PROPAGATE_NONE) {
+        st->ops[st->nops++] = ectx->also_propagate.numops;
+        alsoPropagate(sc->db->id, sc->argv, sc->argc, flags, -1);
+    }
+    sc->flag.force_aof = sc->flag.force_repl = sc->flag.prevent_prop = 0;
+    st->calls[kind]++;
+    st->usec[kind] += duration;
+    if (server.latency_tracking_enabled) updateCommandLatencyHistogram(&o->cs[kind].hist, duration * 1000);
+    if (ectx->current_client) ectx->current_client->commands_processed++;
+    ectx->stat_numcommands++;
+    invokeReplyHandlers(NULL, sc, h, hctx);
+    sc->reply_bytes = 0;
+    ownerScriptFreeArgv(sc, argv, argc);
+    return 0;
+abort:
+    for (int j = 0; j < argc; j++) decrRefCount(argv[j]);
+    zfree(argv);
+    st->abort = 1;
+    return -1;
+}
+
+/* EVALSHA / EVAL on this owner (ownerCall). 1: ran, the reply is on c. 0: aborted, nothing of the run
+ * is left but its lazy-expire DELs; main runs the command. */
+static int ownerScriptRun(owner *o, client *c) {
+    ownerScript *s = o->cur_script;
+    o->cur_script = NULL;
+    long long nk = 0;
+    string2ll(objectGetVal(c->argv[2]), sdslen(objectGetVal(c->argv[2])), &nk);
+    ownerScriptRunState *st = zmalloc(sizeof(*st));
+    st->o = o;
+    st->db = c->db;
+    st->start = getMonotonicUs();
+    st->abort = st->nundo = st->nops = 0;
+    memset(st->calls, 0, sizeof(st->calls));
+    memset(st->usec, 0, sizeof(st->usec));
+    long long dirty = ectx->dirty, hits = ectx->stat_keyspace_hits, misses = ectx->stat_keyspace_misses;
+    long long errors = ectx->stat_total_error_replies, ncmds = ectx->stat_numcommands;
+    long long processed = c->commands_processed;
+    int nerrors = o->nerrors;
+    client *sc = o->sc;
+    sc->db = c->db;
+    sc->user = c->user;
+    sc->resp = 2;
+    /* The keyspace lookups hash each key: a script's keys may be in several of this owner's slots. */
+    int slot = c->slot;
+    c->slot = -1;
+    char *out = NULL;
+    size_t out_len = 0;
+    int r = luaOwnerCallFunction(o->lua, s->ref, c->argv + 3, (size_t)nk, c->argv + 3 + nk, (size_t)(c->argc - 3 - nk),
+                                 st, &out, &out_len);
+    c->slot = slot;
+    if (r == 0 && !st->abort) {
+        addReplyProto(c, out, out_len);
+        zfree(out);
+        for (int k = 0; k < OWN_NCMDS; k++) {
+            o->cs[k].calls += st->calls[k];
+            o->cs[k].usec += st->usec[k];
+        }
+        ownerUndoEnd(st, 0);
+        zfree(st);
+        c->flag.prevent_prop = 1; /* as scriptPrepareForRun: the script's writes propagate, not the EVALSHA */
+        o->script_runs++;
+        return 1;
+    }
+    ownerUndoEnd(st, 1);
+    serverOpArray *oa = &ectx->also_propagate;
+    int w = 0, k = 0;
+    for (int j = 0; j < oa->numops; j++) {
+        serverOp *op = oa->ops + j;
+        if (k < st->nops && st->ops[k] == j) {
+            for (int a = 0; a < op->argc; a++) decrRefCount(op->argv[a]);
+            zfree(op->argv);
+            k++;
+            continue;
+        }
+        oa->ops[w++] = *op;
+    }
+    oa->numops = w;
+    ectx->dirty = dirty;
+    ectx->stat_keyspace_hits = hits;
+    ectx->stat_keyspace_misses = misses;
+    ectx->stat_total_error_replies = errors;
+    ectx->stat_numcommands = ncmds;
+    c->commands_processed = processed;
+    while (o->nerrors > nerrors) sdsfree(o->errors[--o->nerrors].msg);
+    zfree(st);
+    if (++s->aborts >= OWN_SCRIPT_ABORTS) s->state = OWN_SCR_MAIN;
+    o->script_aborts++;
+    return 0;
 }
 
 /* EXEC can run here: every queued command is a native data command on this owner's keys. That is
@@ -2563,7 +3033,19 @@ static int ownerNativeKind(owner *o, client *c) {
         if (c->flag.multi || !mine) return -1; /* WATCH inside MULTI: main replies the error */
         keyed = 1;
         break;
+    case OWN_EVALSHA:
+    case OWN_EVAL:
+        /* RL-g1f-owner-evalsha: RESP2 callers outside MULTI, no maxmemory (no bound on a script's
+         * growth), no WATCHed keys on this owner (an aborted run's writes would have touched them), and
+         * a script this owner has from main's cache (ownerScriptReady). */
+        if (c->flag.multi || own_mm || c->resp != 2 || c->flag.lua_debug || veto || c->slot < o->slot_lo ||
+            c->slot > o->slot_hi || o->watchers || !ownerScriptReady(o, c))
+            return -1;
+        keyed = 1;
+        break;
     default:
+        /* RL-g1f: INCRBY, DECR and DECRBY only inside an owner's script. */
+        if (own_kinds[kind].flags & OWN_K_INNER) return -1;
         /* Inside MULTI an owner queues only what ownerExec runs (OWN_K_TXN); main queues the rest. */
         if (c->flag.multi && !(own_kinds[kind].flags & OWN_K_TXN)) return -1;
         keyed = 1;
@@ -2604,7 +3086,8 @@ static long long ownerExec(owner *o, client *c);
 /* The part of processCommand() and call() that applies to a native command. top: the client's own
  * command; else a queued command run by ownerExec (call() from execCommand), which leaves lastcmd at
  * EXEC and the current client as it is. */
-static void ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, int top) {
+static int ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, int top) {
+    struct serverCommand *old_cmd = c->cmd, *old_lastcmd = c->lastcmd, *old_realcmd = c->realcmd;
     if (top) {
         c->cmd = c->lastcmd = c->realcmd = cmd;
         ectx->current_client = c;
@@ -2626,7 +3109,21 @@ static void ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, 
 
     if (kind == OWN_EXEC)
         inner_errors = ownerExec(o, c);
-    else
+    else if (kind == OWN_EVALSHA || kind == OWN_EVAL) {
+        if (!ownerScriptRun(o, c)) {
+            /* Aborted: main runs the command. Only its lookups' lazy-expire DELs are left to keep. */
+            exitExecutionUnit();
+            c->flag.executing_command = 0;
+            c->flag.force_aof = c->flag.force_repl = c->flag.prevent_prop = 0;
+            if (top && ectx->also_propagate.numops) ownerTakeProp(o, c);
+            c->cmd = old_cmd;
+            c->lastcmd = old_lastcmd;
+            c->realcmd = old_realcmd;
+            ectx->in_call--;
+            ectx->executing_client = prev_client;
+            return 0;
+        }
+    } else
         cmd->proc(c);
 
     exitExecutionUnit();
@@ -2667,6 +3164,7 @@ static void ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, 
     o->fam_total[own_kinds[kind].family]++;
     ectx->in_call--;
     ectx->executing_client = prev_client;
+    return 1;
 }
 
 /* execCommand() on the owner (ownerNativeKind: no EXEC conditions, no watched keys, no veto, every
@@ -3740,7 +4238,10 @@ static int ownerTryNative(client *c) {
         if (kind == OWN_GET && !own_mm && ownerGetRun(o, c)) return 1;
         if (kind == OWN_MGET && !own_mm && ownerMgetRun(o, c)) return 1;
         ownerPrefetch(o, c);
-        ownerCall(o, c, c->parsed_cmd, kind, 1);
+        if (!ownerCall(o, c, c->parsed_cmd, kind, 1)) {
+            ectx->current_client = NULL; /* an aborted script (ownerScriptRun): main runs it */
+            return 0;
+        }
         /* EXEC's bound is a sum over its queued commands: should it still have gone over, every
          * owner sends its work to main until main has looked, as after an oversized read. */
         if (own_mm && kind == OWN_EXEC) ownerMmAfterRead(o);
@@ -4323,6 +4824,16 @@ void ownerInfo(sds *info) {
     }
     *info = sdscatprintf(*info, "owner_tls_port:%d\r\nowner_tls_handshakes:%lld\r\nowner_tls_reads:%lld\r\n",
                          server.owner_tls_port, tls_hs, tls_rd);
+    /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
+     * have the script for (or had it marked for main). */
+    long long s_runs = 0, s_aborts = 0, s_misses = 0;
+    for (int i = 0; i < own_n; i++) {
+        s_runs += owners[i].script_runs;
+        s_aborts += owners[i].script_aborts;
+        s_misses += owners[i].script_misses;
+    }
+    *info = sdscatprintf(*info, "owner_script_runs:%lld\r\nowner_script_aborts:%lld\r\nowner_script_misses:%lld\r\n",
+                         s_runs, s_aborts, s_misses);
     *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
                          server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
     /* D3-all-g14-fold: owner_repl_split: the owners encode each record twice (compact AOF, RESP stream). */

@@ -51,6 +51,7 @@
 #include "script.h"
 #include "scripting_engine.h"
 #include "sds.h"
+#include "owner.h"
 
 
 void evalGenericCommandWithDebugging(client *c, int evalsha);
@@ -218,6 +219,7 @@ void evalRemoveScriptsFromEngine(scriptingEngine *engine) {
 void evalReset(int async) {
     evalRelease(async);
     evalInit();
+    ownerScriptsChanged(); /* RL-g1f-owner-evalsha: SCRIPT FLUSH drops the owners' copies too */
 }
 
 /* ---------------------------------------------------------------------------
@@ -352,8 +354,22 @@ static void evalCtxDeleteScript(sds sha) {
     if (es->node) {
         scriptsLRUDeleteNode(es->node);
         es->node = NULL;
+    } else {
+        ownerScriptsChanged(); /* RL-g1f-owner-evalsha: owners may run SCRIPT LOADed scripts */
     }
     dictFreeUnlinkedEntry(evalCtx.scripts, de);
+}
+
+/* RL-g1f-owner-evalsha (owner.c, main with the owners stopped): the body of a cached script an owner may
+ * run itself, or NULL. Only scripts loaded with SCRIPT LOAD (EVAL's cache keeps an LRU order that every
+ * run updates, and evicts) and with no shebang (the stock EVAL compatibility mode). */
+sds evalScriptBodyForOwner(const char *sha) {
+    dictEntry *de = dictFind(evalCtx.scripts, sha);
+    if (!de) return NULL;
+    evalScript *es = dictGetVal(de);
+    if (es->node || es->flags != SCRIPT_FLAG_EVAL_COMPAT_MODE || !sdsEncodedObject(es->body)) return NULL;
+    if (strcasecmp(scriptingEngineGetName(es->engine), "lua")) return NULL;
+    return sdsdup(objectGetVal(es->body));
 }
 
 /* Add a script to the LRU eviction list, evicting oldest scripts if necessary.

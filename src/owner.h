@@ -52,4 +52,7 @@ void ownerWatchersAdd(int owner, int delta); /* clients with keys in an owner's 
 long long ownerWatchersTotal(void);          /* main: all owners' */
 int ownerOfKey(struct serverObject *key);
 
+/* RL-g1f-owner-evalsha: EVAL / EVALSHA on the owner of their keys (owner.c). */
+void ownerScriptsChanged(void); /* eval.c, main: a cached script an owner may hold is gone (SCRIPT FLUSH, delete) */
+
 #endif

@@ -23,6 +23,8 @@
 #define REGISTRY_ERROR_HANDLER_NAME "__ERROR_HANDLER__"
 
 static int isLuaInsecureAPIEnabled(ValkeyModuleCtx *module_ctx);
+void luaOwnerInstallAPI(lua_State *lua); /* script_lua.c, RL-g1f-owner-evalsha */
+static struct luaEngineCtx *lua_owner_engine_ctx = NULL;
 
 /* Adds server.debug() function used by lua debugger
  *
@@ -208,7 +210,36 @@ static struct luaEngineCtx *createEngineContext(ValkeyModuleCtx *ctx) {
     initializeLuaState(lua_engine_ctx, VMSE_EVAL);
     initializeLuaState(lua_engine_ctx, VMSE_FUNCTION);
 
+    lua_owner_engine_ctx = lua_engine_ctx;
     return lua_engine_ctx;
+}
+
+/* vkevo RL-g1f-owner-evalsha: an owner thread's own Lua state, set up as the eval state (same API,
+ * libraries and locked globals) with the owner's server.call / pcall (script_lua.c luaOwnerInstallAPI).
+ * Called on the owner thread; reads only the engine context's fixed fields (versions, insecure API). */
+void *luaOwnerStateCreate(void) {
+    if (!lua_owner_engine_ctx) return NULL;
+    lua_State *lua = lua_open();
+    luaRegisterServerAPI(lua_owner_engine_ctx, lua);
+    luaStateInstallErrorHandler(lua);
+    initializeEvalLuaState(lua);
+    luaOwnerInstallAPI(lua);
+    luaStateLockGlobalTable(lua);
+    return lua;
+}
+
+/* Compile an EVAL body as luaEngineCompileCode does: the function's registry ref, or -1. */
+int luaOwnerCompile(void *state, const char *code, size_t code_len) {
+    lua_State *lua = state;
+    if (luaL_loadbuffer(lua, code, code_len, "@user_script")) {
+        lua_pop(lua, 1);
+        return -1;
+    }
+    return luaL_ref(lua, LUA_REGISTRYINDEX);
+}
+
+void luaOwnerStateFree(void *state) {
+    lua_close((lua_State *)state);
 }
 
 static void destroyEngineContext(luaEngineCtx *lua_engine_ctx) {

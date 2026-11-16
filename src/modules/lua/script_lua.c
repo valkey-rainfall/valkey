@@ -2172,3 +2172,248 @@ void luaCallFunction(ValkeyModuleCtx *ctx,
 unsigned long luaMemory(lua_State *lua) {
     return lua_gc(lua, LUA_GCCOUNT, 0) * 1024LL;
 }
+
+/* ---------------------------------------------------------------------------
+ * vkevo RL-g1f-owner-evalsha: EVAL / EVALSHA on an owner thread (src/owner.c).
+ *
+ * Each owner has its own Lua state (engine_lua.c luaOwnerStateCreate), set up as the eval state,
+ * whose server.call / server.pcall run the command on the owner (ownerScriptCommand). Whatever the
+ * owner does not run itself (a command outside its list, another owner's key, an error reply, a Lua
+ * error, an API with global state such as math.random or server.log, a reply type other than RESP2's,
+ * the owner's time budget) aborts the run: the owner undoes the run's writes and hands the client to
+ * main, which runs the script as the stock server does. So an owner only completes runs whose every
+ * step it ran itself, and their replies are the stock path's (same conversions as below).
+ * ------------------------------------------------------------------------- */
+int ownerScriptCommand(void *run, ValkeyModuleString **argv, int argc, const ValkeyModuleReplyHandlers *h, void *hctx);
+void ownerScriptAbort(void *run);
+int ownerScriptAborted(void *run);
+int ownerScriptOverBudget(void *run);
+
+#define LUA_OWNER_HOOK_COUNT 1000 /* instructions between two budget checks */
+
+static _Thread_local void *lua_owner_run = NULL; /* the run in progress on this owner thread */
+
+static void luaOwnerAbortHook(lua_State *lua, lua_Debug *ar) {
+    VALKEYMODULE_NOT_USED(ar);
+    lua_pushstring(lua, "owner abort");
+    lua_error(lua);
+}
+
+/* Abort the run: every later instruction raises too (as SCRIPT KILL does), so a pcall in the script
+ * cannot carry on; the owner discards whatever the script does after this anyway. */
+static int luaOwnerAbort(lua_State *lua) {
+    if (lua_owner_run) ownerScriptAbort(lua_owner_run);
+    lua_sethook(lua, luaOwnerAbortHook, LUA_MASKLINE | LUA_MASKCOUNT, 1);
+    lua_pushstring(lua, "owner abort");
+    return lua_error(lua);
+}
+
+static void luaOwnerCountHook(lua_State *lua, lua_Debug *ar) {
+    VALKEYMODULE_NOT_USED(ar);
+    if (lua_owner_run && ownerScriptOverBudget(lua_owner_run)) luaOwnerAbort(lua);
+}
+
+static void luaOwnerErrorCallback(void *ctx, const char *msg, size_t len) {
+    VALKEYMODULE_NOT_USED(msg);
+    VALKEYMODULE_NOT_USED(len);
+    callCtx *call_ctx = ctx;
+    lua_pushnil(call_ctx->lua);
+    call_ctx->error = 1;
+}
+
+/* The stock handlers minus the debugger hook; an error reply aborts (ownerScriptCommand never
+ * delivers one, this only guards it). */
+static const ValkeyModuleReplyHandlers owner_handlers = {
+    .version = VALKEYMODULE_REPLY_HANDLERS_VERSION,
+    .null = nullCallback,
+    .nullArray = nullArrayCallback,
+    .nullBulkString = nullBulkString,
+    .bulkString = bulkStringCallback,
+    .simpleString = simpleStringCallback,
+    .integer = integerCallback,
+    .mapStart = mapStartCallback,
+    .mapEnd = mapEndCallback,
+    .setStart = setStartCallback,
+    .setEnd = setEndCallback,
+    .arrayStart = arrayStartCallback,
+    .arrayEnd = arrayEndCallback,
+    .verbatimString = verbatimStringCallback,
+    .bigNumber = bigNumberCallback,
+    .boolVal = boolCallback,
+    .doubleVal = doubleCallback,
+    .error = luaOwnerErrorCallback,
+};
+
+/* server.call / server.pcall on an owner: the stock argument conversion, then the owner runs it. */
+static int luaOwnerCallCommand(lua_State *lua) {
+    if (!lua_owner_run || ownerScriptAborted(lua_owner_run)) return luaOwnerAbort(lua);
+    int argc = 0;
+    ValkeyModuleString **argv = luaArgsToServerArgv(NULL, lua, &argc);
+    if (argv == NULL) return luaOwnerAbort(lua);
+    callCtx call_ctx = {
+        .lua = lua,
+        .module_ctx = NULL,
+        .error = 0,
+        .in_collection = -1,
+        .collection_item_count = {0},
+        .collection_type = {0},
+    };
+    /* The owner takes the argument objects and the array. */
+    if (ownerScriptCommand(lua_owner_run, argv, argc, &owner_handlers, &call_ctx) != 0 || call_ctx.error)
+        return luaOwnerAbort(lua);
+    return 1;
+}
+
+/* Install the owner versions in a state set up as the eval state, before its tables are locked. */
+void luaOwnerInstallAPI(lua_State *lua) {
+    static const char *aborting[] = {"log", "setresp", "set_repl", "acl_check_cmd", "breakpoint", "debug", NULL};
+    lua_getglobal(lua, SERVER_API_NAME);
+    lua_pushstring(lua, "call");
+    lua_pushcfunction(lua, luaOwnerCallCommand);
+    lua_settable(lua, -3);
+    lua_pushstring(lua, "pcall");
+    lua_pushcfunction(lua, luaOwnerCallCommand);
+    lua_settable(lua, -3);
+    for (int j = 0; aborting[j]; j++) {
+        lua_pushstring(lua, aborting[j]);
+        lua_pushcfunction(lua, luaOwnerAbort);
+        lua_settable(lua, -3);
+    }
+    lua_pop(lua, 1);
+    /* math.random and math.randomseed share one generator with main's state. */
+    lua_getglobal(lua, "math");
+    lua_pushstring(lua, "random");
+    lua_pushcfunction(lua, luaOwnerAbort);
+    lua_settable(lua, -3);
+    lua_pushstring(lua, "randomseed");
+    lua_pushcfunction(lua, luaOwnerAbort);
+    lua_settable(lua, -3);
+    lua_pop(lua, 1);
+}
+
+typedef struct luaOwnerOut {
+    char *buf;
+    size_t len, cap;
+} luaOwnerOut;
+
+static void luaOwnerCat(luaOwnerOut *o, const char *s, size_t n) {
+    if (o->len + n > o->cap) {
+        o->cap = (o->len + n) * 2 + 64;
+        o->buf = ValkeyModule_Realloc(o->buf, o->cap);
+    }
+    memcpy(o->buf + o->len, s, n);
+    o->len += n;
+}
+
+/* luaReplyToServerReply() for a RESP2 caller, into a buffer. Returns 0, or -1 for what an owner does
+ * not reply itself (error tables, RESP3-only types, the stack limit). Leaves the stack as it was
+ * minus the element only on success; the caller resets the stack either way. */
+static int luaOwnerReply(lua_State *lua, luaOwnerOut *out) {
+    char hdr[64];
+    int t = lua_type(lua, -1);
+    if (!lua_checkstack(lua, 4)) return -1;
+    switch (t) {
+    case LUA_TSTRING: {
+        size_t len = lua_strlen(lua, -1);
+        luaOwnerCat(out, hdr, snprintf(hdr, sizeof(hdr), "$%zu\r\n", len));
+        luaOwnerCat(out, lua_tostring(lua, -1), len);
+        luaOwnerCat(out, "\r\n", 2);
+        break;
+    }
+    case LUA_TBOOLEAN:
+        if (lua_toboolean(lua, -1))
+            luaOwnerCat(out, ":1\r\n", 4);
+        else
+            luaOwnerCat(out, "$-1\r\n", 5);
+        break;
+    case LUA_TNUMBER:
+        luaOwnerCat(out, hdr, snprintf(hdr, sizeof(hdr), ":%lld\r\n", (long long)lua_tonumber(lua, -1)));
+        break;
+    case LUA_TTABLE: {
+        static const char *other[] = {"err", "double", "big_number", "verbatim_string", "map", "set", NULL};
+        for (int j = 0; other[j]; j++) {
+            lua_pushstring(lua, other[j]);
+            lua_rawget(lua, -2);
+            int ft = lua_type(lua, -1);
+            lua_pop(lua, 1);
+            if (ft != LUA_TNIL) return -1; /* the stock path decides (by the field's type) */
+        }
+        lua_pushstring(lua, "ok");
+        lua_rawget(lua, -2);
+        if (lua_type(lua, -1) == LUA_TSTRING) {
+            char *ok = copy_string_from_lua_stack(lua);
+            strmapchars(ok, "\r\n", "  ", 2);
+            luaOwnerCat(out, "+", 1);
+            luaOwnerCat(out, ok, strlen(ok));
+            luaOwnerCat(out, "\r\n", 2);
+            ValkeyModule_Free(ok);
+            lua_pop(lua, 2);
+            return 0;
+        }
+        lua_pop(lua, 1);
+        int n = 0;
+        while (1) {
+            lua_pushnumber(lua, n + 1);
+            lua_rawget(lua, -2);
+            int et = lua_type(lua, -1);
+            lua_pop(lua, 1);
+            if (et == LUA_TNIL) break;
+            n++;
+        }
+        luaOwnerCat(out, hdr, snprintf(hdr, sizeof(hdr), "*%d\r\n", n));
+        for (int j = 1; j <= n; j++) {
+            lua_pushnumber(lua, j);
+            lua_rawget(lua, -2);
+            if (luaOwnerReply(lua, out) != 0) return -1;
+        }
+        break;
+    }
+    default: luaOwnerCat(out, "$-1\r\n", 5);
+    }
+    lua_pop(lua, 1);
+    return 0;
+}
+
+/* Run the compiled script function_ref on this owner's state as luaCallFunction() runs an EVAL
+ * (KEYS and ARGV globals, one result). 0 with the RESP2 reply in *out (ValkeyModule_Alloc'ed), or -1
+ * when the run aborted. */
+int luaOwnerCallFunction(lua_State *lua,
+                         int function_ref,
+                         ValkeyModuleString **keys,
+                         size_t nkeys,
+                         ValkeyModuleString **args,
+                         size_t nargs,
+                         void *run,
+                         char **out,
+                         size_t *out_len) {
+    static _Thread_local long gc_count = 0;
+    int top = lua_gettop(lua);
+    lua_owner_run = run;
+    lua_sethook(lua, luaOwnerCountHook, LUA_MASKCOUNT, LUA_OWNER_HOOK_COUNT);
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, function_ref);
+    luaCreateArray(lua, keys, nkeys);
+    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 0);
+    lua_setglobal(lua, "KEYS");
+    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 1);
+    luaCreateArray(lua, args, nargs);
+    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 0);
+    lua_setglobal(lua, "ARGV");
+    lua_enablereadonlytable(lua, LUA_GLOBALSINDEX, 1);
+    int err = lua_pcall(lua, 0, 1, 0);
+    lua_sethook(lua, NULL, 0, 0);
+    if (++gc_count == LUA_GC_CYCLE_PERIOD) {
+        lua_gc(lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
+        gc_count = 0;
+    }
+    luaOwnerOut o = {0};
+    int ok = !err && !ownerScriptAborted(run) && luaOwnerReply(lua, &o) == 0;
+    lua_settop(lua, top);
+    lua_owner_run = NULL;
+    if (!ok) {
+        if (o.buf) ValkeyModule_Free(o.buf);
+        return -1;
+    }
+    *out = o.buf;
+    *out_len = o.len;
+    return 0;
+}
