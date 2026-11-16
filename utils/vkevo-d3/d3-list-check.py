@@ -10,7 +10,8 @@ Suites:
            (lazy expiry on the owner), pushes past the listpack limit (quicklist) and pops back, MULTI/EXEC, LMOVE,
            OBJECT ENCODING, arity and syntax errors), batches pipelined to the owner port of their first key or the
            plain port. Runs: this build with owners (AOF everysec + a replica; AOF always; AOF everysec RESP + a
-           replica), this build with owners vetoed (the main path) and the reference binary. Every reply and the final
+           replica; no AOF + a replica; maxmemory 1gb + AOF everysec + a replica), this build with owners vetoed (the
+           main path) and the reference binary. Every reply and the final
            keyspace (type, encoding, contents, expire time) equal across runs; each replica equals its primary (digest
            and dump); each AOF reloaded into a fresh server equals the primary
   blocked  clients blocked on main (BLPOP BRPOP BLMOVE BLMPOP, connected to owner ports or the plain port) woken by
@@ -383,6 +384,7 @@ def suite_model():
             ("native_always", A.bin, [], False, "always"),
             ("native_resp", A.bin, ["--aof-incr-format", "resp"], True, "everysec"),
             ("native_noaof", A.bin, [], True, None),
+            ("native_mm", A.bin, ["--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"], True, "everysec"),
             ("mainpath", A.bin, ["--owner-repl-native", "no"], True, "everysec")]
     if A.ref_bin:
         runs.append(("parent", A.ref_bin, [], True, "everysec"))
@@ -404,6 +406,7 @@ def suite_model():
         check("model.%s_vs_%s.replies" % (label, base), not bad, detail or "%d replies" % sum(len(x) for x in rr))
         check("model.%s_vs_%s.keyspace" % (label, base), dd == bd, diff_dumps(bd, dd) or "%d keys" % len(dd))
     check("model.native_ran_natively", res["native"][2] > A.per * 8 * 0.3, "native %d" % res["native"][2])
+    check("model.native_mm_ran_natively", res["native_mm"][2] > A.per * 8 * 0.3, "native %d" % res["native_mm"][2])
     check("model.mainpath_vetoed", res["mainpath"][2] == 0, "native %d" % res["mainpath"][2])
     if A.ref_bin:
         print("INFO model native commands: this %d, parent %d" % (res["native"][2], res["parent"][2]), flush=True)
