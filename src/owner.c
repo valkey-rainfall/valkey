@@ -14,7 +14,10 @@
  *
  * Native commands: an owner runs GET, SET, DEL, INCR, MGET, MSET and PING itself when every key's
  * slot is its own (multi-key commands: one slot, as hash tags give): no barrier and no cross-core
- * hop. MULTI/EXEC too, while every queued command is one of those on the owner's keys: the owner
+ * hop. RL-1: also the single-key list, hash, set and sorted-set commands and the key-level commands
+ * (EXPIRE ... TYPE, EXISTS), each by its stock proc; own_kinds[] lists every native command and its
+ * properties. MULTI/EXEC too, while every queued command is a queueable one (OWN_K_TXN) on the
+ * owner's keys: the owner
  * queues them and runs EXEC within one window. WATCH/UNWATCH of its own keys too: an owner keeps its
  * own registry of watched keys (multi.c), which only it, or main with the owners stopped, touches;
  * a watcher that comes to main has its keys moved to the dbs' registries (watchMoveToMain) and is a
@@ -181,6 +184,17 @@ enum {
     OWN_LLEN,
     OWN_LRANGE,
     OWN_LINDEX,
+    /* RL-g1c-native-keyspace: key-level commands. They run the stock procs, so lazy expiry, the
+     * PEXPIREAT / DEL rewrites and their records are the main path's. */
+    OWN_EXPIRE,
+    OWN_PEXPIRE,
+    OWN_EXPIREAT,
+    OWN_PEXPIREAT,
+    OWN_PERSIST,
+    OWN_TTL,
+    OWN_PTTL,
+    OWN_EXISTS,
+    OWN_TYPE,
     OWN_NCMDS
 };
 
@@ -204,7 +218,7 @@ enum {
     OWN_MM_LIST    /* its reply holds elements of the list: at most the whole list (ownerStoredListReplyLen) */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
-enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_NFAM };
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -232,9 +246,20 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_LLEN] = {"llen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
     [OWN_LRANGE] = {"lrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
     [OWN_LINDEX] = {"lindex", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    /* RL-g1c-native-keyspace: not queued natively (inside MULTI main queues them); TTL, PTTL, EXISTS
+     * and TYPE only read; EXISTS with several keys in one slot, as DEL. */
+    [OWN_EXPIRE] = {"expire", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIRE] = {"pexpire", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_EXPIREAT] = {"expireat", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIREAT] = {"pexpireat", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PERSIST] = {"persist", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TTL] = {"ttl", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PTTL] = {"pttl", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_EXISTS] = {"exists", OWN_K_READ, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TYPE] = {"type", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
-    [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn", [OWN_FAM_LIST] = "list"};
+    [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn", [OWN_FAM_LIST] = "list", [OWN_FAM_KEYSPACE] = "keyspace"};
 
 /* Why an owner handed a client to main (client->owner_why). */
 enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
