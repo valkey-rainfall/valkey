@@ -6,6 +6,14 @@ proc parallel_applied {r} {
     return [getInfoProperty [$r info stats] repl_parallel_applied]
 }
 
+# The next MONITOR line that is not an INFO (the test's own polling of the replica).
+proc monitor_next_not_info {mon} {
+    while 1 {
+        set line [$mon read]
+        if {![string match {*"info"*} $line]} { return $line }
+    }
+}
+
 proc assert_in_sync {primary replica} {
     wait_for_ofs_sync $primary $replica
     assert_equal [$primary debug digest] [$replica debug digest]
@@ -96,8 +104,10 @@ start_server {tags {"repl external:skip"} overrides {io-threads 4 io-threads-fas
             $primary set mon:1 a
             $primary set mon:2 b
             wait_for_ofs_sync $primary $replica
-            assert_match {*"set"*"mon:1"*} [$mon read]
-            assert_match {*"set"*"mon:2"*} [$mon read]
+            # MONITOR also shows wait_for_ofs_sync's INFO on the replica, before the replicated SETs when the
+            # replica reads its primary after the first poll (a loaded host): skip those lines.
+            assert_match {*"set"*"mon:1"*} [monitor_next_not_info $mon]
+            assert_match {*"set"*"mon:2"*} [monitor_next_not_info $mon]
             $mon close
             assert_equal [parallel_applied $replica] $before
         }
