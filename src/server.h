@@ -3596,7 +3596,7 @@ void resetSharedQueryBuf(client *c);
 void trimCommandQueue(client *c);
 int _writeToClient(client *c);
 int ownerRunParsedInput(client *c, int (*try_native)(client *c));
-int ownerResumeOnMain(client *c);
+int ownerResumeOnMain(client *c); /* 0: c may be gone (freed or closing) */
 int ownerGuestYield(client *c, int at_end);
 void ownerPostWriteToClient(client *c);
 void ownerCountNetOut(long long n);

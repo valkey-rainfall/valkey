@@ -586,6 +586,7 @@ static void ownerRerunOnMain(void);
 
 static long long own_stops = 0, own_stop_wait_us = 0, own_stop_wait_max_us = 0;
 static long long own_takes = 0, own_returns = 0;
+static long long own_home_now = 0; /* RL-g2a: handed-over clients sent home right after their command */
 static int own_last_veto = OWN_VETO_ALL;
 static int own_dormant = 0; /* io-threads > 1: owners sleep, main serves everything */
 
@@ -1273,6 +1274,8 @@ static void ownerResumeWorld(void) {
         pthread_cond_broadcast(&own_wait_cv);
         pthread_mutex_unlock(&own_wait_mu);
     }
+    /* RL-g1g / RL-g2a: one wakeup per owner whose inbox main filled at this stop (ownerSendToOwner), not one per
+     * client. The owner could not have taken them before now: the world was held. */
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         if (!o->inbox_wake) continue;
@@ -1353,6 +1356,11 @@ void ownerClientFreed(client *c) {
     }
 }
 
+static void ownerArmRead(client *c);
+static int ownerGoHomeNow(client *c);
+static int ownerGuestIdle(client *c, int replies);
+static int ownerSendToOwner(client *c);
+
 /* Main, world held: a client an owner handed over becomes a stock client on main. */
 static void ownerTakeOne(client *c) {
     serverAssert(c->owner_tid == OWNER_IN_TRANSIT);
@@ -1388,11 +1396,19 @@ static void ownerTakeOne(client *c) {
         freeClientAsync(c);
         return;
     }
-    /* owner-pipeline-resume: a client that came to run a command main sends home again at the end of
-     * beforeSleep (ownerGuestYield), mostly, and needs no read handler on main for that; it gets one once
-     * it stays (below, or ownerRerunAdd). */
-    int lazy = why == OWN_WHY_RUN && c->owner_home >= 0 && server.owner_pipeline_resume && !connIsTLS(c->conn);
-    if (!lazy && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+    /* RL-g1g + RL-g2a: a TCP client handed over to run a command gets main's read handler on the connection
+     * but not its epoll registration yet (connSetReadHandler registers only a change). Most go home right after
+     * the command (ownerGoHomeNow, AOF off), or at the end of beforeSleep with the rest of a pipeline
+     * (ownerGuestYield), and main never polls them; one that stays is registered then (ownerArmRead), before
+     * main's next poll, in the state the command left: a command that dropped the handler (protectClient, a
+     * blocked or throttled client) leaves it dropped. Inside processEventsWhileBlocked, for TLS (RL-g1d's owner
+     * TLS ports) and with neither the AOF off nor owner-pipeline-resume, the stock registration as before. */
+    int lazy = why == OWN_WHY_RUN && !ProcessingEventsWhileBlocked && c->owner_home >= 0 &&
+               c->conn->type == connectionTypeTcp() && !c->conn->read_handler &&
+               (server.aof_state == AOF_OFF || server.owner_pipeline_resume);
+    if (lazy)
+        c->conn->read_handler = readQueryFromClient;
+    else if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
         freeClientAsync(c);
         return;
     }
@@ -1404,13 +1420,45 @@ static void ownerTakeOne(client *c) {
         return;
     }
     if (why == OWN_WHY_IDLE) return; /* nothing read: main's own read handler takes the input */
-    if (!lazy) {
-        ownerResumeOnMain(c);
-        return;
+    if (!ownerResumeOnMain(c) || !lazy) return; /* 0: freed or closing, nothing to poll */
+    /* Stopped before the rest of a pipeline: it goes home at the end of beforeSleep (ownerResumeYielded). */
+    if (c->owner_tid != OWNER_ON_MAIN || c->owner_resume == OWN_RES_YIELDED) return;
+    if (!ownerGoHomeNow(c)) ownerArmRead(c);
+}
+
+/* RL-g2a: the epoll registration ownerTakeOne deferred, for a client that stays on main past its command. */
+static void ownerArmRead(client *c) {
+    connection *conn = c->conn;
+    ConnectionCallbackFunc f = conn->read_handler;
+    if (!f || (aeGetFileEvents(server.el, conn->fd) & AE_READABLE)) return;
+    conn->read_handler = NULL;
+    if (connSetReadHandler(conn, f) == C_ERR) freeClientAsync(c);
+}
+
+/* RL-g2a: main just ran a handed-over client's command. When nothing else about the client needs main
+ * (ownerGuestIdle, unsent replies allowed), it goes home now with its replies, which its owner writes when it
+ * takes the client (ownerRegister), so main makes no system call for it: no epoll registration, no write, and
+ * one owner wakeup per stop (ownerResumeWorld). Main writes nothing to the AOF here (aof_state AOF_OFF), and the
+ * owner runs only once main resumes the world, after this iteration's beforeSleep: the replies leave no earlier
+ * than main would have sent them, and in the order main appended them. Not while the native path is vetoed
+ * (guests stay on main then) or the owners sleep, nor for a client RL-g1g's pipeline path holds. */
+static int ownerGoHomeNow(client *c) {
+    if (server.aof_state != AOF_OFF || own_dormant || c->owner_resume || (ownerComputeVeto() & OWN_VETO_ALL) ||
+        !ownerGuestIdle(c, 1))
+        return 0;
+    if (c->flag.pending_write) {
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+        c->flag.pending_write = 0;
     }
-    if (ownerResumeOnMain(c) && c->owner_tid == OWNER_ON_MAIN && c->owner_resume != OWN_RES_YIELDED &&
-        !connHasReadHandler(c->conn) && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR)
-        freeClientAsync(c);
+    ownerClientFreed(c); /* off the guest list */
+    if (!ownerSendToOwner(c)) { /* RL-g1d: only a TLS transport can refuse, and lazy clients are TCP */
+        ownerGuestAdd(c);
+        if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+        return 0;
+    }
+    own_returns++;
+    own_home_now++;
+    return 1;
 }
 
 /* One client at a time: a client's command can run a long script, and main then serves the other
@@ -1557,9 +1605,10 @@ static int ownerGuestFlushed(client *c) {
 
 /* A guest may go home when nothing about it needs main: no input or output in flight, no
  * transaction, watch, block, subscription, tracking, monitor or replication role, no pending
- * close, and no reply mode main must honor. */
-static int ownerGuestIdle(client *c) {
-    if (!ownerGuestFlushed(c)) return 0;
+ * close, and no reply mode main must honor. With replies set (RL-g2a, ownerGoHomeNow) unsent replies
+ * may go along: its owner writes them. */
+static int ownerGuestIdle(client *c, int replies) {
+    if (replies ? connHasWriteHandler(c->conn) : !ownerGuestFlushed(c)) return 0;
     if (c->cmd_queue.off < c->cmd_queue.len) return 0;
     if (c->querybuf && sdslen(c->querybuf) > c->qb_pos) return 0;
     if (c->multibulklen || c->bulklen != -1 || c->reqtype) return 0; /* partial request */
@@ -1572,7 +1621,7 @@ static void ownerReturnGuests(void) {
     listRewind(own_guests, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
-        if (c->owner_resume || !ownerGuestIdle(c) || !ownerSendToOwner(c)) continue;
+        if (c->owner_resume || !ownerGuestIdle(c, 0) || !ownerSendToOwner(c)) continue;
         listDelNode(own_guests, ln);
         c->owner_guest_node = NULL;
         own_returns++;
@@ -3270,7 +3319,12 @@ static void ownerRerunAdd(client *c) {
     c->owner_resume = OWN_RES_RERUN;
     listAddNodeTail(own_rerun, c);
     own_reruns++;
-    if (!connHasReadHandler(c->conn) && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) freeClientAsync(c);
+    /* RL-g2a: a lazy client has the handler on its connection but not in main's epoll yet (ownerArmRead). */
+    if (!connHasReadHandler(c->conn)) {
+        if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) freeClientAsync(c);
+    } else {
+        ownerArmRead(c);
+    }
     if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
     aeSetDontWait(server.el, 1);
 }
@@ -5049,6 +5103,8 @@ void ownerInfo(sds *info) {
                          own_guests ? listLength(own_guests) : 0UL, own_stops, own_stop_wait_us, own_stop_wait_max_us);
     *info = sdscatprintf(*info, "owner_pipeline_resume:%d\r\nowner_pipeline_resumes:%lld\r\nowner_pipeline_reruns:%lld\r\n",
                          server.owner_pipeline_resume, own_resumes, own_reruns);
+    /* RL-g2a: handed-over clients that went home right after their command, replies unsent (ownerGoHomeNow). */
+    *info = sdscatprintf(*info, "owner_returns_with_replies:%lld\r\n", own_home_now);
     *info = sdscatprintf(*info,
                          "owner_aof_ops:%lld\r\nowner_aof_drains:%lld\r\nowner_held_replies:%lld\r\n"
                          "owner_maxmemory_to_main:%lld\r\n",
