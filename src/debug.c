@@ -754,7 +754,7 @@ void debugCommand(client *c) {
             addReplyErrorObject(c, shared.nokeyerr);
             return;
         }
-        strenc = strEncoding(val->encoding);
+        strenc = objectEncodingName(val);
 
         char extra[138] = {0};
         if (val->encoding == OBJ_ENCODING_QUICKLIST) {

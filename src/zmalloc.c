@@ -171,6 +171,17 @@ void *extend_to_usable(void *ptr, size_t size) {
 }
 #endif
 
+/* RL-g7c-key-memory: the block size the allocator gives a request of 'size' bytes (its size class), or 0 when
+ * the allocator does not tell it without allocating. */
+size_t zmalloc_alloc_size_for(size_t size) {
+#if defined(USE_JEMALLOC) && defined(HAVE_MALLOC_SIZE)
+    return je_nallocx(size, 0);
+#else
+    (void)size;
+    return 0;
+#endif
+}
+
 /* Try allocating memory, and return NULL if failed.
  * '*usable' is set to the usable size if non NULL. */
 static inline void *ztrymalloc_usable_internal(size_t size, size_t *usable) {

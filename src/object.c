@@ -53,6 +53,21 @@
  * so if expire is set later, we don't need to reallocate the object. */
 #define KEY_SIZE_TO_INCLUDE_EXPIRE_THRESHOLD 128
 
+/* RL-g7c-key-memory (string-embed-fit): a string value stored under a key is also embedded with its key
+ * (one allocation, EMBSTR) above the 128-byte rule when that one allocation's size class is smaller than the
+ * two of the unembedded object (the object with its key and expire field, and the value's sds), for values
+ * of at most EMBSTR_FIT_MAX bytes and below owner-bigreply-min (owners reply larger values by reference).
+ * The value keeps an SDS_TYPE_8 header up to 251 bytes and an SDS_TYPE_16 header above. Such an object
+ * always carries the expire field. It is an immutable EMBSTR like any other: commands that modify a string
+ * in place make a RAW copy first (dbUnshareStringValue), so every command behaves as for a RAW value, and
+ * OBJECT ENCODING / DEBUG OBJECT report it as raw, the encoding the stock rule gives it. RDB, AOF and the
+ * replication stream carry string bytes, not encodings. Flags in the byte before an embedded key (the key's
+ * sds header size, 1..17, in the low bits): */
+#define EMBKEY_HDR_SIZE_MASK 0x3f
+#define EMBKEY_FIT_FLAG 0x40   /* the value was embedded by the fit rule */
+#define EMBKEY_VAL16_FLAG 0x80 /* the embedded value has an SDS_TYPE_16 header (stock: SDS_TYPE_8) */
+#define EMBSTR_FIT_MAX 2047
+
 /* ===================== Accessor functions for serverObject fields ==================== */
 
 int objectGetType(const robj *o) {
@@ -285,6 +300,9 @@ robj *createRawStringObject(const char *ptr, size_t len) {
 
 /* Creates a new embedded string object and copies the content of key, val_ptr
  * and expire to the new object. LRU is set to 0. */
+static bool shouldEmbedStringObjectStock(size_t val_len, const_sds key, long long expire);
+static char embeddedValType(size_t val_len);
+
 static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
                                                         size_t val_len,
                                                         const_sds key,
@@ -294,7 +312,10 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     size_t key_sds_len = has_embkey ? sdslen(key) : 0;
     char key_sds_type = has_embkey ? sdsReqType(key_sds_len) : 0;
     size_t key_sds_size = has_embkey ? sdsReqSize(key_sds_len, key_sds_type) : 0;
-    size_t val_sds_size = sdsReqSize(val_len, SDS_TYPE_8);
+    /* RL-g7c: embedded by the fit rule (only with a key); else the stock rule, SDS_TYPE_8. */
+    int fit = has_embkey && !shouldEmbedStringObjectStock(val_len, key, expire);
+    char val_type = embeddedValType(val_len);
+    size_t val_sds_size = sdsReqSize(val_len, val_type);
     size_t metadata_size = has_embkey ? object_metadata_size : 0;
     if (val_sds_size < sizeof(void *)) {
         val_sds_size = sizeof(void *); /* Ensure it's possible to "unembed" value later */
@@ -302,7 +323,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
 
     /* We don't need 'val_ptr' when val is embedded, so we can overwrite `val_ptr` memory to reduce memory usage. */
     size_t min_size = sizeof(robj) - sizeof(void *);
-    if (expire != EXPIRY_NONE) {
+    if (expire != EXPIRY_NONE || fit) {
         min_size += sizeof(long long);
     }
     min_size += metadata_size;
@@ -319,7 +340,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     objectSetEncoding(o, OBJ_ENCODING_EMBSTR);
     o->refcount = 1;
     objectSetLRU(o, 0);
-    o->hasexpire = (expire != EXPIRY_NONE);
+    o->hasexpire = (expire != EXPIRY_NONE) || fit;
     o->hasembkey = has_embkey;
     o->hasembval = 1;
 
@@ -348,18 +369,24 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
 
     /* Copy embedded key. */
     if (o->hasembkey) {
-        *data++ = sdsHdrSize(key_sds_type);
+        *data++ = sdsHdrSize(key_sds_type) | (fit ? EMBKEY_FIT_FLAG : 0) |
+                  (val_type == SDS_TYPE_16 ? EMBKEY_VAL16_FLAG : 0);
         sdswrite(data, key_sds_size, key_sds_type, key, key_sds_len);
         data += key_sds_size;
     }
 
-    /* Copy embedded value (EMBSTR) always as SDS TYPE 8. Account for unused
-     * memory in the SDS alloc field. */
+    /* Copy embedded value (EMBSTR) as SDS TYPE 8 (TYPE 16 only by the fit rule, which needs the key's flag
+     * byte to say so). Account for unused memory in the SDS alloc field (TYPE 8: up to its maximum). */
     size_t remaining_size = bufsize - (data - (char *)(void *)o);
 
-    assert(val_len <= sdsTypeMaxSize(SDS_TYPE_8));
-    assert(remaining_size <= sdsTypeMaxSize(SDS_TYPE_8));
-    sdswrite(data, remaining_size, SDS_TYPE_8, val_ptr, val_len);
+    if (val_type == SDS_TYPE_8) {
+        assert(val_len <= sdsTypeMaxSize(SDS_TYPE_8));
+        if (fit && remaining_size > sdsTypeMaxSize(SDS_TYPE_8)) remaining_size = sdsTypeMaxSize(SDS_TYPE_8);
+        assert(remaining_size <= sdsTypeMaxSize(SDS_TYPE_8));
+    } else {
+        assert(has_embkey && val_len <= EMBSTR_FIT_MAX && remaining_size <= sdsTypeMaxSize(SDS_TYPE_16));
+    }
+    sdswrite(data, remaining_size, val_type, val_ptr, val_len);
 
     return o;
 }
@@ -371,7 +398,31 @@ static robj *createEmbeddedStringObject(const char *ptr, size_t len) {
     return createEmbeddedStringObjectWithKeyAndExpire(ptr, len, NULL, EXPIRY_NONE);
 }
 
+/* RL-g7c: an embedded value's sds header: SDS_TYPE_8 while its size fits the type's alloc field. */
+static char embeddedValType(size_t val_len) {
+    return sdsReqSize(val_len, SDS_TYPE_8) <= sdsTypeMaxSize(SDS_TYPE_8) ? SDS_TYPE_8 : SDS_TYPE_16;
+}
+
+/* RL-g7c-key-memory: the fit rule (see EMBKEY_FIT_FLAG). Both sides count the expire field, which a fitted
+ * object always carries and the unembedded one carries when set (SET ... EX). */
+static bool shouldFitEmbedStringObject(size_t val_len, const_sds key) {
+    if (!server.string_embed_fit || key == NULL || val_len > EMBSTR_FIT_MAX) return false;
+    if (server.owner_bigreply_min > 0 && val_len >= (size_t)server.owner_bigreply_min) return false;
+    size_t key_len = sdslen(key);
+    size_t key_part = 1 + sdsReqSize(key_len, sdsReqType(key_len)) + object_metadata_size;
+    size_t emb = zmalloc_alloc_size_for(sizeof(robj) - sizeof(void *) + sizeof(long long) + key_part +
+                                        sdsReqSize(val_len, embeddedValType(val_len)));
+    if (emb == 0) return false; /* the allocator does not tell its size classes */
+    size_t unemb = zmalloc_alloc_size_for(sizeof(robj) + sizeof(long long) + key_part) +
+                   zmalloc_alloc_size_for(sdsReqSize(val_len, sdsReqType(val_len)));
+    return emb < unemb;
+}
+
 static bool shouldEmbedStringObject(size_t val_len, const_sds key, long long expire) {
+    return shouldEmbedStringObjectStock(val_len, key, expire) || shouldFitEmbedStringObject(val_len, key);
+}
+
+static bool shouldEmbedStringObjectStock(size_t val_len, const_sds key, long long expire) {
     /* When to embed? Embed when the sum is up to 128 bytes. (2 cache lines on most systems) */
     if (val_len > sdsTypeMaxSize(SDS_TYPE_8)) return false;
 
@@ -442,6 +493,27 @@ robj *tryCreatePrebuiltStringEntry(const char *ptr, size_t len, const_sds key) {
     return createEmbeddedStringObjectWithKeyAndExpire(ptr, len, key, EXPIRY_NONE);
 }
 
+/* RL-g7c: the byte before an embedded key (its sds header size and the value flags), NULL without one. */
+static uint8_t *objectEmbKeyHdrByte(const robj *o) {
+    if (!o->hasembkey) return NULL;
+    unsigned char *data = objectEmbeddedData(o);
+    if (o->hasexpire) data += sizeof(long long);
+    return data + objectGetMetadataSize(o);
+}
+
+/* RL-g7c: whether a string was embedded by the fit rule (it reports raw, as the stock rule makes it). */
+int objectIsFitEmbedded(const robj *o) {
+    if (!o->hasembval) return 0;
+    uint8_t *b = objectEmbKeyHdrByte(o);
+    return b && (*b & EMBKEY_FIT_FLAG);
+}
+
+/* OBJECT ENCODING / DEBUG OBJECT: the encoding name of an object. */
+char *objectEncodingName(const robj *o) {
+    if (objectGetEncoding(o) == OBJ_ENCODING_EMBSTR && objectIsFitEmbedded(o)) return strEncoding(OBJ_ENCODING_RAW);
+    return strEncoding(objectGetEncoding(o));
+}
+
 void *objectGetVal(const robj *o) {
     if (o->hasembval) {
         unsigned char *data = objectEmbeddedData(o);
@@ -449,16 +521,18 @@ void *objectGetVal(const robj *o) {
             /* Skip expire field */
             data += sizeof(long long);
         }
+        char val_type = SDS_TYPE_8;
         if (o->hasembkey) {
             /* Skip metadata */
             data += objectGetMetadataSize(o);
             /* Skip embedded key */
-            uint8_t hdr_size = *(uint8_t *)data;
-            data += 1 + hdr_size;                /* +1 for header size byte */
-            data += sdslen((const_sds)data) + 1; /* +1 for null terminator */
+            uint8_t hdr_byte = *(uint8_t *)data;
+            if (hdr_byte & EMBKEY_VAL16_FLAG) val_type = SDS_TYPE_16;
+            data += 1 + (hdr_byte & EMBKEY_HDR_SIZE_MASK); /* +1 for header size byte */
+            data += sdslen((const_sds)data) + 1;           /* +1 for null terminator */
         }
         assert(objectGetEncoding(o) == OBJ_ENCODING_EMBSTR);
-        return data + sdsHdrSize(SDS_TYPE_8);
+        return data + sdsHdrSize(val_type);
     } else {
         return o->val_ptr;
     }
@@ -473,8 +547,8 @@ sds objectGetKey(const robj *o) {
     if (o->hasembkey) {
         /* Skip metadata */
         data += objectGetMetadataSize(o);
-        /* Skip header size byte */
-        uint8_t hdr_size = *(uint8_t *)data;
+        /* Skip header size byte (its top bits are RL-g7c's value flags) */
+        uint8_t hdr_size = *(uint8_t *)data & EMBKEY_HDR_SIZE_MASK;
         data += 1 + hdr_size;
         return (sds)data;
     }
@@ -529,10 +603,12 @@ void objectUnembedVal(robj *o) {
 
     /* shift remaining embedded data out of val_ptr location */
     ptrdiff_t embedded_data_size = (unsigned char *)embedded_sds - objectEmbeddedData(o);
-    embedded_data_size -= sdsHdrSize(SDS_TYPE_8);
+    embedded_data_size -= sdsHdrSize(embedded_sds[-1] & SDS_TYPE_MASK);
     memmove(objectEmbeddedData(o) + sizeof(void *), objectEmbeddedData(o), embedded_data_size);
 
     o->hasembval = 0;
+    uint8_t *kb = objectEmbKeyHdrByte(o); /* RL-g7c: no embedded value, no value flags */
+    if (kb) *kb &= EMBKEY_HDR_SIZE_MASK;
     objectSetEncoding(o, OBJ_ENCODING_RAW);
     o->val_ptr = new_val;
 }
@@ -671,7 +747,7 @@ robj *dupStringObject(const robj *o) {
 
     switch (objectGetEncoding(o)) {
     case OBJ_ENCODING_RAW: return createRawStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
-    case OBJ_ENCODING_EMBSTR: return createEmbeddedStringObject(objectGetVal(o), sdslen(objectGetVal(o)));
+    case OBJ_ENCODING_EMBSTR: return createStringObject(objectGetVal(o), sdslen(objectGetVal(o))); /* RL-g7c */
     case OBJ_ENCODING_INT:
         d = createObject(OBJ_STRING, NULL);
         d->encoding = OBJ_ENCODING_INT;
@@ -1956,7 +2032,7 @@ void objectCommand(client *c) {
         addReplyLongLong(c, objectGetRefcount(o));
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "encoding") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.null[c->resp])) == NULL) return;
-        addReplyBulkCString(c, strEncoding(objectGetEncoding(o)));
+        addReplyBulkCString(c, objectEncodingName(o));
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "idletime") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.null[c->resp])) == NULL) return;
         if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {

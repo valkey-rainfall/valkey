@@ -3589,6 +3589,7 @@ standardConfig static_configs[] = {
     createBoolConfig("owner-uring-aof", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_uring_aof, 0, NULL, NULL), /* vkevo g9-fold: owners batch under appendonly too */
     createBoolConfig("owner-set-burst", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_set_burst, 1, NULL, NULL), /* vkevo g10-setburst: plain SET frames answered off the query buffer */
     createIntConfig("owner-pipeline-resume", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1024, server.owner_pipeline_resume, 4, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g1g: owners resume a pipeline after main ran its non-native command (0 = off; N = the run of native commands ahead that sends a client home) */
+    createBoolConfig("string-embed-fit", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.string_embed_fit, 1, NULL, NULL), /* RL-g7c-key-memory */
     createIntConfig("owner-bigreply-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_bigreply_min, 2048, INTEGER_CONFIG, NULL, NULL), /* vkevo g11-bigreply: 0 = copy every value */
     createIntConfig("owner-busy-poll-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.owner_busy_poll_us, 0, INTEGER_CONFIG, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll: 0 = off */
     createIntConfig("owner-busy-poll-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 64, server.owner_busy_poll_budget, 0, INTEGER_CONFIG, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll: 0 = the kernel's 8 */

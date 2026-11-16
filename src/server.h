@@ -2204,6 +2204,7 @@ struct valkeyServer {
     int owner_uring_aof;                      /* owner-uring-aof: owners batch under appendonly too (default no: the syscall path). */
     int owner_set_burst;                      /* owner-set-burst: owners answer plain SET frames off the query buffer (default yes). */
     int owner_pipeline_resume;                /* owner-pipeline-resume N: a guest goes home before N commands in a row its owner runs, or at the end of its input; 0: off (default 4). */
+    int string_embed_fit;                     /* RL-g7c string-embed-fit: embed a keyed string's value with its key when one allocation's size class is smaller (object.c). */
     int owner_bigreply_min;                   /* owner-bigreply-min: owners send GET values of this many bytes or more from where they are (default 2048; 0: copy all). */
     int owner_busy_poll_us;                   /* vkevo RL-g2p: owner-busy-poll-us N: each owner's epoll set busy polls its NIC queue up to N us before sleeping (0: off, the default). */
     int owner_busy_poll_budget;               /* vkevo RL-g2p: packets per busy-poll round (0: the kernel's default, 8; at most 64). */
@@ -3805,6 +3806,8 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 
 /* Objects with val and/or key embedded */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
+char *objectEncodingName(const robj *o);
+int objectIsFitEmbedded(const robj *o);
 robj *tryPrebuildStringEntry(robj *valobj, const_sds key);
 robj *tryCreatePrebuiltStringEntry(const char *ptr, size_t len, const_sds key);
 robj *objectSetExpire(robj *o, long long expire);
