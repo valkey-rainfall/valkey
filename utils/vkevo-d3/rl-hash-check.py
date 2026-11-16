@@ -571,7 +571,14 @@ def run_model(a, tag, extra):
         hset = (b"HSET", b"HMSET", b"hmset", b"HGET", b"HMGET", b"HDEL", b"HEXISTS", b"HLEN", b"HINCRBY", b"HGETALL")
         plain = [k for k in keys.hash if k not in keys.ttl_keys]
         g2 = Gen(rng, keys, len(pm), field_ttl=False)
+        # The model phase's short-expiry state carries over: a key it gave a 1-25 ms TTL stays off limits for its
+        # 0.12 s window (blocked), and a hash with a field that got a short TTL never gets HLEN (hlen_unsafe: HLEN counts
+        # an expired field until active expiry reclaims it, which each server does at its own time). Without this the
+        # phase could hit either right after the model phase and see the two servers expire at different moments.
+        g2.blocked = gen.blocked
+        g2.hlen_unsafe = gen.hlen_unsafe
         sent = bad2 = 0
+        bad2_first = []
         o2 = info(adm_m, "owners")
         while sent < 3000:
             op = g2.op()
@@ -585,13 +592,16 @@ def run_model(a, tag, extra):
             sent += 1
             if norm(x, how) != norm(y, how):
                 bad2 += 1
+                if len(bad2_first) < 3:
+                    bad2_first.append((args, x, y))
         o3 = info(adm_m, "owners")
         nat2 = ival(o3, "owner_hash_commands") - ival(o2, "owner_hash_commands")
         thr = 0.3 if tag.endswith("mm") else 0.9  # under maxmemory value reads of hashtable hashes go to main
         check(tag + ".owner_port_hash_native", nat2 >= thr * sent and bad2 == 0,
               "owner_hash_commands +%d of %d single hash commands on the key's owner port, mismatches %d, "
-              "handoffs +%d" % (nat2, sent, bad2,
-                                ival(o3, "owner_handoffs_to_main") - ival(o2, "owner_handoffs_to_main")))
+              "handoffs +%d %s" % (nat2, sent, bad2,
+                                   ival(o3, "owner_handoffs_to_main") - ival(o2, "owner_handoffs_to_main"),
+                                   repr(bad2_first)[:600] if bad2_first else ""))
         check(tag + ".ref_runs_them_on_main", "owner_hash_commands" not in info(adm_r, "owners"),
               "parent has no owner_hash_commands")
         time.sleep(0.2)  # every short expiry (key or field) is past on both
