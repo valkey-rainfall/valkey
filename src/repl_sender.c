@@ -196,6 +196,16 @@ static void *replStreamSenderMain(void *arg) {
         }
 
         pthread_mutex_lock(&repl_sender_mutex);
+        /* RL-2d: with no replica to send to, sleep until main adds one (replStreamSenderAdd signals) or stops the
+         * sender; the 1 ms backstop below is for partial writes, which need a replica (it woke 1,000 times a
+         * second on a primary without replicas, RL-g2w). */
+        if (!repl_sender_stop && listLength(repl_sender_replicas) == 0) {
+            atomic_store_explicit(&repl_sender_idle, 1, memory_order_release);
+            while (!repl_sender_stop && listLength(repl_sender_replicas) == 0)
+                pthread_cond_wait(&repl_sender_cond, &repl_sender_mutex);
+            atomic_store_explicit(&repl_sender_idle, 0, memory_order_release);
+            continue;
+        }
         /* Wait for main to publish a newer stable offset, or a stop. */
         long long wake = atomic_load_explicit(&repl_sender_wake_offset, memory_order_acquire);
         if (!repl_sender_stop && wake <= stable) {
@@ -235,8 +245,10 @@ void replStreamSenderPublishStable(long long offset) {
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
     /* Signal only a parked sender: a running sender rereads the stable offset on its next
-     * loop pass, so an unconditional signal would be a wasted futex wake per iteration. */
+     * loop pass, so an unconditional signal would be a wasted futex wake per iteration. With no
+     * replica it has nothing to send (RL-2d; main is the only writer of the list). */
     if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
+    if (listLength(repl_sender_replicas) == 0) return;
     atomic_fetch_add_explicit(&server.stat_repl_sender_main_wakes, 1, memory_order_relaxed);
     pthread_cond_signal(&repl_sender_cond);
 }
@@ -258,6 +270,7 @@ void replStreamSenderPublishAppend(long long offset) {
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
     if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
+    if (listLength(repl_sender_replicas) == 0) return; /* RL-2d: nothing to send to */
     long long since = atomic_load_explicit(&repl_sender_last_wake_offset, memory_order_acquire);
     if (offset - since < server.repl_stream_sender_wake_bytes) return;
     atomic_fetch_add_explicit(&server.stat_repl_sender_main_wakes, 1, memory_order_relaxed);
@@ -313,6 +326,8 @@ void replStreamSenderAdd(client *replica) {
         atomic_store_explicit(&rd->sent_offset, cursor_off, memory_order_relaxed);
         atomic_store_explicit(&rd->send_error, 0, memory_order_relaxed);
         listAddNodeTail(repl_sender_replicas, replica);
+        /* RL-2d: the sender sleeps without a timeout while it has no replica: wake it for this one. */
+        if (listLength(repl_sender_replicas) == 1) pthread_cond_signal(&repl_sender_cond);
     }
     pthread_mutex_unlock(&repl_sender_mutex);
 }
