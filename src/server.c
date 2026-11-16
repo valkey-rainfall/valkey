@@ -3376,6 +3376,7 @@ void resetServerStats(void) {
     ectx->stat_numcommands = 0;
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
+    server.stat_repl_apply_inline = 0;
     server.stat_repl_lane_reads = 0;
     server.stat_repl_lane_read_usec = 0;
     server.stat_repl_lane_classify_usec = 0;
@@ -7586,6 +7587,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_commands_processed:%lld\r\n", ectx->stat_numcommands,
                 "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
                 "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
+                "repl_apply_inline:%lld\r\n", server.stat_repl_apply_inline,
                 "repl_lane_reads:%lld\r\n", server.stat_repl_lane_reads,
                 "repl_lane_read_usec:%lld\r\n", server.stat_repl_lane_read_usec,
                 "repl_lane_classify_usec:%lld\r\n", server.stat_repl_lane_classify_usec,

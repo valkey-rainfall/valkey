@@ -698,6 +698,8 @@ static void replApplyKeepForLog(replApplyLane *l, int i, long long duration) {
     l->logs[l->nlogs++] = i;
 }
 
+static void replApplyRunHeld(int lane);
+
 void replApplyRunLane(int tid) {
     if (rp.mode != RP_IDLE) {
         rpPhase(tid);
@@ -705,6 +707,11 @@ void replApplyRunLane(int tid) {
     }
     int lane = ra_main_lane ? tid : tid - 1;
     if (lane < 0 || lane >= ra_nlanes) return;
+    replApplyRunHeld(lane);
+}
+
+/* Lane thread (or main, for a tiny flush): apply lane `lane`'s held SETs. */
+static void replApplyRunHeld(int lane) {
     replApplyLane *l = &ra_lanes[lane];
     if (!l->len) return;
     repl_apply_in_lane = 1;
@@ -810,7 +817,15 @@ void replApplyFlush(client *c) {
     client *old = ectx->current_client;
     ectx->current_client = c; /* replicated writes never see a key as expired */
     dbLanePhaseBegin();
-    stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
+    if (ra_pending < server.io_threads_parallel_writes_min) {
+        /* Too few to pay for waking the threads and waiting at the phase barrier (a primary's transactions
+         * end most segments after a SET or two): main applies every lane itself, lane by lane, as the
+         * inline lanes of the unit tests do. Lanes own disjoint tables, so the order between them is free. */
+        for (int i = 0; i < ra_nlanes; i++) replApplyRunHeld(i);
+        server.stat_repl_apply_inline++;
+    } else {
+        stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
+    }
     /* Fold each thread's per-table changes into the kvstore-wide bookkeeping. */
     dbLanePhaseEnd();
     ectx->current_client = old;

@@ -2267,6 +2267,7 @@ struct valkeyServer {
     time_t stat_starttime;                         /* Server start time */
     long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
     long long stat_repl_apply_phases;              /* APPLY phases run */
+    long long stat_repl_apply_inline;              /* of those, held-SET flushes main ran itself (too few for a phase) */
     long long stat_repl_lane_reads;                /* Primary reads whose plan main ran on the write lanes */
     long long stat_repl_lane_read_usec;            /* IO-thread time of those reads: read, parse and plan */
     long long stat_repl_lane_classify_usec;        /* Of which the scan, and the parse of one-chunk reads */
