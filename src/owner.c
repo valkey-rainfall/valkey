@@ -7265,6 +7265,20 @@ void ownerInfo(sds *info) {
                          server.owner_tls_local_accept, tls_la);
     /* RL-g3i: stops that left closed clients for the next stop (OWN_CLOSES_PER_STOP). */
     *info = sdscatprintf(*info, "owner_close_defers:%lld\r\n", own_close_defers);
+    /* RL-g6a: TLS connections on the owner record path; KeyUpdates read / sent, fatal alerts, close_notify sent;
+     * verify mode: records OpenSSL made too that were equal / not. */
+    *info = sdscatprintf(*info,
+                         "owner_tls_records:%s\r\nowner_tls_rec_conns:%lld\r\nowner_tls_rec_keyupdates_in:%lld\r\n"
+                         "owner_tls_rec_keyupdates_out:%lld\r\nowner_tls_rec_fatal:%lld\r\nowner_tls_rec_closes:%lld\r\n"
+                         "owner_tls_rec_verified:%lld\r\nowner_tls_rec_mismatch:%lld\r\n",
+                         server.tls_owner_records ? (server.tls_owner_records_verify ? "verify" : "yes") : "no",
+                         atomic_load_explicit(&server.stat_tls_rec_conns, memory_order_relaxed),
+                         atomic_load_explicit(&server.stat_tls_rec_keyupdates_in, memory_order_relaxed),
+                         atomic_load_explicit(&server.stat_tls_rec_keyupdates_out, memory_order_relaxed),
+                         atomic_load_explicit(&server.stat_tls_rec_fatal, memory_order_relaxed),
+                         atomic_load_explicit(&server.stat_tls_rec_closes, memory_order_relaxed),
+                         atomic_load_explicit(&server.stat_tls_rec_verified, memory_order_relaxed),
+                         atomic_load_explicit(&server.stat_tls_rec_mismatch, memory_order_relaxed));
     /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
      * have the script for (or had it marked for main). */
     long long s_runs = 0, s_aborts = 0, s_misses = 0;

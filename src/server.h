@@ -2185,6 +2185,13 @@ struct valkeyServer {
     int owner_tls_port;                       /* owner-tls-port: owner i takes TLS clients on owner_tls_port + i; 0 = off (RL-g1d). */
     _Atomic(long long) stat_tls_write_tails;  /* RL-g2d: gathered TLS writes the socket took only part of (rare) */
     int owner_tls_local_accept;               /* owner-tls-local-accept: an owner finishes a TLS accept itself when main's part would only count it (RL-g2v; default yes). */
+    /* RL-g6a-tls-records: owners seal and open TLS 1.3 application-data records themselves (tls.c). */
+    int tls_owner_records;                    /* tls-owner-records (off by default; benchmark-fork research) */
+    int tls_owner_records_verify;             /* tls-owner-records-verify (debug): OpenSSL makes every record too, compared */
+    long long tls_owner_records_rekey;        /* tls-owner-records-rekey: records per write key before our own KeyUpdate */
+    _Atomic(long long) stat_tls_rec_conns;    /* connections switched to the owner record path */
+    _Atomic(long long) stat_tls_rec_keyupdates_in, stat_tls_rec_keyupdates_out, stat_tls_rec_fatal, stat_tls_rec_closes;
+    _Atomic(long long) stat_tls_rec_verified, stat_tls_rec_mismatch; /* verify mode: records compared equal / not */
     char *owner_cpulist;                      /* owner-cpulist: owner i is pinned to the i-th CPU of the list. */
     char *owner_announce_ip;                  /* owner-announce-ip: address CLUSTER SLOTS announces. */
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */

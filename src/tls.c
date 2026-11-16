@@ -47,6 +47,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/hmac.h> /* RL-g6a: HKDF-Expand-Label for the owner record path */
 #include <openssl/pem.h>
 #include <openssl/bn.h>
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -161,6 +162,8 @@ static void initCryptoLocks(void) {
 
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
 static void tlsGatherInit(void); /* RL-g2d gathered writes */
+static void tlsRecCtxSetup(SSL_CTX *ctx); /* RL-g6a owner record path */
+static int tls_rec_exidx = -1;            /* RL-g6a: SSL ex data slot -> tls_connection */
 #endif
 
 static void tlsInit(void) {
@@ -191,6 +194,7 @@ static void tlsInit(void) {
     pending_list = listCreate();
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
     tlsGatherInit(); /* RL-g2d */
+    tls_rec_exidx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL); /* RL-g6a */
 #endif
 }
 
@@ -802,6 +806,9 @@ static int tlsCreateContexts(serverTLSContextConfig *ctx_config,
     /* Create server side/general context */
     ctx = createSSLContext(ctx_config, protocols, 0, out_info);
     if (!ctx) goto error;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
+    tlsRecCtxSetup(ctx); /* RL-g6a: only when tls-owner-records is on */
+#endif
 
     if (ctx_config->session_caching) {
         SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
@@ -1233,7 +1240,20 @@ typedef struct tls_connection {
     const char *pre;
     size_t pre_len, pre_off, pre_cap;
     char *pre_buf;
+    /* RL-g6a: the owner record path (NULL when off or not possible for this connection). vmode (verify mode
+     * only): the filter keeps OpenSSL's output in vw (1, 2) and serves OpenSSL's input from vr (2). */
+    struct tlsRec *rec;
+    int vmode;
+    char *vw, *vr;
+    size_t vwlen, vwcap, vrlen, vroff, vrcap;
 } tls_connection;
+
+/* RL-g6a: OpenSSL's I/O calls go through these; on the owner record path they are served by it. */
+static int tlsSslGetError(tls_connection *conn, int ret);
+static int tlsSslPending(tls_connection *conn);
+static int tlsSslHasPending(tls_connection *conn);
+static const char *tlsRecWhy(tls_connection *conn);
+static void tlsRecAttach(tls_connection *conn);
 
 /* RL-g2k: OpenSSL may hold input no socket event reports: in its buffer, or not read yet from an io_uring recv */
 static inline int tlsPreLeft(tls_connection *conn) {
@@ -1301,6 +1321,7 @@ static connection *connCreateAcceptedTLS(int fd, void *priv) {
 
     SSL_set_fd(conn->ssl, conn->c.fd);
     SSL_set_accept_state(conn->ssl);
+    tlsRecAttach(conn); /* RL-g6a */
 
     return (connection *)conn;
 }
@@ -1321,7 +1342,7 @@ static void clearTLSWantFlags(tls_connection *conn) {
 static int handleSSLReturnCode(tls_connection *conn, int ret_value) {
     clearTLSWantFlags(conn);
     if (ret_value <= 0) {
-        int ssl_err = SSL_get_error(conn->ssl, ret_value);
+        int ssl_err = tlsSslGetError(conn, ret_value);
         switch (ssl_err) {
         case SSL_ERROR_WANT_WRITE: conn->flags |= TLS_CONN_FLAG_READ_WANT_WRITE; return 0;
         case SSL_ERROR_WANT_READ: conn->flags |= TLS_CONN_FLAG_WRITE_WANT_READ; return 0;
@@ -1332,7 +1353,13 @@ static int handleSSLReturnCode(tls_connection *conn, int ret_value) {
             break;
         default:
             /* Error! */
-            updateTLSError(conn);
+            if (tlsRecWhy(conn)) { /* RL-g6a: the owner record path says why */
+                conn->c.last_errno = 0;
+                if (conn->ssl_error) zfree(conn->ssl_error);
+                conn->ssl_error = zstrdup(tlsRecWhy(conn));
+            } else {
+                updateTLSError(conn);
+            }
             break;
         }
 
@@ -1421,7 +1448,7 @@ static void updatePendingData(tls_connection *conn) {
 }
 
 void updateSSLPendingFlag(tls_connection *conn) {
-    if (conn->ssl && (SSL_pending(conn->ssl) > 0 || tlsPreLeft(conn))) { /* RL-g2k: or pre-read ciphertext */
+    if (conn->ssl && (tlsSslPending(conn) > 0 || tlsPreLeft(conn))) { /* RL-g2k: or pre-read ciphertext */
         conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
     } else {
         conn->flags &= ~TLS_CONN_FLAG_HAS_PENDING;
@@ -1771,11 +1798,15 @@ static void connTLSCloseListener(connListener *listener) {
     connectionTypeTcp()->closeListener(listener);
 }
 
+static int tlsSslShutdown(tls_connection *conn);
+static void tlsRecFree(tls_connection *conn);
+
 static void connTLSShutdown(connection *conn_) {
     tls_connection *conn = (tls_connection *)conn_;
 
     if (conn->ssl) {
-        if (conn->c.state == CONN_STATE_CONNECTED) SSL_shutdown(conn->ssl);
+        if (conn->c.state == CONN_STATE_CONNECTED) tlsSslShutdown(conn); /* RL-g6a: ours on the record path */
+        tlsRecFree(conn);
         SSL_free(conn->ssl);
         conn->ssl = NULL;
     }
@@ -1788,7 +1819,8 @@ static void connTLSClose(connection *conn_) {
 
     if (conn->ssl) {
         /* RL-g2d: no close_notify ahead of records still waiting in the tail (they would arrive out of order) */
-        if (conn->c.state == CONN_STATE_CONNECTED && conn->olen <= conn->ooff) SSL_shutdown(conn->ssl);
+        if (conn->c.state == CONN_STATE_CONNECTED && conn->olen <= conn->ooff) tlsSslShutdown(conn);
+        tlsRecFree(conn);
         SSL_free(conn->ssl);
         conn->ssl = NULL;
     }
@@ -1987,6 +2019,16 @@ static int tlsGatherBioWrite(BIO *b, const char *in, int inl) {
     tls_connection *conn = BIO_get_data(b);
     BIO *next = BIO_next(b);
     if (inl <= 0) return 0;
+    if (conn && conn->vmode) { /* RL-g6a verify: OpenSSL's copy of records we made, kept for the comparison */
+        if (conn->vwlen + (size_t)inl > conn->vwcap) {
+            conn->vwcap = (conn->vwlen + (size_t)inl) * 2;
+            conn->vw = zrealloc(conn->vw, conn->vwcap);
+        }
+        memcpy(conn->vw + conn->vwlen, in, inl);
+        conn->vwlen += (size_t)inl;
+        BIO_clear_retry_flags(b);
+        return inl;
+    }
     if (conn && conn->collect) { /* a gathered write: into the thread's arena */
         tlsArena *a = &tls_arena;
         tlsArenaRoom(a, (size_t)inl);
@@ -2011,6 +2053,18 @@ static int tlsGatherBioRead(BIO *b, char *out, int outl) {
     tls_connection *conn = BIO_get_data(b);
     BIO *next = BIO_next(b);
     if (outl <= 0) return 0;
+    if (conn && conn->vmode == 2) { /* RL-g6a verify: OpenSSL reads only the record we opened */
+        size_t n = conn->vrlen - conn->vroff;
+        if (!n) {
+            BIO_set_retry_read(b);
+            return -1;
+        }
+        if (n > (size_t)outl) n = (size_t)outl;
+        memcpy(out, conn->vr + conn->vroff, n);
+        conn->vroff += n;
+        BIO_clear_retry_flags(b);
+        return (int)n;
+    }
     if (conn && tlsPreLeft(conn)) {
         size_t n = conn->pre_len - conn->pre_off;
         if (n > (size_t)outl) n = (size_t)outl;
@@ -2037,7 +2091,7 @@ static long tlsGatherBioCtrl(BIO *b, int cmd, long num, void *ptr) {
     long r;
     switch (cmd) {
     case BIO_CTRL_FLUSH:
-        if (conn && (conn->collect || conn->olen > conn->ooff)) return 1;
+        if (conn && (conn->vmode || conn->collect || conn->olen > conn->ooff)) return 1;
         break;
     case BIO_CTRL_PENDING:
         r = next ? BIO_ctrl(next, cmd, num, ptr) : 0;
@@ -2102,6 +2156,657 @@ static int tlsGatherOn(tls_connection *conn) {
     return conn->gbio || tlsGatherInstall(conn) == C_OK;
 }
 
+/* ===== RL-g6a-tls-records: the owner record path =====
+ * BENCHMARK-FORK RESEARCH. This changes how a network server protects its traffic and needs a security review
+ * before it is used anywhere else. Off by default (tls-owner-records).
+ *
+ * OpenSSL keeps the handshake, session tickets and everything that is not a TLS 1.3 application-data record
+ * of an established connection. Once a server connection is established (TLS 1.3, AES-128-GCM, AES-256-GCM or
+ * ChaCha20-Poly1305, no KeyUpdate seen, OpenSSL holding no input or output it has not handed over) and an owner
+ * thread uses it, the connection seals and opens its records here instead of in OpenSSL's record layer:
+ * - keys: the traffic secrets OpenSSL derived, from its keylog callback (never logged; zeroed when freed);
+ *   key and IV by HKDF-Expand-Label; AEAD through EVP, as OpenSSL's own record layer does it;
+ * - sequence numbers: exactly the records OpenSSL itself wrote and read after the Finished messages, counted by
+ *   its message callback (one call per record header). From then on every record takes the next number, so a
+ *   nonce never repeats under a key; the write key moves on (KeyUpdate) after tls-owner-records-rekey records;
+ * - every record's tag is checked before any of its bytes is used; KeyUpdate both ways (read: new key, and
+ *   update_requested is answered before our next record); close_notify; anything else (other alerts, other
+ *   handshake messages, a bad tag, a bad length, a wrong outer type or version) closes the connection with an
+ *   alert, never silently, and nothing is written after a fatal alert;
+ * - OpenSSL is never asked to read or write records on such a connection again (quiet shutdown: our own
+ *   close_notify), except in verify mode, where it makes each record too and the bytes must be equal.
+ * The records go through the same filter BIO and buffers as OpenSSL's (gathered writes, io_uring batches,
+ * tails), so every caller and thread sees the same SSL_read / SSL_write semantics as before. */
+#define TLS_REC_HDR 5
+#define TLS_REC_TAG 16
+#define TLS_REC_MAXPT 16384
+#define TLS_REC_MAXCT (TLS_REC_MAXPT + 256)
+#define TLS_REC_RCAP (TLS_REC_HDR + TLS_REC_MAXCT + 768)
+#define TLS_REC_KU_LEN (TLS_REC_HDR + 5 + 1 + TLS_REC_TAG)
+
+typedef struct tlsRec {
+    /* before the switch, from OpenSSL's callbacks */
+    int wapp, rapp, bad, wsec_len, rsec_len;
+    uint64_t wcnt, rcnt;
+    /* the record path */
+    int on, fatal, closed_in, ku_peer, ku_self, err, hashlen, keylen;
+    const char *why;
+    const EVP_CIPHER *cipher;
+    const EVP_MD *md;
+    EVP_CIPHER_CTX *wctx, *rctx;
+    unsigned char wsec[EVP_MAX_MD_SIZE], rsec[EVP_MAX_MD_SIZE], wiv[12], riv[12];
+    uint64_t wseq, rseq, wepoch, vseq, vepoch;
+    char *rin; /* ciphertext read: rin[roff .. rlen) not opened yet */
+    size_t rlen, roff;
+    const char *pt; /* plaintext of the record in hand (inside rin) */
+    size_t ptlen, ptoff;
+    char *wbuf; /* a sealed write the BIO took only part of: wbuf[woff .. wlen), wpend_pt its plaintext */
+    size_t wcap, wlen, woff, wpend_pt;
+} tlsRec;
+
+static inline int tlsRecOn(tls_connection *conn) {
+    return conn->rec && conn->rec->on;
+}
+
+static const char *tlsRecWhy(tls_connection *conn) {
+    return tlsRecOn(conn) ? conn->rec->why : NULL;
+}
+
+static void tlsRecDrop(tls_connection *conn) { /* not possible for this connection: OpenSSL keeps it */
+    if (!conn->rec) return;
+    OPENSSL_cleanse(conn->rec, sizeof(tlsRec));
+    zfree(conn->rec);
+    conn->rec = NULL;
+    if (conn->ssl) SSL_set_msg_callback(conn->ssl, NULL);
+}
+
+static void tlsRecFree(tls_connection *conn) {
+    tlsRec *r = conn->rec;
+    if (r) {
+        EVP_CIPHER_CTX_free(r->wctx); /* clears the key schedule */
+        EVP_CIPHER_CTX_free(r->rctx);
+        if (r->rin) {
+            OPENSSL_cleanse(r->rin, TLS_REC_RCAP);
+            zfree(r->rin);
+        }
+        zfree(r->wbuf);
+        OPENSSL_cleanse(r, sizeof(tlsRec));
+        zfree(r);
+        conn->rec = NULL;
+    }
+    zfree(conn->vw);
+    zfree(conn->vr);
+    conn->vw = conn->vr = NULL;
+    conn->vwlen = conn->vwcap = conn->vrlen = conn->vroff = conn->vrcap = 0;
+}
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* OpenSSL's keylog line "<LABEL> <client random> <secret>", for the two application traffic secrets. */
+static void tlsRecKeylog(const SSL *ssl, const char *line) {
+    tls_connection *conn = tls_rec_exidx >= 0 ? SSL_get_ex_data(ssl, tls_rec_exidx) : NULL;
+    if (!conn || !conn->rec || conn->rec->on) return;
+    tlsRec *r = conn->rec;
+    unsigned char *dst;
+    int *dlen;
+    if (!strncmp(line, "SERVER_TRAFFIC_SECRET_0 ", 24)) {
+        dst = r->wsec;
+        dlen = &r->wsec_len;
+    } else if (!strncmp(line, "CLIENT_TRAFFIC_SECRET_0 ", 24)) {
+        dst = r->rsec;
+        dlen = &r->rsec_len;
+    } else {
+        return;
+    }
+    const char *p = strchr(line + 24, ' ');
+    if (!p) return;
+    p++;
+    size_t hl = strlen(p);
+    int n = 0;
+    if (hl % 2 || hl / 2 > EVP_MAX_MD_SIZE) {
+        r->bad = 1;
+        return;
+    }
+    for (size_t i = 0; i < hl; i += 2) {
+        int hi = hexval(p[i]), lo = hexval(p[i + 1]);
+        if (hi < 0 || lo < 0) {
+            r->bad = 1;
+            return;
+        }
+        dst[n++] = (unsigned char)(hi << 4 | lo);
+    }
+    if (*dlen) r->bad = 1; /* a second epoch-0 secret: not a state this path knows */
+    *dlen = n;
+}
+
+/* OpenSSL's message callback: one SSL3_RT_HEADER call per record read or written, and one call per handshake
+ * message. After the server's Finished (written) and the client's Finished (read), every record header is a
+ * record under the application traffic key of that direction. Any KeyUpdate, or any other post-handshake message
+ * but the server's NewSessionTickets, and the connection stays on OpenSSL. */
+static void tlsRecMsg(int write_p, int version, int content_type, const void *buf, size_t len, SSL *ssl, void *arg) {
+    UNUSED(version);
+    UNUSED(arg);
+    tls_connection *conn = tls_rec_exidx >= 0 ? SSL_get_ex_data(ssl, tls_rec_exidx) : NULL;
+    if (!conn || !conn->rec || conn->rec->on) return;
+    tlsRec *r = conn->rec;
+    if (content_type == SSL3_RT_HEADER) {
+        if (write_p && r->wapp) r->wcnt++;
+        if (!write_p && r->rapp) r->rcnt++;
+        return;
+    }
+    if (content_type != SSL3_RT_HANDSHAKE || len < 1) return;
+    int t = ((const unsigned char *)buf)[0];
+    if (t == SSL3_MT_FINISHED) {
+        int *app = write_p ? &r->wapp : &r->rapp;
+        if (*app) r->bad = 1;
+        *app = 1;
+        if (write_p)
+            r->wcnt = 0;
+        else
+            r->rcnt = 0;
+    } else if (t == SSL3_MT_KEY_UPDATE) {
+        r->bad = 1;
+    } else if (write_p ? (r->wapp && t != SSL3_MT_NEWSESSION_TICKET) : r->rapp) {
+        r->bad = 1;
+    }
+}
+
+static void tlsRecCtxSetup(SSL_CTX *ctx) {
+    if (!server.tls_owner_records || tls_rec_exidx < 0 || !tls_gather_meth) return;
+    SSL_CTX_set_keylog_callback(ctx, tlsRecKeylog);
+    SSL_CTX_set_msg_callback(ctx, tlsRecMsg);
+}
+
+/* An accepted connection: its handshake's secrets and records are followed from the start. */
+static void tlsRecAttach(tls_connection *conn) {
+    if (!server.tls_owner_records || tls_rec_exidx < 0 || !conn->ssl) return;
+    if (SSL_CTX_get_keylog_callback(SSL_get_SSL_CTX(conn->ssl)) != tlsRecKeylog) return;
+    conn->rec = zcalloc(sizeof(tlsRec));
+    SSL_set_ex_data(conn->ssl, tls_rec_exidx, conn);
+}
+
+/* HKDF-Expand-Label(secret, label, "", outlen) for outlen up to the hash length (one HMAC block). */
+static int tlsRecExpand(const EVP_MD *md, const unsigned char *sec, int seclen, const char *label, unsigned char *out, int outlen) {
+    unsigned char info[2 + 1 + 6 + 32 + 1 + 1], t[EVP_MAX_MD_SIZE];
+    unsigned int tl = 0;
+    size_t ll = strlen(label), n = 0;
+    if (ll > 32 || outlen > EVP_MD_get_size(md)) return 0;
+    info[n++] = (unsigned char)(outlen >> 8);
+    info[n++] = (unsigned char)outlen;
+    info[n++] = (unsigned char)(6 + ll);
+    memcpy(info + n, "tls13 ", 6);
+    n += 6;
+    memcpy(info + n, label, ll);
+    n += ll;
+    info[n++] = 0; /* empty context */
+    info[n++] = 1; /* HKDF-Expand: T(1) */
+    int ok = HMAC(md, sec, seclen, info, n, t, &tl) != NULL && (int)tl >= outlen;
+    if (ok) memcpy(out, t, outlen);
+    OPENSSL_cleanse(t, sizeof(t));
+    return ok;
+}
+
+/* Key and IV of one direction from its current secret, into that direction's cipher context. */
+static int tlsRecKeys(tlsRec *r, int wr) {
+    unsigned char key[32];
+    unsigned char *sec = wr ? r->wsec : r->rsec, *iv = wr ? r->wiv : r->riv;
+    EVP_CIPHER_CTX **cx = wr ? &r->wctx : &r->rctx;
+    int ok = tlsRecExpand(r->md, sec, r->hashlen, "key", key, r->keylen) && tlsRecExpand(r->md, sec, r->hashlen, "iv", iv, 12);
+    if (ok && !*cx) ok = (*cx = EVP_CIPHER_CTX_new()) != NULL;
+    if (ok) ok = EVP_CipherInit_ex(*cx, r->cipher, NULL, key, NULL, wr) == 1 && EVP_CIPHER_CTX_get_iv_length(*cx) == 12;
+    OPENSSL_cleanse(key, sizeof(key));
+    return ok;
+}
+
+/* KeyUpdate of one direction: secret = HKDF-Expand-Label(secret, "traffic upd", "", hash length), new key and
+ * IV, sequence number 0. */
+static int tlsRecUpdate(tlsRec *r, int wr) {
+    unsigned char ns[EVP_MAX_MD_SIZE];
+    unsigned char *sec = wr ? r->wsec : r->rsec;
+    if (!tlsRecExpand(r->md, sec, r->hashlen, "traffic upd", ns, r->hashlen)) return 0;
+    memcpy(sec, ns, r->hashlen);
+    OPENSSL_cleanse(ns, sizeof(ns));
+    if (!tlsRecKeys(r, wr)) return 0;
+    if (wr) {
+        r->wseq = 0;
+        r->wepoch++;
+    } else {
+        r->rseq = 0;
+    }
+    return 1;
+}
+
+static inline void tlsRecNonce(const unsigned char *iv, uint64_t seq, unsigned char *n) {
+    memcpy(n, iv, 12);
+    for (int i = 0; i < 8; i++) n[11 - i] ^= (unsigned char)(seq >> (8 * i));
+}
+
+/* Seals one record (inner type t, n <= 16384 bytes) into out (room: 5 + n + 1 + 16). Returns its length, 0 on
+ * an error. The nonce is the write IV xor the record's sequence number, which only ever goes up by one. */
+static size_t tlsRecSeal(tlsRec *r, unsigned char t, const unsigned char *in, size_t n, unsigned char *out) {
+    size_t clen = n + 1 + TLS_REC_TAG;
+    unsigned char nonce[12];
+    int l;
+    if (r->wseq == UINT64_MAX || n > TLS_REC_MAXPT) return 0;
+    if (server.tls_owner_records_verify) { /* the nonce never repeats: (epoch, seq) strictly increases */
+        if (r->wepoch == r->vepoch && r->wseq && r->wseq != r->vseq + 1) return 0;
+        if (r->wepoch != r->vepoch && r->wseq != 0) return 0;
+        r->vepoch = r->wepoch;
+        r->vseq = r->wseq;
+    }
+    out[0] = 0x17;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    out[3] = (unsigned char)(clen >> 8);
+    out[4] = (unsigned char)clen;
+    tlsRecNonce(r->wiv, r->wseq, nonce);
+    if (EVP_EncryptInit_ex(r->wctx, NULL, NULL, NULL, nonce) != 1 || EVP_EncryptUpdate(r->wctx, NULL, &l, out, TLS_REC_HDR) != 1 ||
+        (n && (EVP_EncryptUpdate(r->wctx, out + TLS_REC_HDR, &l, in, (int)n) != 1 || (size_t)l != n)) ||
+        EVP_EncryptUpdate(r->wctx, out + TLS_REC_HDR + n, &l, &t, 1) != 1 || l != 1 ||
+        EVP_EncryptFinal_ex(r->wctx, out + TLS_REC_HDR + n + 1, &l) != 1 ||
+        EVP_CIPHER_CTX_ctrl(r->wctx, EVP_CTRL_AEAD_GET_TAG, TLS_REC_TAG, out + TLS_REC_HDR + n + 1) != 1)
+        return 0;
+    r->wseq++;
+    return TLS_REC_HDR + clen;
+}
+
+/* A fatal alert (best effort: only when nothing of ours waits to go out), then nothing more is written or
+ * read on this connection. Returns -1 (SSL_ERROR_SSL). */
+static int tlsRecFatal(tls_connection *conn, int desc, const char *why) {
+    tlsRec *r = conn->rec;
+    if (!r->fatal) {
+        r->fatal = 1;
+        r->why = why;
+        atomic_fetch_add_explicit(&server.stat_tls_rec_fatal, 1, memory_order_relaxed);
+        if (desc >= 0 && !conn->collect && r->wlen <= r->woff && conn->olen <= conn->ooff && conn->c.fd != -1) {
+            unsigned char a[2] = {2, (unsigned char)desc}, out[TLS_REC_HDR + 2 + 1 + TLS_REC_TAG];
+            size_t m = tlsRecSeal(r, SSL3_RT_ALERT, a, 2, out);
+            if (m && write(conn->c.fd, out, m) < 0) { /* best effort */
+            }
+        }
+    }
+    r->err = SSL_ERROR_SSL;
+    return -1;
+}
+
+/* Verify mode: OpenSSL makes the same record(s) (its write state follows ours record by record) and the bytes
+ * must be equal. What OpenSSL wrote while reading (a KeyUpdate answer) is already in vw, in order. */
+static int tlsRecVerifyWrite(tls_connection *conn, const char *data, size_t n, const unsigned char *ours, size_t m) {
+    conn->vmode = 1;
+    tlsClearErrors();
+    int x = SSL_write(conn->ssl, data, (int)n);
+    conn->vmode = 0;
+    int ok = x == (int)n && conn->vwlen == m && memcmp(conn->vw, ours, m) == 0;
+    if (!ok) {
+        atomic_fetch_add_explicit(&server.stat_tls_rec_mismatch, 1, memory_order_relaxed);
+        serverLog(LL_WARNING, "tls-owner-records-verify: sealed record differs from OpenSSL's (ours %zu bytes, OpenSSL %zu, SSL_write %d)",
+                  m, conn->vwlen, x);
+    } else {
+        atomic_fetch_add_explicit(&server.stat_tls_rec_verified, 1, memory_order_relaxed);
+    }
+    conn->vwlen = 0;
+    return ok ? C_OK : C_ERR;
+}
+
+/* Verify mode: OpenSSL opens the same record (vr, the ciphertext) and must find the same content: n bytes of
+ * application data at pt, or (n < 0) no application data and no error (KeyUpdate, close_notify, empty). */
+static int tlsRecVerifyRead(tls_connection *conn, const char *pt, long n) {
+    static __thread char tmp[TLS_REC_MAXPT + 64];
+    conn->vmode = 2;
+    tlsClearErrors();
+    int x = SSL_read(conn->ssl, tmp, sizeof(tmp));
+    int e = x <= 0 ? SSL_get_error(conn->ssl, x) : SSL_ERROR_NONE;
+    conn->vmode = 0;
+    int ok = conn->vroff == conn->vrlen &&
+             (n > 0 ? (x == n && memcmp(tmp, pt, n) == 0) : (x <= 0 && (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_ZERO_RETURN)));
+    if (!ok) {
+        atomic_fetch_add_explicit(&server.stat_tls_rec_mismatch, 1, memory_order_relaxed);
+        serverLog(LL_WARNING, "tls-owner-records-verify: opened record differs from OpenSSL's (ours %ld bytes, OpenSSL %d, err %d)", n, x, e);
+    } else {
+        atomic_fetch_add_explicit(&server.stat_tls_rec_verified, 1, memory_order_relaxed);
+    }
+    return ok ? C_OK : C_ERR;
+}
+
+/* The switch, tried by an owner thread before each OpenSSL I/O call until it happens or cannot. Returns 1 when
+ * this connection is now on the record path. */
+static int tlsRecSwitch(tls_connection *conn) {
+    tlsRec *r = conn->rec;
+    SSL *s = conn->ssl;
+    if (!(conn->flags & TLS_CONN_FLAG_IO_OWNED) || inMainThread() || conn->c.state != CONN_STATE_CONNECTED) return 0;
+    if (!SSL_is_init_finished(s) || SSL_in_init(s)) return 0;
+    if (!conn->gbio && tlsGatherInstall(conn) != C_OK) return 0; /* the records go through the filter BIO */
+    const SSL_CIPHER *c = SSL_get_current_cipher(s);
+    unsigned long id = c ? (SSL_CIPHER_get_id(c) & 0xffff) : 0;
+    const EVP_CIPHER *ev = NULL;
+    const EVP_MD *md = NULL;
+    int kl = 0;
+    switch (id) {
+    case 0x1301: ev = EVP_aes_128_gcm(); md = EVP_sha256(); kl = 16; break;
+    case 0x1302: ev = EVP_aes_256_gcm(); md = EVP_sha384(); kl = 32; break;
+    case 0x1303: ev = EVP_chacha20_poly1305(); md = EVP_sha256(); kl = 32; break;
+    default: break;
+    }
+    if (r->bad || SSL_version(s) != TLS1_3_VERSION || !SSL_is_server(s) || !ev || !md || !r->wapp || !r->rapp ||
+        r->wsec_len != EVP_MD_get_size(md) || r->rsec_len != EVP_MD_get_size(md)) {
+        serverLog(LL_VERBOSE, "TLS owner record path not used for a connection (bad %d, version %x, cipher %lx, finished %d/%d, secrets %d/%d)",
+                  r->bad, (unsigned)SSL_version(s), id, r->wapp, r->rapp, r->wsec_len, r->rsec_len);
+        tlsRecDrop(conn);
+        return 0;
+    }
+    /* OpenSSL must hold nothing it has not handed over: no input (processed or not), no output, no KeyUpdate.
+     * (WRITE_WANT_READ only says the last read wanted more input: no bytes of OpenSSL's.) */
+    if (SSL_has_pending(s) || SSL_pending(s) > 0 || SSL_want_write(s) || conn->last_failed_write_data_len ||
+        (conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE) || SSL_get_key_update_type(s) != SSL_KEY_UPDATE_NONE) {
+        if (!r->why) {
+            serverLog(LL_VERBOSE, "TLS owner record path: not yet (has_pending %d, pending %d, want_write %d, failed %zu, rww %d, ku %d)",
+                      SSL_has_pending(s), SSL_pending(s), SSL_want_write(s), conn->last_failed_write_data_len,
+                      !!(conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE), SSL_get_key_update_type(s));
+            r->why = "waiting";
+        }
+        return 0;
+    }
+    r->why = NULL;
+    r->cipher = ev;
+    r->md = md;
+    r->keylen = kl;
+    r->hashlen = EVP_MD_get_size(md);
+    if (!tlsRecKeys(r, 1) || !tlsRecKeys(r, 0)) {
+        EVP_CIPHER_CTX_free(r->wctx);
+        EVP_CIPHER_CTX_free(r->rctx);
+        r->wctx = r->rctx = NULL;
+        tlsRecDrop(conn);
+        return 0;
+    }
+    r->wseq = r->wcnt;
+    r->rseq = r->rcnt;
+    r->vseq = r->wseq ? r->wseq - 1 : 0;
+    SSL_set_msg_callback(s, NULL);
+    SSL_set_quiet_shutdown(s, 1); /* OpenSSL's write state is stale from here: it must never write a record */
+    if (!server.tls_owner_records_verify) SSL_free_buffers(s);
+    r->on = 1;
+    atomic_fetch_add_explicit(&server.stat_tls_rec_conns, 1, memory_order_relaxed);
+    return 1;
+}
+
+static inline int tlsRecActive(tls_connection *conn) {
+    tlsRec *r = conn->rec;
+    if (!r) return 0;
+    if (r->on) return 1;
+    return tlsRecSwitch(conn);
+}
+
+static int tlsRecWriteFail(tls_connection *conn, int w) {
+    tlsRec *r = conn->rec;
+    if (w > 0 || BIO_should_retry(conn->gbio)) {
+        r->err = SSL_ERROR_WANT_WRITE;
+        errno = EAGAIN;
+    } else {
+        r->err = SSL_ERROR_SYSCALL;
+    }
+    return -1;
+}
+
+/* SSL_write in partial-write mode: one application-data record of up to 16384 bytes per call (after a
+ * KeyUpdate we owe); a record the BIO took only part of is finished by the next call, which must offer at least
+ * the same bytes, and then reports them. In a gathered write (collect) the record is sealed straight into the
+ * thread's arena. */
+static int tlsRecWrite(tls_connection *conn, const void *data, int len) {
+    tlsRec *r = conn->rec;
+    r->err = SSL_ERROR_NONE;
+    if (r->fatal) {
+        r->err = SSL_ERROR_SSL;
+        return -1;
+    }
+    if (r->wlen > r->woff) {
+        if (len < 0 || (size_t)len < r->wpend_pt) return tlsRecFatal(conn, -1, "owner TLS record: bad write retry");
+        int w = BIO_write(conn->gbio, r->wbuf + r->woff, (int)(r->wlen - r->woff));
+        if (w > 0) r->woff += (size_t)w;
+        if (r->woff < r->wlen) return tlsRecWriteFail(conn, w);
+        size_t pt = r->wpend_pt;
+        r->wlen = r->woff = r->wpend_pt = 0;
+        return (int)pt;
+    }
+    if (len <= 0) return 0;
+    size_t n = (size_t)len > TLS_REC_MAXPT ? TLS_REC_MAXPT : (size_t)len;
+    int ku = r->ku_peer || r->ku_self;
+    size_t room = (ku ? TLS_REC_KU_LEN : 0) + TLS_REC_HDR + n + 1 + TLS_REC_TAG, m = 0;
+    tlsArena *a = &tls_arena;
+    unsigned char *out;
+    if (conn->collect) {
+        tlsArenaRoom(a, room);
+        out = (unsigned char *)a->buf + a->used;
+    } else {
+        if (r->wcap < room) {
+            zfree(r->wbuf);
+            r->wcap = room < 4096 ? 4096 : room;
+            r->wbuf = zmalloc(r->wcap);
+        }
+        out = (unsigned char *)r->wbuf;
+    }
+    if (ku) { /* KeyUpdate(update_not_requested) under the old key, then the new key */
+        unsigned char kmsg[5] = {SSL3_MT_KEY_UPDATE, 0, 0, 1, 0};
+        m = tlsRecSeal(r, SSL3_RT_HANDSHAKE, kmsg, 5, out);
+        if (!m || !tlsRecUpdate(r, 1)) return tlsRecFatal(conn, SSL_AD_INTERNAL_ERROR, "owner TLS record: KeyUpdate");
+        r->ku_peer = r->ku_self = 0;
+        atomic_fetch_add_explicit(&server.stat_tls_rec_keyupdates_out, 1, memory_order_relaxed);
+    }
+    size_t k = tlsRecSeal(r, SSL3_RT_APPLICATION_DATA, data, n, out + m);
+    if (!k) return tlsRecFatal(conn, SSL_AD_INTERNAL_ERROR, "owner TLS record: seal");
+    m += k;
+    if (server.tls_owner_records_verify && tlsRecVerifyWrite(conn, data, n, out, m) != C_OK)
+        return tlsRecFatal(conn, -1, "owner TLS record: verify mismatch (write)");
+    if (r->wseq >= (uint64_t)server.tls_owner_records_rekey) {
+        r->ku_self = 1; /* before the next record */
+        if (server.tls_owner_records_verify) SSL_key_update(conn->ssl, SSL_KEY_UPDATE_NOT_REQUESTED);
+    }
+    if (conn->collect) {
+        a->used += m;
+        return (int)n;
+    }
+    int w = BIO_write(conn->gbio, out, (int)m);
+    if (w == (int)m) return (int)n;
+    r->wlen = m;
+    r->woff = w > 0 ? (size_t)w : 0;
+    r->wpend_pt = n;
+    return tlsRecWriteFail(conn, w);
+}
+
+/* Opens the next whole record in rin. Returns 1 when one was opened (its application data, if any, is at pt),
+ * 0 when rin holds no whole record, -1 on a fatal error (alert sent, connection done). */
+static int tlsRecOpen(tls_connection *conn) {
+    tlsRec *r = conn->rec;
+    size_t avail = r->rlen - r->roff;
+    if (avail < TLS_REC_HDR) return 0;
+    unsigned char *h = (unsigned char *)r->rin + r->roff;
+    size_t clen = ((size_t)h[3] << 8) | h[4];
+    if (h[0] != SSL3_RT_APPLICATION_DATA) return tlsRecFatal(conn, SSL_AD_UNEXPECTED_MESSAGE, "owner TLS record: outer type");
+    if (h[1] != 0x03 || h[2] != 0x03) return tlsRecFatal(conn, SSL_AD_PROTOCOL_VERSION, "owner TLS record: version");
+    if (clen > TLS_REC_MAXCT) return tlsRecFatal(conn, SSL_AD_RECORD_OVERFLOW, "owner TLS record: too long");
+    if (clen < TLS_REC_TAG + 1) return tlsRecFatal(conn, SSL_AD_BAD_RECORD_MAC, "owner TLS record: too short");
+    if (avail < TLS_REC_HDR + clen) return 0;
+    if (r->rseq == UINT64_MAX) return tlsRecFatal(conn, SSL_AD_INTERNAL_ERROR, "owner TLS record: sequence");
+    unsigned char *body = h + TLS_REC_HDR, nonce[12];
+    size_t n = clen - TLS_REC_TAG;
+    int l;
+    if (server.tls_owner_records_verify) { /* the ciphertext, for OpenSSL to open too */
+        if (conn->vrcap < TLS_REC_HDR + clen) {
+            zfree(conn->vr);
+            conn->vrcap = TLS_REC_RCAP;
+            conn->vr = zmalloc(conn->vrcap);
+        }
+        memcpy(conn->vr, h, TLS_REC_HDR + clen);
+        conn->vrlen = TLS_REC_HDR + clen;
+        conn->vroff = 0;
+    }
+    tlsRecNonce(r->riv, r->rseq, nonce);
+    if (EVP_DecryptInit_ex(r->rctx, NULL, NULL, NULL, nonce) != 1 || EVP_DecryptUpdate(r->rctx, NULL, &l, h, TLS_REC_HDR) != 1 ||
+        EVP_DecryptUpdate(r->rctx, body, &l, body, (int)n) != 1 || (size_t)l != n ||
+        EVP_CIPHER_CTX_ctrl(r->rctx, EVP_CTRL_AEAD_SET_TAG, TLS_REC_TAG, body + n) != 1 ||
+        EVP_DecryptFinal_ex(r->rctx, body + n, &l) != 1)
+        return tlsRecFatal(conn, SSL_AD_BAD_RECORD_MAC, "owner TLS record: bad record mac");
+    /* the tag held: from here the plaintext may be used */
+    r->rseq++;
+    r->roff += TLS_REC_HDR + clen;
+    while (n && body[n - 1] == 0) n--; /* padding */
+    if (!n) return tlsRecFatal(conn, SSL_AD_UNEXPECTED_MESSAGE, "owner TLS record: no content type");
+    unsigned char type = body[--n];
+    if (n > TLS_REC_MAXPT) return tlsRecFatal(conn, SSL_AD_RECORD_OVERFLOW, "owner TLS record: plaintext too long");
+    switch (type) {
+    case SSL3_RT_APPLICATION_DATA:
+        if (server.tls_owner_records_verify && tlsRecVerifyRead(conn, (const char *)body, n ? (long)n : -1) != C_OK)
+            return tlsRecFatal(conn, -1, "owner TLS record: verify mismatch (read)");
+        r->pt = (const char *)body;
+        r->ptlen = n;
+        r->ptoff = 0;
+        return 1;
+    case SSL3_RT_ALERT:
+        if (n != 2) return tlsRecFatal(conn, SSL_AD_DECODE_ERROR, "owner TLS record: alert length");
+        if (body[1] == SSL_AD_CLOSE_NOTIFY) {
+            if (server.tls_owner_records_verify && tlsRecVerifyRead(conn, NULL, -1) != C_OK)
+                return tlsRecFatal(conn, -1, "owner TLS record: verify mismatch (read)");
+            r->closed_in = 1;
+            return 1;
+        }
+        r->fatal = 1; /* the peer's error alert: the connection is done, nothing is sent back */
+        r->why = "owner TLS record: peer alert";
+        r->err = SSL_ERROR_SSL;
+        return -1;
+    case SSL3_RT_HANDSHAKE:
+        /* only a KeyUpdate, whole, alone and last in its record (no message spans a key change) */
+        if (n != 5 || body[0] != SSL3_MT_KEY_UPDATE || body[1] || body[2] || body[3] != 1)
+            return tlsRecFatal(conn, SSL_AD_UNEXPECTED_MESSAGE, "owner TLS record: handshake message");
+        if (body[4] > 1) return tlsRecFatal(conn, SSL_AD_ILLEGAL_PARAMETER, "owner TLS record: KeyUpdate type");
+        if (server.tls_owner_records_verify && tlsRecVerifyRead(conn, NULL, -1) != C_OK)
+            return tlsRecFatal(conn, -1, "owner TLS record: verify mismatch (read)");
+        if (!tlsRecUpdate(r, 0)) return tlsRecFatal(conn, SSL_AD_INTERNAL_ERROR, "owner TLS record: KeyUpdate");
+        if (body[4] == 1) r->ku_peer = 1; /* update_requested: ours goes before our next record */
+        atomic_fetch_add_explicit(&server.stat_tls_rec_keyupdates_in, 1, memory_order_relaxed);
+        return 1;
+    default: return tlsRecFatal(conn, SSL_AD_UNEXPECTED_MESSAGE, "owner TLS record: content type");
+    }
+}
+
+/* SSL_read: application data of the records in hand and of the whole records rin holds, up to len bytes; the
+ * BIO (pre-read ciphertext, then the socket) is read only when nothing was found. */
+static int tlsRecRead(tls_connection *conn, void *buf_, int len) {
+    tlsRec *r = conn->rec;
+    char *buf = buf_;
+    size_t got = 0;
+    r->err = SSL_ERROR_NONE;
+    if (r->fatal) {
+        r->err = SSL_ERROR_SSL;
+        return -1;
+    }
+    while (len > 0 && got < (size_t)len) {
+        if (r->ptoff < r->ptlen) {
+            size_t k = r->ptlen - r->ptoff;
+            if (k > (size_t)len - got) k = (size_t)len - got;
+            memcpy(buf + got, r->pt + r->ptoff, k);
+            r->ptoff += k;
+            got += k;
+            continue;
+        }
+        if (r->closed_in) break;
+        int st = tlsRecOpen(conn);
+        if (st > 0) continue;
+        if (st < 0) {
+            if (got) break; /* what came before the bad record; the next call reports the error */
+            return -1;
+        }
+        if (got) break;
+        /* no whole record: more ciphertext */
+        if (!r->rin) r->rin = zmalloc(TLS_REC_RCAP);
+        if (r->roff == r->rlen) {
+            r->roff = r->rlen = 0;
+        } else if (r->roff && TLS_REC_RCAP - r->rlen < TLS_REC_HDR + TLS_REC_MAXCT) {
+            memmove(r->rin, r->rin + r->roff, r->rlen - r->roff);
+            r->rlen -= r->roff;
+            r->roff = 0;
+        }
+        int rd = BIO_read(conn->gbio, r->rin + r->rlen, (int)(TLS_REC_RCAP - r->rlen));
+        if (rd > 0) {
+            r->rlen += (size_t)rd;
+            continue;
+        }
+        if (rd < 0 && BIO_should_retry(conn->gbio)) {
+            r->err = SSL_ERROR_WANT_READ;
+            errno = EAGAIN;
+            return -1;
+        }
+        r->err = SSL_ERROR_SYSCALL; /* EOF (errno 0: closed) or a socket error */
+        if (rd == 0) errno = 0;
+        return rd == 0 ? 0 : -1;
+    }
+    if (got) return (int)got;
+    if (r->closed_in) {
+        r->err = SSL_ERROR_ZERO_RETURN;
+        return 0;
+    }
+    r->err = SSL_ERROR_SSL;
+    return -1;
+}
+
+/* SSL_pending: plaintext in hand, or a whole record waiting (both are read without the socket). */
+static int tlsRecPending(tlsRec *r) {
+    if (r->ptoff < r->ptlen) return (int)(r->ptlen - r->ptoff);
+    size_t avail = r->rlen - r->roff;
+    if (avail >= TLS_REC_HDR) {
+        const unsigned char *h = (const unsigned char *)r->rin + r->roff;
+        if (avail >= TLS_REC_HDR + (((size_t)h[3] << 8) | h[4])) return 1;
+    }
+    return r->closed_in ? 1 : 0;
+}
+
+/* Our close_notify (OpenSSL's shutdown is quiet on the record path). */
+static int tlsRecShutdown(tls_connection *conn) {
+    tlsRec *r = conn->rec;
+    if (r->fatal || r->wlen > r->woff || conn->olen > conn->ooff) return 0;
+    unsigned char a[2] = {1, SSL_AD_CLOSE_NOTIFY}, out[TLS_REC_HDR + 2 + 1 + TLS_REC_TAG];
+    size_t m = tlsRecSeal(r, SSL3_RT_ALERT, a, 2, out);
+    r->fatal = 1; /* nothing after close_notify */
+    if (!m) return 0;
+    atomic_fetch_add_explicit(&server.stat_tls_rec_closes, 1, memory_order_relaxed);
+    return BIO_write(conn->gbio, out, (int)m) == (int)m;
+}
+
+/* The OpenSSL calls of this file, served by the record path once the connection is on it. */
+static inline int tlsSslWrite(tls_connection *conn, const void *d, int n) {
+    if (tlsRecActive(conn)) return tlsRecWrite(conn, d, n);
+    return SSL_write(conn->ssl, d, n);
+}
+
+static inline int tlsSslRead(tls_connection *conn, void *d, int n) {
+    if (tlsRecActive(conn)) return tlsRecRead(conn, d, n);
+    return SSL_read(conn->ssl, d, n);
+}
+
+static int tlsSslGetError(tls_connection *conn, int ret) {
+    if (tlsRecOn(conn)) return conn->rec->err;
+    return SSL_get_error(conn->ssl, ret);
+}
+
+static int tlsSslPending(tls_connection *conn) {
+    if (tlsRecOn(conn)) return tlsRecPending(conn->rec);
+    return SSL_pending(conn->ssl);
+}
+
+static int tlsSslHasPending(tls_connection *conn) {
+    if (tlsRecOn(conn)) return conn->rec->ptoff < conn->rec->ptlen || conn->rec->rlen > conn->rec->roff;
+    return SSL_has_pending(conn->ssl);
+}
+
+static int tlsSslShutdown(tls_connection *conn) {
+    if (tlsRecOn(conn)) return tlsRecShutdown(conn);
+    return SSL_shutdown(conn->ssl);
+}
+/* ===== end RL-g6a ===== */
+
 /* Sends the out buffer from ooff. Returns 1 when it is all out, 0 when the socket is full, -1 on an error. */
 static int tlsObufSend(tls_connection *conn) {
     while (conn->ooff < conn->olen) {
@@ -2152,7 +2857,7 @@ static size_t tlsCollect(tls_connection *conn, const char *data, size_t data_len
     conn->collect = 1;
     while (pt < data_len && conn->nrec < TLS_GATHER_MAXREC) {
         tlsClearErrors();
-        *ret = SSL_write(conn->ssl, data + pt, data_len - pt);
+        *ret = tlsSslWrite(conn, data + pt, data_len - pt);
         if (*ret <= 0) break;
         pt += (size_t)*ret;
         conn->rec_pt[conn->nrec] = (size_t)*ret;
@@ -2189,7 +2894,7 @@ static int tlsGatherWrite(tls_connection *conn, const char *data, size_t data_le
     if (!a->inflight) tlsArenaReset(a);
     if (data_len > NET_MAX_WRITES_PER_EVENT) data_len = NET_MAX_WRITES_PER_EVENT;
     size_t pt = tlsCollect(conn, data, data_len, &ret);
-    int ssl_err = ret <= 0 ? SSL_get_error(conn->ssl, ret) : SSL_ERROR_NONE, saved_errno = errno;
+    int ssl_err = ret <= 0 ? tlsSslGetError(conn, ret) : SSL_ERROR_NONE, saved_errno = errno;
     const char *ct = a->buf + a->cstart;
     size_t ctlen = a->used - a->cstart, off = 0;
     a->used = a->cstart; /* the records leave the arena with this call: on the socket, or into the tail */
@@ -2277,7 +2982,7 @@ static int connTLSIOOwnerWritePrepare(connection *conn_, const char *data, size_
         return -1;
     }
     if (ret <= 0) {
-        int ssl_err = SSL_get_error(conn->ssl, ret);
+        int ssl_err = tlsSslGetError(conn, ret);
         if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) conn->last_failed_write_data_len = len - pt;
     }
     a->inflight++;
@@ -2301,6 +3006,39 @@ static int connTLSIOOwnerWriteDone(connection *conn_, ssize_t sent) {
     conn->pw_ct = NULL;
     if (--a->inflight == 0) tlsArenaReset(a);
     return (int)rep;
+}
+#else /* no owner record path (RL-g6a) without the filter BIO: OpenSSL's calls as they are */
+static inline int tlsRecOn(tls_connection *conn) {
+    UNUSED(conn);
+    return 0;
+}
+static const char *tlsRecWhy(tls_connection *conn) {
+    UNUSED(conn);
+    return NULL;
+}
+static void tlsRecAttach(tls_connection *conn) {
+    UNUSED(conn);
+}
+static void tlsRecFree(tls_connection *conn) {
+    UNUSED(conn);
+}
+static inline int tlsSslWrite(tls_connection *conn, const void *d, int n) {
+    return SSL_write(conn->ssl, d, n);
+}
+static inline int tlsSslRead(tls_connection *conn, void *d, int n) {
+    return SSL_read(conn->ssl, d, n);
+}
+static int tlsSslGetError(tls_connection *conn, int ret) {
+    return SSL_get_error(conn->ssl, ret);
+}
+static int tlsSslPending(tls_connection *conn) {
+    return SSL_pending(conn->ssl);
+}
+static int tlsSslHasPending(tls_connection *conn) {
+    return SSL_has_pending(conn->ssl);
+}
+static int tlsSslShutdown(tls_connection *conn) {
+    return SSL_shutdown(conn->ssl);
 }
 #endif
 
@@ -2335,7 +3073,7 @@ static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
         // TODO: place debugAssert for this case once the known issue described is resolved
         return -1;
     }
-    ret = SSL_write(conn->ssl, data, data_len);
+    ret = tlsSslWrite(conn, data, data_len);
     conn->last_failed_write_data_len = ret <= 0 ? data_len : 0;
     return updateStateAfterSSLIO(conn, ret, 1);
 }
@@ -2427,13 +3165,13 @@ static int connTLSRead(connection *conn_, void *buf, size_t buf_len) {
     /* A read served from OpenSSL's buffer says nothing of the socket, which may have received more
      * since the last socket read; only a socket read that comes back short shows it drained. */
     if (conn->flags & TLS_CONN_FLAG_READ_AHEAD) conn->socket_read_full = 1;
-    ret = SSL_read(conn->ssl, buf, buf_len);
+    ret = tlsSslRead(conn, buf, buf_len);
     updateSSLPendingFlag(conn);
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
     /* With read-ahead the records after this one may already be off the socket, where no event
      * reports them. After a read that stopped short of WANT_READ, any buffered record bytes are
      * worth another read; after WANT_READ they are a partial record and the socket is drained. */
-    if (ret > 0 && (conn->flags & TLS_CONN_FLAG_READ_AHEAD) && SSL_has_pending(conn->ssl))
+    if (ret > 0 && (conn->flags & TLS_CONN_FLAG_READ_AHEAD) && tlsSslHasPending(conn))
         conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
 #endif
     return updateStateAfterSSLIO(conn, ret, 1);
@@ -2483,7 +3221,7 @@ static int connTLSIOOwnerBegin(connection *conn_) {
     conn->socket_read_full = 1; /* unknown: read until a socket read comes back short */
     SSL_set_read_ahead(conn->ssl, 1);
     conn->flags |= TLS_CONN_FLAG_READ_AHEAD;
-    if (SSL_pending(conn->ssl) > 0 || SSL_has_pending(conn->ssl))
+    if (tlsSslPending(conn) > 0 || tlsSslHasPending(conn))
         conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
     else
         conn->flags &= ~TLS_CONN_FLAG_HAS_PENDING;
@@ -2502,7 +3240,7 @@ static void connTLSIOOwnerEnd(connection *conn_) {
 #ifdef TLS_IO_OWNER_SUPPORTED
     /* Records read ahead off the socket (behind a handshake the owner ran, too) raise no event on main
      * either: connUpdateState puts the connection on the pending list. */
-    if (conn->ssl && (SSL_pending(conn->ssl) > 0 || SSL_has_pending(conn->ssl) || tlsPreLeft(conn)))
+    if (conn->ssl && (tlsSslPending(conn) > 0 || tlsSslHasPending(conn) || tlsPreLeft(conn)))
         conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
 #endif
 }
@@ -2596,11 +3334,27 @@ static ssize_t connTLSSyncWrite(connection *conn_, char *ptr, ssize_t size, long
         tlsObufDrained(conn);
     }
 #endif
-    SSL_clear_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
-    tlsClearErrors();
-    int ret = SSL_write(conn->ssl, ptr, size);
-    ret = updateStateAfterSSLIO(conn, ret, 0);
-    SSL_set_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+    int ret;
+#ifdef TLS_GATHER_SUPPORTED
+    if (tlsRecOn(conn)) { /* RL-g6a: record by record, the whole write (the socket is blocking here) */
+        ssize_t done = 0;
+        ret = 1;
+        tlsClearErrors();
+        while (done < size) {
+            ret = tlsRecWrite(conn, ptr + done, (int)(size - done > TLS_REC_MAXPT ? TLS_REC_MAXPT : size - done));
+            if (ret <= 0) break;
+            done += ret;
+        }
+        ret = done == size ? (int)size : updateStateAfterSSLIO(conn, ret, 0);
+    } else
+#endif
+    {
+        SSL_clear_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+        tlsClearErrors();
+        ret = SSL_write(conn->ssl, ptr, size);
+        ret = updateStateAfterSSLIO(conn, ret, 0);
+        SSL_set_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+    }
     if (!blocking) {
         unsetBlockingTimeout(conn);
     }
@@ -2616,7 +3370,7 @@ static ssize_t connTLSSyncRead(connection *conn_, char *ptr, ssize_t size, long 
     int blocking = isBlocking(conn);
     setBlockingTimeout(conn, timeout);
     tlsClearErrors();
-    int ret = SSL_read(conn->ssl, ptr, size);
+    int ret = tlsSslRead(conn, ptr, size);
     updateSSLPendingFlag(conn);
     ret = updateStateAfterSSLIO(conn, ret, 0);
     if (!blocking) {
@@ -2641,7 +3395,7 @@ static ssize_t connTLSSyncReadLine(connection *conn_, char *ptr, ssize_t size, l
         char c;
 
         tlsClearErrors();
-        int ret = SSL_read(conn->ssl, &c, 1);
+        int ret = tlsSslRead(conn, &c, 1);
         updateSSLPendingFlag(conn);
         ret = updateStateAfterSSLIO(conn, ret, 0);
         if (ret <= 0) {
