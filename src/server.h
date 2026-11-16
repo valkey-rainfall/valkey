@@ -3194,6 +3194,7 @@ struct serverCommand {
                          the user associated to the connection has this command
                          bit set in the bitmap of allowed commands. */
     int write_lane;   /* A parallel write lane may run it. */
+    int owner_kind;   /* vkevo owner threads: 1 + the native kind owners run it as (owner.c ownerKindOf), 0: none */
     sds fullname;     /* Includes parent name if any: "parentcmd|childcmd". Unchanged if command is renamed. */
     sds current_name; /* Same as fullname, becomes a separate string if command is renamed. */
     struct hdr_histogram

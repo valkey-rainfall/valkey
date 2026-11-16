@@ -153,6 +153,8 @@
  * PROTO_IOBUF_LEN scratch buffer (mmap: only touched pages count, and not toward used_memory). */
 #define OWN_URING_BATCH 64
 
+/* Native command kinds. The order means nothing: every property of a kind is in its own_kinds[] row,
+ * looked up by name, so a kind can be added anywhere without changing another kind's meaning. */
 enum {
     OWN_GET,
     OWN_SET,
@@ -161,15 +163,55 @@ enum {
     OWN_PING,
     OWN_MGET,
     OWN_MSET,
-    OWN_MULTI, /* from here on: not queueable in a native transaction (ownerTxnNative) */
+    OWN_MULTI,
     OWN_EXEC,
     OWN_DISCARD,
     OWN_WATCH,
     OWN_UNWATCH,
     OWN_NCMDS
 };
-static const char *const own_cmd_names[OWN_NCMDS] = {"get",  "set",  "del",  "incr",    "ping",  "mget",
-                                                     "mset", "multi", "exec", "discard", "watch", "unwatch"};
+
+/* own_kinds[].flags */
+#define OWN_K_READ 1 /* only reads its keys: runs under a write veto (OWN_VETO_WRITE), as GET does */
+#define OWN_K_TXN 2  /* queued natively inside MULTI and run by ownerExec; inside MULTI any other kind
+                      * goes to main with the transaction */
+/* own_kinds[].keys: where the keys are (ownerKeySlot). */
+enum {
+    OWN_KEYS_NONE, /* no key (PING, MULTI, EXEC, ...): no slot */
+    OWN_KEYS_ONE,  /* argv[1] only (the rest are fields, values, options) */
+    OWN_KEYS_ALL,  /* argv[1..]: every one in the same slot */
+    OWN_KEYS_PAIRS /* argv[1], argv[3], ...: key value pairs, every key in the same slot */
+};
+/* own_kinds[].mm: what the command can add under maxmemory beyond its arguments and a reply block,
+ * which ownerMmCmdFits counts for every command (ownerMmMore). */
+enum {
+    OWN_MM_NONE,   /* nothing more */
+    OWN_MM_VALUES, /* its reply holds stored strings (GET, MGET, SET ... GET) */
+    OWN_MM_EXEC    /* its queued commands (ownerMmExecBound) */
+};
+/* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_NFAM };
+
+typedef struct ownKind {
+    const char *name; /* the command's original name (own_cmds[]) */
+    unsigned char flags, keys, mm, family;
+} ownKind;
+
+static const ownKind own_kinds[OWN_NCMDS] = {
+    [OWN_GET] = {"get", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_VALUES, OWN_FAM_STRING},
+    [OWN_SET] = {"set", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_VALUES, OWN_FAM_STRING},
+    [OWN_DEL] = {"del", OWN_K_TXN, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_INCR] = {"incr", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_PING] = {"ping", OWN_K_TXN, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_MGET] = {"mget", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ALL, OWN_MM_VALUES, OWN_FAM_STRING},
+    [OWN_MSET] = {"mset", OWN_K_TXN, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_MULTI] = {"multi", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
+    [OWN_EXEC] = {"exec", 0, OWN_KEYS_NONE, OWN_MM_EXEC, OWN_FAM_TXN},
+    [OWN_DISCARD] = {"discard", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
+    [OWN_WATCH] = {"watch", OWN_K_READ, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_TXN},
+    [OWN_UNWATCH] = {"unwatch", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
+};
+static const char *const own_fam_names[OWN_NFAM] = {[OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn"};
 
 /* Why an owner handed a client to main (client->owner_why). */
 enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
@@ -309,6 +351,7 @@ typedef struct owner {
     long long held_total, mm_refused_total;
     long long burst_total, bursts_total; /* GETs answered by bursts, and the bursts (ownerGetBurst) */
     long long setburst_total, setbursts_total; /* SETs answered by SET bursts, and those bursts (ownerSetBurst) */
+    long long fam_total[OWN_NFAM]; /* RL-1: native commands by family (own_kinds[].family; in native_total too) */
     /* io_uring (owner-uring): the owner's own ring, used only by the owner thread, inside its windows.
      * Every op is MSG_DONTWAIT and completes inside the io_uring_enter that submits it, so no op is in
      * flight outside a window and main never sees one: the sockets, query buffers and replies are
@@ -336,6 +379,12 @@ int owner_accept_home = -1;
 static owner *owners = NULL;
 static int own_n = 0;
 static struct serverCommand *own_cmds[OWN_NCMDS];
+
+/* The native kind of a command, or -1 (own_cmds[k]->owner_kind = k + 1, set by ownerThreadsInit). By
+ * command, not proc: HSET and HMSET share a proc, SMEMBERS shares SINTER's. */
+static inline int ownerKindOf(struct serverCommand *cmd) {
+    return cmd->owner_kind - 1;
+}
 
 static _Atomic int own_stop = 1; /* main holds (or is taking) the world; owners start stopped */
 static int own_held = 1;         /* main's view of the same */
@@ -581,8 +630,9 @@ void ownerThreadsInit(void) {
     own_guests = listCreate();
     for (int k = 0; k < OWN_NCMDS; k++) {
         /* By original name: rename-command moves the same command under another name. */
-        own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_cmd_names[k]);
+        own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_kinds[k].name);
         serverAssert(own_cmds[k] != NULL);
+        own_cmds[k]->owner_kind = k + 1; /* ownerKindOf */
     }
     /* A burst takes "GET"/"get" frames for getCommand: only while that name still means it. */
     struct serverCommand *get = lookupCommandByCString("get");
@@ -2030,6 +2080,15 @@ static size_t ownerReplyValuesLen(client *c, struct serverCommand *cmd, robj **a
     return 0;
 }
 
+/* What native command `kind` can add under maxmemory beyond what ownerMmCmdFits counts for every
+ * command, by its own_kinds[].mm bound; SIZE_MAX when nothing cheap bounds it (main runs it). */
+static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int kind) {
+    switch (own_kinds[kind].mm) {
+    case OWN_MM_VALUES: return ownerReplyValuesLen(c, cmd, argv, argc, slot);
+    default: return 0;
+    }
+}
+
 /* EXEC (D3-all): what its queued commands can add, each bounded as ownerMmCmdFits bounds one command;
  * 3x the queued arguments covers their encoding and the values a queued SET makes a later GET return. */
 static size_t ownerMmExecBound(owner *o, client *c) {
@@ -2037,13 +2096,15 @@ static size_t ownerMmExecBound(owner *o, client *c) {
     size_t b = 3 * ms->argv_len_sums;
     for (int j = 0; j < ms->count; j++) {
         multiCmd *mc = ms->commands + j;
-        b += OWN_MM_CMD + 64 * (size_t)mc->argc + ownerReplyValuesLen(c, mc->cmd, mc->argv, mc->argc, mc->slot);
+        size_t more = ownerMmMore(c, mc->cmd, mc->argv, mc->argc, mc->slot, ownerKindOf(mc->cmd));
+        if (more == SIZE_MAX) return SIZE_MAX;
+        b += OWN_MM_CMD + 64 * (size_t)mc->argc + more;
         if (own_keep) b += OWN_MM_REC * (32 * (size_t)mc->argc + 64) + 2 * sizeof(serverOp);
     }
     if (own_keep) b += OWN_MM_REC * ms->argv_len_sums;
     if (server.latency_tracking_enabled)
-        for (int k = 0; k < OWN_MULTI; k++)
-            if (!o->cs[k].hist) b += OWN_MM_HISTOGRAM; /* a queued command's first histogram */
+        for (int k = 0; k < OWN_NCMDS; k++)
+            if ((own_kinds[k].flags & OWN_K_TXN) && !o->cs[k].hist) b += OWN_MM_HISTOGRAM; /* a queued command's first histogram */
     return b;
 }
 
@@ -2055,11 +2116,10 @@ static int ownerMmCmdFits(owner *o, client *c, int kind) {
     size_t b = OWN_MM_CMD + 2 * c->argv_len_sum + 64 * (size_t)c->argc + 2 * ownerArraysBytes(o);
     if (server.latency_tracking_enabled && !o->cs[kind].hist) b += OWN_MM_HISTOGRAM;
     if (own_keep) b += OWN_MM_REC * (c->argv_len_sum + 32 * (size_t)c->argc + 64);
-    if (kind == OWN_EXEC)
-        b += ownerMmExecBound(o, c);
-    else
-        b += ownerReplyValuesLen(c, c->parsed_cmd, c->argv, c->argc, c->slot);
-    return ownerMmFits(o, b);
+    size_t more = own_kinds[kind].mm == OWN_MM_EXEC ? ownerMmExecBound(o, c)
+                                                    : ownerMmMore(c, c->parsed_cmd, c->argv, c->argc, c->slot, kind);
+    if (more == SIZE_MAX) return 0;
+    return ownerMmFits(o, b + more);
 }
 
 /* Memory leases: whether the next SET of a SET burst fits, bounded as ownerMmCmdFits bounds that SET on
@@ -2080,22 +2140,21 @@ int ownerResizeAllowed(size_t more_mem) {
     return ownerMmFits(own_self, more_mem);
 }
 
-/* The cluster slot of a native candidate's keys, or -1: GET, SET and INCR (one key), and DEL, MGET,
- * MSET and WATCH when all their keys hash to one slot (hash-tagged, as cluster mode requires). Keys in
- * two slots go to main even when one owner owns both: the slot cached on the command must hold for
- * every key (getKVStoreIndexUsingCachedSlot). */
+/* The cluster slot of a native candidate's keys, or -1, by its kind's key layout (own_kinds[].keys):
+ * one key, or several (DEL, MGET, MSET, WATCH) when all hash to one slot (hash-tagged, as cluster mode
+ * requires). Keys in two slots go to main even when one owner owns both: the slot cached on the command
+ * must hold for every key (getKVStoreIndexUsingCachedSlot). */
 static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int read_flags) {
     if (!cmd || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) return -1;
-    serverCommandProc *p = cmd->proc;
+    int kind = ownerKindOf(cmd);
+    if (kind < 0) return -1;
     int step; /* distance between keys; 0: one key */
-    if (p == getCommand || p == setCommand || p == incrCommand)
-        step = 0;
-    else if (p == delCommand || p == mgetCommand || p == watchCommand)
-        step = 1;
-    else if (p == msetCommand)
-        step = 2;
-    else
-        return -1;
+    switch (own_kinds[kind].keys) {
+    case OWN_KEYS_ONE: step = 0; break;
+    case OWN_KEYS_ALL: step = 1; break;
+    case OWN_KEYS_PAIRS: step = 2; break;
+    default: return -1;
+    }
     sds key = objectGetVal(argv[1]);
     int slot = ownerKeyHashSlot(key, sdslen(key));
     for (int j = 1 + step; step && j < argc; j += step) {
@@ -2140,30 +2199,13 @@ static void ownerPrefetch(owner *o, client *c) {
     prefetchBatchReset();
 }
 
-/* The native kind of a command, or -1. */
-static int ownerKindOf(serverCommandProc *p) {
-    if (p == getCommand) return OWN_GET;
-    if (p == setCommand) return OWN_SET;
-    if (p == delCommand) return OWN_DEL;
-    if (p == incrCommand) return OWN_INCR;
-    if (p == pingCommand) return OWN_PING;
-    if (p == mgetCommand) return OWN_MGET;
-    if (p == msetCommand) return OWN_MSET;
-    if (p == multiCommand) return OWN_MULTI;
-    if (p == execCommand) return OWN_EXEC;
-    if (p == discardCommand) return OWN_DISCARD;
-    if (p == watchCommand) return OWN_WATCH;
-    if (p == unwatchCommand) return OWN_UNWATCH;
-    return -1;
-}
-
 /* EXEC can run here: every queued command is a native data command on this owner's keys. That is
  * the only way an owner queues (ownerNativeKind), so this only guards the invariant. */
 static int ownerTxnNative(owner *o, client *c) {
     for (int j = 0; j < c->mstate->count; j++) {
         multiCmd *mc = c->mstate->commands + j;
-        int kind = ownerKindOf(mc->cmd->proc);
-        if (kind < 0 || kind >= OWN_MULTI) return 0;
+        int kind = ownerKindOf(mc->cmd);
+        if (kind < 0 || !(own_kinds[kind].flags & OWN_K_TXN)) return 0;
         if (kind != OWN_PING && (mc->slot < o->slot_lo || mc->slot > o->slot_hi)) return 0;
     }
     return 1;
@@ -2178,7 +2220,7 @@ static int ownerNativeKind(owner *o, client *c) {
     if (!cmd || (c->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) return -1;
     int veto = atomic_load_explicit(&own_veto, memory_order_relaxed);
     if (veto & OWN_VETO_ALL) return -1;
-    int kind = ownerKindOf(cmd->proc);
+    int kind = ownerKindOf(cmd);
     if (kind < 0) return -1;
     /* With both streams on, one record buffer serves both (ownerTakeProp): a client whose ops could
      * have only one of the targets runs on main. */
@@ -2211,10 +2253,14 @@ static int ownerNativeKind(owner *o, client *c) {
         if (c->flag.multi || !mine) return -1; /* WATCH inside MULTI: main replies the error */
         keyed = 1;
         break;
-    default: keyed = 1; break;
+    default:
+        /* Inside MULTI an owner queues only what ownerExec runs (OWN_K_TXN); main queues the rest. */
+        if (c->flag.multi && !(own_kinds[kind].flags & OWN_K_TXN)) return -1;
+        keyed = 1;
+        break;
     }
     if (keyed) {
-        if (kind != OWN_GET && kind != OWN_MGET && kind != OWN_WATCH && (veto & OWN_VETO_WRITE)) return -1;
+        if (!(own_kinds[kind].flags & OWN_K_READ) && (veto & OWN_VETO_WRITE)) return -1;
         /* The slot ownerTryNative computed: the keys are hashed once per command. */
         if (c->slot < o->slot_lo || c->slot > o->slot_hi) return -1; /* another owner's key: main */
     }
@@ -2303,6 +2349,7 @@ static void ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, 
     c->commands_processed++;
     ectx->stat_numcommands++;
     o->native_total++;
+    o->fam_total[own_kinds[kind].family]++;
     ectx->in_call--;
     ectx->executing_client = prev_client;
 }
@@ -2338,7 +2385,7 @@ static long long ownerExec(owner *o, client *c) {
         c->cmd = c->realcmd = mc->cmd;
         c->slot = mc->slot; /* the keyspace lookups use the queued command's slot */
         long long e = ectx->stat_total_error_replies;
-        ownerCall(o, c, mc->cmd, ownerKindOf(mc->cmd->proc), 0);
+        ownerCall(o, c, mc->cmd, ownerKindOf(mc->cmd), 0);
         inner_errors += ectx->stat_total_error_replies - e;
         /* Commands may alter argc/argv (MSET encodes its values): keep them in mstate. */
         mc->argc = c->argc;
@@ -3392,8 +3439,8 @@ static int ownerTryNative(client *c) {
 void ownerErrorReply(client *c, const char *s, size_t len, int flags) {
     owner *o = own_self;
     if (flags & ERR_REPLY_FLAG_NO_STATS_UPDATE) {
-        for (int k = 0; k < OWN_NCMDS; k++)
-            if (own_cmds[k] == c->realcmd) o->cs[k].failed++;
+        int kind = c->realcmd ? ownerKindOf(c->realcmd) : -1;
+        if (kind >= 0) o->cs[kind].failed++;
         return;
     }
     ectx->stat_total_error_replies++;
@@ -3876,6 +3923,12 @@ void ownerInfo(sds *info) {
                          "owner_mm_exact_windows:%lld\r\n",
                          server.owner_mm_lease ? "yes" : "no", own_mm ? own_mm_slice : 0LL, mm_lease_w, mm_exact_w);
     *info = sdscatprintf(*info, "owner_burst_commands:%lld\r\nowner_bursts:%lld\r\n", burst, bursts);
+    /* RL-1: native commands by family (own_kinds[].family). */
+    for (int f = 0; f < OWN_NFAM; f++) {
+        long long n = 0;
+        for (int i = 0; i < own_n; i++) n += owners[i].fam_total[f];
+        *info = sdscatprintf(*info, "owner_%s_commands:%lld\r\n", own_fam_names[f], n);
+    }
     *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
                          server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
     /* D3-all-g14-fold: owner_repl_split: the owners encode each record twice (compact AOF, RESP stream). */
