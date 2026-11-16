@@ -1956,15 +1956,35 @@ static int ownerGoHomeNow(client *c) {
 }
 
 /* One client at a time: a client's command can run a long script, and main then serves the other
- * clients from inside it (processEventsWhileBlocked), including the ones still queued here. */
+ * clients from inside it (processEventsWhileBlocked), including the ones still queued here.
+ * RL-g3i-accept-storm: at most OWN_CLOSES_PER_STOP closes per stop. The owners hand every closed client to main,
+ * and when a storm of clients disconnects at once main freed them all in one stop (10,000 in 60-110 ms with the
+ * world held). The rest wait in order for the next stop, which main's own wakeup brings at once, after the owners ran. */
+#define OWN_CLOSES_PER_STOP 256
+static int own_stop_closes = 0; /* closes taken since the last stop began (ownerAfterSleep) */
+static long long own_close_defers = 0; /* stops that left closes for the next one (INFO) */
+
 static void ownerTakeHandoffs(void) {
     for (;;) {
+        if (own_stop_closes >= OWN_CLOSES_PER_STOP) {
+            pthread_mutex_lock(&own_main_mu);
+            int left = listLength(own_main_inbox) != 0;
+            pthread_mutex_unlock(&own_main_mu);
+            if (left) {
+                uint64_t one = 1;
+                own_close_defers++;
+                if (write(own_main_wakefd, &one, sizeof(one)) == -1) { /* a wakeup is pending anyway */
+                }
+            }
+            return;
+        }
         pthread_mutex_lock(&own_main_mu);
         listNode *ln = listFirst(own_main_inbox);
         client *c = ln ? listNodeValue(ln) : NULL;
         if (ln) listDelNode(own_main_inbox, ln);
         pthread_mutex_unlock(&own_main_mu);
         if (!c) return;
+        if (c->owner_why == OWN_WHY_CLOSE) own_stop_closes++;
         ownerTakeOne(c);
     }
 }
@@ -2210,6 +2230,7 @@ void ownerIOThreadsChanged(void) {
 
 void ownerAfterSleep(void) {
     if (!own_n) return;
+    own_stop_closes = 0; /* RL-g3i: this stop's close budget */
     if (ProcessingEventsWhileBlocked) {
         if (own_held) {
             ownerTakeHandoffs(); /* queued behind the command that is running now */
@@ -6575,6 +6596,8 @@ void ownerInfo(sds *info) {
     /* RL-g2v: TLS accepts the owners finished without a trip to main. */
     *info = sdscatprintf(*info, "owner_tls_local_accept:%d\r\nowner_tls_local_accepts:%lld\r\n",
                          server.owner_tls_local_accept, tls_la);
+    /* RL-g3i: stops that left closed clients for the next stop (OWN_CLOSES_PER_STOP). */
+    *info = sdscatprintf(*info, "owner_close_defers:%lld\r\n", own_close_defers);
     /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
      * have the script for (or had it marked for main). */
     long long s_runs = 0, s_aborts = 0, s_misses = 0;
