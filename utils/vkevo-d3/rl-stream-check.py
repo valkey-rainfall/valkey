@@ -350,10 +350,20 @@ def streams_keys(a):
     return None
 
 
+MULTI_NATIVE = False  # RL-2s: the candidate queues stream commands natively in MULTI (RL-g6h: owner_txn_commands)
+
+
 def streams_native_expected(block, ranges, port):
     """How many commands of this block the owner at `port` should run natively (0: main runs them)."""
     if block[0][0] == b"MULTI":
-        return 0
+        # RL-2s: with RL-g6h an owner runs a MULTI block of native stream commands on its own key at EXEC (each one
+        # counted in owner_stream_commands); before it, main ran every MULTI block
+        if not MULTI_NATIVE:
+            return 0
+        inner = block[1:-1]
+        if not all(streams_native_expected([a], ranges, port) for a in inner):
+            return 0
+        return len(inner)
     a = block[0]
     n = a[0].upper()
     if n in (b"TYPE", b"DEL", b"SET") or a[-1:] == [b"HELP"]:
@@ -545,6 +555,8 @@ def main():
         pairs = [[b"{xm%d.%d}:a" % (a.seed, i), b"{xm%d.%d}:b" % (a.seed, i)] for i in range(4)]
         pairs.append([keys[0], keys[1]])  # two slots: main
         o0 = cand.owners()
+        global MULTI_NATIVE
+        MULTI_NATIVE = "owner_txn_commands" in o0  # RL-2s: RL-g6h's counter
         cconns = {p: cand.c(p) for p in [a.port] + oports}
         rconn = ref.c()
         sent = {"native": 0, "total": 0}
