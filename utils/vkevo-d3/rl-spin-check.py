@@ -211,9 +211,13 @@ c2 = [round(d2[k]['oncpu'], 4) for k in own]
 w2 = [d2[k]['vol'] for k in own]
 print('INFO idle owner CPU under load %s; first second after %s; second second %s; wakeups/s then %s' % (
     loadcpu, c1, c2, w2), flush=True)
-res(max(c1) < 0.02 and max(c2) < 0.005 and max(w2) <= 5, 'spin.idle.sleep',
-    'owner CPU after the load stopped: max %.4f then %.4f of a core (want < 0.02, < 0.005), wakeups/s max %d' % (
-        max(c1), max(c2), max(w2)))
+# RL-g2m (on RL-1 with RL-g2c and RL-g3b): owners keep their own hz ticks when idle (RL-g2c's client cron slices,
+# RL-g3b's table upkeep: at most one wakeup per 1000/hz ms, as main's serverCron), so the bound is hz + 2, not 5;
+# the CPU bounds, which say an idle owner does not spin, are unchanged.
+hz = 10  # the checker's servers run the default hz
+res(max(c1) < 0.02 and max(c2) < 0.005 and max(w2) <= hz + 2, 'spin.idle.sleep',
+    'owner CPU after the load stopped: max %.4f then %.4f of a core (want < 0.02, < 0.005), wakeups/s max %d (want <= %d)' % (
+        max(c1), max(c2), max(w2), hz + 2))
 stop()
 
 # 3 + 4. world stops and main under a mixed load, candidate vs parent, twice in alternating order. The verdicts use a
