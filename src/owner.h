@@ -64,7 +64,7 @@ long long ownerFieldExpireBound(void); /* main: no hash with volatile fields tra
 void ownerNoteFieldExpire(void);       /* any thread: a hash with volatile fields is tracked */
 void ownerPublishedStats(long long *cmds, long long *net_in, long long *net_out, long long *dirty);
 enum { OWN_FULL_TIMEPROC, OWN_FULL_SHUTDOWN, OWN_FULL_VERBOSE, OWN_FULL_EXPIRE, OWN_FULL_DEFRAG, OWN_FULL_TABLES,
-       OWN_FULL_PERSIST, OWN_FULL_CLIENTS, OWN_FULL_TLS, OWN_FULL_HOTKEYS, OWN_FULL_NCOUNT };
+       OWN_FULL_PERSIST, OWN_FULL_CLIENTS, OWN_FULL_TLS, OWN_FULL_HOTKEYS, OWN_FULL_PUBSUB, OWN_FULL_NCOUNT };
 void ownerBusyPollApply(void); /* RL-g2p-busy-poll: owner-busy-poll-* onto every owner's epoll set (main) */
 /* RL-g4c-blocking-native: blocking pops parked on the owner of their keys (owner.c). */
 int ownerBlockForKeys(struct client *c, int btype, struct serverObject **keys, int numkeys, long long timeout);

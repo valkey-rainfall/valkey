@@ -376,6 +376,10 @@ enum {
     OWN_XSETID,
     /* RL-g6g-scripts: TIME, only inside an owner's script (a client's own TIME goes to main). */
     OWN_TIME,
+    /* RL-g6e-pubsub: PUBLISH and SPUBLISH touch no key. The owner counts the receivers and queues the message;
+     * main delivers it (ownerPublish, ownerPubDeliver). */
+    OWN_PUBLISH,
+    OWN_SPUBLISH,
     OWN_NCMDS
 };
 /* RL-g6g-scripts: a script run keeps per-kind stats for every kind (ownerScriptRunState; tk holds kinds in a byte). */
@@ -426,7 +430,7 @@ enum {
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
 enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_FAM_SCRIPT,
-       OWN_FAM_STREAM, OWN_NFAM };
+       OWN_FAM_STREAM, OWN_FAM_PUBSUB, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -616,11 +620,14 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     /* RL-g6g-scripts: the clock, only inside an owner's script (ownerScriptCommand answers it from the run's own
      * clock: timeCommand reads main's cached time). */
     [OWN_TIME] = {"time", OWN_K_READ | OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_SCRIPT},
+    /* RL-g6e-pubsub: not queued natively, not run by a script; only while own_pub_ok (ownerNativeKind). */
+    [OWN_PUBLISH] = {"publish", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_PUBSUB},
+    [OWN_SPUBLISH] = {"spublish", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_PUBSUB},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
     [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash", [OWN_FAM_SETZSET] = "setzset",
-    [OWN_FAM_SCRIPT] = "script", [OWN_FAM_STREAM] = "stream"};
+    [OWN_FAM_SCRIPT] = "script", [OWN_FAM_STREAM] = "stream", [OWN_FAM_PUBSUB] = "pubsub"};
 
 /* Why an owner handed a client to main (client->owner_why). OWN_WHY_ACCEPTED: its TLS handshake ended
  * on the owner (done or failed); main runs the accept handler (RL-g1d). */
@@ -714,6 +721,14 @@ static inline int ownerRefWanted(size_t len) {
     return min > 0 && len >= (size_t)min;
 }
 
+/* RL-g6e-pubsub: a message a native PUBLISH / SPUBLISH queued: its global order, the receivers the owner counted,
+ * and copies of the channel and the message (main frees them after the delivery). */
+typedef struct ownerPubRec {
+    long long seq, n;
+    int sharded;
+    robj *channel, *msg;
+} ownerPubRec;
+
 typedef struct owner {
     _Atomic int active; /* inside a window: written by the owner, read by main */
     char pad0[CACHE_LINE_SIZE - sizeof(int)];
@@ -744,6 +759,13 @@ typedef struct owner {
     pthread_mutex_t inbox_mu;
     list *inbox; /* clients main handed over, not yet registered */
     int inbox_wake; /* main: clients went into the inbox while the world is held; wake the owner at resume */
+    /* RL-g6e-pubsub: messages this owner's native PUBLISH / SPUBLISH queued for main to deliver (ownerPublish),
+     * in seq order; pub_mu covers pubq / npub (main takes them in ownerPubDeliver). */
+    pthread_mutex_t pub_mu;
+    struct ownerPubRec *pubq;
+    int npub, pub_cap;
+    int pub_wake;                   /* this window queued a message: wake main through own_pub_wakefd */
+    long long pub_native, pub_queued; /* native publishes; of them, queued (one receiver or more) */
     execContext ectx;
     /* Written by the owner, folded and cleared by main under the stop. */
     ownerCmdStat cs[OWN_NCMDS];
@@ -946,6 +968,16 @@ static _Atomic int own_waiters = 0;
 static pthread_mutex_t own_main_mu = PTHREAD_MUTEX_INITIALIZER;
 static list *own_main_inbox = NULL; /* clients owners handed to main */
 static int own_main_wakefd = -1;
+/* RL-g6e-pubsub: owners queue native publishes' messages (o->pubq) and wake main through own_pub_wakefd; a main
+ * iteration only this fd woke runs without the world (ownerAfterSleep, own_light_pub) and delivers them.
+ * own_pub_ok (main, at resume): owners may run PUBLISH / SPUBLISH this period. own_pub_seq orders the messages of
+ * every owner; own_pub_enq counts queued messages (owners), own_pub_deq the ones main took. */
+static int own_pub_wakefd = -1;
+static _Atomic int own_pub_ok = 0;
+static _Atomic long long own_pub_seq = 0, own_pub_enq = 0;
+static long long own_pub_deq = 0, own_pub_delivered = 0, own_pub_mismatch = 0, own_pub_light_iters = 0;
+static long long own_pub_drains = 0;
+static int own_light_pub = 0; /* this light iteration was started by own_pub_wakefd alone */
 static list *own_guests = NULL; /* clients with a home owner, served by main now */
 /* owner-pipeline-resume (RL-g1g), main only: guests main stopped between two commands because their owner
  * runs the next one (ownerGuestYield), sent home at the end of beforeSleep (ownerResumeYielded); and the
@@ -1051,7 +1083,8 @@ enum { OWN_NOLIGHT_CONFIG, OWN_NOLIGHT_VETO, OWN_NOLIGHT_AOF, OWN_NOLIGHT_MAXMEM
        OWN_NOLIGHT_PENDING, OWN_NOLIGHT_OTHER, OWN_NOLIGHT_NCOUNT };
 static long long own_nolight[OWN_NOLIGHT_NCOUNT];
 static const char *const own_full_names[OWN_FULL_NCOUNT] = {"timeproc", "shutdown", "verbose", "expire", "defrag",
-                                                            "tables", "persist", "clients", "tls", "hotkeys"};
+                                                            "tables", "persist", "clients", "tls", "hotkeys",
+                                                            "pubsub"};
 static const char *const own_nolight_names[OWN_NOLIGHT_NCOUNT] = {"config", "veto",  "aof",     "maxmemory",
                                                                   "child",  "repl", "pending", "other"};
 
@@ -1189,7 +1222,9 @@ void clientAcceptHandler(connection *conn); /* networking.c: the rest of an acce
 static void ownerTlsRelease(client *c);
 static void ownerTlsOnMain(client *c);
 static void ownerBeforeTimeProc(aeEventLoop *el, aeTimeProc *proc); /* RL-g3b */
-static int ownerLightWhyNot(void);                                 /* RL-g3b */
+static int ownerLightWhyNot(int pub);                              /* RL-g3b; RL-g6e: pub */
+static void ownerPubWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask); /* RL-g6e */
+static void ownerPubDeliver(void);                                                  /* RL-g6e */
 
 /* The slot hash of the owner hot path: keyHashSlot() (the slot a cluster client routes a key by),
  * with its CRC16 taken 8 bytes per step instead of 1. own_crc16[k][v] is the CRC16 of 8 bytes with
@@ -1299,6 +1334,12 @@ void ownerThreadsInit(void) {
         serverLog(LL_WARNING, "owner threads: cannot create the main wake event: %s", strerror(errno));
         exit(1);
     }
+    own_pub_wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); /* RL-g6e-pubsub */
+    if (own_pub_wakefd == -1 ||
+        aeCreateFileEvent(server.el, own_pub_wakefd, AE_READABLE, ownerPubWakeHandler, NULL) == AE_ERR) {
+        serverLog(LL_WARNING, "owner threads: cannot create the pub/sub wake event: %s", strerror(errno));
+        exit(1);
+    }
     aeSetBeforeTimeProc(server.el, ownerBeforeTimeProc); /* RL-g3b */
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
@@ -1314,6 +1355,7 @@ void ownerThreadsInit(void) {
         atomic_store_explicit(&o->pub_exp_min, LLONG_MAX, memory_order_relaxed);
         o->inbox = listCreate();
         pthread_mutex_init(&o->inbox_mu, NULL);
+        pthread_mutex_init(&o->pub_mu, NULL); /* RL-g6e-pubsub */
         o->watched = zmalloc(sizeof(dict *) * server.dbnum);
         for (int j = 0; j < server.dbnum; j++) o->watched[j] = dictCreate(&keylistDictType);
         o->park_keys = zcalloc(sizeof(dict *) * server.dbnum);
@@ -1696,6 +1738,9 @@ static void ownerStopWorld(void) {
     ownerFoldProp();
     ownerScriptAnswerAll();
     ownerExpireBoundReset();
+    /* RL-g6e-pubsub: the messages native publishes queued reach their receivers before main runs anything (a
+     * subscribe change, a kill, its own publish), as on the stock server, where each was delivered by then. */
+    ownerPubDeliver();
 }
 
 /* maxmemory: the bytes all owners may add before main must look at memory again (0 when an eviction
@@ -1890,6 +1935,23 @@ static void ownerResumeWorld(void) {
     ownerSettleCommandTables();
     ownerSettleTable(server.commands);
     ownerSettleTable(server.orig_commands);
+    /* RL-g6e-pubsub: owners may run PUBLISH / SPUBLISH this period when nothing vetoes the native path, no
+     * replication stream or AOF would carry them (the stock PUBLISH propagates to replicas), no maxmemory, and
+     * the server's pub/sub tables are not rehashing: owners (and main, delivering in an iteration that leaves
+     * them running) only read those tables then, and a lookup in a rehashing table takes a rehash step. Only main
+     * changes them, with the world held. */
+    {
+        hashtable *pt[3] = {kvstoreGetHashtable(server.pubsub_channels, 0),
+                            kvstoreGetHashtable(server.pubsubshard_channels, 0), server.pubsub_patterns};
+        int settled = 1;
+        for (int t = 0; t < 3; t++) {
+            ownerSettleTable(pt[t]);
+            if (pt[t] && hashtableIsRehashing(pt[t])) settled = 0;
+        }
+        int pub = server.owner_native_pubsub && !own_last_veto && !own_keep && !server.maxmemory &&
+                  !server.cluster_enabled && !server.sentinel_mode && settled;
+        atomic_store_explicit(&own_pub_ok, pub, memory_order_relaxed);
+    }
     dbLanePhaseBegin();
     atomic_store_explicit(&own_cron, ownerCronOnOwners() && !server.pause_cron, memory_order_relaxed);
     atomic_store_explicit(&own_tables, ownerTablesOnOwners() && !server.pause_cron, memory_order_relaxed);
@@ -2220,6 +2282,84 @@ static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int ma
     ownerTakeHandoffs();
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * RL-g6e-pubsub: native PUBLISH / SPUBLISH, main's half
+ *
+ * A PUBLISH touches no key: it reads the server's pub/sub tables (channel -> subscribers, the patterns) and writes
+ * the message into each receiver's output. Every receiver is main's client (a subscribed client stays on main), and
+ * only main changes the tables, with the world held. So an owner may run it in its window while own_pub_ok: it
+ * counts the receivers from the tables (the PUBLISH reply), queues the message in its own o->pubq under o->pub_mu
+ * with the next own_pub_seq, replies, and wakes main through own_pub_wakefd at the end of the window. Main then
+ * delivers the queued messages in seq order with the stock pubsubPublishMessage:
+ *   - in a main iteration only that fd woke, without stopping the world (own_light_pub: ownerLightWhyNot(1));
+ *     main and the owners only read the tables then (none is rehashing: ownerResumeWorld), and main writes only
+ *     its own clients (the subscribers) and their sockets (handleClientsWithPendingWrites right away, since a light
+ *     iteration skips beforeSleep);
+ *   - and first thing whenever the world stops (ownerStopWorld), before main runs anything.
+ * Nothing changes the tables or the subscribers between an owner's count and main's delivery (both need the world
+ * held, and the delivery comes first), so the receivers are the ones counted: the reply equals the deliveries
+ * (owner_pubsub_mismatch counts any difference; 0 expected). Taking every owner's lock at once gives a prefix of
+ * the seq order, so the messages reach each subscriber in the order the publishes ran (per publisher too).
+ * ---------------------------------------------------------------------------------------------- */
+
+static int ownerPubSeqCmp(const void *a, const void *b) {
+    long long x = ((const ownerPubRec *)a)->seq, y = ((const ownerPubRec *)b)->seq;
+    return x < y ? -1 : x > y;
+}
+
+/* Main (world held, or a light iteration): deliver every message the owners queued so far, in seq order. */
+static void ownerPubDeliver(void) {
+    if (!own_n || atomic_load_explicit(&own_pub_enq, memory_order_acquire) == own_pub_deq) return;
+    for (int i = 0; i < own_n; i++) pthread_mutex_lock(&owners[i].pub_mu);
+    int total = 0;
+    for (int i = 0; i < own_n; i++) total += owners[i].npub;
+    ownerPubRec *all = total ? zmalloc(sizeof(ownerPubRec) * total) : NULL;
+    int k = 0;
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        if (o->npub) memcpy(all + k, o->pubq, sizeof(ownerPubRec) * o->npub);
+        k += o->npub;
+        o->npub = 0;
+    }
+    for (int i = own_n - 1; i >= 0; i--) pthread_mutex_unlock(&owners[i].pub_mu);
+    own_pub_deq += total;
+    if (!total) return;
+    own_pub_drains++;
+    qsort(all, total, sizeof(ownerPubRec), ownerPubSeqCmp);
+    for (int j = 0; j < total; j++) {
+        int got = pubsubPublishMessage(all[j].channel, all[j].msg, all[j].sharded);
+        own_pub_delivered += got;
+        if (got != all[j].n) own_pub_mismatch++;
+        decrRefCount(all[j].channel);
+        decrRefCount(all[j].msg);
+    }
+    zfree(all);
+}
+
+/* Main: an iteration own_pub_wakefd alone woke. Without the world (own_light_pub) main delivers and writes the
+ * subscribers now; a close the writes asked for gets the world and the rest of the stock iteration. With the world
+ * held the stop delivered them already. */
+static void ownerPubWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(privdata);
+    UNUSED(mask);
+    uint64_t v;
+    if (read(fd, &v, sizeof(v)) == -1) { /* EAGAIN: already drained */
+    }
+    ownerPubDeliver();
+    if (!own_light) return;
+    handleClientsWithPendingWrites();
+    if (listLength(server.clients_pending_write) || listLength(server.clients_to_close)) ownerHoldWorld(OWN_FULL_PUBSUB);
+}
+
+/* Main, afterSleep: 1 when own_pub_wakefd is the only file event that woke this iteration. */
+static int ownerPubOnlyWake(void) {
+    if (own_pub_wakefd < 0) return 0;
+    for (int j = 0; j < own_iter_events; j++)
+        if (server.el->fired[j].fd != own_pub_wakefd) return 0;
+    return 1;
+}
+
 /* Main, world held: give a client to its home owner. Returns 0 when it cannot go (a TLS connection whose
  * transport cannot leave main's event loop now): it stays where it is. */
 static int ownerSendToOwner(client *c) {
@@ -2516,12 +2656,18 @@ void ownerAfterSleep(void) {
         }
         return;
     }
-    /* RL-g3b: a wake no file event caused may leave the owners running (the iteration stops them if it must). */
-    if (!own_held && own_iter_events == 0) {
-        int why = ownerLightWhyNot();
+    /* RL-g3b: a wake no file event caused may leave the owners running (the iteration stops them if it must).
+     * RL-g6e-pubsub: so may one only own_pub_wakefd caused (owners queued messages): main delivers them. */
+    int pubwake = own_iter_events > 0 && ownerPubOnlyWake();
+    if (!own_held && (own_iter_events == 0 || pubwake)) {
+        int why = ownerLightWhyNot(pubwake);
         if (why < 0) {
             own_light = 1;
-            own_light_iters++;
+            own_light_pub = pubwake;
+            if (pubwake)
+                own_pub_light_iters++;
+            else
+                own_light_iters++;
             return;
         }
         own_nolight[why]++;
@@ -2597,8 +2743,12 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
 /* Main, afterSleep of an iteration no file event woke (owners running): -1 when it may run without the world, else
  * why not. Main runs only its own clients' work in such an iteration, so nothing may be pending for them, and every
  * feature whose periodic work touches owner state rules it out. */
-static int ownerLightWhyNot(void) {
-    if (!server.owner_light_cron || own_dormant || server.pause_cron) return OWN_NOLIGHT_CONFIG;
+static int ownerLightWhyNot(int pub) {
+    /* RL-g6e-pubsub (pub): an iteration own_pub_wakefd alone woke. It delivers queued messages to main's
+     * subscribers (ownerPubWakeHandler) and runs no command, so guests (a subscriber on an owner port stays on main
+     * for good) need nothing in it; its timers get the world (ownerBeforeTimeProc). */
+    if (!(pub ? server.owner_native_pubsub : server.owner_light_cron) || own_dormant || server.pause_cron)
+        return OWN_NOLIGHT_CONFIG;
     if (own_last_veto != 0) return OWN_NOLIGHT_VETO;
     if (server.aof_state != AOF_OFF) return OWN_NOLIGHT_AOF;
     if (server.maxmemory) return OWN_NOLIGHT_MAXMEMORY;
@@ -2606,9 +2756,9 @@ static int ownerLightWhyNot(void) {
     if (server.primary_host || server.repl_backlog || listLength(server.replicas) ||
         server.failover_state != NO_FAILOVER)
         return OWN_NOLIGHT_REPL;
-    if (listLength(own_guests) || listLength(server.clients_to_close) || listLength(server.clients_pending_write) ||
-        listLength(server.unblocked_clients) || listLength(server.clients_waiting_acks) || connTypeHasPendingData() ||
-        server.shutdown_asap)
+    if ((!pub && listLength(own_guests)) || listLength(server.clients_to_close) ||
+        listLength(server.clients_pending_write) || listLength(server.unblocked_clients) ||
+        listLength(server.clients_waiting_acks) || connTypeHasPendingData() || server.shutdown_asap)
         return OWN_NOLIGHT_PENDING;
     /* RL-g2m (port onto RL-1): RL-g1g's yielded and rerun clients are main's work with the world held too. */
     if (listLength(own_yielded) || listLength(own_rerun)) return OWN_NOLIGHT_PENDING;
@@ -2629,6 +2779,7 @@ int ownerLightIteration(void) {
 void ownerHoldWorld(int why) {
     if (!own_light) return;
     own_light = 0;
+    own_light_pub = 0;
     own_light_full++;
     if (why >= 0 && why < OWN_FULL_NCOUNT) own_light_full_why[why]++;
     ownerStopWorld();
@@ -2639,14 +2790,17 @@ void ownerHoldWorld(int why) {
 
 void ownerLightEnd(void) {
     own_light = 0;
+    own_light_pub = 0;
     own_iter_cron = 0;
 }
 
 /* The ae hook before each time event: a timer other than serverCron's and clientsTimeProc's (defrag, eviction,
- * module and other timers) gets the stock world. */
+ * module and other timers) gets the stock world. RL-g6e-pubsub: so does every timer of an iteration own_pub_wakefd
+ * woke (ownerLightWhyNot(1) does not check what RL-g3b's light tick needs, such as no guests). */
 static void ownerBeforeTimeProc(aeEventLoop *el, aeTimeProc *proc) {
     UNUSED(el);
-    if (own_light && proc != serverCron && proc != clientsTimeProc) ownerHoldWorld(OWN_FULL_TIMEPROC);
+    if (own_light && (own_light_pub || (proc != serverCron && proc != clientsTimeProc)))
+        ownerHoldWorld(OWN_FULL_TIMEPROC);
 }
 
 int ownerTablesOnOwners(void) {
@@ -4556,6 +4710,12 @@ static int ownerNativeKind(owner *o, client *c) {
             return -1;
         keyed = 1;
         break;
+    case OWN_PUBLISH:
+    case OWN_SPUBLISH:
+        /* RL-g6e-pubsub: outside MULTI (main queues it), with no veto, this period (own_pub_ok). It touches no
+         * key, so any owner runs it, whatever the channel's slot. */
+        if (c->flag.multi || veto || !atomic_load_explicit(&own_pub_ok, memory_order_relaxed)) return -1;
+        break;
     default:
         /* RL-g1f: INCRBY, DECR and DECRBY only inside an owner's script. */
         if (own_kinds[kind].flags & OWN_K_INNER) return -1;
@@ -4601,7 +4761,7 @@ static int ownerGuestNativeNext(owner *o, parsedCommand *p, int veto, int *in_mu
         return 0;
     int kind = ownerKindOf(p->cmd);
     if (kind < 0 || kind == OWN_WATCH || kind == OWN_UNWATCH || own_kinds[kind].family == OWN_FAM_SCRIPT ||
-        (own_kinds[kind].flags & OWN_K_INNER))
+        own_kinds[kind].family == OWN_FAM_PUBSUB || (own_kinds[kind].flags & OWN_K_INNER))
         return 0;
     if (kind == OWN_MULTI) {
         if (*in_multi) return 0;
@@ -4750,6 +4910,53 @@ static void ownerKeepLogs(owner *o, void **entries, int *types, int n) {
 
 static long long ownerExec(owner *o, client *c);
 
+/* RL-g6e-pubsub, owner in a window: PUBLISH / SPUBLISH channel message (ownerNativeKind: own_pub_ok). The receivers
+ * are counted as pubsubPublishMessage would deliver to them (the channel's subscribers; for PUBLISH also every
+ * client of every matching pattern), by reading the server's tables (none rehashing; nobody changes them while the
+ * owners run). The message is queued for main with the next global seq (ownerPubDeliver) when anyone receives it.
+ * As the stock command with no replica and no backlog, it propagates nothing. */
+static void ownerPublish(owner *o, client *c, int sharded) {
+    robj *channel = c->argv[1];
+    long long n = 0;
+    void *found;
+    kvstore *kvs = sharded ? server.pubsubshard_channels : server.pubsub_channels;
+    if (kvstoreHashtableFind(kvs, 0, channel, &found)) n += (long long)hashtableSize((hashtable *)found);
+    robj *ch = getDecodedObject(channel);
+    if (!sharded && dictSize(server.pubsub_patterns)) {
+        dictIterator *di = dictGetIterator(server.pubsub_patterns);
+        dictEntry *de;
+        while ((de = dictNext(di)) != NULL) {
+            robj *pattern = dictGetKey(de);
+            if (stringmatchlen((char *)objectGetVal(pattern), sdslen(objectGetVal(pattern)), (char *)objectGetVal(ch),
+                               sdslen(objectGetVal(ch)), 0))
+                n += (long long)hashtableSize((hashtable *)dictGetVal(de));
+        }
+        dictReleaseIterator(di);
+    }
+    o->pub_native++;
+    if (n) {
+        robj *msg = getDecodedObject(c->argv[2]);
+        ownerPubRec r = {.n = n,
+                         .sharded = sharded,
+                         .channel = createStringObject(objectGetVal(ch), sdslen(objectGetVal(ch))),
+                         .msg = createStringObject(objectGetVal(msg), sdslen(objectGetVal(msg)))};
+        decrRefCount(msg);
+        pthread_mutex_lock(&o->pub_mu);
+        if (o->npub == o->pub_cap) {
+            o->pub_cap = o->pub_cap ? o->pub_cap * 2 : 64;
+            o->pubq = zrealloc(o->pubq, sizeof(ownerPubRec) * o->pub_cap);
+        }
+        r.seq = atomic_fetch_add_explicit(&own_pub_seq, 1, memory_order_relaxed);
+        o->pubq[o->npub++] = r;
+        atomic_fetch_add_explicit(&own_pub_enq, 1, memory_order_release);
+        pthread_mutex_unlock(&o->pub_mu);
+        o->pub_wake = 1;
+        o->pub_queued++;
+    }
+    decrRefCount(ch);
+    addReplyLongLong(c, n);
+}
+
 /* The part of processCommand() and call() that applies to a native command. top: the client's own
  * command; else a queued command run by ownerExec (call() from execCommand), which leaves lastcmd at
  * EXEC and the current client as it is. */
@@ -4790,7 +4997,9 @@ static int ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, i
             ectx->executing_client = prev_client;
             return 0;
         }
-    } else
+    } else if (kind == OWN_PUBLISH || kind == OWN_SPUBLISH)
+        ownerPublish(o, c, kind == OWN_SPUBLISH); /* RL-g6e-pubsub */
+    else
         cmd->proc(c);
 
     exitExecutionUnit();
@@ -7368,6 +7577,12 @@ static void *ownerThreadMain(void *arg) {
             if (write(own_main_wakefd, &one, sizeof(one)) == -1) { /* a wakeup is pending anyway */
             }
         }
+        if (o->pub_wake) { /* RL-g6e-pubsub: main delivers what this window's publishes queued */
+            o->pub_wake = 0;
+            uint64_t one = 1;
+            if (write(own_pub_wakefd, &one, sizeof(one)) == -1) { /* a wakeup is pending anyway */
+            }
+        }
         if (flow_skipped || (flow && o->ntlsp)) {
             /* RL-g3h: the skipped sockets are still readable, so epoll_wait would return at once: nap outside
              * the window (main may stop the world meanwhile) until the sender clears the flag, at most
@@ -7659,6 +7874,20 @@ void ownerInfo(sds *info) {
     long long txn_n = 0;
     for (int i = 0; i < own_n; i++) txn_n += owners[i].txn_total;
     *info = sdscatprintf(*info, "owner_txn_commands:%lld\r\n", txn_n);
+    /* RL-g6e-pubsub: native publishes (of them, queued: one receiver or more), messages main delivered from the
+     * queues, drains that delivered any, iterations only own_pub_wakefd woke that ran without the world, and
+     * deliveries whose receivers differed from the owner's count (0 expected). */
+    long long pub_n = 0, pub_q = 0;
+    for (int i = 0; i < own_n; i++) {
+        pub_n += owners[i].pub_native;
+        pub_q += owners[i].pub_queued;
+    }
+    *info = sdscatprintf(*info,
+                         "owner_native_pubsub:%s\r\nowner_pubsub_ok:%d\r\nowner_pubsub_native:%lld\r\n"
+                         "owner_pubsub_queued:%lld\r\nowner_pubsub_delivered:%lld\r\nowner_pubsub_drains:%lld\r\n"
+                         "owner_pubsub_light_iterations:%lld\r\nowner_pubsub_mismatch:%lld\r\n",
+                         server.owner_native_pubsub ? "yes" : "no", atomic_load_explicit(&own_pub_ok, memory_order_relaxed),
+                         pub_n, pub_q, own_pub_delivered, own_pub_drains, own_pub_light_iters, own_pub_mismatch);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
     long long tls_hs = 0, tls_rd = 0, tls_la = 0, tls_ur = 0, tls_uw = 0;
     for (int i = 0; i < own_n; i++) {
