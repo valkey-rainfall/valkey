@@ -115,6 +115,13 @@ typedef struct __attribute__((aligned(64))) rpChunk {
     /* RL-g2l: a MULTI this chunk opened, its plan positions so far; placed at its EXEC (rpTxnEnd) */
     int *txn;
     int txn_n, txn_cap, txn_open, txn_ok, txn_shard;
+    /* RL-g4b, a parallel scan (rpSpecChunk): where its scan stopped, whether exactly at the next chunk's start
+     * (which proves that start a command boundary), the last MULTI (1) or EXEC / DISCARD (2) in it, whether it
+     * has a SELECT, whether it was parsed (its start proved and its state known), and the flag the threads of
+     * later chunks wait for. */
+    size_t spec_end;
+    int spec_exact, spec_txn, spec_sel, spec_valid;
+    _Atomic int spec_done;
 } rpChunk;
 
 /* Lane l's place in the plan: a chunk and a position in that chunk's vector for l. */
@@ -135,6 +142,9 @@ static struct {
     int *bpos; /* plan positions of all barriers, in T order */
     int nb, bcap;
     size_t scan_end;                /* querybuf offset past the last command of the plan */
+    int spec;                       /* RL-g4b: the PARSE phase scans the chunks too (parallel scan) */
+    int spec_cap;                   /* RL-g4b: commands the queue and the plan have room for */
+    rpState spec_st0;               /* RL-g4b: the state before chunk 0's first command */
     uint32_t seg;                   /* the segment an APPLY phase runs */
     long long read_us, classify_us; /* IO thread: the read job, and the scan and planning in it */
 } rp;
@@ -391,6 +401,169 @@ static void rpResetChunk(rpChunk *k) {
     k->nb = 0;
     k->txn_n = 0;
     k->txn_open = 0;
+    k->spec_valid = 0;
+    atomic_store_explicit(&k->spec_done, 0, memory_order_relaxed);
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * RL-g4b: the parallel scan. A large planned read is cut at guessed command starts, one per staged thread,
+ * and each thread scans its chunk in the PARSE phase instead of one IO thread scanning the whole read before
+ * it. A guess is a command start only if the scan of the chunk before it, itself from a proven start, ends
+ * exactly on it: chunk 0 starts at qb_pos, so the proof runs from chunk 0 on. A thread parses its chunk once
+ * the scans of all chunks before it prove its start and give its plan position and its state; a chunk whose
+ * start is not proved (a guess inside a value, a malformed command, a SELECT before it) is not parsed, and
+ * its bytes and everything after them go the usual way, as bytes past a serial scan's stop do.
+ * --------------------------------------------------------------------------------------------- */
+#define RP_SPEC_MIN (128 * 1024) /* bytes of a read below which one thread scans it */
+#define RP_SPEC_SEARCH 65536     /* bytes searched from a guessed cut for a command start */
+
+/* A spin step while a thread waits for the scans of the chunks before its own (as phase_barrier.c's). */
+static inline void rpRelax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
+#endif
+}
+
+/* 1 MULTI, 2 EXEC or DISCARD, 3 SELECT, 0 anything else (rpTrack's names). */
+static inline int rpTxnKind(const char *name, size_t nlen) {
+    if (!name || nlen < 4 || nlen > 7) return 0;
+    char c0 = (char)(name[0] | 0x20);
+    if (nlen == 5 && c0 == 'm' && rpNameIs(name, nlen, "multi")) return 1;
+    if ((nlen == 4 && c0 == 'e' && rpNameIs(name, nlen, "exec")) ||
+        (nlen == 7 && c0 == 'd' && rpNameIs(name, nlen, "discard")))
+        return 2;
+    if (nlen == 6 && c0 == 's' && rpNameIs(name, nlen, "select")) return 3;
+    return 0;
+}
+
+/* One complete multibulk command at p of qb[0, end), as rpScan accepts it: the offset past it, or 0. Its name
+ * in *name / *nlen. */
+static inline size_t rpScanCommand(const char *qb, size_t p, size_t end, const char **name, size_t *nlen) {
+    long long n, len;
+    *name = NULL;
+    *nlen = 0;
+    if (qb[p] != '*') return 0;
+    size_t q = rpScanInt(qb, p + 1, end, &n);
+    if (!q || n <= 0 || n > 1024 * 1024) return 0;
+    for (long long j = 0; j < n; j++) {
+        if (q >= end || qb[q] != '$') return 0;
+        size_t d = rpScanInt(qb, q + 1, end, &len);
+        if (!d || len < 0 || d + (size_t)len + 2 > end || qb[d + len] != '\r' || qb[d + len + 1] != '\n') return 0;
+        if (j == 0) *name = qb + d, *nlen = (size_t)len;
+        q = d + (size_t)len + 2;
+    }
+    return q;
+}
+
+/* A guessed command start at or after from: '*' after a CRLF, then a complete command header with a name of
+ * letters. 0 when none within RP_SPEC_SEARCH bytes. A wrong guess costs speed, never correctness. */
+static size_t rpSpecGuess(const char *qb, size_t from, size_t end) {
+    size_t lim = from + RP_SPEC_SEARCH < end ? from + RP_SPEC_SEARCH : end;
+    size_t p = from < 2 ? 2 : from;
+    while (p + 8 < lim) {
+        const char *x = memchr(qb + p, '*', lim - p);
+        if (!x) return 0;
+        p = (size_t)(x - qb);
+        if (qb[p - 2] == '\r' && qb[p - 1] == '\n') {
+            long long n, len;
+            size_t q = rpScanInt(qb, p + 1, end, &n);
+            if (q && n > 0 && n <= 1024 * 1024 && q < end && qb[q] == '$') {
+                size_t d = rpScanInt(qb, q + 1, end, &len);
+                if (d && len > 0 && len <= 32 && d + (size_t)len + 2 <= end && qb[d + len] == '\r' &&
+                    qb[d + len + 1] == '\n') {
+                    int ok = 1;
+                    for (long long i = 0; i < len && ok; i++) {
+                        char ch = (char)(qb[d + i] | 0x20);
+                        ok = (ch >= 'a' && ch <= 'z') || qb[d + i] == '|' || qb[d + i] == '_' || qb[d + i] == '-';
+                    }
+                    if (ok) return p;
+                }
+            }
+        }
+        p++;
+    }
+    return 0;
+}
+
+/* IO thread: cut the read into guessed chunks for a parallel scan. Returns 0 when fewer than 2 chunks. */
+static int rpSpecPlan(client *c) {
+    const char *qb = c->querybuf;
+    size_t end = sdslen(c->querybuf), p0 = c->qb_pos, avail = end - p0;
+    int t = 1;
+    rp.ch[0].start = p0;
+    for (int i = 1; i < rp.nlanes; i++) {
+        size_t from = p0 + avail / (size_t)rp.nlanes * (size_t)i;
+        if (from <= rp.ch[t - 1].start) from = rp.ch[t - 1].start + 1;
+        size_t g = rpSpecGuess(qb, from, end);
+        if (!g || g <= rp.ch[t - 1].start) continue;
+        rp.ch[t++].start = g;
+    }
+    rp.nchunks = t;
+    return t >= 2;
+}
+
+/* Thread of chunk t, PARSE phase of a parallel scan: scan the chunk to the next chunk's start (the end of the
+ * read for the last), publish, then, when the chunks before it prove its start, parse and classify it. */
+static void rpSpecChunk(int t) {
+    rpChunk *k = &rp.ch[t];
+    client *c = rp.c;
+    const char *qb = c->querybuf;
+    size_t end = sdslen(c->querybuf);
+    int last = t + 1 == rp.nchunks;
+    size_t bound = last ? end : rp.ch[t + 1].start;
+    size_t p = k->start;
+    int n = 0, txn = 0, sel = 0;
+    while (p < bound && n < RP_MAX_CMDS) {
+        const char *name;
+        size_t nlen;
+        size_t q = rpScanCommand(qb, p, end, &name, &nlen);
+        if (!q || q > bound) break;
+        int kind = rpTxnKind(name, nlen);
+        if (kind == 3)
+            sel = 1;
+        else if (kind)
+            txn = kind;
+        n++;
+        p = q;
+    }
+    k->n = n;
+    k->spec_end = p;
+    k->spec_exact = !last && p == bound;
+    k->spec_txn = txn;
+    k->spec_sel = sel;
+    atomic_store_explicit(&k->spec_done, 1, memory_order_release);
+
+    /* The chunks before it: its start, its plan position and its state. */
+    rpState st = rp.spec_st0;
+    int first = 1;
+    for (int j = 0; j < t; j++) {
+        rpChunk *b = &rp.ch[j];
+        while (!atomic_load_explicit(&b->spec_done, memory_order_acquire)) rpRelax();
+        if (!b->spec_exact || b->spec_sel) return; /* its start is not proved, or its state not known */
+        first += b->n;
+        if (b->spec_txn) st.in_multi = b->spec_txn == 1;
+    }
+    if (first - 1 + n > rp.spec_cap) return;
+    k->first = first;
+    k->st = st;
+    rpParseChunk(t);
+    k->spec_valid = 1;
+}
+
+/* Main, after the PARSE phase of a parallel scan: the plan is the chunks whose starts were proved. */
+static void rpSpecFinish(client *c) {
+    int v = 0, total = 0;
+    while (v < rp.nchunks && rp.ch[v].spec_valid) total += rp.ch[v++].n;
+    serverAssert(v >= 1); /* chunk 0 starts at qb_pos */
+    if (v < rp.nchunks) server.stat_repl_lane_spec_partial++;
+    rp.scan_end = rp.ch[v - 1].spec_end;
+    rp.nchunks = v;
+    rp.n = 1 + total;
+    c->cmd_queue.len = (uint16_t)total;
+    c->cmd_queue.off = 0;
+    c->qb_pos = rp.scan_end;
 }
 
 void replApplyPlanRead(client *c) {
@@ -409,6 +582,30 @@ void replApplyPlanRead(client *c) {
         rp.e = zmalloc(sizeof(rpEntry) * (size_t)rp.cap);
     }
     rpClassify(k0, 0, c->parsed_cmd, c->argv, c->argc, c->read_flags, c->slot, c->qb_applied);
+    rp.spec = 0;
+    if (server.replica_parallel_scan && rp.nlanes > 1 && sdslen(c->querybuf) - c->qb_pos >= RP_SPEC_MIN &&
+        rpSpecPlan(c)) {
+        /* The PARSE phase scans the chunks: room for as many commands as the read can hold. */
+        rp.spec = 1;
+        rp.spec_st0 = k0->st;
+        size_t bound = (sdslen(c->querybuf) - c->qb_pos) / 10 + 1; /* the shortest command, *1 $0, is 10 bytes */
+        int cap = bound < RP_MAX_CMDS ? (int)bound : RP_MAX_CMDS;
+        rp.spec_cap = cap;
+        if (rp.cap < cap + 1) {
+            rp.cap = cap + 1;
+            rp.e = zrealloc(rp.e, sizeof(rpEntry) * (size_t)rp.cap);
+        }
+        cmdQueue *q = &c->cmd_queue;
+        serverAssert(q->len == 0);
+        if (q->cap < cap) {
+            q->cmds = zrealloc(q->cmds, sizeof(parsedCommand) * (size_t)cap);
+            q->cap = (uint16_t)cap;
+        }
+        server.stat_repl_lane_spec_reads++;
+        rp.classify_us = getMonotonicUs() - start;
+        rp.ready = 1;
+        return;
+    }
     int total = rpScan(c, k0->st);
     rp.n = 1 + total;
     if (rp.cap < rp.n) {
@@ -542,7 +739,12 @@ static void rpPhase(int tid) {
     int lane = rp.main_lane ? tid : tid - 1;
     if (lane < 0 || lane >= rp.nlanes) return;
     if (rp.mode == RP_PARSE) {
-        if (lane < rp.nchunks) rpParseChunk(lane);
+        if (lane < rp.nchunks) {
+            if (rp.spec)
+                rpSpecChunk(lane);
+            else
+                rpParseChunk(lane);
+        }
     } else {
         rpRunLane(lane);
     }
@@ -706,9 +908,13 @@ int replApplyRunPlan(client *c) {
         monotime parse_start = getMonotonicUs();
         rpRunPhase(RP_PARSE);
         server.stat_repl_lane_parse_usec += getMonotonicUs() - parse_start;
-        c->cmd_queue.len = (uint16_t)(rp.n - 1);
-        c->cmd_queue.off = 0;
-        c->qb_pos = rp.scan_end;
+        if (rp.spec) {
+            rpSpecFinish(c);
+        } else {
+            c->cmd_queue.len = (uint16_t)(rp.n - 1);
+            c->cmd_queue.off = 0;
+            c->qb_pos = rp.scan_end;
+        }
     }
     rpMerge();
     server.stat_repl_lane_reads++;

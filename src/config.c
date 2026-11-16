@@ -3599,6 +3599,7 @@ standardConfig static_configs[] = {
     createIntConfig("owner-spin-stop-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 100000, server.owner_spin_stop_us, 1000, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g2f: owners spin while main holds the world (0: off) */
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("replica-parallel-apply-multi", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.replica_parallel_apply_multi, 1, NULL, NULL),
+    createBoolConfig("replica-parallel-scan", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.replica_parallel_scan, 1, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes", NULL, MODIFIABLE_CONFIG, server.io_threads_parallel_writes, 1, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes-maxmemory", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_parallel_writes_maxmemory, 1, NULL, NULL),
