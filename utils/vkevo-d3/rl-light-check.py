@@ -194,6 +194,11 @@ class Server:
             return -1
 
 
+def light(i):
+    """Iterations that ran light to the end (started light, never stopped the world)."""
+    return int(i['owner_light_iterations']) - int(i['owner_light_full'])
+
+
 def oval(srv, k):
     return info(srv.m, 'owners').get(k)
 
@@ -204,12 +209,15 @@ def run(binary, tag, is_cand):
     m = srv.m
     try:
         if is_cand:
+            # no client of main's meanwhile (its cron would need the world): only the 4 owner clients stay
             i0 = info(m, 'owners')
+            m.close()
             time.sleep(3)
+            m = srv.m = Conn(A.port)
             i1 = info(m, 'owners')
-            li = int(i1['owner_light_iterations']) - int(i0['owner_light_iterations'])
+            li = light(i1) - light(i0)
             cs = int(i1['owner_cron_stops']) - int(i0['owner_cron_stops'])
-            say(li >= 20 and cs <= 3, '%s.light.idle' % tag, 'in 3 s: light iterations +%d, cron stops +%d' % (li, cs))
+            say(li >= 20 and cs <= 3, '%s.light.idle' % tag, 'in 3 s: light ticks +%d, cron stops +%d' % (li, cs))
         # expire
         e0 = int(info(m, 'stats')['expired_keys'])
         long_keys = [('SET', 'el:%d' % i, 'v', 'EX', '3600') for i in range(2000)]
@@ -248,7 +256,7 @@ def run(binary, tag, is_cand):
                 time.sleep(0.05)
         rate = n / (time.time() - t0)
         ib = info(m, 'owners')
-        lb = int(ib.get('owner_light_iterations', 0)) - int(ia.get('owner_light_iterations', 0)) if is_cand else None
+        lb = light(ib) - light(ia) if is_cand else None
         say(samples and 0.4 * rate <= samples[0] <= 1.6 * rate, '%s.stats.instantaneous' % tag,
             'instantaneous_ops_per_sec %s vs measured %.0f/s (light iterations meanwhile %s)' % (samples, rate, lb))
         m.cmd('FLUSHALL')
@@ -304,12 +312,14 @@ def run(binary, tag, is_cand):
             v0 = oval(srv, 'owner_light_full_why')
             m.cmd('CONFIG', 'SET', 'loglevel', 'verbose')
             i0 = info(m, 'owners')
+            m.close()
             time.sleep(6)
+            m = srv.m = Conn(A.port)
             i1 = info(m, 'owners')
             m.cmd('CONFIG', 'SET', 'loglevel', 'notice')
             vv = lambda d: int(dict(x.split('=') for x in d['owner_light_full_why'].split(','))['verbose'])
             dv = vv(i1) - vv(i0)
-            li = int(i1['owner_light_iterations']) - int(i0['owner_light_iterations'])
+            li = light(i1) - light(i0)
             say(1 <= dv <= 3 and li >= 40, '%s.verbose' % tag, 'loglevel verbose 6 s: verbose stops +%d, light +%d' % (dv, li))
             r = m.cmd('CONFIG', 'SET', 'activedefrag', 'yes')
             if r == b'+OK':
@@ -323,10 +333,12 @@ def run(binary, tag, is_cand):
                 say(True, '%s.defrag' % tag, 'activedefrag not supported here: %r' % r[:60])
             time.sleep(1)
             i0 = info(m, 'owners')
-            time.sleep(1)
+            m.close()
+            time.sleep(1.5)
+            m = srv.m = Conn(A.port)
             i1 = info(m, 'owners')
-            li = int(i1['owner_light_iterations']) - int(i0['owner_light_iterations'])
-            say(li >= 6, '%s.light.again' % tag, 'light iterations +%d in 1 s after verbose and defrag' % li)
+            li = light(i1) - light(i0)
+            say(li >= 6, '%s.light.again' % tag, 'light ticks +%d in 1.5 s after verbose and defrag' % li)
     finally:
         srv.stop()
     say(srv.crashes() == 0, '%s.no_crash' % tag, 'crash lines %d' % srv.crashes())
