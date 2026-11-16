@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "owner.h"
 #include "io_threads.h" /* inMainThread() for refcount-discipline asserts */
 #include "ordered_index.h"
 #include "serverassert.h"
@@ -231,6 +232,7 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     if (o->hasexpire) {
         *(long long *)data = expire;
         data += sizeof(long long);
+        if (expire != EXPIRY_NONE) ownerNoteExpire(expire); /* RL-g3b: the owners' expire bound */
     }
 
     /* Initialize metadata to zero */
@@ -335,6 +337,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     if (o->hasexpire) {
         *(long long *)data = expire;
         data += sizeof(long long);
+        if (expire != EXPIRY_NONE) ownerNoteExpire(expire); /* RL-g3b: the owners' expire bound */
     }
 
     /* Initialize metadata to zero */
@@ -497,6 +500,7 @@ robj *objectSetExpire(robj *o, long long expire) {
         /* Update existing expire field. */
         unsigned char *data = objectEmbeddedData(o);
         *(long long *)data = expire;
+        if (expire != EXPIRY_NONE) ownerNoteExpire(expire); /* RL-g3b: the owners' expire bound */
         return o;
     } else if (expire == EXPIRY_NONE) {
         return o;

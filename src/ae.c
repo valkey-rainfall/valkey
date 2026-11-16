@@ -97,6 +97,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->beforesleep = NULL;
     eventLoop->aftersleep = NULL;
     eventLoop->afterfileevents = NULL;
+    eventLoop->beforetimeproc = NULL;
     eventLoop->custompoll = NULL;
     eventLoop->flags = 0;
     eventLoop->priority_apidata = NULL;
@@ -425,6 +426,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
 
             id = te->id;
             te->refcount++;
+            if (eventLoop->beforetimeproc) eventLoop->beforetimeproc(eventLoop, te->timeProc);
             retval = te->timeProc(eventLoop, id, te->clientData);
             te->refcount--;
             processed++;
@@ -694,6 +696,10 @@ void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep
 
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep) {
     eventLoop->aftersleep = aftersleep;
+}
+
+void aeSetBeforeTimeProc(aeEventLoop *eventLoop, aeBeforeTimeProc *beforetimeproc) {
+    eventLoop->beforetimeproc = beforetimeproc;
 }
 
 void aeSetAfterFileEventsProc(aeEventLoop *eventLoop, aeBeforeSleepProc *afterfileevents) {

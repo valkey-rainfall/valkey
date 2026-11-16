@@ -3579,6 +3579,7 @@ standardConfig static_configs[] = {
     createIntConfig("owner-bigreply-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_bigreply_min, 2048, INTEGER_CONFIG, NULL, NULL), /* vkevo g11-bigreply: 0 = copy every value */
     createBoolConfig("owner-mm-lease", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_mm_lease, 1, NULL, NULL), /* vkevo g11-maxmem: batched reads and SET bursts inside each owner's memory lease */
     createBoolConfig("owner-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_cron, 1, NULL, NULL), /* vkevo RL-g2c: owners run their own clients' cron */
+    createBoolConfig("owner-light-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_light_cron, 1, NULL, NULL), /* vkevo RL-g3b: timer wakes without owner-state work do not stop the owners */
     createBoolConfig("owner-repl-native", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_native, 1, NULL, NULL), /* vkevo g11-repl: owners native with replicas attached */
     createBoolConfig("owner-repl-sender", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_sender, 1, NULL, NULL), /* vkevo g11-repl: owner threads start repl-stream-sender append */
     createIntConfig("owner-uring-deep", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_uring_deep, 0, INTEGER_CONFIG, NULL, NULL), /* vkevo g9-fold: 0 = batch deep pipelines too */

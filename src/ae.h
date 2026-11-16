@@ -84,6 +84,8 @@ typedef void aeEventFinalizerProc(struct aeEventLoop *eventLoop, void *clientDat
 typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 typedef void aeAfterSleepProc(struct aeEventLoop *eventLoop, int numevents);
 typedef int aeCustomPollProc(struct aeEventLoop *eventLoop);
+/* Called before each time event's proc runs (RL-g3b: owner threads' world stop before a timer that needs it). */
+typedef void aeBeforeTimeProc(struct aeEventLoop *eventLoop, aeTimeProc *proc);
 /* Callback invoked with elapsed microseconds after high-priority events are processed. */
 typedef void aeQoSStatsProc(struct aeEventLoop *eventLoop, uint64_t duration_us);
 
@@ -128,6 +130,7 @@ typedef struct aeEventLoop {
     aeAfterSleepProc *aftersleep;
     aeBeforeSleepProc *afterfileevents; /* after one pass of file events, before time events */
     aeCustomPollProc *custompoll;
+    aeBeforeTimeProc *beforetimeproc;
     pthread_mutex_t poll_mutex;
     int flags;
 
@@ -168,6 +171,7 @@ void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep);
 void aeSetAfterFileEventsProc(aeEventLoop *eventLoop, aeBeforeSleepProc *afterfileevents);
 void aeSetCustomPollProc(aeEventLoop *eventLoop, aeCustomPollProc *custompoll);
+void aeSetBeforeTimeProc(aeEventLoop *eventLoop, aeBeforeTimeProc *beforetimeproc);
 void aeSetPollProtect(aeEventLoop *eventLoop, int protect);
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);
 int aeGetSetSize(aeEventLoop *eventLoop);

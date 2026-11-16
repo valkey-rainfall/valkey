@@ -563,6 +563,12 @@ typedef struct owner {
     int spin_stop_us; /* stop budget now: spin this long on own_stop before sleeping on own_wait_cv */
     long long spins, spin_hits, spin_time_us, waits;   /* INFO, never cleared */
     long long stop_spins, stop_spin_hits, stop_sleeps; /* INFO, never cleared */
+    /* RL-g3b-light-cron: what main reads while the owners run, published by the owner at the end of each window
+     * (relaxed stores; the counters are the unfolded ones, which main zeroes when it folds them, owners stopped). */
+    _Atomic long long pub_cmds, pub_net_in, pub_net_out, pub_dirty, pub_exp_min;
+    long long exp_min;              /* the earliest key / field expire this owner set since the last reset */
+    int tbl_lo, tbl_hi, tbl_cursor; /* its keyspace tables, and the rightsize cursor over them */
+    long long tbl_checked, tbl_rehash_us; /* INFO, never cleared: tables rightsize-checked, rehash microseconds */
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -677,6 +683,18 @@ static const char *const own_cause_names[OWN_NCAUSES] = {"cron", "wake", "file",
 static int own_iter_wake = 0;
 static long long own_cause_stops[OWN_NCAUSES], own_cause_held_us[OWN_NCAUSES];
 static long long own_held_hist[OWN_HELD_BUCKETS], own_held_max_us = 0;
+/* RL-g3b-light-cron: this iteration runs without the world (ownerAfterSleep chose it; ownerHoldWorld ends it). */
+static int own_light = 0;
+static _Atomic int own_tables = 0; /* the owners rightsize and rehash their own tables this period */
+static _Atomic long long own_exp_min_other = LLONG_MAX; /* expires set by main and any thread but the owners */
+static long long own_light_iters = 0, own_light_full = 0, own_light_full_why[OWN_FULL_NCOUNT];
+enum { OWN_NOLIGHT_CONFIG, OWN_NOLIGHT_VETO, OWN_NOLIGHT_AOF, OWN_NOLIGHT_MAXMEMORY, OWN_NOLIGHT_CHILD, OWN_NOLIGHT_REPL,
+       OWN_NOLIGHT_PENDING, OWN_NOLIGHT_OTHER, OWN_NOLIGHT_NCOUNT };
+static long long own_nolight[OWN_NOLIGHT_NCOUNT];
+static const char *const own_full_names[OWN_FULL_NCOUNT] = {"timeproc", "shutdown", "verbose", "expire", "defrag",
+                                                            "tables", "persist", "clients", "tls", "hotkeys"};
+static const char *const own_nolight_names[OWN_NOLIGHT_NCOUNT] = {"config", "veto",  "aof",     "maxmemory",
+                                                                  "child",  "repl", "pending", "other"};
 
 int ownerThreadsEnabled(void) {
     return own_n > 0;
@@ -811,6 +829,8 @@ static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int ma
 void clientAcceptHandler(connection *conn); /* networking.c: the rest of an accept after the transport's */
 static void ownerTlsRelease(client *c);
 static void ownerTlsOnMain(client *c);
+static void ownerBeforeTimeProc(aeEventLoop *el, aeTimeProc *proc); /* RL-g3b */
+static int ownerLightWhyNot(void);                                 /* RL-g3b */
 
 /* The slot hash of the owner hot path: keyHashSlot() (the slot a cluster client routes a key by),
  * with its CRC16 taken 8 bytes per step instead of 1. own_crc16[k][v] is the CRC16 of 8 bytes with
@@ -900,6 +920,7 @@ void ownerThreadsInit(void) {
         serverLog(LL_WARNING, "owner threads: cannot create the main wake event: %s", strerror(errno));
         exit(1);
     }
+    aeSetBeforeTimeProc(server.el, ownerBeforeTimeProc); /* RL-g3b */
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         o->id = i;
@@ -908,6 +929,10 @@ void ownerThreadsInit(void) {
         const int tables = 1 << OWNER_SHARD_BITS, per = CLUSTER_SLOTS / tables;
         o->slot_lo = (int)((long long)tables * i / own_n) * per;
         o->slot_hi = (int)((long long)tables * (i + 1) / own_n) * per - 1;
+        o->tbl_lo = OWNER_TABLE_OF_SLOT(o->slot_lo);
+        o->tbl_hi = OWNER_TABLE_OF_SLOT(o->slot_hi);
+        o->exp_min = LLONG_MAX;
+        atomic_store_explicit(&o->pub_exp_min, LLONG_MAX, memory_order_relaxed);
         o->inbox = listCreate();
         pthread_mutex_init(&o->inbox_mu, NULL);
         o->watched = zmalloc(sizeof(dict *) * server.dbnum);
@@ -1218,6 +1243,20 @@ static void ownerFoldProp(void) {
     if (listLength(server.replicas)) ownerReplCloses();
 }
 
+/* RL-g3b-light-cron, main, world stopped and the kvstores folded: with no key or field expire left anywhere, the
+ * expire bound starts over (every expire set from now on lowers it again). */
+static void ownerExpireBoundReset(void) {
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db && (kvstoreSize(db->expires) || kvstoreSize(db->keys_with_volatile_items))) return;
+    }
+    atomic_store_explicit(&own_exp_min_other, LLONG_MAX, memory_order_relaxed);
+    for (int i = 0; i < own_n; i++) {
+        owners[i].exp_min = LLONG_MAX;
+        atomic_store_explicit(&owners[i].pub_exp_min, LLONG_MAX, memory_order_relaxed);
+    }
+}
+
 /* Main: wait until no owner is inside a window. From here until ownerResumeWorld main has the
  * keyspace, the clients and every owner's state to itself. */
 static void ownerStopWorld(void) {
@@ -1246,6 +1285,7 @@ static void ownerStopWorld(void) {
     dbLanePhaseEnd();
     ownerFoldProp();
     ownerScriptAnswerAll();
+    ownerExpireBoundReset();
 }
 
 /* maxmemory: the bytes all owners may add before main must look at memory again (0 when an eviction
@@ -1366,6 +1406,7 @@ static void ownerResumeWorld(void) {
     ownerSettleTable(server.orig_commands);
     dbLanePhaseBegin();
     atomic_store_explicit(&own_cron, ownerCronOnOwners() && !server.pause_cron, memory_order_relaxed);
+    atomic_store_explicit(&own_tables, ownerTablesOnOwners() && !server.pause_cron, memory_order_relaxed);
     if (own_stop_t0) {
         long long held = (long long)(getMonotonicUs() - own_stop_t0);
         own_held_us += held;
@@ -1452,6 +1493,11 @@ static void ownerFoldStats(void) {
         server.stat_total_writes_processed += o->writes;
         server.stat_client_outbuf_limit_disconnections += o->outbuf_disconnects;
         o->net_in = o->net_out = o->reads = o->writes = o->outbuf_disconnects = 0;
+        /* RL-g3b: folded, so nothing is left unfolded to publish (owners stopped) */
+        atomic_store_explicit(&o->pub_cmds, 0, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_net_in, 0, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_net_out, 0, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_dirty, 0, memory_order_relaxed);
         /* RL-g2c: client memory the owner's cron measured (updateClientMemoryUsage's changes) */
         for (int t = 0; t < CLIENT_TYPE_COUNT; t++) {
             server.stat_clients_type_memory[t] += o->cmem[t];
@@ -1884,6 +1930,16 @@ void ownerAfterSleep(void) {
         }
         return;
     }
+    /* RL-g3b: a wake no file event caused may leave the owners running (the iteration stops them if it must). */
+    if (!own_held && own_iter_events == 0) {
+        int why = ownerLightWhyNot();
+        if (why < 0) {
+            own_light = 1;
+            own_light_iters++;
+            return;
+        }
+        own_nolight[why]++;
+    }
     ownerStopWorld();
     ownerFoldStats();
     ownerTakeHandoffs();
@@ -1931,6 +1987,119 @@ void ownerNoteWake(int numevents) {
 
 void ownerNoteCron(void) {
     own_iter_cron = 1;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * RL-g3b-light-cron: main iterations that leave the owners running
+ *
+ * Every main iteration used to stop every owner (ownerAfterSleep), timer wakes included. On an all-native load the
+ * only main wakes left are serverCron's (hz times a second), and most of what a tick does touches no owner state:
+ * the memory stats (jemalloc's mallctl and zmalloc's counters are thread-safe), the instantaneous metrics (from the
+ * counters each owner publishes at the end of its windows), the cached time (main already writes it while the owners
+ * run), replicationCron with no replication, the MIGRATE socket cache. So an iteration that no file event woke and
+ * that has nothing pending on main for its own clients (ownerLightWhyNot) starts without a stop; any step that needs
+ * the owners still (serverCronNeedsWorld in server.c; any other timer proc; beforeSleep's work) stops them first
+ * (ownerHoldWorld) and the iteration goes on exactly as before. Two of serverCron's steps that need owner state every
+ * tick get it without a stop: databasesCron's rightsize and rehash run on each owner for its own tables
+ * (ownerTablesCron, in its windows), and the slow expire cycle is skipped while no key or field expire anyone set
+ * (ownerNoteExpire) has come due, when it could expire nothing.
+ * ---------------------------------------------------------------------------------------------- */
+
+long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData);
+long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
+
+/* Main, afterSleep of an iteration no file event woke (owners running): -1 when it may run without the world, else
+ * why not. Main runs only its own clients' work in such an iteration, so nothing may be pending for them, and every
+ * feature whose periodic work touches owner state rules it out. */
+static int ownerLightWhyNot(void) {
+    if (!server.owner_light_cron || own_dormant || server.pause_cron) return OWN_NOLIGHT_CONFIG;
+    if (own_last_veto != 0) return OWN_NOLIGHT_VETO;
+    if (server.aof_state != AOF_OFF) return OWN_NOLIGHT_AOF;
+    if (server.maxmemory) return OWN_NOLIGHT_MAXMEMORY;
+    if (hasActiveChildProcess() || server.aof_rewrite_scheduled || server.rdb_bgsave_scheduled) return OWN_NOLIGHT_CHILD;
+    if (server.primary_host || server.repl_backlog || listLength(server.replicas) ||
+        server.failover_state != NO_FAILOVER)
+        return OWN_NOLIGHT_REPL;
+    if (listLength(own_guests) || listLength(server.clients_to_close) || listLength(server.clients_pending_write) ||
+        listLength(server.unblocked_clients) || listLength(server.clients_waiting_acks) || connTypeHasPendingData() ||
+        server.shutdown_asap)
+        return OWN_NOLIGHT_PENDING;
+    /* RL-g2m (port onto RL-1): RL-g1g's yielded and rerun clients are main's work with the world held too. */
+    if (listLength(own_yielded) || listLength(own_rerun)) return OWN_NOLIGHT_PENDING;
+    /* QoS polling (priority_apidata) carries internal links only: cluster bus, replication, slot migration. Static
+     * modules (the scripting engine) have no event listeners; their modulesCron runs in the light tick. */
+    if (server.cluster_enabled || moduleCountLoaded()) return OWN_NOLIGHT_OTHER;
+    pthread_mutex_lock(&own_main_mu);
+    int handed = listLength(own_main_inbox) != 0;
+    pthread_mutex_unlock(&own_main_mu);
+    if (handed) return OWN_NOLIGHT_PENDING;
+    return -1;
+}
+
+int ownerLightIteration(void) {
+    return own_light;
+}
+
+void ownerHoldWorld(int why) {
+    if (!own_light) return;
+    own_light = 0;
+    own_light_full++;
+    if (why >= 0 && why < OWN_FULL_NCOUNT) own_light_full_why[why]++;
+    ownerStopWorld();
+    ownerFoldStats();
+    /* Clients handed over since afterSleep stay queued (their owners' wakeup ends main's next sleep at once): main is
+     * inside a timer here, not where it runs clients' commands. */
+}
+
+void ownerLightEnd(void) {
+    own_light = 0;
+    own_iter_cron = 0;
+}
+
+/* The ae hook before each time event: a timer other than serverCron's and clientsTimeProc's (defrag, eviction,
+ * module and other timers) gets the stock world. */
+static void ownerBeforeTimeProc(aeEventLoop *el, aeTimeProc *proc) {
+    UNUSED(el);
+    if (own_light && proc != serverCron && proc != clientsTimeProc) ownerHoldWorld(OWN_FULL_TIMEPROC);
+}
+
+int ownerTablesOnOwners(void) {
+    return ownerCronOnOwners() && server.owner_light_cron;
+}
+
+long long ownerExpireBound(void) {
+    long long b = atomic_load_explicit(&own_exp_min_other, memory_order_relaxed);
+    for (int i = 0; i < own_n; i++) {
+        long long v = atomic_load_explicit(&owners[i].pub_exp_min, memory_order_relaxed);
+        if (v < b) b = v;
+    }
+    return b;
+}
+
+/* Any thread: an expire was set (object.c, every write of a key's expire field; db.c, a hash with volatile fields
+ * is tracked: 0, so the slow cycle runs). Owners keep their own minimum (published at the end of each window);
+ * main and any other thread lower a shared one. */
+void ownerNoteExpire(long long when) {
+    if (!own_n) return;
+    owner *o = own_self;
+    if (o) {
+        if (when < o->exp_min) o->exp_min = when;
+        return;
+    }
+    long long cur = atomic_load_explicit(&own_exp_min_other, memory_order_relaxed);
+    while (when < cur && !atomic_compare_exchange_weak_explicit(&own_exp_min_other, &cur, when, memory_order_relaxed,
+                                                                memory_order_relaxed)) {
+    }
+}
+
+void ownerPublishedStats(long long *cmds, long long *net_in, long long *net_out, long long *dirty) {
+    *cmds = *net_in = *net_out = *dirty = 0;
+    for (int i = 0; i < own_n; i++) {
+        *cmds += atomic_load_explicit(&owners[i].pub_cmds, memory_order_relaxed);
+        *net_in += atomic_load_explicit(&owners[i].pub_net_in, memory_order_relaxed);
+        *net_out += atomic_load_explicit(&owners[i].pub_net_out, memory_order_relaxed);
+        *dirty += atomic_load_explicit(&owners[i].pub_dirty, memory_order_relaxed);
+    }
 }
 
 static void ownerAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -5022,6 +5191,37 @@ static void ownerUringInit(owner *o) {
 }
 #endif
 
+/* RL-g3b-light-cron: databasesCron's rightsize and rehash steps for this owner's own tables, at the stock rates: each
+ * kvstore of each db gets CRON_DICTS_PER_DB of its 1 << OWNER_SHARD_BITS tables checked a tick, so an owner checks its
+ * share of them (every table about once in the stock sweep); the stock rehash budget (1% of a tick) is split across
+ * the owners. Not while a child process runs (copy-on-write), as stock. The kvstores are in concurrent mode: a table's
+ * rightsize and rehash touch only that table (its changes reach the kvstore at main's next fold). */
+static void ownerTablesCron(owner *o) {
+    if (hasActiveChildProcess()) return;
+    int T = o->tbl_hi - o->tbl_lo + 1, ntab = 1 << OWNER_SHARD_BITS;
+    if (T <= 0) return;
+    int per = (CRON_DICTS_PER_DB * T + ntab - 1) / ntab;
+    if (per > T) per = T;
+    uint64_t budget = 0, spent = 0;
+    if (server.activerehashing) {
+        budget = (uint64_t)(1000000 / (server.hz > 0 ? server.hz : 1) / 100) / own_n;
+        if (!budget) budget = 1;
+    }
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (!db) continue;
+        kvstore *kvs[3] = {db->keys, db->expires, db->keys_with_volatile_items};
+        for (int k = 0; k < 3; k++) {
+            for (int t = 0; t < per; t++) kvstoreTryResizeHashtable(kvs[k], o->tbl_lo + (o->tbl_cursor + t) % T);
+            o->tbl_checked += per;
+            for (int d = o->tbl_lo; d <= o->tbl_hi && spent < budget; d++)
+                spent += kvstoreRehashHashtable(kvs[k], d, budget - spent);
+        }
+    }
+    o->tbl_cursor = (o->tbl_cursor + per) % T;
+    o->tbl_rehash_us += (long long)spent;
+}
+
 /* RL-g2c-owner-cron: one client's share of clientsCron, on its owner, in a window. The stock checks in the stock order
  * (clientsCronHandleTimeout, clientsCronResizeQueryBuffer, clientsCronResizeOutputBuffer,
  * clientsCronTrackExpensiveClients, updateClientMemoryUsage, closeClientOnOutputBufferLimitReached); the parts that
@@ -5072,6 +5272,7 @@ static int ownerClientsCron(owner *o, long long now_us) {
     o->cron_period_ms = 1000 / hz;
     o->cron_next_us = now_us + 1000000LL / hz;
     o->cron_slices++;
+    if (atomic_load_explicit(&own_tables, memory_order_relaxed)) ownerTablesCron(o); /* RL-g3b */
     int slot = server.unixtime % CLIENTS_PEAK_MEM_USAGE_SLOTS;
     int next = (slot + 1) % CLIENTS_PEAK_MEM_USAGE_SLOTS;
     o->peak_in[next] = o->peak_out[next] = 0;
@@ -5090,7 +5291,8 @@ static int ownerClientsCron(owner *o, long long now_us) {
 
 /* Owner, outside a window: the epoll timeout until its next cron slice (-1 with no client). */
 static int ownerCronTimeout(owner *o) {
-    if (!o->nclients) return -1;
+    /* RL-g3b: an owner with tables to keep wakes for them with no client too */
+    if (!o->nclients && !atomic_load_explicit(&own_tables, memory_order_relaxed)) return -1;
     long long left = o->cron_next_us - (long long)getMonotonicUs();
     if (left <= 0) return 0;
     long long ms = (left + 999) / 1000, period = o->cron_period_ms ? o->cron_period_ms : 100;
@@ -5267,6 +5469,12 @@ static void *ownerThreadMain(void *arg) {
                     handed |= ownerClientsCron(o, now_us);
             }
         }
+        /* RL-g3b: what main reads while the owners run (ownerPublishedStats, ownerExpireBound) */
+        atomic_store_explicit(&o->pub_cmds, o->ectx.stat_numcommands, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_net_in, o->net_in, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_net_out, o->net_out, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_dirty, o->ectx.dirty, memory_order_relaxed);
+        atomic_store_explicit(&o->pub_exp_min, o->exp_min, memory_order_relaxed);
         ownerLeave(o);
         if (handed || o->wake_main) {
             uint64_t one = 1;
@@ -5581,6 +5789,28 @@ void ownerInfo(sds *info) {
     *info = sdscatprintf(*info, "owner_world_held_max_us:%lld\r\nowner_world_held_hist:", own_held_max_us);
     for (int b = 0; b < OWN_HELD_BUCKETS; b++) *info = sdscatprintf(*info, "%s%lld", b ? "/" : "", own_held_hist[b]);
     *info = sdscat(*info, "\r\n");
+    /* RL-g3b-light-cron: main iterations run without the world (owner_light_iterations), those of them that had to
+     * stop it and why (owner_light_full: a step that needed owner state), and timer wakes that could not start light
+     * and why (owner_light_refused); the expire bound; the owners' table upkeep. */
+    long long tchk = 0, trh = 0;
+    for (int i = 0; i < own_n; i++) {
+        tchk += owners[i].tbl_checked;
+        trh += owners[i].tbl_rehash_us;
+    }
+    long long bound = ownerExpireBound();
+    *info = sdscatprintf(*info, "owner_light_cron:%s\r\nowner_light_iterations:%lld\r\nowner_light_full:%lld\r\n",
+                         server.owner_light_cron ? "yes" : "no", own_light_iters, own_light_full);
+    *info = sdscatfmt(*info, "owner_light_full_why:");
+    for (int k = 0; k < OWN_FULL_NCOUNT; k++)
+        *info = sdscatprintf(*info, "%s%s=%lld", k ? "," : "", own_full_names[k], own_light_full_why[k]);
+    *info = sdscatfmt(*info, "\r\nowner_light_refused:");
+    for (int k = 0; k < OWN_NOLIGHT_NCOUNT; k++)
+        *info = sdscatprintf(*info, "%s%s=%lld", k ? "," : "", own_nolight_names[k], own_nolight[k]);
+    *info = sdscatprintf(*info,
+                         "\r\nowner_expire_bound_ms:%lld\r\nowner_tables:%s\r\nowner_tables_checked:%lld\r\n"
+                         "owner_tables_rehash_us:%lld\r\n",
+                         bound == LLONG_MAX ? -1LL : bound,
+                         atomic_load_explicit(&own_tables, memory_order_relaxed) ? "yes" : "no", tchk, trh);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,

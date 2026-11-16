@@ -1424,6 +1424,7 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
             return 1000;
         }
     }
+    ownerHoldWorld(OWN_FULL_CLIENTS); /* RL-g3b: main's clients' cron, with the world as before */
     int clients_this_cycle = numclients / server.hz; /* Initial computation based on standard hz */
     int delay_ms;
 
@@ -1464,6 +1465,26 @@ static void clientsCronOnServerCron(void) {
     cronStatsRecord(CRON_JOB_CLIENTS_TIMEPROC, getMonotonicUs() - t0);
 }
 
+/* RL-g3b-light-cron, a light tick: does this tick's share of the client list (clientsCronOnServerCron's walk) hold a
+ * client of main's? Owners never free or move a client off them, so the walk is safe while they run. Without one the
+ * share is passed over (rotated) as that walk would have, having nothing to do in it. */
+static int clientsCronShareNeedsMain(void) {
+    if (!ownerCronOnOwners()) return 1;
+    int owned = ownerResidentClients(), all = listLength(server.clients);
+    if (all - owned > CLIENTS_CRON_MAX_PER_CYCLE * server.hz) return 0; /* clientsTimeProc's (it holds the world) */
+    int visits = (all + server.hz - 1) / server.hz + CLIENTS_CRON_MIN_PER_CYCLE;
+    if (visits > all) visits = all;
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients, &li);
+    for (int k = 0; k < visits && (ln = listNext(&li)) != NULL; k++) {
+        client *c = listNodeValue(ln);
+        if (c->owner_tid == OWNER_ON_MAIN) return 1;
+    }
+    for (int k = 0; k < visits; k++) listRotateHeadToTail(server.clients);
+    return 0;
+}
+
 /* This function handles 'background' operations we are required to do
  * incrementally in the databases, such as active key expiring, resizing,
  * rehashing. */
@@ -1499,7 +1520,8 @@ void databasesCron(void) {
     /* Perform hash tables rehashing if needed, but only if there are no
      * other processes saving the DB on disk. Otherwise, rehashing is bad
      * as will cause a lot of copy-on-write of memory pages. */
-    if (!hasActiveChildProcess()) {
+    /* RL-g3b: with owner threads keeping their own tables (ownerTablesCron), main has none left to keep. */
+    if (!hasActiveChildProcess() && !ownerTablesOnOwners()) {
         /* When the MAINT phase handles table work, post a rightsize request for every table and a
          * rehash request with the stock budget; maintRun runs them after crons(), in parallel when
          * it can and inline on main otherwise. Falls back to today's code when lanes are off. */
@@ -1702,6 +1724,112 @@ void cronUpdateMemoryStats(void) {
     }
 }
 
+/* RL-g3b-light-cron. In a light iteration (owner.c ownerLightWhyNot: no file event woke main, no AOF, no maxmemory,
+ * no child, no replication, no modules, no veto, nothing pending for main's clients) a serverCron tick runs with the
+ * owners running when none of its steps needs owner state. This returns why one does (an OWN_FULL_* reason), or -1.
+ * Every other step of serverCron is, under those preconditions, either a no-op (pause, tracking, throttling, AOF,
+ * cluster, modules, staged eviction, dict resize policy) or main-only state, which serverCronLight runs. */
+static int clientsCronShareNeedsMain(void);
+static int serverCronNeedsWorld(void) {
+    if (server.shutdown_asap || isShutdownInitiated()) return OWN_FULL_SHUTDOWN;
+    /* The 5 s DB log (verbose) reads the kvstores: only the tick its run_with_period(5000) fires on. */
+    int tick_ms = 1000 / server.hz;
+    if (server.verbosity <= LL_VERBOSE && (5000 <= tick_ms || !(server.cronloops % (5000 / tick_ms))))
+        return OWN_FULL_VERBOSE;
+    /* The slow expire cycle samples the owners' tables. It can expire nothing while no key or field expire set since
+     * the bound's last reset (ownerNoteExpire) has come due. */
+    if (server.active_expire_enabled && !server.import_mode &&
+        (!iAmPrimary() || getReplicaKeyWithExpireCount() > 0 || ownerExpireBound() <= server.mstime))
+        return OWN_FULL_EXPIRE;
+    if (server.active_defrag_enabled) return OWN_FULL_DEFRAG;
+    if (!ownerTablesOnOwners()) return OWN_FULL_TABLES; /* main rightsizes and rehashes the tables */
+    if (server.hotkeys_manager) return OWN_FULL_HOTKEYS;
+    if (server.aof_rewrite_scheduled || server.rdb_bgsave_scheduled || hasActiveChildProcess() ||
+        scriptingEngineDebuggerPendingChildren())
+        return OWN_FULL_PERSIST;
+    if (server.saveparamslen) {
+        /* A save point counts every owner's unfolded changes too. */
+        long long cmds, nin, nout, dirty;
+        ownerPublishedStats(&cmds, &nin, &nout, &dirty);
+        dirty += ectx->dirty;
+        for (int j = 0; j < server.saveparamslen; j++) {
+            struct saveparam *sp = server.saveparams + j;
+            if (dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
+                (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
+                 server.lastbgsave_status == C_OK))
+                return OWN_FULL_PERSIST;
+        }
+    }
+#if defined(USE_OPENSSL) && USE_OPENSSL == 1 /* BUILD_YES */
+    if ((server.tls_port || server.tls_replication || server.tls_cluster) &&
+        server.tls_ctx_config.auto_reload_interval > 0)
+        return OWN_FULL_TLS;
+#endif
+    if (clientsCronShareNeedsMain()) return OWN_FULL_CLIENTS;
+    return -1;
+}
+
+/* The steps of a serverCron tick that touch no owner state, with the owners running: the instantaneous metrics (the
+ * owners' unfolded counters come from what they publish at the end of each window), the memory stats (zmalloc's
+ * counters and jemalloc's mallctl are thread-safe), the cached time, replicationCron with no replication (main-only
+ * state and files), the MIGRATE socket cache. The slow expire cycle could expire nothing (serverCronNeedsWorld), so
+ * only its stale-keys estimate moves, as a cycle that finds nothing moves it. */
+static void serverCronLight(void) {
+    monotime cron_start = getMonotonicUs();
+    run_with_period(100) {
+        monotime current_time = getMonotonicUs();
+        long long factor = 1000000; // us
+        long long cmds, nin, nout, dirty;
+        ownerPublishedStats(&cmds, &nin, &nout, &dirty);
+        long long repl_in = server.stat_net_repl_input_bytes +
+                            atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed);
+        trackInstantaneousMetric(STATS_METRIC_COMMAND, ectx->stat_numcommands + cmds, current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT,
+                                 server.stat_net_input_bytes + nin + repl_in + server.stat_net_cluster_slot_import_bytes,
+                                 current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
+                                 server.stat_net_output_bytes + nout + server.stat_net_repl_output_bytes +
+                                     server.stat_net_cluster_slot_export_bytes,
+                                 current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, repl_in, current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT_REPLICATION, server.stat_net_repl_output_bytes, current_time,
+                                 factor);
+        trackInstantaneousMetric(STATS_METRIC_EL_CYCLE, server.duration_stats[EL_DURATION_TYPE_EL].cnt, current_time,
+                                 factor);
+        trackInstantaneousMetric(STATS_METRIC_EL_DURATION, server.duration_stats[EL_DURATION_TYPE_EL].sum,
+                                 server.duration_stats[EL_DURATION_TYPE_EL].cnt, 1);
+    }
+    {
+        monotime mem_t0 = getMonotonicUs();
+        cronUpdateMemoryStats();
+        cronStatsRecord(CRON_JOB_SC_MEM_STATS, getMonotonicUs() - mem_t0);
+    }
+    run_with_period(1000) updateCachedTime(1);
+    if (server.active_expire_enabled && iAmPrimary() && !server.import_mode) {
+        server.stat_expired_keys_stale_perc *= 0.95;
+        server.stat_expired_keys_with_vola_stale_perc *= 0.95;
+    }
+    run_with_period(1000) {
+        monotime rc = getMonotonicUs();
+        replicationCron();
+        cronStatsRecord(CRON_JOB_SC_REPLICATION_CRON, getMonotonicUs() - rc);
+    }
+    run_with_period(1000) migrateCloseTimedoutSockets();
+    if (moduleCount()) {
+        run_with_period(100) {
+            monotime mc = getMonotonicUs();
+            modulesCron(); /* the module temp-client pool: main-only state */
+            cronStatsRecord(CRON_JOB_SC_MODULES_CRON, getMonotonicUs() - mc);
+        }
+    }
+    ValkeyModuleCronLoopV1 ei = {VALKEYMODULE_CRON_LOOP_VERSION, server.hz};
+    moduleFireServerEvent(VALKEYMODULE_EVENT_CRON_LOOP, 0, &ei); /* listeners only with loaded modules: none here */
+    server.cronloops++;
+    uint64_t cron_whole = elapsedUs(cron_start);
+    cronStatsRecord(CRON_JOB_SC_WHOLE, cron_whole);
+    server.el_cron_duration += cron_whole;
+}
+
 /* This is our timer interrupt, called server.hz times per second.
  * Here is where we do a number of things that need to be done asynchronously.
  * For instance:
@@ -1734,6 +1862,16 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     /* for debug purposes: skip actual cron work if pause_cron is on */
     if (server.pause_cron) return 1000 / server.hz;
     ownerNoteCron();
+
+    /* RL-g3b-light-cron: a tick none of whose steps needs owner state leaves the owners running. */
+    if (ownerLightIteration()) {
+        int why = serverCronNeedsWorld();
+        if (why < 0) {
+            serverCronLight();
+            return 1000 / server.hz;
+        }
+        ownerHoldWorld(why);
+    }
 
     monotime cron_start = getMonotonicUs();
     uint64_t sc_sub_before = cronStatsUsecRange(CRON_JOB_SC_EXPIRE_SLOW, CRON_JOB_SC_PERSISTENCE);
@@ -2179,6 +2317,25 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
         server.events_processed_while_blocked += processed;
+        return;
+    }
+
+    /* RL-g3b-light-cron: an iteration that never stopped the owners has none of the rest to do (owner.c started it
+     * only with nothing pending for main's clients): it ends here, the owners still running. */
+    if (ownerLightIteration()) {
+        drainPendingMainFrees();
+        fastpathReleaseDeferred();
+        monotime now = getMonotonicUs();
+        if (server.el_start > 0) durationAddSample(EL_DURATION_TYPE_EL, now - server.el_start);
+        durationAddSample(EL_DURATION_TYPE_CRON, server.el_cron_duration);
+        server.el_cron_duration = 0;
+        aeSetDontWait(server.el, 0);
+        ownerLightEnd();
+        if (moduleCount()) {
+            moduleFireServerEvent(VALKEYMODULE_EVENT_EVENTLOOP, VALKEYMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP, NULL);
+            atomic_store_explicit(&server.module_gil_acquired, 0, memory_order_relaxed);
+            moduleReleaseGIL(); /* afterSleep takes it again */
+        }
         return;
     }
 

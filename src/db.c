@@ -682,6 +682,7 @@ void dbTrackKeyWithVolatileItems(serverDb *db, robj *o) {
     serverAssert(objectGetKey(o));
     if (objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields(o)) {
         int dict_index = getKVStoreIndexForKey(objectGetKey(o));
+        ownerNoteExpire(0); /* RL-g3b: field expiry needs the slow cycle (the owners' expire bound) */
         kvstoreHashtableAdd(db->keys_with_volatile_items, dict_index, o);
     }
 }

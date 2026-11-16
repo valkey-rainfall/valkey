@@ -49,6 +49,18 @@ int ownerResidentClients(void);       /* main, world held: clients served by own
 void ownerPeakMemInfo(size_t *in_usage, size_t *out_usage); /* main, world held: owners' recent client peaks */
 void ownerNoteWake(int numevents);    /* main, afterSleep: file events that woke this iteration (INFO counters) */
 void ownerNoteCron(void);             /* main: a cron timer proc ran in this iteration (INFO counters) */
+
+/* RL-g3b-light-cron: a main iteration that no file event woke may leave the owners running ("light"): main stops
+ * the world only when a step of it needs owner state (ownerHoldWorld). */
+int ownerLightIteration(void);        /* main: this iteration runs without the world */
+void ownerHoldWorld(int why);         /* main: stop the world now if this iteration has not (why: INFO counter) */
+void ownerLightEnd(void);             /* main, light beforeSleep: the iteration ends without a stop */
+int ownerTablesOnOwners(void);        /* main: owners rightsize and rehash their own tables (databasesCron skips them) */
+long long ownerExpireBound(void);     /* main: no key or field expire set since the last reset is earlier than this */
+void ownerNoteExpire(long long when); /* any thread: an expire time was set (when; 0 for a hash with volatile fields) */
+void ownerPublishedStats(long long *cmds, long long *net_in, long long *net_out, long long *dirty);
+enum { OWN_FULL_TIMEPROC, OWN_FULL_SHUTDOWN, OWN_FULL_VERBOSE, OWN_FULL_EXPIRE, OWN_FULL_DEFRAG, OWN_FULL_TABLES,
+       OWN_FULL_PERSIST, OWN_FULL_CLIENTS, OWN_FULL_TLS, OWN_FULL_HOTKEYS, OWN_FULL_NCOUNT };
 extern int owner_accept_home; /* createClient: home owner of the connection being accepted */
 
 /* WATCH (multi.c): an owner keeps its own registry (a dict like db->watched_keys) of the keys its
