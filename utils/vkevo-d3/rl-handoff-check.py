@@ -16,11 +16,15 @@ digest and expire presence equal on A and R; commandstats calls / failed / rejec
 home with their replies (owner_returns_with_replies).
 
 Suites (--suite): plain; mm (maxmemory 1gb allkeys-lru); repl (A has a replica: its keyspace equals A's exactly);
-aof (appendonly everysec: reload A from its AOF, keyspace equal; handed-over clients take the stock path there).
+aof (appendonly everysec: reload A from its AOF, keyspace equal; handed-over clients take the stock path there);
+uringaofrepl (appendonly everysec with owner-uring-aof yes, so owners batch reads under the AOF, plus a replica:
+replica exactly equal to A, then A reloaded from its AOF equal). With RL-g4a's counters A must have left windows
+early for pending stops in every suite (early_leaves_exercised).
 Prints PASS/FAIL lines and 'RLHANDOFF {json}'; exit 1 on any FAIL.
 """
 import argparse
 import json
+import multiprocessing
 import os
 import random
 import shutil
@@ -327,22 +331,61 @@ def cmdstats(c):
     return out
 
 
+def bg_keys(srv):
+    """The background load's keys (bg_worker's tags, same seeds)."""
+    out = []
+    for j in range(A.bg):
+        rng = random.Random(7000 + j)
+        for lo, hi in srv.ranges:
+            t = tags_in(rng, lo, hi, 1, b"bg%d-" % (7000 + j))[0]
+            out += [b"{%s}:%d" % (t, x) for x in range(16)] + [b"{%s}:%d:n" % (t, x) for x in range(16)]
+    return out
+
+
 def owner_args(cpus, main, bg):
     return ["--owner-threads", str(A.n), "--owner-cpulist", cpus, "--server-cpulist", main, "--bio-cpulist", bg,
             "--aof-rewrite-cpulist", bg, "--bgsave-cpulist", bg]
+
+
+def bg_worker(ports, ranges, stop_at, seed, counter):
+    """RL-g4a stress: pipelined native writes and reads (32 per pipeline) on every owner port of A, on keys of its own
+    tags, so owner windows hold full read batches while the checker's handoffs make main stop the world often."""
+    rng = random.Random(seed)
+    conns = []
+    for i, (lo, hi) in enumerate(ranges):
+        t = tags_in(rng, lo, hi, 1, b"bg%d-" % seed)[0]
+        conns.append((Conn("127.0.0.1", ports[i]), [b"{%s}:%d" % (t, j) for j in range(16)]))
+    n = 0
+    while time.time() < stop_at:
+        for c, ks in conns:
+            batch = []
+            for _ in range(32):
+                k = rng.choice(ks)
+                x = rng.random()
+                batch.append(("SET", k, "b%d" % rng.randrange(1000)) if x < 0.4 else ("GET", k) if x < 0.7 else
+                             ("INCR", k + b":n") if x < 0.85 else ("MSET", ks[0], "m", ks[1], "n") if x < 0.95 else ("DEL", k))
+            c.send(batch)
+            for _ in batch:
+                c.read()
+            n += len(batch)
+    with counter.get_lock():
+        counter.value += n
 
 
 def suite(name):
     extra = {"plain": ["--appendonly", "no"],
              "mm": ["--appendonly", "no", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"],
              "repl": ["--appendonly", "no", "--repl-backlog-size", "64mb"],
-             "aof": ["--appendonly", "yes", "--appendfsync", "everysec"]}[name]
+             "aof": ["--appendonly", "yes", "--appendfsync", "everysec"],
+             # RL-g4a: owners batch their reads under the AOF too (owner-uring-aof), with a replica
+             "uringaofrepl": ["--appendonly", "yes", "--appendfsync", "everysec", "--owner-uring-aof", "yes",
+                              "--repl-backlog-size", "64mb"]}[name]
     a = Srv("a-" + name, A.bin, A.port, A.owner_port, owner_args(A.a_cpus, A.a_main, A.a_bg) + extra,
             "%s,%s" % (A.a_cpus, A.a_bg), A.dir)
     r = Srv("r-" + name, A.ref_bin, A.ref_port, A.ref_owner_port, owner_args(A.r_cpus, A.r_main, A.r_bg) + extra,
             "%s,%s" % (A.r_cpus, A.r_bg), A.dir)
     rep = None
-    if name == "repl":
+    if name in ("repl", "uringaofrepl"):
         rep = Srv("rep-" + name, A.bin, A.replica_port, 0, ["--appendonly", "no"], A.rep_cpus, A.dir)
         rep.c.cmd("REPLICAOF", "127.0.0.1", A.port)
         for _ in range(400):
@@ -362,10 +405,19 @@ def suite(name):
     stop_at = time.time() + A.secs
     ths = [threading.Thread(target=worker, args=(w, a, r, out, stop_at, A.seed * 1000 + w, shared))
            for w in range(A.threads)]
+    bgn = multiprocessing.Value("q", 0)
+    bgs = [multiprocessing.Process(target=bg_worker, args=([A.owner_port + i for i in range(len(a.ranges))], a.ranges,
+                                                           stop_at, 7000 + j, bgn)) for j in range(A.bg)]
+    for p in bgs:
+        p.start()
     for th in ths:
         th.start()
     for th in ths:
         th.join()
+    for p in bgs:
+        p.join()
+    if A.bg:
+        check("%s.bg_load_ran" % name, bgn.value > 10000, "%d background native commands on A's owner ports" % bgn.value)
     s1 = d3.ostat(a.c)
     st1a, st1r = cmdstats(a.c), cmdstats(r.c)
     n = sum(o["cmds"] for o in out.values())
@@ -386,18 +438,26 @@ def suite(name):
     da = {k: v for k, v in da.items() if v != (0, 0, 0)}
     dr = {k: v for k, v in dr.items() if v != (0, 0, 0)}
     bad = {k: (da.get(k), dr.get(k)) for k in set(da) | set(dr) if da.get(k) != dr.get(k)}
-    check("%s.commandstats_equal_parent" % name, not bad, bad if bad else "%d commands' calls / rejected / failed" % len(da))
+    if not A.bg:  # the background load runs on A only
+        check("%s.commandstats_equal_parent" % name, not bad, bad if bad else "%d commands' calls / rejected / failed" % len(da))
     hand = s1["owner_handoffs_to_main"] - s0["owner_handoffs_to_main"]
     stops = max(1, s1["owner_world_stops"] - s0["owner_world_stops"])
     # RL-1b: with RL-g1g in the tree, a client with input left goes home by RL-g1g's resume (the rest of its
     # input and main's replies, at the end of beforeSleep) before ownerGoHomeNow can take it: both count.
+    # RL-g4a: no trip home by ownerGoHomeNow under the AOF (aof, uringaofrepl).
     wr = s1.get("owner_returns_with_replies", 0) - s0.get("owner_returns_with_replies", 0)
     rs = s1.get("owner_pipeline_resumes", 0) - s0.get("owner_pipeline_resumes", 0)
     home = wr + rs
-    want_home = name != "aof"
+    want_home = name not in ("aof", "uringaofrepl")
     check("%s.handoffs_went_home" % name, hand > 1000 and ((home > 0.5 * hand) if want_home else wr == 0),
           "handoffs %d (%.1f per stop), home with replies %d + pipeline resumes %d, returns %d" %
           (hand, hand / stops, wr, rs, s1["owner_returns_from_main"] - s0["owner_returns_from_main"]))
+    if "owner_stop_early_leaves" in s1:
+        # RL-g4a: owners left windows early for pending stops during the run (inbox clients, unsubmitted reads)
+        el = s1["owner_stop_early_leaves"] - s0.get("owner_stop_early_leaves", 0)
+        il = s1["owner_stop_inbox_left"] - s0.get("owner_stop_inbox_left", 0)
+        rl = s1["owner_stop_reads_left"] - s0.get("owner_stop_reads_left", 0)
+        check("%s.early_leaves_exercised" % name, el > 0, "early leaves %d, inbox clients left %d, reads left %d" % (el, il, rl))
     keys = sorted(set(k for o in out.values() for k in o["keys"])) + [shared]
     sa, sr = snapshot(a.port, keys), snapshot(r.port, keys)
     badk = [(k, sa.get(k), sr.get(k)) for k in set(sa) | set(sr)
@@ -417,18 +477,26 @@ def suite(name):
         sp = snapshot(rep.port, keys)
         sa = snapshot(a.port, keys)
         badr = [(k, sa.get(k), sp.get(k)) for k in set(sa) | set(sp) if sa.get(k) != sp.get(k)]
-        check("repl.replica_keyspace_equal", not badr and len(sa) > 100,
+        check("%s.replica_keyspace_equal" % name, not badr and len(sa) > 100,
               badr[:3] if badr else "%d keys exactly equal on the replica (PEXPIRETIME too), link %s" %
               (len(sa), ri.get("master_link_status")))
-    if name == "aof":
+        bga = snapshot(a.port, bg_keys(a))
+        bgp = snapshot(rep.port, bg_keys(a))
+        check("%s.replica_dbsize_and_bg_keys_equal" % name, a.c.cmd("DBSIZE") == rep.c.cmd("DBSIZE") and bga == bgp,
+              "dbsize %s / %s, %d background keys equal" % (a.c.cmd("DBSIZE"), rep.c.cmd("DBSIZE"), len(bga)))
+    if name in ("aof", "uringaofrepl"):
         sa = snapshot(a.port, keys)
+        bga, dba = snapshot(a.port, bg_keys(a)), a.c.cmd("DBSIZE")
         a.stop()
         b = Srv("a-" + name, A.bin, A.port, A.owner_port, owner_args(A.a_cpus, A.a_main, A.a_bg) + extra,
                 "%s,%s" % (A.a_cpus, A.a_bg), A.dir, fresh=False)
         sb = snapshot(b.port, keys)
         badl = [(k, sa.get(k), sb.get(k)) for k in set(sa) | set(sb) if sa.get(k) != sb.get(k)]
-        check("aof.reload_keyspace_equal", not badl and len(sa) > 100,
+        check("%s.reload_keyspace_equal" % name, not badl and len(sa) > 100,
               badl[:3] if badl else "%d keys exactly equal after reloading A's AOF" % len(sa))
+        bgb = snapshot(b.port, bg_keys(b))
+        check("%s.reload_dbsize_and_bg_keys_equal" % name, b.c.cmd("DBSIZE") == dba and bgb == bga,
+              "dbsize %s / %s, %d background keys equal" % (dba, b.c.cmd("DBSIZE"), len(bga)))
         a = b
     for s in (a, r, rep):
         if s:
@@ -459,7 +527,8 @@ def main():
     ap.add_argument("--threads", type=int, default=24)
     ap.add_argument("--secs", type=float, default=20)
     ap.add_argument("--seed", type=int, default=3)
-    ap.add_argument("--suite", default="plain,mm,repl,aof")
+    ap.add_argument("--suite", default="plain,mm,repl,aof,uringaofrepl")
+    ap.add_argument("--bg", type=int, default=0, help="RL-g4a stress: background processes of pipelined native load on A")
     A = ap.parse_args()
     import hashlib
     A.sha = hashlib.sha1(LUA_INCR.encode()).hexdigest()
