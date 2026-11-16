@@ -8186,8 +8186,12 @@ int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
         parseResult res = handleParseResults(c);
         if (res == PARSE_NEEDMORE) {
             /* The rest of a command read off the wire earlier: parse on, or wait for it. A partial
-             * taken from the queue may have its completion bytes in the query buffer already. */
-            if (!popped) return 0;
+             * taken from the queue may have its completion bytes in the query buffer already.
+             * RL-2e: so may one the caller took from the queue (ownerResumeInput of a client RL-g4c
+             * parked: its owner read the rest while it was parked, ownerParkedRead, without parsing):
+             * parse whatever the query buffer holds past qb_pos before waiting for the socket, which
+             * will not report those bytes again. */
+            if (!popped && (!c->querybuf || c->qb_pos >= sdslen(c->querybuf))) return 0;
         } else if (c->argc > 0 && !try_native(c)) {
             return 1;
         }
