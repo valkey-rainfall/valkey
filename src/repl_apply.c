@@ -758,6 +758,25 @@ void replApplyRunLane(int tid) {
     repl_apply_in_lane = 0;
 }
 
+/* Main, outside phases: fold the held SETs' per-lane latencies into SET's histogram (before it is read). */
+void replApplyFoldLaneHistograms(void) {
+    for (int i = 0; i < IO_THREADS_MAX_NUM; i++) {
+        struct hdr_histogram *h = ra_lanes[i].hist;
+        if (!h || h->total_count == 0) continue;
+        if (!ra_set_cmd->latency_histogram)
+            hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
+                     &ra_set_cmd->latency_histogram);
+        hdr_add(ra_set_cmd->latency_histogram, h);
+        hdr_reset(h);
+    }
+}
+
+/* Main, outside phases (CONFIG RESETSTAT): drop the latencies not folded yet. */
+void replApplyResetLaneStats(void) {
+    for (int i = 0; i < IO_THREADS_MAX_NUM; i++)
+        if (ra_lanes[i].hist && ra_lanes[i].hist->total_count) hdr_reset(ra_lanes[i].hist);
+}
+
 /* Main: the commandlog entry call() would add for the op, attributed to the primary client c. */
 static void replApplyLogOp(client *c, replApplyOp *op) {
     robj **argv = c->argv, **original_argv = c->original_argv;
@@ -802,15 +821,9 @@ void replApplyFlush(client *c) {
         replApplyLane *l = &ra_lanes[i];
         usec += l->usec;
         if (l->max_us > max_us) max_us = l->max_us;
-        if (l->hist) {
-            if (server.latency_tracking_enabled && l->hist->total_count) {
-                if (!ra_set_cmd->latency_histogram)
-                    hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
-                             &ra_set_cmd->latency_histogram);
-                hdr_add(ra_set_cmd->latency_histogram, l->hist);
-            }
-            hdr_reset(l->hist);
-        }
+        /* The lane's SET latencies stay in its histogram until INFO latencystats or LATENCY HISTOGRAM reads
+         * them (replApplyFoldLaneHistograms) or CONFIG RESETSTAT clears them: folding a histogram walks all
+         * its buckets, which cost main more than the SETs themselves at one or two SETs per flush. */
         for (int j = 0; j < l->nlogs; j++) replApplyLogOp(c, &l->ops[l->logs[j]]);
         l->usec = 0;
         l->max_us = 0;

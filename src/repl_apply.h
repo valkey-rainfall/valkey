@@ -42,6 +42,9 @@ int replApplyMayDefer(void);
 int replApplyPending(void);
 /* Staged thread tid (0 = main): apply its lane during an APPLY phase. */
 void replApplyRunLane(int tid);
+/* Main, outside phases: fold the held SETs' lane latencies into SET's histogram, or drop them (RESETSTAT). */
+void replApplyFoldLaneHistograms(void);
+void replApplyResetLaneStats(void);
 
 /* Set on a thread while it applies a lane. Paths gated off by replApplyDefer must not run. */
 extern _Thread_local int repl_apply_in_lane;

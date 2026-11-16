@@ -8,6 +8,7 @@
 
 #include "server.h"
 #include "fastpath.h"
+#include "repl_apply.h"
 #include "io_threads.h"
 #include "memory_prefetch.h"
 #include "fastget.h"
@@ -2603,6 +2604,7 @@ static void fpLaneHistogram(fpLane *L, struct serverCommand *cmd, long long ns) 
 }
 
 void fastpathFoldLaneHistograms(void) {
+    replApplyFoldLaneHistograms();
     for (int l = 0; l < FP_MAX_LANES; l++) {
         fpLane *L = &fp_lanes[l];
         for (int id = 0; id < L->hist_cap; id++) {
@@ -2619,6 +2621,7 @@ void fastpathFoldLaneHistograms(void) {
 }
 
 void fastpathResetLaneStats(void) {
+    replApplyResetLaneStats();
     for (int l = 0; l < FP_MAX_LANES; l++) {
         fpLane *L = &fp_lanes[l];
         for (int id = 0; id < L->hist_cap; id++)
