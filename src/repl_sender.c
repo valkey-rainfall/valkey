@@ -484,6 +484,28 @@ void replStreamSenderAdoptSettled(client *replica) {
               replicationGetReplicaName(replica));
 }
 
+/* Main, from replicaStartCommandStream (RL-g2l-repl-speed): a replica synced by a diskless (socket)
+ * transfer stays off the sender only until its first REPLCONF ACK starts its command stream
+ * (stream_ineligible: no byte may follow the RDB's EOF mark before that ACK). From then on it is an
+ * ordinary ONLINE replica, so hand it to the sender the way replStreamSenderAdoptOnline does: now,
+ * or once a write in flight completes (sender_adopt_pending). Without this, main writes such a
+ * replica itself for the whole connection, and with owner threads every owner window that appends
+ * to the stream wakes main to stop the world for that write. Returns 1 when the sender owns it. */
+int replStreamSenderAdoptStarted(client *replica) {
+    replica->repl_data->stream_ineligible = 0;
+    if (!repl_sender_running) return 0; /* replStreamSenderInit adopts it when the sender starts */
+    if (replica->repl_data->stream_via_sender) return 1;
+    if (replica->flag.close_asap || !replStreamSenderEligible(replica)) return 0;
+    reconcileLazyWrite(replica);
+    if (replica->flag.close_asap) return 0;
+    if (replica->io_write_state != CLIENT_IDLE) {
+        replica->repl_data->sender_adopt_pending = 1;
+        return 0;
+    }
+    replStreamSenderTakeFromMain(replica);
+    return replica->repl_data->stream_via_sender;
+}
+
 /* Main: start the sender thread (idempotent) and adopt the ONLINE replicas. */
 void replStreamSenderInit(void) {
     if (repl_sender_running) return;
@@ -553,6 +575,10 @@ void replStreamSenderAdd(client *replica) {
 }
 void replStreamSenderAdoptSettled(client *replica) {
     UNUSED(replica);
+}
+int replStreamSenderAdoptStarted(client *replica) {
+    replica->repl_data->stream_ineligible = 0;
+    return 0;
 }
 void replStreamSenderRemove(client *replica) {
     UNUSED(replica);

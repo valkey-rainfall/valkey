@@ -3838,6 +3838,7 @@ void replStreamSenderPublishStable(long long offset);
 void replStreamSenderPublishAppend(long long offset);
 void replStreamSenderAdd(client *replica);
 void replStreamSenderAdoptSettled(client *replica);
+int replStreamSenderAdoptStarted(client *replica);
 void replStreamSenderRemove(client *replica);
 void replStreamSenderAccount(void);
 int replStreamSenderActive(void);

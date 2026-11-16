@@ -2079,6 +2079,9 @@ void replicaStartCommandStream(client *replica) {
         replicationFeedReplicas(-1, ping_argv, 1);
     }
 
+    /* RL-g2l-repl-speed: the stream has started, so a diskless-synced replica may go to the
+     * repl-stream-sender now; it sends what accumulated since the RDB from the replica's cursor. */
+    if (replStreamSenderAdoptStarted(replica)) return;
     putClientInPendingWriteQueue(replica);
 }
 
@@ -2511,9 +2514,9 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
                  * data. */
                 /* A diskless (socket) RDB transfer joins the end of the RDB to the start of the
                  * command stream through a deferred ack-driven handoff the repl stream sender does
-                 * not model, so keep these replicas on the main
-                 * path. Set before replicaPutOnline so the sender never even briefly registers
-                 * this replica. */
+                 * not model, so keep these replicas on the main path until that handoff is done
+                 * (replicaStartCommandStream hands them to the sender then). Set before
+                 * replicaPutOnline so the sender never even briefly registers this replica. */
                 replica->repl_data->stream_ineligible = 1;
                 if (!replicaPutOnline(replica)) {
                     freeClientAsync(replica);
