@@ -159,8 +159,10 @@
 #include "mt19937-64.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 
 #ifdef __linux__
 #include <sys/epoll.h>
@@ -326,6 +328,9 @@ enum {
     OWN_OBJECT_REFCOUNT,
     OWN_OBJECT_IDLETIME,
     OWN_OBJECT_FREQ,
+    /* RL-g3i-accept-storm: CLUSTER SLOTS, which a cluster client sends on each new connection: the owners'
+     * map is fixed at startup, so its owner answers it (a connection storm was one trip to main per client). */
+    OWN_CLUSTER_SLOTS,
     OWN_NCMDS
 };
 /* RL-g2o-long-tail: every kind a script may run (OWN_K_SCRIPT) is below OWN_DECRBY + 1, so a script run's
@@ -515,6 +520,8 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_OBJECT_REFCOUNT] = {"object|refcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_OBJECT_IDLETIME] = {"object|idletime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_OBJECT_FREQ] = {"object|freq", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    /* RL-g3i-accept-storm: CLUSTER SLOTS, keyless, answered from the owners' fixed map (ownerClusterCommand). */
+    [OWN_CLUSTER_SLOTS] = {"cluster|slots", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_STRING},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
@@ -1085,6 +1092,26 @@ static void ownerSlotHashInit(void) {
     }
 }
 
+/* RL-g3i-accept-storm: the kernel grows a process's fd table by doubling, and in a process with more than one
+ * thread each growth waits an RCU grace period (expand_fdtable: 50-100 ms on vkevo-build, fdgrow.py). Main
+ * accepts with the world held, so a connection storm that took the server past 1024, 2048, 4096 or 8192 fds
+ * stopped every owner for that long, once per doubling (the 30-110 ms holds of RL-2's storm cells, and of
+ * memtier's first connections). Grown here once, at startup, to what the open-files limit allows for
+ * maxclients: no accept grows it after that unless CONFIG SET maxclients raises the limit. */
+static void ownerPresizeFdTable(int any_fd) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == -1 || rl.rlim_cur == RLIM_INFINITY) return;
+    long long want = (long long)server.maxclients + CONFIG_MIN_RESERVED_FDS;
+    if (want > (long long)rl.rlim_cur) want = (long long)rl.rlim_cur;
+    int fd = want > 1024 ? fcntl(any_fd, F_DUPFD_CLOEXEC, (int)want - 1) : -1;
+    if (fd == -1) {
+        serverLog(LL_VERBOSE, "owner threads: fd table not presized (%lld): %s", want, strerror(errno));
+        return;
+    }
+    close(fd);
+    serverLog(LL_NOTICE, "owner threads: fd table presized for %lld fds (no growth while the world is held)", want);
+}
+
 void ownerThreadsInit(void) {
     if (server.owner_threads == 0) return;
 #ifdef __linux__
@@ -1224,6 +1251,7 @@ void ownerThreadsInit(void) {
     if (server.owner_tls_port)
         serverLog(LL_NOTICE, "owner threads: TLS ports %d-%d (handshake, reads and writes on the owners)",
                   server.owner_tls_port, server.owner_tls_port + own_n - 1);
+    ownerPresizeFdTable(owners[0].epfd);
 #endif
 }
 
@@ -3904,6 +3932,11 @@ static int ownerNativeKind(owner *o, client *c) {
     int keyed = 0; /* the command's keys must be this owner's */
     switch (kind) {
     case OWN_PING: break;
+    case OWN_CLUSTER_SLOTS:
+        /* RL-g3i: ownerClusterCommand's reply reads the owners' fixed ports and slot ranges, the server's run id
+         * and owner-announce-ip (changed only on main, with the world held); inside MULTI main queues it. */
+        if (c->flag.multi || server.cluster_enabled || !server.owner_port) return -1;
+        break;
     case OWN_MULTI:
         if (c->flag.multi) return -1; /* nested MULTI: main replies the error */
         break;
