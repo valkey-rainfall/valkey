@@ -8181,6 +8181,7 @@ int processClientIOReadsDone(client *c) {
  * must take the client, with its current command (if any) parsed and not executed. */
 int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
     bool popped = false;
+    size_t parsed_at = (size_t)-1; /* RL-2e: qb_pos of the last parseInputBuffer here (no reparse without progress) */
     for (;;) {
         if (!canParseCommand(c) || isParsingError(c)) return 1;
         parseResult res = handleParseResults(c);
@@ -8190,8 +8191,9 @@ int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
              * RL-2e: so may one the caller took from the queue (ownerResumeInput of a client RL-g4c
              * parked: its owner read the rest while it was parked, ownerParkedRead, without parsing):
              * parse whatever the query buffer holds past qb_pos before waiting for the socket, which
-             * will not report those bytes again. */
-            if (!popped && (!c->querybuf || c->qb_pos >= sdslen(c->querybuf))) return 0;
+             * will not report those bytes again; but only once per position (a big argument still
+             * arriving leaves qb_pos where it was: parsing again would spin). */
+            if (!popped && (!c->querybuf || c->qb_pos >= sdslen(c->querybuf) || c->qb_pos == parsed_at)) return 0;
         } else if (c->argc > 0 && !try_native(c)) {
             return 1;
         }
@@ -8204,6 +8206,7 @@ int ownerRunParsedInput(client *c, int (*try_native)(client *c)) {
             continue;
         }
         if (!c->querybuf || c->qb_pos >= sdslen(c->querybuf)) return 0;
+        parsed_at = c->qb_pos;
         parseInputBuffer(c);
         prepareCommandQueue(c);
         popped = false;
