@@ -2735,6 +2735,13 @@ static int updateProcTitleTemplate(const char **err) {
     return 1;
 }
 
+/* vkevo RL-g2p-busy-poll: CONFIG SET owner-busy-poll-*: every owner's epoll set takes the new values. */
+static int updateOwnerBusyPoll(const char **err) {
+    UNUSED(err);
+    ownerBusyPollApply();
+    return 1;
+}
+
 static int updateHZ(const char **err) {
     UNUSED(err);
     /* Hz is more a hint from the user, so we accept values out of range
@@ -3577,6 +3584,9 @@ standardConfig static_configs[] = {
     createBoolConfig("owner-set-burst", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_set_burst, 1, NULL, NULL), /* vkevo g10-setburst: plain SET frames answered off the query buffer */
     createIntConfig("owner-pipeline-resume", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1024, server.owner_pipeline_resume, 4, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g1g: owners resume a pipeline after main ran its non-native command (0 = off; N = the run of native commands ahead that sends a client home) */
     createIntConfig("owner-bigreply-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_bigreply_min, 2048, INTEGER_CONFIG, NULL, NULL), /* vkevo g11-bigreply: 0 = copy every value */
+    createIntConfig("owner-busy-poll-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.owner_busy_poll_us, 0, INTEGER_CONFIG, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll: 0 = off */
+    createIntConfig("owner-busy-poll-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 64, server.owner_busy_poll_budget, 0, INTEGER_CONFIG, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll: 0 = the kernel's 8 */
+    createBoolConfig("owner-busy-poll-prefer", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_busy_poll_prefer, 0, NULL, updateOwnerBusyPoll), /* vkevo RL-g2p-busy-poll */
     createBoolConfig("owner-mm-lease", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_mm_lease, 1, NULL, NULL), /* vkevo g11-maxmem: batched reads and SET bursts inside each owner's memory lease */
     createBoolConfig("owner-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_cron, 1, NULL, NULL), /* vkevo RL-g2c: owners run their own clients' cron */
     createBoolConfig("owner-light-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_light_cron, 1, NULL, NULL), /* vkevo RL-g3b: timer wakes without owner-state work do not stop the owners */

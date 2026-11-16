@@ -2192,6 +2192,9 @@ struct valkeyServer {
     int owner_set_burst;                      /* owner-set-burst: owners answer plain SET frames off the query buffer (default yes). */
     int owner_pipeline_resume;                /* owner-pipeline-resume N: a guest goes home before N commands in a row its owner runs, or at the end of its input; 0: off (default 4). */
     int owner_bigreply_min;                   /* owner-bigreply-min: owners send GET values of this many bytes or more from where they are (default 2048; 0: copy all). */
+    int owner_busy_poll_us;                   /* vkevo RL-g2p: owner-busy-poll-us N: each owner's epoll set busy polls its NIC queue up to N us before sleeping (0: off, the default). */
+    int owner_busy_poll_budget;               /* vkevo RL-g2p: packets per busy-poll round (0: the kernel's default, 8; at most 64). */
+    int owner_busy_poll_prefer;               /* vkevo RL-g2p: prefer_busy_poll (yes: the kernel lets the poller take the queue from the softirq). */
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
     int owner_cron;                           /* owner-cron (RL-g2c): owners run the per-client cron of the clients they serve (default yes). */
     int owner_light_cron;                     /* owner-light-cron (RL-g3b): timer wakes with no owner-state work leave the owners running (default yes). */

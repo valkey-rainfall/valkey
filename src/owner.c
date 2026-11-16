@@ -164,6 +164,7 @@
 #ifdef __linux__
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #endif
 #ifdef HAVE_LIBURING
@@ -688,6 +689,12 @@ typedef struct owner {
     long long exp_min;              /* the earliest key / field expire this owner set since the last reset */
     int tbl_lo, tbl_hi, tbl_cursor; /* its keyspace tables, and the rightsize cursor over them */
     long long tbl_checked, tbl_rehash_us; /* INFO, never cleared: tables rightsize-checked, rehash microseconds */
+    /* RL-g2p-busy-poll: bp_ok = this owner may busy poll (pinned to a CPU main is not pinned to); bp_on =
+     * its epoll set has owner-busy-poll-us now (main: EPIOCSPARAMS took); tid = the owner thread's id
+     * (INFO reads its sleeps); epoll_waits = epoll_waits that could block (INFO, never cleared). */
+    int bp_ok, bp_on;
+    _Atomic int tid;
+    long long epoll_waits;
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -5435,11 +5442,23 @@ static int ownerCronTimeout(owner *o) {
  * finds nothing ready polls its own epoll (non-blocking, no lock taken while nothing is ready) for up
  * to its budget, a few pipeline flushes apart, and sleeps only when that found nothing. It runs
  * outside any window, so main's stops never wait for it. */
+/* RL-2b: RL-g2f's spin and RL-g2p-busy-poll together. The spin is user space: non-blocking epoll_waits (timeout 0),
+ * which the kernel never busy polls (ep_poll returns before ep_busy_loop when the caller does not wait). The wait
+ * after it is the blocking epoll_wait, and that is where the kernel busy polls the set's NAPI queue for up to
+ * owner-busy-poll-us (EPIOCSPARAMS, ownerBusyPollApply) before it sleeps. So an owner spins first, then busy polls,
+ * then sleeps; either part is off on its own (owner-spin-us 0, owner-busy-poll-us 0), and both use one eligibility
+ * rule (spin_ok == bp_ok: a core of its own). owner_epoll_waits counts the waits that could block. */
+static inline int ownerWaitBlocking(owner *o, struct epoll_event *evs) {
+    int tmo = ownerCronTimeout(o); /* RL-g2c: cron slices */
+    if (tmo) o->epoll_waits++;
+    return epoll_wait(o->epfd, evs, OWNER_EVENTS, tmo);
+}
+
 static int ownerPoll(owner *o, struct epoll_event *evs) {
     if (o->ntlsp) return epoll_wait(o->epfd, evs, OWNER_EVENTS, 0); /* RL-g1d: TLS input may wait */
     int cap = o->spin_ok ? ownerSpinCap(&server.owner_spin_us) : 0;
     o->waits++;
-    if (cap <= 0) return epoll_wait(o->epfd, evs, OWNER_EVENTS, ownerCronTimeout(o)); /* RL-g2c: cron slices */
+    if (cap <= 0) return ownerWaitBlocking(o, evs);
     int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, 0);
     if (n != 0) return n;
     monotime t0 = getMonotonicUs();
@@ -5462,9 +5481,103 @@ static int ownerPoll(owner *o, struct epoll_event *evs) {
         }
         o->spin_us = b / 2;
     }
-    n = epoll_wait(o->epfd, evs, OWNER_EVENTS, ownerCronTimeout(o));
+    n = ownerWaitBlocking(o, evs);
     if (n > 0) ownerSpinSeed(&o->spin_us, (long long)(getMonotonicUs() - t0), cap);
     return n;
+}
+
+/* RL-g2p-busy-poll (owner-busy-poll-us, default 0 = off): NAPI busy polling on each owner's own epoll
+ * set (EPIOCSPARAMS, Linux 6.9). An owner whose epoll_wait finds nothing ready then polls the NIC queue
+ * its sockets' packets came in on (the set's NAPI id: that of the last socket that went ready) for up
+ * to owner-busy-poll-us before it sleeps, instead of sleeping until the interrupt and the wakeup. With
+ * the owner ports NIC-steered (owner i's flows on RX queue i, its IRQ on owner i's CPU) that is the
+ * owner's own queue on its own core. The kernel ends the poll as soon as anything in the set is ready
+ * (a socket, or main's wake eventfd) or the CPU is wanted, so main's wakeups are seen as before; the
+ * owner polls outside its windows, so main's stop never waits for it. No NAPI id (loopback, a device
+ * without NAPI): epoll does not poll and the option changes nothing. Only owners pinned to a CPU main
+ * is not pinned to poll (bp_ok): an owner sharing main's CPU would take it from main. */
+#ifndef EPIOCSPARAMS
+struct epoll_params { /* linux/eventpoll.h (6.9), which does not go with sys/epoll.h */
+    uint32_t busy_poll_usecs;
+    uint16_t busy_poll_budget;
+    uint8_t prefer_busy_poll;
+    uint8_t __pad;
+};
+#define EPIOCSPARAMS _IOW(0x8A, 0x01, struct epoll_params)
+#define EPIOCGPARAMS _IOR(0x8A, 0x02, struct epoll_params)
+#endif
+
+static int own_bp_ready = 0;        /* ownerThreadsStart ran: bp_ok is known */
+static long long own_bp_errors = 0; /* EPIOCSPARAMS calls that failed (INFO) */
+static int own_bp_errno = 0;        /* the last one's errno */
+
+/* Main: owner-busy-poll-* onto every owner's epoll set (at start, and on CONFIG SET). A set that never
+ * had it is left alone while the option is 0, so off is the parent's epoll set exactly. */
+void ownerBusyPollApply(void) {
+    if (!own_bp_ready) return;
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        int us = o->bp_ok ? server.owner_busy_poll_us : 0;
+        if (!us && !o->bp_on) continue;
+        struct epoll_params p = {0};
+        p.busy_poll_usecs = (uint32_t)us;
+        p.busy_poll_budget = us ? (uint16_t)server.owner_busy_poll_budget : 0;
+        p.prefer_busy_poll = us && server.owner_busy_poll_prefer;
+        if (ioctl(o->epfd, EPIOCSPARAMS, &p) == -1) {
+            own_bp_errors++;
+            own_bp_errno = errno;
+            serverLog(LL_WARNING, "owner %d: owner-busy-poll-us %d: EPIOCSPARAMS: %s", i, us, strerror(errno));
+            continue;
+        }
+        o->bp_on = us > 0;
+    }
+}
+
+/* INFO: the owner thread's voluntary context switches (its sleeps), from /proc; 0 when unknown. */
+static long long ownerSleeps(owner *o) {
+    int tid = atomic_load_explicit(&o->tid, memory_order_relaxed);
+    if (!tid) return 0;
+    char path[64], line[128];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/status", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    long long v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "voluntary_ctxt_switches:", 24)) {
+            v = strtoll(line + 24, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return v;
+}
+
+/* INFO: TcpExt BusyPollRxPackets (packets busy polling took off a queue, this network namespace); -1
+ * when the kernel does not have it. */
+static long long ownerBusyPollRxPackets(void) {
+    FILE *f = fopen("/proc/self/net/netstat", "r");
+    if (!f) return -1;
+    char *names = NULL, *vals = NULL;
+    size_t nn = 0, nv = 0;
+    long long v = -1;
+    while (getline(&names, &nn, f) > 0 && getline(&vals, &nv, f) > 0) {
+        if (strncmp(names, "TcpExt:", 7) || strncmp(vals, "TcpExt:", 7)) continue;
+        char *sn, *sv;
+        char *n = strtok_r(names + 7, " \n", &sn), *x = strtok_r(vals + 7, " \n", &sv);
+        while (n && x) {
+            if (!strcmp(n, "BusyPollRxPackets")) {
+                v = strtoll(x, NULL, 10);
+                break;
+            }
+            n = strtok_r(NULL, " \n", &sn);
+            x = strtok_r(NULL, " \n", &sv);
+        }
+        break;
+    }
+    zlibc_free(names); /* getline's, from libc malloc */
+    zlibc_free(vals);
+    fclose(f);
+    return v;
 }
 
 static void *ownerThreadMain(void *arg) {
@@ -5481,6 +5594,7 @@ static void *ownerThreadMain(void *arg) {
     }
     own_self = o;
     ectx = &o->ectx;
+    atomic_store_explicit(&o->tid, (int)gettid(), memory_order_relaxed);
     ioThreadsMarkOwnerThread();
     initSharedQueryBuf();
 #ifdef HAVE_LIBURING
@@ -5617,17 +5731,30 @@ static void *ownerThreadMain(void *arg) {
 }
 
 void ownerThreadsStart(void) {
-    /* RL-g2f: main's CPUs are set by now (serverSetCpuAffinity runs just before this). An owner spins
-     * only on a core of its own: pinned, and not on a CPU main is pinned to. */
+    /* RL-g2f / RL-g2p-busy-poll: main's CPUs are set by now (serverSetCpuAffinity runs just before this). An owner
+     * spins, and busy polls, only on a core of its own: pinned, and not on a CPU main is pinned to (one rule for
+     * both: spin_ok == bp_ok). */
     cpu_set_t mainset;
     CPU_ZERO(&mainset);
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int main_pinned = sched_getaffinity(0, sizeof(mainset), &mainset) == 0 && CPU_COUNT(&mainset) < ncpu;
+    int bp_ok = 0;
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         o->spin_ok = o->cpu >= 0 && !(main_pinned && CPU_ISSET(o->cpu, &mainset));
         o->spin_us = server.owner_spin_us;
         o->spin_stop_us = server.owner_spin_stop_us;
+        o->bp_ok = o->spin_ok;
+        bp_ok += o->bp_ok;
+    }
+    own_bp_ready = 1;
+    ownerBusyPollApply();
+    if (server.owner_busy_poll_us) {
+        int on = 0;
+        for (int i = 0; i < own_n; i++) on += owners[i].bp_on;
+        serverLog(LL_NOTICE, "owner busy poll: %d us, budget %d, prefer %s: on %d of %d owners (%d may poll)",
+                  server.owner_busy_poll_us, server.owner_busy_poll_budget,
+                  server.owner_busy_poll_prefer ? "yes" : "no", on, own_n, bp_ok);
     }
     for (int i = 0; i < own_n; i++) {
         if (pthread_create(&owners[i].thread, NULL, ownerThreadMain, &owners[i]) != 0) {
@@ -5946,6 +6073,35 @@ void ownerInfo(sds *info) {
                          "owner_tables_rehash_us:%lld\r\n",
                          bound == LLONG_MAX ? -1LL : bound,
                          atomic_load_explicit(&own_tables, memory_order_relaxed) ? "yes" : "no", tchk, trh);
+    /* RL-g2p-busy-poll: owner_busy_poll_owners = owners whose epoll set busy polls now (read back with
+     * EPIOCGPARAMS); owner_epoll_waits = epoll_waits that could block. With the option on, also the owner
+     * threads' sleeps (voluntary context switches, /proc; they also sleep on main's stop) and the
+     * kernel's TcpExt BusyPollRxPackets (packets busy polling took off a queue, this network namespace;
+     * on loopback 0). Waits that found work without sleeping: about owner_epoll_waits - owner_sleeps. */
+    long long waits = 0, sleeps = -1, bprx = -1;
+    int bp_on = 0, bp_ok = 0;
+    for (int i = 0; i < own_n; i++) {
+        waits += owners[i].epoll_waits;
+        bp_ok += owners[i].bp_ok;
+    }
+    if (server.owner_busy_poll_us) {
+        sleeps = 0;
+        for (int i = 0; i < own_n; i++) {
+            owner *o = &owners[i];
+            struct epoll_params p = {0};
+            if (o->bp_on && ioctl(o->epfd, EPIOCGPARAMS, &p) == 0 && p.busy_poll_usecs) bp_on++;
+            sleeps += ownerSleeps(o);
+        }
+        bprx = ownerBusyPollRxPackets();
+    }
+    *info = sdscatprintf(*info,
+                         "owner_busy_poll_us:%d\r\nowner_busy_poll_budget:%d\r\nowner_busy_poll_prefer:%s\r\n"
+                         "owner_busy_poll_owners:%d\r\nowner_busy_poll_may:%d\r\nowner_busy_poll_errors:%lld\r\n"
+                         "owner_busy_poll_errno:%d\r\nowner_epoll_waits:%lld\r\nowner_sleeps:%lld\r\n"
+                         "owner_busy_poll_rx_packets:%lld\r\n",
+                         server.owner_busy_poll_us, server.owner_busy_poll_budget,
+                         server.owner_busy_poll_prefer ? "yes" : "no", bp_on, bp_ok, own_bp_errors,
+                         own_bp_errno, waits, sleeps, bprx);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,
