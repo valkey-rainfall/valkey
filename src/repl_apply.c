@@ -170,11 +170,14 @@ static int rpNameIs(const char *s, size_t len, const char *name) {
  * the read waits for it. */
 static void rpTrack(rpState *st, const char *name, size_t nlen, const char *arg, size_t alen, int argc) {
     if (nlen < 4 || nlen > 7) return;
-    if (rpNameIs(name, nlen, "multi")) {
+    /* One length and first letter each: most commands are rejected without a compare. */
+    char c0 = (char)(name[0] | 0x20);
+    if (nlen == 5 && c0 == 'm' && rpNameIs(name, nlen, "multi")) {
         st->in_multi = 1;
-    } else if (rpNameIs(name, nlen, "exec") || rpNameIs(name, nlen, "discard")) {
+    } else if ((nlen == 4 && c0 == 'e' && rpNameIs(name, nlen, "exec")) ||
+               (nlen == 7 && c0 == 'd' && rpNameIs(name, nlen, "discard"))) {
         st->in_multi = 0;
-    } else if (rpNameIs(name, nlen, "select")) {
+    } else if (nlen == 6 && c0 == 's' && rpNameIs(name, nlen, "select")) {
         long long id;
         serverDb *db = NULL;
         if (!st->in_multi && argc == 2 && string2ll(arg, alen, &id) && id >= 0 && id < server.dbnum)
@@ -282,11 +285,21 @@ static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **ar
 
 /* A RESP integer ending at the next \r\n of [p, end). Returns the position after the \n, or 0 when the
  * line is not complete or not a number. */
-static size_t rpScanInt(const char *qb, size_t p, size_t end, long long *v) {
+static inline size_t rpScanInt(const char *qb, size_t p, size_t end, long long *v) {
+    /* The stream's lengths are plain decimals: digits only, no sign, no leading zero, at most 18 of them
+     * (string2ll's rules on that range). Anything else returns 0 and goes the usual way. */
     size_t q = p;
-    while (q < end && qb[q] != '\r') q++;
-    if (q + 1 >= end || qb[q + 1] != '\n') return 0;
-    if (!string2ll(qb + p, q - p, v)) return 0;
+    unsigned long long x = 0;
+    *v = 0;
+    while (q < end && q - p < 18) {
+        unsigned d = (unsigned char)qb[q] - '0';
+        if (d > 9) break;
+        x = x * 10 + d;
+        q++;
+    }
+    if (q == p || (qb[p] == '0' && q - p > 1)) return 0;
+    if (q + 1 >= end || qb[q] != '\r' || qb[q + 1] != '\n') return 0;
+    *v = (long long)x;
     return q + 2;
 }
 
