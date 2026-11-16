@@ -167,6 +167,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #endif
 #ifdef HAVE_LIBURING
 #include <liburing.h>
@@ -175,6 +176,7 @@
 #define OWNER_MAX 256
 #define OWNER_EVENTS 256
 #define OWNER_WAKE_TOKEN UINT64_MAX
+#define OWNER_EXPIRE_TOKEN (UINT64_MAX - 1) /* RL-g2b: the owner's expire timer */
 #define OWN_RING_MAX 128 /* GET and MGET ring slots: prefetch-batch-max-size's maximum; a power of two */
 /* io_uring (owner-uring, D3-all-g8): reads and writes per io_uring_enter. Each read slot has a
  * PROTO_IOBUF_LEN scratch buffer (mmap: only touched pages count, and not toward used_memory). */
@@ -738,6 +740,23 @@ typedef struct owner {
     int bp_ok, bp_on;
     _Atomic int tid;
     long long epoll_waits;
+    /* RL-g2b: active expiry of this owner's keys (ownerExpireRun), only by this thread in its windows.
+     * Per db and own table a scan cursor, per db the table its walk is at; the cycle in progress (it
+     * runs in slices); what main folds (cycle time, time-limit stops, the TTL sample for avg_ttl). */
+    unsigned long long *exp_cur;  /* [db * exp_ntables + t]: table exp_t0 + t */
+    int *exp_at;                  /* [db]: the walk's table, 0..exp_ntables-1 */
+    long long *exp_ttl_sum, *exp_ttl_n; /* [db]: folded and cleared by main */
+    int exp_t0, exp_ntables;      /* its tables */
+    int exp_db, exp_dbs, exp_j;   /* the cycle in progress: next db, dbs left to do, dbs visited */
+    long long exp_left;           /* its time left in us; 0: no cycle in progress */
+    unsigned long exp_c_sampled, exp_c_expired; /* its samples so far (the stale estimate at its end) */
+    int exp_timelimit;            /* the last cycle stopped on its time limit (stock timelimit_exit) */
+    int exp_fold;                 /* something for main to fold */
+    int exp_tfd, exp_hz, exp_due; /* the slow cycles' timer (timerfd, period 1/exp_hz; 0: off); it fired */
+    monotime exp_last_fast;
+    double exp_stale;             /* stock stat_expired_keys_stale_perc, over this owner's keys */
+    long long exp_us, exp_cap;    /* folded and cleared by main: cycle time, time-limit stops */
+    long long exp_cycles, exp_fast, exp_slices, exp_keys, exp_sampled, exp_us_total; /* INFO, never cleared */
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -828,6 +847,9 @@ static unsigned long long own_mm_period = 0;
 static _Atomic int own_mm_over = 0;       /* an owner went over its slice: every owner sends work to main */
 static int own_mm_lease = 0;              /* maxmemory and owner-mm-lease: batched reads and SET bursts in the lease */
 static long long own_aof_ops = 0;         /* main: ops folded into the AOF */
+/* RL-g2b: the owners run the active expiry of their own keys (ownerExpireRun) until main's next stop; set
+ * by main when it resumes them, read by the owners in and between windows. */
+static _Atomic int own_expire = 0;
 /* GET bursts (ownerGetBurst): the command a "GET"/"get" frame resolves to, when that is getCommand under
  * its own name (rename-command can move it); NULL turns bursts off. The shared name objects stand in
  * for the frame's argv[0] in slow commandlog entries. */
@@ -856,6 +878,7 @@ static long long own_held_hist[OWN_HELD_BUCKETS], own_held_max_us = 0;
 static int own_light = 0;
 static _Atomic int own_tables = 0; /* the owners rightsize and rehash their own tables this period */
 static _Atomic long long own_exp_min_other = LLONG_MAX; /* expires set by main and any thread but the owners */
+static _Atomic long long own_fexp_min = LLONG_MAX; /* RL-g3f: hash-field expiry (0 once a hash with volatile fields is tracked) */
 static long long own_light_iters = 0, own_light_full = 0, own_light_full_why[OWN_FULL_NCOUNT];
 enum { OWN_NOLIGHT_CONFIG, OWN_NOLIGHT_VETO, OWN_NOLIGHT_AOF, OWN_NOLIGHT_MAXMEMORY, OWN_NOLIGHT_CHILD, OWN_NOLIGHT_REPL,
        OWN_NOLIGHT_PENDING, OWN_NOLIGHT_OTHER, OWN_NOLIGHT_NCOUNT };
@@ -1113,6 +1136,13 @@ void ownerThreadsInit(void) {
         o->sc->flag.script = 1;
         o->sc->flag.argv_borrowed = 1; /* as VM_CallArgv's: the vector belongs to the script run */
         o->aof_first_db = -1;
+        /* RL-g2b: the tables this owner expires keys in (its own: whole tables) */
+        o->exp_t0 = OWNER_TABLE_OF_SLOT(o->slot_lo);
+        o->exp_ntables = OWNER_TABLE_OF_SLOT(o->slot_hi) - o->exp_t0 + 1;
+        o->exp_cur = zcalloc(sizeof(unsigned long long) * server.dbnum * o->exp_ntables);
+        o->exp_at = zcalloc(sizeof(int) * server.dbnum);
+        o->exp_ttl_sum = zcalloc(sizeof(long long) * server.dbnum);
+        o->exp_ttl_n = zcalloc(sizeof(long long) * server.dbnum);
         o->fdmap_cap = 1024;
         o->fdmap = zcalloc(sizeof(client *) * o->fdmap_cap);
         o->epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -1120,6 +1150,13 @@ void ownerThreadsInit(void) {
         struct epoll_event ev = {.events = EPOLLIN, .data.u64 = OWNER_WAKE_TOKEN};
         if (o->epfd == -1 || o->wakefd == -1 || epoll_ctl(o->epfd, EPOLL_CTL_ADD, o->wakefd, &ev) == -1) {
             serverLog(LL_WARNING, "owner threads: cannot create owner %d's event loop: %s", i, strerror(errno));
+            exit(1);
+        }
+        /* RL-g2b: the owner's slow expire cycle timer (armed by the owner itself, ownerExpireArm) */
+        o->exp_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        struct epoll_event tev = {.events = EPOLLIN, .data.u64 = OWNER_EXPIRE_TOKEN};
+        if (o->exp_tfd == -1 || epoll_ctl(o->epfd, EPOLL_CTL_ADD, o->exp_tfd, &tev) == -1) {
+            serverLog(LL_WARNING, "owner threads: cannot create owner %d's expire timer: %s", i, strerror(errno));
             exit(1);
         }
         /* A listener per owner on every bind address, accepted on main (clientAcceptHandler adopts). */
@@ -1348,7 +1385,7 @@ static void ownerAofAppend(owner *o) {
             ownerPropUnit *pu = &o->units[u];
             size_t end = own_split ? pu->rend : pu->end;
             size_t at = end + (o->aof_first_db != -1 && end > rsel ? sel_len : 0);
-            pu->c->woff = base + (long long)at;
+            if (pu->c) pu->c->woff = base + (long long)at; /* RL-g2b: an active expire's unit has no client */
             own_repl_ops += pu->n;
             if (own_split) own_split_ops += pu->n;
         }
@@ -1371,7 +1408,7 @@ static void ownerAofAppend(owner *o) {
             ownerPropUnit *pu = &o->units[u];
             if (pu->repl) {
                 server.primary_repl_offset += pu->repl; /* replicationFeedReplicas without replicas */
-                pu->c->woff = server.primary_repl_offset;
+                if (pu->c) pu->c->woff = server.primary_repl_offset;
             }
         }
     }
@@ -1416,10 +1453,16 @@ static void ownerFoldProp(void) {
 /* RL-g3b-light-cron, main, world stopped and the kvstores folded: with no key or field expire left anywhere, the
  * expire bound starts over (every expire set from now on lowers it again). */
 static void ownerExpireBoundReset(void) {
+    int keys = 0, fields = 0;
     for (int j = 0; j < server.dbnum; j++) {
         serverDb *db = server.db[j];
-        if (db && (kvstoreSize(db->expires) || kvstoreSize(db->keys_with_volatile_items))) return;
+        if (!db) continue;
+        keys |= kvstoreSize(db->expires) != 0;
+        fields |= kvstoreSize(db->keys_with_volatile_items) != 0;
     }
+    /* RL-g3f: the field bound starts over once no hash has volatile fields, whatever the keys' expires */
+    if (!fields) atomic_store_explicit(&own_fexp_min, LLONG_MAX, memory_order_relaxed);
+    if (keys || fields) return;
     atomic_store_explicit(&own_exp_min_other, LLONG_MAX, memory_order_relaxed);
     for (int i = 0; i < own_n; i++) {
         owners[i].exp_min = LLONG_MAX;
@@ -1569,6 +1612,19 @@ static void ownerResumeWorld(void) {
     /* Each owner appends its own records at the end of its window, except under appendfsync always
      * (main writes every owner's records at its stop and fsyncs them once). */
     own_aof_drain = own_keep && !(own_aof && server.aof_fsync == AOF_FSYNC_ALWAYS);
+    /* RL-g2b: the owners expire their own keys while nothing vetoes the native path and the stock
+     * cycle would run (activeExpireCycle's conditions on main); otherwise main expires every key. */
+    int expire = server.owner_active_expire && !own_last_veto && server.active_expire_enabled && iAmPrimary() &&
+                 !server.import_mode && !isPausedActions(PAUSE_ACTION_EXPIRE);
+    if (expire && !atomic_load_explicit(&own_expire, memory_order_relaxed)) {
+        /* An owner asleep with no timeout wakes to start its cycles. */
+        for (int i = 0; i < own_n; i++) {
+            uint64_t one = 1;
+            if (write(owners[i].wakefd, &one, sizeof(one)) == -1) { /* a wakeup is pending anyway */
+            }
+        }
+    }
+    atomic_store_explicit(&own_expire, expire, memory_order_relaxed);
     ownerReleaseHeld();
     ownerMmPlan();
     ownerSettleCommandTables();
@@ -1673,6 +1729,25 @@ static void ownerFoldStats(void) {
             server.stat_clients_type_memory[t] += o->cmem[t];
             o->cmem[t] = 0;
         }
+        if (o->exp_fold) { /* RL-g2b: the owner's active expiry */
+            server.stat_expire_cycle_time_used += o->exp_us;
+            server.stat_expired_time_cap_reached_count += o->exp_cap;
+            o->exp_us = o->exp_cap = 0;
+            for (int j = 0; j < server.dbnum; j++) {
+                if (o->exp_ttl_n[j] && server.db[j]) {
+                    /* as activeExpireCycleJob's running average: this sample at 2% */
+                    long long avg = o->exp_ttl_sum[j] / o->exp_ttl_n[j], *cur = &server.db[j]->expiry[KEYS].avg_ttl;
+                    *cur = *cur == 0 ? avg : avg + (long long)((*cur - avg) * 0.98);
+                }
+                o->exp_ttl_sum[j] = o->exp_ttl_n[j] = 0;
+            }
+            o->exp_fold = 0;
+        }
+    }
+    if (ownerExpiresKeys()) { /* RL-g2b: expired_stale_perc over every owner's keys */
+        double stale = 0;
+        for (int i = 0; i < own_n; i++) stale += owners[i].exp_stale;
+        server.stat_expired_keys_stale_perc = stale / own_n;
     }
 }
 
@@ -2249,6 +2324,17 @@ long long ownerExpireBound(void) {
 /* Any thread: an expire was set (object.c, every write of a key's expire field; db.c, a hash with volatile fields
  * is tracked: 0, so the slow cycle runs). Owners keep their own minimum (published at the end of each window);
  * main and any other thread lower a shared one. */
+/* RL-g3f-owner-expire-light: while the owners expire keys (RL-g2b, ownerExpiresKeys), main's slow cycle runs the
+ * hash-field job alone, so a light tick needs the world for it only once a hash with volatile fields exists. */
+long long ownerFieldExpireBound(void) {
+    return atomic_load_explicit(&own_fexp_min, memory_order_relaxed);
+}
+
+void ownerNoteFieldExpire(void) {
+    if (own_n && atomic_load_explicit(&own_fexp_min, memory_order_relaxed) != 0)
+        atomic_store_explicit(&own_fexp_min, 0, memory_order_relaxed);
+}
+
 void ownerNoteExpire(long long when) {
     if (!own_n) return;
     owner *o = own_self;
@@ -2887,7 +2973,7 @@ static void ownerTakeProp(owner *o, client *c) {
      * (server.aof_fd_fmt changes only with the owners stopped and their records folded); D3-all-g14-fold:
      * own_rec_fmt (RESP with the AOF off), plus a RESP copy for the stream when that format is compact. */
     int fmt = own_rec_fmt;
-    int wrap = n > 1 && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS), repl = 0;
+    int wrap = n > 1 && c && !(c->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS), repl = 0;
     if (wrap) {
         o->aofbuf = aofCatMulti(o->aofbuf, fmt);
         if (own_split) o->replbuf = aofCatMulti(o->replbuf, AOF_FMT_RESP);
@@ -5543,6 +5629,8 @@ static int ownerCronTimeout(owner *o) {
  * finds nothing ready polls its own epoll (non-blocking, no lock taken while nothing is ready) for up
  * to its budget, a few pipeline flushes apart, and sleeps only when that found nothing. It runs
  * outside any window, so main's stops never wait for it. */
+static int ownerExpireTimeout(owner *o); /* RL-g2b */
+
 /* RL-2b: RL-g2f's spin and RL-g2p-busy-poll together. The spin is user space: non-blocking epoll_waits (timeout 0),
  * which the kernel never busy polls (ep_poll returns before ep_busy_loop when the caller does not wait). The wait
  * after it is the blocking epoll_wait, and that is where the kernel busy polls the set's NAPI queue for up to
@@ -5557,6 +5645,7 @@ static inline int ownerWaitBlocking(owner *o, struct epoll_event *evs) {
 
 static int ownerPoll(owner *o, struct epoll_event *evs) {
     if (o->ntlsp) return epoll_wait(o->epfd, evs, OWNER_EVENTS, 0); /* RL-g1d: TLS input may wait */
+    if (ownerExpireTimeout(o) == 0) return epoll_wait(o->epfd, evs, OWNER_EVENTS, 0); /* RL-g2b: a cycle goes on */
     int cap = o->spin_ok ? ownerSpinCap(&server.owner_spin_us) : 0;
     o->waits++;
     if (cap <= 0) return ownerWaitBlocking(o, evs);
@@ -5681,6 +5770,210 @@ static long long ownerBusyPollRxPackets(void) {
     return v;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * RL-g2b: active expiry on the owners
+ *
+ * Every key lives in a table one owner owns, so each owner runs the active expire cycle over its own
+ * tables, on its own thread inside its windows, and main stops no owner for it. The algorithm and the
+ * budgets are stock's (activeExpireCycle, activeExpireCycleJob's KEYS job), per owner: a slow cycle every
+ * 1/hz s with ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC of the period, a fast cycle of
+ * ACTIVE_EXPIRE_CYCLE_FAST_DURATION at most once per twice that after a cycle that stopped on its time
+ * limit, rounds of keys_per_loop samples in at most 10x as many buckets, repeated while more than the
+ * acceptable share was stale, active-expire-effort; with this owner's own cursors (one per db and table)
+ * and stale estimate. A cycle runs in slices of at most OWN_EXPIRE_SLICE_US after each batch of client
+ * work, and stops when main wants the world (it goes on in the next window). An expired key is deleted
+ * as activeExpireCycleTryExpire deletes it (deleteExpiredKeyAndPropagate: lazyfree, WATCH, expired_keys,
+ * its DEL or UNLINK), and the DEL/UNLINK goes into this owner's records as a native command's
+ * (ownerTakeProp), so the AOF and the replicas get it in this owner's order, and replies after it wait
+ * for the AOF as usual. Main folds the cycle time, time-limit stops, stale estimate and TTL sample into
+ * the stock stats. While the owners do this (ownerExpiresKeys) main expires only hash fields. Whenever
+ * the native path is vetoed (a replica, notifications, tracking, pause, modules, ...), expiry is off
+ * or owner-active-expire is no, main runs the stock cycle for every key, as before. A replica never
+ * expires keys: owners are vetoed there, and own_expire needs iAmPrimary.
+ * ---------------------------------------------------------------------------------------------- */
+
+#define OWN_EXPIRE_SLICE_US 100 /* the longest a cycle runs between two batches of client work */
+
+int ownerExpiresKeys(void) {
+    return own_n && !own_dormant && atomic_load_explicit(&own_expire, memory_order_relaxed);
+}
+
+typedef struct ownerExpireScan {
+    owner *o;
+    serverDb *db;
+    mstime_t now;
+    unsigned long sampled, expired;
+    int mm_stop; /* under maxmemory: the next delete's records do not fit this owner's lease */
+} ownerExpireScan;
+
+/* expireScanCallback and activeExpireCycleTryExpire on the owner. */
+static void ownerExpireScanCb(void *privdata, void *entry, int didx) {
+    ownerExpireScan *d = privdata;
+    owner *o = d->o;
+    robj *val = entry;
+    if (d->mm_stop) return;
+    mstime_t when = objectGetExpire(val);
+    if (d->now > when) {
+        sds key = objectGetKey(val);
+        /* Under maxmemory the records it adds must fit this owner's lease (the delete frees more). */
+        if (own_mm && !ownerMmFits(o, OWN_MM_REC * (sdslen(key) + 64))) {
+            d->mm_stop = 1;
+            return;
+        }
+        enterExecutionUnit(0, 0); /* not main's cached clock: the owner's own time (d->now) */
+        robj *keyobj = createStringObject(key, sdslen(key));
+        deleteExpiredKeyAndPropagateWithDictIndex(d->db, keyobj, didx);
+        decrRefCount(keyobj);
+        ectx->dirty++;
+        exitExecutionUnit();
+        if (ectx->also_propagate.numops) ownerTakeProp(o, NULL); /* one op: no MULTI around it */
+        d->expired++;
+    } else if (when > d->now) {
+        o->exp_ttl_sum[d->db->id] += when - d->now;
+        o->exp_ttl_n[d->db->id]++;
+    }
+    d->sampled++;
+}
+
+/* This owner's keys with an expire in kvs, counted up to cap. */
+static unsigned long ownerExpireCount(owner *o, kvstore *kvs, unsigned long cap) {
+    unsigned long n = 0;
+    for (int t = 0; t < o->exp_ntables && n < cap; t++) n += kvstoreHashtableSize(kvs, o->exp_t0 + t);
+    return n;
+}
+
+/* One sampling round over this owner's tables of a db: up to num keys in at most num * 10 buckets,
+ * from where the walk stopped; empty tables are skipped, as the kvstore cursor skips them. Returns 1
+ * when the walk went past this owner's last table (activeExpireCycleJob's db_done). */
+static int ownerExpireRound(owner *o, kvstore *kvs, int dbid, unsigned long num, ownerExpireScan *d) {
+    unsigned long start = d->sampled;
+    long checked = 0, max_buckets = (long)num * 10;
+    while (d->sampled - start < num && checked < max_buckets && !d->mm_stop) {
+        int t = o->exp_at[dbid], didx = o->exp_t0 + t;
+        unsigned long long *cur = &o->exp_cur[dbid * o->exp_ntables + t];
+        if (kvstoreHashtableSize(kvs, didx)) {
+            *cur = kvstoreScan(kvs, *cur, didx, didx, ownerExpireScanCb, expireShouldSkipTableForSamplingCb, d);
+            checked++;
+        } else {
+            *cur = 0;
+        }
+        if (*cur == 0) {
+            o->exp_at[dbid] = t + 1 == o->exp_ntables ? 0 : t + 1;
+            if (t + 1 == o->exp_ntables) return 1;
+        }
+    }
+    return 0;
+}
+
+/* The cycle in progress ends: the stale estimate as activeExpireCycleJob updates it, 5% per cycle. */
+static void ownerExpireEnd(owner *o) {
+    double perc = o->exp_c_sampled ? (double)o->exp_c_expired / o->exp_c_sampled : 0;
+    o->exp_stale = perc * 0.05 + o->exp_stale * 0.95;
+    o->exp_left = 0;
+}
+
+static void ownerExpireBegin(owner *o, long long budget_us) {
+    if (o->exp_left) ownerExpireEnd(o); /* its slices did not get to finish it within its period */
+    o->exp_left = budget_us;
+    o->exp_dbs = CRON_DBS_PER_CALL > server.dbnum || o->exp_timelimit ? server.dbnum : CRON_DBS_PER_CALL;
+    o->exp_j = 0;
+    o->exp_timelimit = 0;
+    o->exp_c_sampled = o->exp_c_expired = 0;
+}
+
+/* Owner, in a window after its clients' work: start a cycle when one is due, and run the cycle in
+ * progress for one slice. */
+static void ownerExpireRun(owner *o) {
+    monotime t0 = getMonotonicUs();
+    int effort = server.active_expire_effort - 1;
+    unsigned long acceptable = ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE - effort;
+    unsigned long keys_per_loop = ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP + ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP / 4 * effort;
+    if (o->exp_due) { /* serverCron's slow cycle, at this owner's 1/hz timer */
+        o->exp_due = 0;
+        long long period = 1000000 / server.hz;
+        ownerExpireBegin(o, (long long)(ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC + 2 * effort) * period / 100);
+        o->exp_cycles++;
+    } else if (!o->exp_left) { /* beforeSleep's fast cycle */
+        long long fast = ACTIVE_EXPIRE_CYCLE_FAST_DURATION + ACTIVE_EXPIRE_CYCLE_FAST_DURATION / 4 * effort;
+        /* compared as activeExpireCycleJob compares them (a share against a percentage) */
+        if (!o->exp_timelimit && o->exp_stale < acceptable) return;
+        if (t0 < o->exp_last_fast + 2 * fast) return;
+        o->exp_last_fast = t0;
+        ownerExpireBegin(o, fast);
+        o->exp_fast++;
+    }
+    long long slice = o->exp_left < OWN_EXPIRE_SLICE_US ? o->exp_left : OWN_EXPIRE_SLICE_US;
+    client *cur_client = ectx->current_client, *exec_client = ectx->executing_client;
+    ectx->current_client = ectx->executing_client = NULL;
+    int out = 0; /* the slice is over: its time is up, main wants the world, or the lease is spent */
+    while (!out && o->exp_dbs > 0 && o->exp_j < server.dbnum) {
+        serverDb *db = server.db[o->exp_db % server.dbnum];
+        if (!db || !ownerExpireCount(o, db->expires, 1)) {
+            o->exp_db++;
+            o->exp_j++;
+            continue;
+        }
+        ownerExpireScan d = {.o = o, .db = db, .now = mstime()};
+        ectx->cmd_time_snapshot = d.now;
+        int repeat = 0;
+        do {
+            unsigned long num = ownerExpireCount(o, db->expires, keys_per_loop);
+            if (num == 0) break;
+            unsigned long s = d.sampled, e = d.expired;
+            int done = ownerExpireRound(o, db->expires, db->id, num, &d);
+            s = d.sampled - s;
+            e = d.expired - e;
+            repeat = !done && (s == 0 || e * 100 / s > acceptable);
+            if ((long long)(getMonotonicUs() - t0) >= slice || d.mm_stop ||
+                atomic_load_explicit(&own_stop, memory_order_relaxed))
+                out = 1;
+        } while (repeat && !out);
+        o->exp_c_sampled += d.sampled;
+        o->exp_c_expired += d.expired;
+        o->exp_sampled += d.sampled;
+        o->exp_keys += d.expired;
+        if (!repeat) { /* this db is done for this cycle */
+            o->exp_db++;
+            o->exp_j++;
+            o->exp_dbs--;
+        }
+    }
+    ectx->current_client = cur_client;
+    ectx->executing_client = exec_client;
+    long long us = (long long)(getMonotonicUs() - t0);
+    o->exp_left -= us;
+    o->exp_us += us;
+    o->exp_us_total += us;
+    o->exp_slices++;
+    o->exp_fold = 1;
+    if (o->exp_dbs == 0 || o->exp_j >= server.dbnum) {
+        ownerExpireEnd(o);
+    } else if (o->exp_left <= 0) {
+        o->exp_timelimit = 1; /* the next cycles do every db; fast cycles run */
+        o->exp_cap++;
+        ownerExpireEnd(o);
+    }
+}
+
+/* The owner's epoll timeout: a cycle in progress goes on at once; the slow cycles come with the timer. */
+static int ownerExpireTimeout(owner *o) {
+    return o->exp_left && atomic_load_explicit(&own_expire, memory_order_relaxed) ? 0 : -1;
+}
+
+/* Owner, in a window: its slow-cycle timer follows own_expire and hz (period 1/hz; off when 0). */
+static void ownerExpireArm(owner *o, int hz) {
+    struct itimerspec its = {{0, 0}, {0, 0}};
+    if (hz > 0) {
+        long long ns = 1000000000LL / hz;
+        its.it_interval.tv_sec = its.it_value.tv_sec = (time_t)(ns / 1000000000LL);
+        its.it_interval.tv_nsec = its.it_value.tv_nsec = (long)(ns % 1000000000LL);
+    }
+    if (timerfd_settime(o->exp_tfd, 0, &its, NULL) == -1)
+        serverLog(LL_WARNING, "owner %d: expire timer: %s", o->id, strerror(errno));
+    o->exp_hz = hz;
+    if (!hz) o->exp_due = 0;
+}
+
 static void *ownerThreadMain(void *arg) {
     owner *o = arg;
     char name[32];
@@ -5750,6 +6043,13 @@ static void *ownerThreadMain(void *arg) {
                 ownerTakeInbox(o);
                 continue;
             }
+            if (d == OWNER_EXPIRE_TOKEN) { /* RL-g2b: a slow expire cycle is due */
+                uint64_t ticks;
+                if (read(o->exp_tfd, &ticks, sizeof(ticks)) == -1) { /* EAGAIN: already read */
+                }
+                o->exp_due = 1;
+                continue;
+            }
             int fd = (int)(uint32_t)d;
             client *c = fd < o->fdmap_cap ? o->fdmap[fd] : NULL;
             if (!c || (uint32_t)c->id != (uint32_t)(d >> 32)) continue; /* stale: main took it back */
@@ -5803,6 +6103,11 @@ static void *ownerThreadMain(void *arg) {
         /* RL-g1d: TLS clients whose input OpenSSL may hold (none while main waits: next window). */
         if (o->ntlsp && !atomic_load_explicit(&own_stop, memory_order_relaxed)) handed |= ownerTlsPending(o);
         serverAssert(o->mm_resv == 0); /* every queued read ran, and gave its reservation back */
+        /* RL-g2b: this owner's active expiry, after its clients' work (a slice; it stops when main waits). */
+        int expire = atomic_load_explicit(&own_expire, memory_order_relaxed) &&
+                     !atomic_load_explicit(&own_veto, memory_order_relaxed);
+        if ((expire ? server.hz : 0) != o->exp_hz) ownerExpireArm(o, expire ? server.hz : 0);
+        if (expire && !atomic_load_explicit(&own_stop, memory_order_relaxed)) ownerExpireRun(o);
         /* This window's AOF records: written here (everysec, no), unless main is stopping the world,
          * which folds them first thing and writes them with its own. */
         if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
@@ -6074,6 +6379,21 @@ void ownerInfo(sds *info) {
                          server.owner_tls_port, tls_hs, tls_rd);
     *info = sdscatprintf(*info, "owner_tls_write_tails:%lld\r\n", /* RL-g2d */
                          atomic_load_explicit(&server.stat_tls_write_tails, memory_order_relaxed));
+    /* RL-g2b: active expiry on the owners: on now (yes) or main's (no); cycles, slices, keys, time. */
+    long long ex_cyc = 0, ex_fast = 0, ex_sl = 0, ex_keys = 0, ex_samp = 0, ex_us = 0;
+    for (int i = 0; i < own_n; i++) {
+        ex_cyc += owners[i].exp_cycles;
+        ex_fast += owners[i].exp_fast;
+        ex_sl += owners[i].exp_slices;
+        ex_keys += owners[i].exp_keys;
+        ex_samp += owners[i].exp_sampled;
+        ex_us += owners[i].exp_us_total;
+    }
+    *info = sdscatprintf(*info,
+                         "owner_active_expire:%s\r\nowner_expire_cycles:%lld\r\nowner_expire_fast_cycles:%lld\r\n"
+                         "owner_expire_slices:%lld\r\nowner_expired_keys:%lld\r\nowner_expire_sampled:%lld\r\n"
+                         "owner_expire_usec:%lld\r\n",
+                         ownerExpiresKeys() ? "yes" : "no", ex_cyc, ex_fast, ex_sl, ex_keys, ex_samp, ex_us);
     /* RL-g1f-owner-evalsha: scripts run on owners, runs that aborted to main, calls an owner did not
      * have the script for (or had it marked for main). */
     long long s_runs = 0, s_aborts = 0, s_misses = 0;

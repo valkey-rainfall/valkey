@@ -58,6 +58,9 @@ void ownerLightEnd(void);             /* main, light beforeSleep: the iteration 
 int ownerTablesOnOwners(void);        /* main: owners rightsize and rehash their own tables (databasesCron skips them) */
 long long ownerExpireBound(void);     /* main: no key or field expire set since the last reset is earlier than this */
 void ownerNoteExpire(long long when); /* any thread: an expire time was set (when; 0 for a hash with volatile fields) */
+/* RL-g3f: the bound for hash-field expiry alone, which main still runs while the owners expire keys (RL-g2b). */
+long long ownerFieldExpireBound(void); /* main: no hash with volatile fields tracked since the last reset: LLONG_MAX */
+void ownerNoteFieldExpire(void);       /* any thread: a hash with volatile fields is tracked */
 void ownerPublishedStats(long long *cmds, long long *net_in, long long *net_out, long long *dirty);
 enum { OWN_FULL_TIMEPROC, OWN_FULL_SHUTDOWN, OWN_FULL_VERBOSE, OWN_FULL_EXPIRE, OWN_FULL_DEFRAG, OWN_FULL_TABLES,
        OWN_FULL_PERSIST, OWN_FULL_CLIENTS, OWN_FULL_TLS, OWN_FULL_HOTKEYS, OWN_FULL_NCOUNT };
@@ -74,6 +77,7 @@ struct hashtable *ownerWatchRegistry(int owner, int dbid);
 void ownerWatchersAdd(int owner, int delta); /* clients with keys in an owner's registry */
 long long ownerWatchersTotal(void);          /* main: all owners' */
 int ownerOfKey(struct serverObject *key);
+int ownerExpiresKeys(void); /* main: the owners run the active expiry of keys now (RL-g2b); main only hash fields */
 
 /* RL-g1f-owner-evalsha: EVAL / EVALSHA on the owner of their keys (owner.c). */
 void ownerScriptsChanged(void); /* eval.c, main: a cached script an owner may hold is gone (SCRIPT FLUSH, delete) */

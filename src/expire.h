@@ -19,6 +19,12 @@
 #define ACTIVE_EXPIRE_CYCLE_SLOW 0
 #define ACTIVE_EXPIRE_CYCLE_FAST 1
 
+/* The active expire cycle's parameters (expire.c; RL-g2b: owner.c's per-owner cycle uses the same). */
+#define ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP 20    /* Keys for each DB loop. */
+#define ACTIVE_EXPIRE_CYCLE_FAST_DURATION 1000  /* Microseconds. */
+#define ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 25   /* Max % of CPU to use. */
+#define ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE 10 /* % of stale keys after which */
+
 /* Command flags for items expiration update conditions */
 #define EXPIRE_NX (1 << 0)
 #define EXPIRE_XX (1 << 1)
@@ -67,6 +73,8 @@ int convertExpireArgumentToUnixTime(client *c, robj *arg, mstime_t basetime, int
 
 /* Handling of expired keys and hash fields */
 ustime_t activeExpireCycle(int type);
+struct hashtable;
+int expireShouldSkipTableForSamplingCb(struct hashtable *ht); /* sparse tables are not sampled */
 /* Main: active expire of keys runs in the MAINT phase now (lanes ready and nothing observes deletes). */
 int activeExpireInLanes(void);
 /* Main, before a MAINT phase: does an expired key need main's per-key replay (an observer or propagation

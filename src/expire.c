@@ -44,6 +44,7 @@
 #include "module.h"
 #include "staged_loop.h"
 #include "io_threads.h"
+#include "owner.h"
 
 #include <stdatomic.h>
 
@@ -127,10 +128,7 @@ int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx) 
  * order to do more work in both the fast and slow expire cycles.
  */
 
-#define ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP 20    /* Keys for each DB loop. */
-#define ACTIVE_EXPIRE_CYCLE_FAST_DURATION 1000  /* Microseconds. */
-#define ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 25   /* Max % of CPU to use. */
-#define ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE 10 /* % of stale keys after which */
+/* ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP, _FAST_DURATION, _SLOW_TIME_PERC and _ACCEPTABLE_STALE: expire.h. */
 
 /* Data used by the key expire kvstore scan callback. */
 typedef struct {
@@ -189,7 +187,7 @@ void fieldExpireScanCallback(void *privdata, void *volaKey, int didx) {
     }
 }
 
-static int expireShouldSkipTableForSamplingCb(hashtable *ht) {
+int expireShouldSkipTableForSamplingCb(hashtable *ht) {
     long long numkeys = hashtableSize(ht);
     unsigned long buckets = hashtableBuckets(ht);
     /* When there are less than 1% filled buckets, sampling the key
@@ -1008,7 +1006,7 @@ ustime_t activeExpireCycle(int type) {
     /* Try to smoke-out bugs (ectx->also_propagate should be empty here) */
     serverAssert(ectx->also_propagate.numops == 0);
 
-    if (activeExpireInLanes()) {
+    if (activeExpireInLanes() && !ownerExpiresKeys()) {
         /* Keys and hash fields both expire in the MAINT phase after crons(), every staged thread taking
          * whole tables. No client is served between crons() and the phase, so the stall is the phase. One
          * expire-cycle sample covers the phase (recorded in activeExpireLaneEnd). A fast cycle opens a
@@ -1036,12 +1034,15 @@ void activeExpireRunPostedOnMain(uint64_t timelimit_us) {
 static ustime_t activeExpireCycleOnMain(int type, ustime_t timelimit_us) {
     static bool expireCycleStartWithFields = 0;
     ustime_t elapsed = 0;
+    /* RL-g2b: while the owner threads expire the keys of their own tables (owner.c), main expires only
+     * hash fields. */
+    int keys = !ownerExpiresKeys();
 
     if (expireCycleStartWithFields) {
         elapsed += activeExpireCycleJob(FIELDS, type, timelimit_us - elapsed);
-        elapsed += activeExpireCycleJob(KEYS, type, timelimit_us - elapsed);
+        if (keys) elapsed += activeExpireCycleJob(KEYS, type, timelimit_us - elapsed);
     } else {
-        elapsed += activeExpireCycleJob(KEYS, type, timelimit_us - elapsed);
+        if (keys) elapsed += activeExpireCycleJob(KEYS, type, timelimit_us - elapsed);
         elapsed += activeExpireCycleJob(FIELDS, type, timelimit_us - elapsed);
     }
     server.stat_expire_cycle_time_used += elapsed;

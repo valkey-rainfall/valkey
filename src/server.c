@@ -1737,9 +1737,11 @@ static int serverCronNeedsWorld(void) {
     if (server.verbosity <= LL_VERBOSE && (5000 <= tick_ms || !(server.cronloops % (5000 / tick_ms))))
         return OWN_FULL_VERBOSE;
     /* The slow expire cycle samples the owners' tables. It can expire nothing while no key or field expire set since
-     * the bound's last reset (ownerNoteExpire) has come due. */
+     * the bound's last reset (ownerNoteExpire) has come due. RL-g3f: while the owners expire keys themselves
+     * (RL-g2b), main's cycle is the hash-field job alone: only the field bound counts. */
+    long long due = ownerExpiresKeys() ? ownerFieldExpireBound() : ownerExpireBound();
     if (server.active_expire_enabled && !server.import_mode &&
-        (!iAmPrimary() || getReplicaKeyWithExpireCount() > 0 || ownerExpireBound() <= server.mstime))
+        (!iAmPrimary() || getReplicaKeyWithExpireCount() > 0 || due <= server.mstime))
         return OWN_FULL_EXPIRE;
     if (server.active_defrag_enabled) return OWN_FULL_DEFRAG;
     if (!ownerTablesOnOwners()) return OWN_FULL_TABLES; /* main rightsizes and rehashes the tables */
@@ -1806,7 +1808,8 @@ static void serverCronLight(void) {
     }
     run_with_period(1000) updateCachedTime(1);
     if (server.active_expire_enabled && iAmPrimary() && !server.import_mode) {
-        server.stat_expired_keys_stale_perc *= 0.95;
+        /* RL-g3f: with the owners expiring keys the key estimate is theirs (folded at every stop) */
+        if (!ownerExpiresKeys()) server.stat_expired_keys_stale_perc *= 0.95;
         server.stat_expired_keys_with_vola_stale_perc *= 0.95;
     }
     run_with_period(1000) {

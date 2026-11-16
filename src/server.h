@@ -2198,6 +2198,7 @@ struct valkeyServer {
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
     int owner_cron;                           /* owner-cron (RL-g2c): owners run the per-client cron of the clients they serve (default yes). */
     int owner_light_cron;                     /* owner-light-cron (RL-g3b): timer wakes with no owner-state work leave the owners running (default yes). */
+    int owner_active_expire;                  /* owner-active-expire: owners run the active expire cycle over their own keys (default yes, RL-g2b). */
     int owner_repl_native;                    /* owner-repl-native: owners stay native with replicas / a backlog (g11-repl, default yes). */
     int owner_repl_sender;                    /* owner-repl-sender: with owner threads, repl-stream-sender starts as append (default yes). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
