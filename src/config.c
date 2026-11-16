@@ -3580,6 +3580,8 @@ standardConfig static_configs[] = {
     createBoolConfig("tls-owner-records", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.tls_owner_records, 0, NULL, NULL), /* vkevo RL-g6a: owners seal / open TLS 1.3 application-data records themselves */
     createBoolConfig("tls-owner-records-verify", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.tls_owner_records_verify, 0, NULL, NULL), /* vkevo RL-g6a debug: OpenSSL makes each record too, bytes compared */
     createLongLongConfig("tls-owner-records-rekey", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 1, (1LL << 30), server.tls_owner_records_rekey, (1LL << 23), INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g6a: records per write key before our own KeyUpdate */
+    createBoolConfig("owner-replica-reads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_replica_reads, 1, NULL, NULL), /* vkevo RL-g7d: a replica's owners serve reads natively */
+    createIntConfig("owner-replica-pace-ms", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 100, server.owner_replica_pace_ms, 2, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g7d: after applying a read of the primary's stream, main reads the link again this many ms later (0: at once) */
     createStringConfig("owner-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.owner_cpulist, NULL, NULL, NULL),
     createStringConfig("owner-announce-ip", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.owner_announce_ip, NULL, NULL, NULL),
     createBoolConfig("owner-adopt-all", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.owner_adopt_all, 0, NULL, NULL),

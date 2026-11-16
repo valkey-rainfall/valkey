@@ -2192,6 +2192,8 @@ struct valkeyServer {
     _Atomic(long long) stat_tls_rec_conns;    /* connections switched to the owner record path */
     _Atomic(long long) stat_tls_rec_keyupdates_in, stat_tls_rec_keyupdates_out, stat_tls_rec_fatal, stat_tls_rec_closes;
     _Atomic(long long) stat_tls_rec_verified, stat_tls_rec_mismatch; /* verify mode: records compared equal / not */
+    int owner_replica_reads;                  /* owner-replica-reads: a replica's owners serve reads natively; main applies the stream (RL-g7d; default yes). */
+    int owner_replica_pace_ms;                /* owner-replica-pace-ms: a replica with native reads applies the stream at most once per this many ms (RL-g7d; default 2, 0 off). */
     char *owner_cpulist;                      /* owner-cpulist: owner i is pinned to the i-th CPU of the list. */
     char *owner_announce_ip;                  /* owner-announce-ip: address CLUSTER SLOTS announces. */
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */

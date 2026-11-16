@@ -5634,6 +5634,7 @@ void readQueryFromClient(connection *conn) {
     bool repeat = false;
     int iter = 0;
     size_t decoded_bytes = 0;
+    long long read_total = 0; /* RL-g7d: bytes the primary's link gave this event */
     do {
         ssize_t decoded_this_iteration = 0;
         bool full_read;
@@ -5648,6 +5649,7 @@ void readQueryFromClient(connection *conn) {
             read_ok = readAndDecodePrimaryStream(c, decode_budget, &decoded_this_iteration, &full_read);
         } else {
             full_read = readToQueryBuf(c);
+            if (c->nread > 0) read_total += c->nread;
             read_ok = handleReadResult(c) == C_OK;
         }
         if (read_ok) {
@@ -5671,6 +5673,8 @@ void readQueryFromClient(connection *conn) {
                   full_read);
         beforeNextClient(c);
     } while (repeat);
+    /* RL-g7d-replica-reads: a replica whose owners serve reads applies its primary's stream in paced batches. */
+    if (c->flag.primary && read_total > 0) ownerReplicaReadDone(c, read_total);
 }
 
 /* An "Address String" is a colon separated ip:port pair.

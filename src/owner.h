@@ -34,6 +34,7 @@ int ownerAdoptHandshake(struct client *c); /* acceptCommonHandler: 1 when an own
 void ownerIOThreadsChanged(void);         /* CONFIG SET io-threads: owners sleep while it is > 1 */
 void ownerReclaim(struct client *c);       /* freeClient on main: take the client back from its owner */
 void ownerClientFreed(struct client *c);   /* freeClient on main: drop it from the guest list */
+void ownerReplicaReadDone(struct client *c, long long nread); /* RL-g7d: main applied a read of the primary's stream */
 void ownerErrorReply(struct client *c, const char *s, size_t len, int flags);
 void ownerCountOutbufDisconnect(void);
 int ownerResizeAllowed(size_t more_mem);    /* hashtable resizes on an owner thread: within its maxmemory headroom */

@@ -1691,8 +1691,9 @@ static long long ownerMmHeadroom(void) {
 static int ownerComputeVeto(void) {
     /* AOF on is served natively (ownerFoldProp); turning it on (AOF_WAIT_REWRITE) is not. Replicas and
      * the backlog of a top-level primary are served natively too (D3-all-g11-repl: ownerAofAppend
-     * feeds the stream); being a replica is not. */
-    if ((server.aof_state != AOF_OFF && server.aof_state != AOF_ON) || server.primary_host ||
+     * feeds the stream); being a replica is not, except for reads (RL-g7d, below). */
+    if ((server.aof_state != AOF_OFF && server.aof_state != AOF_ON) ||
+        (server.primary_host && !server.owner_replica_reads) ||
         (!server.owner_repl_native && (server.repl_backlog || listLength(server.replicas))))
         return OWN_VETO_ALL;
     if (server.loading || server.async_loading || server.paused_actions || server.import_mode) return OWN_VETO_ALL;
@@ -1717,6 +1718,17 @@ static int ownerComputeVeto(void) {
         v |= OWN_VETO_BLOCKED;
     if (writeCommandsDeniedByDiskError() != DISK_ERROR_TYPE_NONE || !checkGoodReplicasStatus())
         v |= OWN_VETO_WRITE;
+    /* RL-g7d-replica-reads: a replica's owners run the read kinds (OWN_K_READ, PING, MULTI / DISCARD around queued
+     * reads) and hand everything else to main, where processCommand answers writes as the stock replica does
+     * (-READONLY, or a local write on a writable replica). Main applies the primary's stream with the world held, so
+     * a native read sees the keyspace between two applied commands (a MULTI block is applied by its EXEC, whole):
+     * a prefix of the stream. A lookup on a replica keeps an expired key (POLICY_KEEP_EXPIRED: the primary's DEL
+     * removes it). While the link is down and replica-serve-stale-data is no, main answers every command
+     * (MASTERDOWN), as stock. */
+    if (server.primary_host) {
+        if (server.repl_state != REPL_STATE_CONNECTED && !server.repl_serve_stale_data) return OWN_VETO_ALL;
+        v |= OWN_VETO_WRITE;
+    }
     return v;
 }
 
@@ -2225,6 +2237,52 @@ static void ownerTlsOnMain(client *c) {
 }
 
 /* Returns 1 when an owner took the client, 0 when it stays on main as a guest (it goes home later). */
+/* ------------------------------------------------------------------------------------------------
+ * RL-g7d-replica-reads: pacing the replica's apply
+ *
+ * With native reads on a replica (ownerComputeVeto: OWN_VETO_WRITE), every main iteration that reads the primary's
+ * stream stops every owner to apply it. Main wakes as soon as the link has bytes, so at a steady stream it would
+ * stop the owners once per few kB. After an iteration that applied stream bytes main takes the link out of its
+ * event loop for owner-replica-pace-ms and then reads it again from a timer (the world held: a replica's iterations
+ * always stop the owners, OWN_NOLIGHT_REPL), so the bytes that arrived meanwhile are applied in one stop
+ * (readQueryFromClient reads up to REPL_MAX_READS_PER_IO_EVENT buffers of a primary per event). The replica applies
+ * at most owner-replica-pace-ms later than it would have; offsets, acks and the order of the stream are unchanged.
+ * Not while the native path is vetoed, owners sleep or main is inside a long command.
+ * ---------------------------------------------------------------------------------------------- */
+static long long own_rpace_timer = -1;
+static uint64_t own_rpace_cid = 0;
+static long long own_rpace_paced = 0, own_rpace_fires = 0, own_rpace_bytes = 0;
+
+static long long ownerReplicaPaceProc(struct aeEventLoop *el, long long id, void *data) {
+    UNUSED(el);
+    UNUSED(id);
+    UNUSED(data);
+    own_rpace_timer = -1;
+    own_rpace_fires++;
+    client *c = server.primary;
+    if (!c || c->id != own_rpace_cid || !c->conn || c->flag.close_asap) return AE_NOMORE;
+    if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+        freeClientAsync(c);
+        return AE_NOMORE;
+    }
+    readQueryFromClient(c->conn);
+    return AE_NOMORE;
+}
+
+/* Main, readQueryFromClient of the primary client after it read (nread > 0) and ran its input. */
+void ownerReplicaReadDone(client *c, long long nread) {
+    if (!own_n || nread <= 0 || !server.owner_replica_pace_ms || own_dormant || ProcessingEventsWhileBlocked) return;
+    if (c != server.primary || !c->conn || c->flag.close_asap || connGetState(c->conn) != CONN_STATE_CONNECTED) return;
+    if ((ownerComputeVeto() & OWN_VETO_ALL) || own_rpace_timer != -1) return;
+    own_rpace_bytes += nread;
+    long long t = aeCreateTimeEvent(server.el, server.owner_replica_pace_ms, ownerReplicaPaceProc, NULL, NULL);
+    if (t == AE_ERR) return;
+    connSetReadHandler(c->conn, NULL);
+    own_rpace_timer = t;
+    own_rpace_cid = c->id;
+    own_rpace_paced++;
+}
+
 int ownerAdoptAccepted(client *c) {
     /* Main is inside a long command (busy script, loading): owners stay stopped until it ends, so
      * the new client stays on main, where it can get BUSY or send SCRIPT KILL. Same while the
@@ -7374,6 +7432,13 @@ void ownerInfo(sds *info) {
                          server.owner_pipeline_resume, own_resumes, own_reruns);
     /* RL-g2a: handed-over clients that went home right after their command, replies unsent (ownerGoHomeNow). */
     *info = sdscatprintf(*info, "owner_returns_with_replies:%lld\r\n", own_home_now);
+    /* RL-g7d-replica-reads: native reads on a replica; paced applies of the primary's stream (timers armed, fired,
+     * and the bytes of the reads that armed them). */
+    *info = sdscatprintf(*info,
+                         "owner_replica_reads:%s\r\nowner_replica_pace_ms:%d\r\nowner_replica_paced:%lld\r\n"
+                         "owner_replica_pace_fires:%lld\r\nowner_replica_paced_bytes:%lld\r\n",
+                         server.owner_replica_reads ? "yes" : "no", server.owner_replica_pace_ms, own_rpace_paced,
+                         own_rpace_fires, own_rpace_bytes);
     /* RL-g4a: windows left early for a pending stop; inbox clients and queued reads left for the next window. */
     *info = sdscatprintf(*info, "owner_stop_early_leaves:%lld\r\nowner_stop_inbox_left:%lld\r\nowner_stop_reads_left:%lld\r\n",
                          atomic_load_explicit(&own_early_leaves, memory_order_relaxed),
