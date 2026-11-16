@@ -168,6 +168,19 @@ enum {
     OWN_DISCARD,
     OWN_WATCH,
     OWN_UNWATCH,
+    /* RL-g1b-native-list: single-key list commands. A push must wake the clients blocked on its key
+     * (dbAdd's signalKeyAsReady). Owners never run while a client is blocked on a list: any blocked
+     * client (list, zset, stream or module) vetoes the whole native path (ownerComputeVeto:
+     * OWN_VETO_ALL), and main recomputes the veto each time it resumes the owners. Only main blocks or
+     * unblocks a client, and only while the owners are stopped, so in an owner's window no client is
+     * blocked on a list and signalKeyAsReady returns at its first check, as it does on main. */
+    OWN_LPUSH,
+    OWN_RPUSH,
+    OWN_LPOP,
+    OWN_RPOP,
+    OWN_LLEN,
+    OWN_LRANGE,
+    OWN_LINDEX,
     OWN_NCMDS
 };
 
@@ -187,10 +200,11 @@ enum {
 enum {
     OWN_MM_NONE,   /* nothing more */
     OWN_MM_VALUES, /* its reply holds stored strings (GET, MGET, SET ... GET) */
-    OWN_MM_EXEC    /* its queued commands (ownerMmExecBound) */
+    OWN_MM_EXEC,   /* its queued commands (ownerMmExecBound) */
+    OWN_MM_LIST    /* its reply holds elements of the list: at most the whole list (ownerStoredListReplyLen) */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
-enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_NFAM };
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -210,8 +224,17 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_DISCARD] = {"discard", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
     [OWN_WATCH] = {"watch", OWN_K_READ, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_TXN},
     [OWN_UNWATCH] = {"unwatch", 0, OWN_KEYS_NONE, OWN_MM_NONE, OWN_FAM_TXN},
+    /* RL-g1b-native-list: queueable in a native MULTI, as SET; LLEN, LRANGE and LINDEX only read. */
+    [OWN_LPUSH] = {"lpush", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_RPUSH] = {"rpush", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LPOP] = {"lpop", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_RPOP] = {"rpop", OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LLEN] = {"llen", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LRANGE] = {"lrange", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LINDEX] = {"lindex", OWN_K_READ | OWN_K_TXN, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
 };
-static const char *const own_fam_names[OWN_NFAM] = {[OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn"};
+static const char *const own_fam_names[OWN_NFAM] = {
+    [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn", [OWN_FAM_LIST] = "list"};
 
 /* Why an owner handed a client to main (client->owner_why). */
 enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE };
@@ -2080,11 +2103,29 @@ static size_t ownerReplyValuesLen(client *c, struct serverCommand *cmd, robj **a
     return 0;
 }
 
+/* RL-g1b-native-list: what a list read or pop's reply can hold, bounded by the whole list at `key` in
+ * reply form (an element's reply is at most 5x its stored bytes, for small integers, plus a bulk header).
+ * Only maxmemory asks (ownerMmCmdFits). */
+static size_t ownerStoredListReplyLen(client *c, int slot, robj *key) {
+    void *found;
+    if (slot < 0 || !kvstoreHashtableFind(c->db->keys, OWNER_TABLE_OF_SLOT(slot), objectGetVal(key), &found))
+        return 0;
+    robj *v = found;
+    if (objectGetType(v) != OBJ_LIST) return 0;
+    size_t bytes = 0;
+    if (objectGetEncoding(v) == OBJ_ENCODING_LISTPACK)
+        bytes = lpBytes(objectGetVal(v));
+    else
+        for (quicklistNode *n = ((quicklist *)objectGetVal(v))->head; n; n = n->next) bytes += n->sz;
+    return 5 * bytes + 32 * listTypeLength(v) + 64;
+}
+
 /* What native command `kind` can add under maxmemory beyond what ownerMmCmdFits counts for every
  * command, by its own_kinds[].mm bound; SIZE_MAX when nothing cheap bounds it (main runs it). */
 static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int kind) {
     switch (own_kinds[kind].mm) {
     case OWN_MM_VALUES: return ownerReplyValuesLen(c, cmd, argv, argc, slot);
+    case OWN_MM_LIST: return ownerStoredListReplyLen(c, slot, argv[1]);
     default: return 0;
     }
 }
