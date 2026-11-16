@@ -1313,13 +1313,7 @@ static void ownerFoldStats(void) {
                 cmd->failed_calls += cs->failed;
                 cs->calls = cs->usec = cs->failed = 0;
             }
-            if (cs->hist && cs->hist->total_count) {
-                if (cmd->latency_histogram == NULL)
-                    hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
-                             &cmd->latency_histogram);
-                hdr_add(cmd->latency_histogram, cs->hist);
-                hdr_reset(cs->hist);
-            }
+            /* RL-g3a: the latency histogram folds when something reads it (ownerFoldLatencyHistograms). */
         }
         for (int j = 0; j < o->nerrors; j++) {
             incrementErrorStatsForReply(o->errors[j].msg, sdslen(o->errors[j].msg), o->errors[j].flags);
@@ -1335,6 +1329,37 @@ static void ownerFoldStats(void) {
         server.stat_client_outbuf_limit_disconnections += o->outbuf_disconnects;
         o->net_in = o->net_out = o->reads = o->writes = o->outbuf_disconnects = 0;
     }
+}
+
+/* RL-g3a-cheap-stop: the owners' latency histograms go into the commands' histograms only when something reads
+ * or resets them (INFO latencystats, LATENCY HISTOGRAM, CONFIG RESETSTAT: the points where D0's lanes fold theirs,
+ * fastpathFoldLaneHistograms), not at every world stop. hdr_add walks every bucket of the owner's histogram and
+ * hdr_reset clears all of them, about 0.5 us per owner and command kind with calls: at W=16 that was 103 us of
+ * each 595 us stop. The counts are the same: a bucket's count is the sum of what every owner recorded in it, folded
+ * once or at every stop. Main with the world held only (the owners write their histograms in their windows); from
+ * anywhere else (an owner thread, a crash report) nothing folds and the readers see what is folded. */
+void ownerFoldLatencyHistograms(void) {
+    if (!own_n || own_self || !own_held) return;
+    for (int i = 0; i < own_n; i++) {
+        for (int k = 0; k < OWN_NCMDS; k++) {
+            ownerCmdStat *cs = &owners[i].cs[k];
+            if (!cs->hist || !cs->hist->total_count) continue;
+            struct serverCommand *cmd = own_cmds[k];
+            if (cmd->latency_histogram == NULL)
+                hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
+                         &cmd->latency_histogram);
+            hdr_add(cmd->latency_histogram, cs->hist);
+            hdr_reset(cs->hist);
+        }
+    }
+}
+
+/* CONFIG RESETSTAT (resetCommandTableStats): what the owners recorded and main has not folded yet goes too. */
+void ownerResetLatencyHistograms(void) {
+    if (!own_n || own_self || !own_held) return;
+    for (int i = 0; i < own_n; i++)
+        for (int k = 0; k < OWN_NCMDS; k++)
+            if (owners[i].cs[k].hist && owners[i].cs[k].hist->total_count) hdr_reset(owners[i].cs[k].hist);
 }
 
 static void ownerGuestAdd(client *c) {

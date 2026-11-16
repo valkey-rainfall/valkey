@@ -39,6 +39,8 @@ void ownerCountOutbufDisconnect(void);
 int ownerResizeAllowed(size_t more_mem);    /* hashtable resizes on an owner thread: within its maxmemory headroom */
 int ownerClusterCommand(struct client *c); /* CLUSTER on a standalone server with owner ports */
 void ownerInfo(sds *info);
+void ownerFoldLatencyHistograms(void);  /* INFO latencystats, LATENCY HISTOGRAM: fold the owners' histograms */
+void ownerResetLatencyHistograms(void); /* CONFIG RESETSTAT */
 extern int owner_accept_home; /* createClient: home owner of the connection being accepted */
 
 /* WATCH (multi.c): an owner keeps its own registry (a dict like db->watched_keys) of the keys its

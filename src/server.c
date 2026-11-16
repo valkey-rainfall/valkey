@@ -3926,6 +3926,7 @@ void populateCommandTable(void) {
 
 void resetCommandTableStats(hashtable *commands) {
     fastpathResetLaneStats();
+    ownerResetLatencyHistograms();
     hashtableIterator iter;
     void *next;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
@@ -6814,6 +6815,7 @@ sds genValkeyInfoStringACLStats(sds info) {
 
 sds genValkeyInfoStringLatencyStats(sds info, hashtable *commands) {
     fastpathFoldLaneHistograms();
+    ownerFoldLatencyHistograms();
     hashtableIterator iter;
     void *next;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);

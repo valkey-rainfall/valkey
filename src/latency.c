@@ -538,6 +538,7 @@ void fillCommandCDF(client *c, struct hdr_histogram *histogram) {
  * a per command cumulative distribution of latencies. */
 void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with_data) {
     fastpathFoldLaneHistograms();
+    ownerFoldLatencyHistograms();
     hashtableIterator iter;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
     void *next;
@@ -560,6 +561,7 @@ void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with
  * a per command cumulative distribution of latencies. */
 void latencySpecificCommandsFillCDF(client *c) {
     fastpathFoldLaneHistograms();
+    ownerFoldLatencyHistograms();
     void *replylen = addReplyDeferredLen(c);
     int command_with_data = 0;
     for (int j = 2; j < c->argc; j++) {
