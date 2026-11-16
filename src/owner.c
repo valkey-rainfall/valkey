@@ -137,6 +137,8 @@
 #include "throttle.h"
 #include "hotkeys.h"
 #include "hdr_histogram.h"
+#include "intset.h"
+#include "listpack.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -208,6 +210,20 @@ enum {
     OWN_HEXISTS,
     OWN_HLEN,
     OWN_HGETALL,
+    /* RL-g1e-native-set-zset: single-key set and sorted-set commands. SMEMBERS shares sinterCommand with
+     * SINTER (not native): ownerKindOf is by command. The set / zset code has no shared mutable state
+     * (t_set.c, t_zset.c write no globals and draw no random level; dirty and stats go through ectx). */
+    OWN_SADD,
+    OWN_SREM,
+    OWN_SISMEMBER,
+    OWN_SMEMBERS,
+    OWN_SCARD,
+    OWN_ZADD,
+    OWN_ZREM,
+    OWN_ZRANGE,
+    OWN_ZSCORE,
+    OWN_ZCARD,
+    OWN_ZINCRBY,
     OWN_NCMDS
 };
 
@@ -230,11 +246,15 @@ enum {
     OWN_MM_EXEC,   /* its queued commands (ownerMmExecBound) */
     OWN_MM_LIST,   /* its reply holds elements of the list: at most the whole list (ownerStoredListReplyLen) */
     OWN_MM_HASH_W, /* a hash write: a listpack may convert to a hashtable (ownerHashBound) */
-    OWN_MM_HASH_R  /* a hash read that replies values: at most the whole listpack; no cheap bound on a
+    OWN_MM_HASH_R, /* a hash read that replies values: at most the whole listpack; no cheap bound on a
                     * hashtable (ownerHashBound) */
+    OWN_MM_SET_W,  /* SADD: an intset or listpack may be rebuilt (ownerSetZsetBound) */
+    OWN_MM_ZSET_W, /* ZADD, ZINCRBY: a listpack may be rebuilt, a tree node may split (ownerSetZsetBound) */
+    OWN_MM_COLL_R  /* SMEMBERS, ZRANGE: at most the whole compact collection; no cheap bound on a hashtable
+                    * or a tree (ownerSetZsetBound) */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
-enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_NFAM };
+enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_NFAM };
 
 typedef struct ownKind {
     const char *name; /* the command's original name (own_cmds[]) */
@@ -284,10 +304,23 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_HEXISTS] = {"hexists", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
     [OWN_HLEN] = {"hlen", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
     [OWN_HGETALL] = {"hgetall", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    /* RL-g1e-native-set-zset: not queued natively; SISMEMBER, SMEMBERS, SCARD, ZRANGE, ZSCORE and ZCARD
+     * only read. */
+    [OWN_SADD] = {"sadd", 0, OWN_KEYS_ONE, OWN_MM_SET_W, OWN_FAM_SETZSET},
+    [OWN_SREM] = {"srem", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SISMEMBER] = {"sismember", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SMEMBERS] = {"smembers", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_SCARD] = {"scard", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZADD] = {"zadd", 0, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
+    [OWN_ZREM] = {"zrem", 0, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZRANGE] = {"zrange", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZSCORE] = {"zscore", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZCARD] = {"zcard", OWN_K_READ, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZINCRBY] = {"zincrby", 0, OWN_KEYS_ONE, OWN_MM_ZSET_W, OWN_FAM_SETZSET},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
-    [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash"};
+    [OWN_FAM_KEYSPACE] = "keyspace", [OWN_FAM_HASH] = "hash", [OWN_FAM_SETZSET] = "setzset"};
 
 /* Why an owner handed a client to main (client->owner_why). OWN_WHY_ACCEPTED: its TLS handshake ended
  * on the owner (done or failed); main runs the accept handler (RL-g1d). */
@@ -2320,6 +2353,37 @@ static size_t ownerHashBound(client *c, int slot, robj *key, int write) {
     return write ? 0 : SIZE_MAX;
 }
 
+/* RL-g1e-native-set-zset: what a native set or sorted-set command can add beyond what ownerMmCmdFits
+ * counts for every command (its arguments, a reply block), or SIZE_MAX when there is no cheap bound and
+ * main must run it. A write that outgrows a compact encoding (intset or listpack) rebuilds the whole
+ * collection as a listpack, a hashtable or the sorted set's tree: 4x its bytes + 128 B an entry. A
+ * sorted-set write into the tree can split a node per member: 1 KB per argument. SMEMBERS and ZRANGE
+ * reply members: from a compact encoding at most 2x its bytes + 64 B an entry (framing, a score); from a
+ * hashtable or a tree nothing cheap bounds the reply, so main runs them. */
+static size_t ownerSetZsetBound(client *c, int slot, robj *key, int argc, int mm) {
+    void *found;
+    robj *v = NULL;
+    if (slot >= 0 && kvstoreHashtableFind(c->db->keys, OWNER_TABLE_OF_SLOT(slot), objectGetVal(key), &found)) v = found;
+    size_t bytes = 0, n = 0;
+    int compact = 0, coll = v && (objectGetType(v) == OBJ_SET || objectGetType(v) == OBJ_ZSET);
+    int enc = coll ? (int)objectGetEncoding(v) : -1;
+    if (enc == OBJ_ENCODING_INTSET) {
+        bytes = intsetBlobLen(objectGetVal(v));
+        n = intsetLen(objectGetVal(v));
+        compact = 1;
+    } else if (enc == OBJ_ENCODING_LISTPACK) {
+        bytes = lpBytes(objectGetVal(v));
+        n = lpLength(objectGetVal(v));
+        compact = 1;
+    }
+    switch (mm) {
+    case OWN_MM_SET_W: return compact ? 4 * bytes + 128 * n : 0;
+    case OWN_MM_ZSET_W: return (compact ? 4 * bytes + 128 * n : 0) + 1024 * (size_t)argc;
+    case OWN_MM_COLL_R: return coll && !compact ? SIZE_MAX : 2 * bytes + 64 * n;
+    default: return 0;
+    }
+}
+
 /* What native command `kind` can add under maxmemory beyond what ownerMmCmdFits counts for every
  * command, by its own_kinds[].mm bound; SIZE_MAX when nothing cheap bounds it (main runs it). */
 static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int kind) {
@@ -2328,6 +2392,9 @@ static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int
     case OWN_MM_LIST: return ownerStoredListReplyLen(c, slot, argv[1]);
     case OWN_MM_HASH_W: return ownerHashBound(c, slot, argv[1], 1);
     case OWN_MM_HASH_R: return ownerHashBound(c, slot, argv[1], 0);
+    case OWN_MM_SET_W:
+    case OWN_MM_ZSET_W:
+    case OWN_MM_COLL_R: return ownerSetZsetBound(c, slot, argv[1], argc, own_kinds[kind].mm);
     default: return 0;
     }
 }
