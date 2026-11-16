@@ -658,6 +658,13 @@ static _Atomic int own_cron = 0;
 static monotime own_stop_t0 = 0;
 static int own_iter_events = 0, own_iter_cron = 0;
 static long long own_held_us = 0, own_cron_stops = 0, own_cron_held_us = 0;
+/* RL-g2m-fixed-rate-tail: stops by cause and the held times' log2 histogram (bucket b: [2^b, 2^(b+1)) us). */
+enum { OWN_CAUSE_CRON, OWN_CAUSE_WAKE, OWN_CAUSE_FILE, OWN_CAUSE_OTHER, OWN_NCAUSES };
+static const char *const own_cause_names[OWN_NCAUSES] = {"cron", "wake", "file", "other"};
+#define OWN_HELD_BUCKETS 20
+static int own_iter_wake = 0;
+static long long own_cause_stops[OWN_NCAUSES], own_cause_held_us[OWN_NCAUSES];
+static long long own_held_hist[OWN_HELD_BUCKETS], own_held_max_us = 0;
 
 int ownerThreadsEnabled(void) {
     return own_n > 0;
@@ -1309,8 +1316,21 @@ static void ownerResumeWorld(void) {
             own_cron_stops++;
             own_cron_held_us += held;
         }
+        /* RL-g2m: each stop by what woke main (cron alone, an owner's wake fd, another file event: a main-port
+         * client or an accept, anything else), and the held times' log2 histogram. */
+        int cause = own_iter_cron && !own_iter_events ? OWN_CAUSE_CRON
+                    : own_iter_wake                    ? OWN_CAUSE_WAKE
+                    : own_iter_events                  ? OWN_CAUSE_FILE
+                                                       : OWN_CAUSE_OTHER;
+        own_cause_stops[cause]++;
+        own_cause_held_us[cause] += held;
+        int b = 0;
+        while (b < OWN_HELD_BUCKETS - 1 && (1LL << (b + 1)) <= held) b++;
+        own_held_hist[b]++;
+        if (held > own_held_max_us) own_held_max_us = held;
     }
     own_iter_cron = 0;
+    own_iter_wake = 0;
     own_held = 0;
     atomic_store_explicit(&own_stop, 0, memory_order_seq_cst);
     if (atomic_load_explicit(&own_waiters, memory_order_seq_cst)) {
@@ -1562,6 +1582,7 @@ static void ownerMainWakeHandler(aeEventLoop *el, int fd, void *privdata, int ma
     uint64_t v;
     if (read(fd, &v, sizeof(v)) == -1) { /* EAGAIN: already drained */
     }
+    own_iter_wake = 1; /* RL-g2m: this stop's cause */
     /* afterSleep already took the clients; anything newer arrives with the next wakeup. */
     ownerTakeHandoffs();
 }
@@ -5419,6 +5440,14 @@ void ownerInfo(sds *info) {
                          "owner_cron_stop_held_us:%lld\r\n",
                          atomic_load_explicit(&own_cron, memory_order_relaxed) ? "yes" : "no", cc, cs, ct, ccl,
                          own_held_us, own_cron_stops, own_cron_held_us);
+    /* RL-g2m: world stops by cause (cron alone, an owner's wake, another file event, other) and the held-time
+     * histogram (owner_world_held_hist: counts of [2^b, 2^(b+1)) us, b = 0..19). */
+    for (int k = 0; k < OWN_NCAUSES; k++)
+        *info = sdscatprintf(*info, "owner_stop_%s:stops=%lld,held_us=%lld\r\n", own_cause_names[k], own_cause_stops[k],
+                             own_cause_held_us[k]);
+    *info = sdscatprintf(*info, "owner_world_held_max_us:%lld\r\nowner_world_held_hist:", own_held_max_us);
+    for (int b = 0; b < OWN_HELD_BUCKETS; b++) *info = sdscatprintf(*info, "%s%lld", b ? "/" : "", own_held_hist[b]);
+    *info = sdscat(*info, "\r\n");
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,
