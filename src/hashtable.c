@@ -1151,7 +1151,7 @@ static void sampleEntriesScanFn(void *privdata, void *entry) {
         /* More entries than we wanted. This can happen if there are long
          * bucket chains. Replace random entries using reservoir sampling. */
         samples->seen++;
-        unsigned idx = random() % samples->seen;
+        unsigned idx = threadRandom() % samples->seen;
         if (idx < samples->size) samples->entries[idx] = entry;
     }
 }
@@ -2473,7 +2473,7 @@ bool hashtableRandomEntry(hashtable *ht, void **found) {
     void *samples[WEAK_RANDOM_SAMPLE_SIZE];
     unsigned count = sampleRandomBuckets(ht, &samples[0], WEAK_RANDOM_SAMPLE_SIZE);
     if (count == 0) return false;
-    unsigned idx = random() % count;
+    unsigned idx = threadRandom() % count;
     *found = samples[idx];
     return true;
 }
@@ -2486,7 +2486,7 @@ bool hashtableFairRandomEntry(hashtable *ht, void **found) {
     void *samples[num_samples];
     unsigned count = sampleRandomBuckets(ht, &samples[0], num_samples);
     if (count == 0) return false;
-    unsigned idx = random() % count;
+    unsigned idx = threadRandom() % count;
     *found = samples[idx];
     return true;
 }

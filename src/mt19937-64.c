@@ -54,8 +54,12 @@
 */
 
 
+#include "fmacros.h"
 #include "mt19937-64.h"
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define NN 312
 #define MM 156
@@ -64,10 +68,13 @@
 #define LM 0x7FFFFFFFULL /* Least significant 31 bits */
 
 
-/* The array for the state vector */
-static unsigned long long mt[NN];
+/* The array for the state vector. vkevo RL-g3g-long-tail-rand: one state per thread (owner threads run SPOP,
+ * SRANDMEMBER, HRANDFIELD and ZRANDMEMBER, whose hashtable sampling draws from here; the shared state was not
+ * thread-safe). The main thread's state is the one it always had (seeded in main()); an owner thread seeds its own
+ * (init_genrand64 at its start). */
+static __thread unsigned long long mt[NN];
 /* mti==NN+1 means mt[NN] is not initialized */
-static int mti=NN+1;
+static __thread int mti=NN+1;
 
 /* initializes mt[NN] with a seed */
 void init_genrand64(unsigned long long seed)
@@ -165,6 +172,33 @@ double genrand64_real3(void)
 {
     return ((genrand64_int64() >> 12) + 0.5) * (1.0/4503599627370496.0);
 }
+
+/* vkevo RL-g3g-long-tail-rand: random() for code an owner thread runs (listpack, intset and hashtable sampling,
+ * SPOP, SRANDMEMBER, HRANDFIELD, ZRANDMEMBER). A thread that called threadRandomSeed() draws from its own state with
+ * glibc's own generator (random_r: random()'s algorithm and default state size), so no state is shared between
+ * threads; every other thread (main) calls random() itself, whose stream is the stock one. rand() and random() are
+ * the same glibc generator, so a former rand() caller sees the same numbers. */
+#ifdef __linux__
+static __thread struct random_data thr_rand;
+static __thread char thr_rand_state[128];
+static __thread int thr_rand_on;
+
+void threadRandomSeed(unsigned int seed) {
+    memset(&thr_rand, 0, sizeof(thr_rand));
+    initstate_r(seed, thr_rand_state, sizeof(thr_rand_state), &thr_rand);
+    thr_rand_on = 1;
+}
+
+long threadRandom(void) {
+    if (!thr_rand_on) return random();
+    int32_t r;
+    random_r(&thr_rand, &r);
+    return r;
+}
+#else
+void threadRandomSeed(unsigned int seed) { (void)seed; }
+long threadRandom(void) { return random(); }
+#endif
 
 #ifdef MT19937_64_MAIN
 int main(void)

@@ -84,4 +84,9 @@ double genrand64_real3(void);
 /* generates a random number on (0,1]-real-interval */
 double genrand64_real4(void);
 
+/* vkevo RL-g3g-long-tail-rand: random() with a per-thread state once the thread seeded it (owner threads), else
+ * random() itself (mt19937-64.c). */
+void threadRandomSeed(unsigned int seed);
+long threadRandom(void);
+
 #endif

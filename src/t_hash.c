@@ -37,6 +37,7 @@
 #include "listpack.h"
 #include "rax.h"
 #include "sds.h"
+#include "mt19937-64.h"
 #include "util.h"
 #include "vset.h"
 #include "server.h"
@@ -1215,7 +1216,7 @@ static int hashTypeRandomElement(robj *hashobj, unsigned long hashsize, listpack
     listpackEntry cf, cv;
     hashTypeInitIterator(hashobj, &hi);
     while (hashTypeNext(&hi) != C_ERR) {
-        if (rand() % ++seen == 0) {
+        if (threadRandom() % ++seen == 0) {
             hashTypeCurrentToEntry(&hi, val != NULL, &cf, val ? &cv : NULL);
             found = 1;
         }
@@ -2690,7 +2691,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
             listpackEntry *values = withvalues ? zmalloc(sizeof(listpackEntry) * size) : NULL;
             unsigned long live = hashTypeCollectLive(hash, withvalues, fields, values);
             while (live > 0 && count--) {
-                unsigned long idx = rand() % live;
+                unsigned long idx = threadRandom() % live;
                 hrandfieldReplyWithListpack(wpc, 1, &fields[idx], values ? &values[idx] : NULL);
                 if (c->flag.close_asap) break;
                 reply_size++;
@@ -2726,7 +2727,7 @@ void hrandfieldWithCountCommand(client *c, long l, int withvalues) {
                     hashTypeCurrentToEntry(&hi, withvalues, &rf[filled], withvalues ? &rv[filled] : NULL);
                     filled++;
                 } else {
-                    unsigned long j = rand() % seen;
+                    unsigned long j = threadRandom() % seen;
                     if (j < count) hashTypeCurrentToEntry(&hi, withvalues, &rf[j], withvalues ? &rv[j] : NULL);
                 }
             }

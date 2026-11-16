@@ -35,6 +35,7 @@
 #include "server.h"
 #include "hashtable.h"
 #include "intset.h" /* Compact integer set structure */
+#include "mt19937-64.h"
 
 /*-----------------------------------------------------------------------------
  * Set Commands
@@ -430,7 +431,7 @@ int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) 
         *str = NULL; /* Not needed. Defensive. */
     } else if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(setobj);
-        int r = rand() % lpLength(lp);
+        int r = threadRandom() % lpLength(lp);
         unsigned char *p = lpSeek(lp, r);
         unsigned int l;
         *str = (char *)lpGetValue(p, &l, (long long *)llele);

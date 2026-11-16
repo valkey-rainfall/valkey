@@ -43,6 +43,7 @@
 #include "listpack.h"
 #include "listpack_malloc.h"
 #include "serverassert.h"
+#include "mt19937-64.h"
 #include "util.h"
 #include "config.h"
 
@@ -1532,7 +1533,7 @@ void lpRandomPair(unsigned char *lp, unsigned long total_count, listpackEntry *k
     assert(total_count);
 
     /* Generate even numbers, because listpack saved K-V pair */
-    int r = (rand() % total_count) * 2;
+    int r = (threadRandom() % total_count) * 2;
     assert((p = lpSeek(lp, r)));
     key->sval = lpGetValue(p, &(key->slen), &(key->lval));
 
@@ -1552,7 +1553,7 @@ void lpRandomEntries(unsigned char *lp, unsigned int count, listpackEntry *entri
     unsigned int total_size = lpLength(lp);
     assert(total_size);
     for (unsigned int i = 0; i < count; i++) {
-        picks[i].index = rand() % total_size;
+        picks[i].index = threadRandom() % total_size;
         picks[i].order = i;
     }
 
@@ -1600,7 +1601,7 @@ void lpRandomPairs(unsigned char *lp, unsigned int count, listpackEntry *keys, l
 
     /* create a pool of random indexes (some may be duplicate). */
     for (unsigned int i = 0; i < count; i++) {
-        picks[i].index = (rand() % total_size) * 2; /* Generate even indexes */
+        picks[i].index = (threadRandom() % total_size) * 2; /* Generate even indexes */
         /* keep track of the order we picked them */
         picks[i].order = i;
     }
@@ -1704,7 +1705,7 @@ lpNextRandom(unsigned char *lp, unsigned char *p, unsigned int *index, unsigned 
         /* Do we pick this element? */
         unsigned int available = total_size - i;
         if (even_only) available /= 2;
-        double randomDouble = ((double)rand()) / RAND_MAX;
+        double randomDouble = ((double)threadRandom()) / RAND_MAX;
         double threshold = ((double)remaining) / available;
         if (randomDouble <= threshold) {
             *index = i;

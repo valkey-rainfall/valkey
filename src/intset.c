@@ -35,6 +35,7 @@
 #include "zmalloc.h"
 #include "endianconv.h"
 #include "serverassert.h"
+#include "mt19937-64.h"
 
 /* Note that these encodings are ordered, so:
  * INTSET_ENC_INT16 < INTSET_ENC_INT32 < INTSET_ENC_INT64. */
@@ -261,7 +262,7 @@ uint8_t intsetFind(intset *is, int64_t value) {
 int64_t intsetRandom(intset *is) {
     uint32_t len = intrev32ifbe(is->length);
     assert(len); /* avoid division by zero on corrupt intset payload. */
-    return _intsetGet(is, rand() % len);
+    return _intsetGet(is, threadRandom() % len);
 }
 
 /* Return the largest member. */

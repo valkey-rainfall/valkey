@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """RL-g2o-long-tail model check: owners run the long tail of single-key / single-slot data commands natively.
+RL-g3g-long-tail-rand: also the numkeys commands (SINTERCARD ZINTERCARD ZUNION ZINTER ZDIFF LMPOP ZMPOP), OBJECT
+ENCODING / REFCOUNT / IDLETIME / FREQ and the deterministic forms of SPOP / SRANDMEMBER / HRANDFIELD / ZRANDMEMBER
+(count 0, count >= the size, missing keys, WRONGTYPE, bad counts) in every cand-vs-ref phase; and the 'rand' suites
+(--rand-suites): random commands from every owner and main at once, each reply checked against a model of the
+keyspace, the keyspace, a replica and the AOF reload equal to the model, the draws' distribution (chi-square per
+owner) as good as the parent's main path, and each owner drawing its own stream.
 
 Starts two servers with owner threads: the candidate (--bin) and the reference (--ref-bin, the parent RL-1, whose
 owners hand every tail command to main: the main path). Both get the same deterministic workload, and every reply
@@ -224,12 +230,48 @@ TAIL = ["GETEX", "GETDEL", "GETSET", "SETNX", "SETEX", "PSETEX", "APPEND", "STRL
         "LPUSHX", "RPUSHX", "LSET", "LINSERT", "LREM", "LTRIM", "LPOS", "RPOPLPUSH", "LMOVE", "SMISMEMBER", "SMOVE",
         "ZREVRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZRANK", "ZREVRANK",
         "ZCOUNT", "ZLEXCOUNT", "ZMSCORE", "ZPOPMIN", "ZPOPMAX", "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK",
-        "ZREMRANGEBYLEX", "EXPIRETIME", "PEXPIRETIME", "UNLINK", "TOUCH"]
+        "ZREMRANGEBYLEX", "EXPIRETIME", "PEXPIRETIME", "UNLINK", "TOUCH",
+        # RL-g3g
+        "SINTERCARD", "ZINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "LMPOP", "ZMPOP", "OBJECT", "SRANDALL", "SPOPALL",
+        "HRANDALL", "ZRANDALL"]
 
 
-def tail_cmd(r, k, k2):
+def numkeys(r, k, k2, bad):
+    """RL-g3g: numkeys and keys for a numkeys command (a bad numkeys only with bad=True: main replies the error)."""
+    if bad and r.random() < 0.05:
+        return [r.choice([b"0", b"-1", b"x", b"9"]), k]
+    return [b"1", k] if r.random() < 0.5 else [b"2", k, k2]
+
+
+def tail_cmd(r, k, k2, bad=True):
     """One tail command (correct arity) on k (and k2: a second key, same slot unless the caller chose otherwise)."""
     c = r.choice(TAIL)
+    if c in ("SINTERCARD", "ZINTERCARD"):
+        return [c] + numkeys(r, k, k2, bad) + (["LIMIT", r.choice([b"0", b"1", b"3", b"-1"])] if r.random() < 0.3 else [])
+    if c in ("ZUNION", "ZINTER", "ZDIFF"):
+        x = [c] + numkeys(r, k, k2, bad)
+        if c != "ZDIFF" and r.random() < 0.3:
+            x += ["WEIGHTS"] + [r.choice([b"1", b"2", b"-1.5", b"0"]) for _ in range(int(x[1]) if x[1] in (b"1", b"2") else 1)]
+        if c != "ZDIFF" and r.random() < 0.3:
+            x += ["AGGREGATE", r.choice(["SUM", "MIN", "MAX", "BOGUS"])]
+        if r.random() < 0.5:
+            x.append("WITHSCORES")
+        return x
+    if c in ("LMPOP", "ZMPOP"):
+        x = [c] + numkeys(r, k, k2, bad) + [r.choice(["LEFT", "RIGHT", "UP"] if c == "LMPOP" else ["MIN", "MAX", "UP"])]
+        if r.random() < 0.5:
+            x += ["COUNT", r.choice([b"1", b"2", b"5", b"0", b"-1"])]
+        return x
+    if c == "OBJECT":
+        return [c, r.choice(["ENCODING", "ENCODING", "REFCOUNT", "IDLETIME", "FREQ"]), k]
+    if c == "SRANDALL":
+        return ["SRANDMEMBER", k, r.choice([b"100000", b"100000", b"0", b"x"])]
+    if c == "SPOPALL":
+        return ["SPOP", k, r.choice([b"100000", b"100000", b"0", b"-1"])]
+    if c == "HRANDALL":
+        return ["HRANDFIELD", k, r.choice([b"100000", b"100000", b"0"])] + (["WITHVALUES"] if r.random() < 0.5 else [])
+    if c == "ZRANDALL":
+        return ["ZRANDMEMBER", k, r.choice([b"100000", b"100000", b"0"])] + (["WITHSCORES"] if r.random() < 0.5 else [])
     if c == "GETEX":
         opt = r.choice([[], ["EX", "100000"], ["PX", "100000000"], ["EXAT", "4102444800"],
                         ["PXAT", "4102444800000"], ["PERSIST"], ["PXAT", "1"], ["EX", "-5"], ["EX", "abc"],
@@ -376,10 +418,24 @@ TIMED = {"TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME"}
 UNORDERED = {"HKEYS", "HVALS", "SMEMBERS", "HGETALL"}
 
 
+RANDALL = {"SRANDMEMBER", "SPOP", "HRANDFIELD", "ZRANDMEMBER"}
+
+
+def _s(x):
+    return x if isinstance(x, str) else x.decode()
+
+
 def norm(cmd, rep):
     """Replies with a time in them by sign; hashtable-ordered replies sorted."""
     if cmd[0] in TIMED and isinstance(rep, int):
         return rep if rep < 0 else "pos"
+    if cmd[0] == "OBJECT" and _s(cmd[1]).upper() == "IDLETIME" and isinstance(rep, int):
+        return "int"  # seconds idle: the two servers run one after the other
+    if cmd[0] in RANDALL and isinstance(rep, list):
+        # only the deterministic forms reach here (count 0 or >= the size): the whole collection, in table order
+        if len(cmd) > 3 and _s(cmd[3]).upper() in ("WITHVALUES", "WITHSCORES"):
+            return sorted(zip(rep[0::2], rep[1::2]))
+        return sorted(rep)
     if cmd[0] in UNORDERED and isinstance(rep, list):
         return sorted(rep)
     if cmd[0] == "EXEC" and isinstance(rep, list):
@@ -480,11 +536,10 @@ def native_phase(srv, a, seed, mm):
                   ["SADD", k, "e1", "e2", "5"], ["ZADD", k, "1", "e1", "2", "e2", "3", "a"]][t]
             reps.append(c.cmd(*cm))
         for _ in range(a.native_ops // 8):
-            cmds = [tail_cmd(r, r.choice(keys), None) for _ in range(r.choice([1, 1, 4, 16]))]
-            for cm in cmds:  # the second key: the first key's sibling (same slot)
-                for j in range(len(cm)):
-                    if cm[j] is None:
-                        cm[j] = sib(cm[1])
+            cmds = []
+            for _ in range(r.choice([1, 1, 4, 16])):
+                k = r.choice(keys)  # the second key: the first key's sibling (same slot); numkeys always valid
+                cmds.append(tail_cmd(r, k, sib(k), bad=False))
             c.send(cmds)
             for cm in cmds:
                 reps.append(norm(cm, c.read()))
@@ -636,6 +691,7 @@ def suite(a, name, seed):
         else:
             check(name + ".native.owners_ran_them", nz == nsent and nh == 0, "owner_tail_commands +%d of %d, handoffs +%d" % (nz, nsent, nh))
         n0, _ = tail_native(cand)
+        r0, _ = tail_native(ref)  # RL-g3g: the parent RL-g2o has the counter too
         out_c, sent = disjoint(cand, a, seed)
         out_r, _ = disjoint(ref, a, seed)
         mism = [(i, j) for i in range(a.threads) for j in range(min(len(out_c[i]), len(out_r[i])))
@@ -654,9 +710,9 @@ def suite(a, name, seed):
               "%d commands, mismatches %d %s" % (len(lc), len(lm), ("#%d cand %r ref %r" % (lm[0], lc[lm[0]], lr[lm[0]])) if lm else ""))
         n1, nat = tail_native(cand)
         rn, _ = tail_native(ref)
-        check(name + ".mixed.owners_ran_tail", n1 - n0 > sent * 0.1 and rn == -1,
-              "cand owner_tail_commands +%d over ~%d mixed commands (native total %d); ref field %s" %
-              (n1 - n0, sent, nat, "absent" if rn == -1 else rn))
+        check(name + ".mixed.owners_ran_tail", n1 - n0 > sent * 0.1 and (rn == -1 or n1 - n0 > rn - r0),
+              "cand owner_tail_commands +%d over ~%d mixed commands (native total %d); ref %s" %
+              (n1 - n0, sent, nat, "field absent" if rn == -1 else "+%d" % (rn - r0)))
         dc, gc = dump(cand)
         dr, gr = dump(ref)
         ntypes = {}
@@ -704,6 +760,388 @@ def suite(a, name, seed):
             shutil.rmtree(os.path.join(a.dir, d, "appendonlydir"), ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------------------------------------
+# RL-g3g-long-tail-rand: the rand suites. Random replies differ between two servers, so each server's replies are
+# checked against a model of its own keyspace (every connection works on its own keys, so the model follows each
+# connection's commands in order), and its final keyspace, replica and AOF reload must equal that model.
+
+def rand_keys(tag, i, n, own):
+    """Keys of one connection: 7 collections of each kind, in owner own's slots (own -1: anywhere)."""
+    ks = make_keys("%s%d" % (tag, i), 14, own, n, 1.0 if own >= 0 else 0.0)
+    kinds = ["sint", "slp", "sht", "hlp", "hht", "zlp", "zsl"]
+    return [(k, kinds[j % len(kinds)]) for j, k in enumerate(ks)]
+
+
+SHT_N, HHT_N, ZSL_N = 150, 150, 150
+
+
+def rand_setup(c, keys):
+    """Create each collection; return the model {key: set | dict} read back from the server."""
+    cmds = []
+    for k, kind in keys:
+        if kind == "sint":
+            cmds.append(["SADD", k] + [b"%d" % v for v in range(12)])
+        elif kind == "slp":
+            cmds.append(["SADD", k] + SHORT[:10])
+        elif kind == "sht":
+            cmds.append(["SADD", k] + [b"h%d" % v for v in range(SHT_N)])
+        elif kind == "hlp":
+            cmds.append(["HSET", k] + sum(([b"f%d" % v, b"v%d" % v] for v in range(6)), []))
+        elif kind == "hht":
+            cmds.append(["HSET", k] + sum(([b"f%d" % v, b"v%d" % v] for v in range(HHT_N)), []))
+        elif kind == "zlp":
+            cmds.append(["ZADD", k] + sum(([b"%d" % v, b"z%d" % v] for v in range(10)), []))
+        else:
+            cmds.append(["ZADD", k] + sum(([b"%d" % (v % 37), b"z%d" % v] for v in range(ZSL_N)), []))
+    c.send(cmds)
+    for _ in cmds:
+        c.read()
+    return {k: rand_read(c, k, kind) for k, kind in keys}
+
+
+def rand_read(c, k, kind):
+    if kind.startswith("s"):
+        return set(c.cmd("SMEMBERS", k))
+    if kind.startswith("h"):
+        h = c.cmd("HGETALL", k)
+        return dict(zip(h[0::2], h[1::2]))
+    z = c.cmd("ZRANGE", k, "0", "-1", "WITHSCORES")
+    return dict(zip(z[0::2], z[1::2]))
+
+
+def rand_op(r, k, kind, m):
+    """One command on k (kind), given the model value m (set / dict, possibly empty)."""
+    x = r.random()
+    if kind.startswith("s"):
+        pool = [b"%d" % v for v in range(40)] if kind == "sint" else (SHORT if kind == "slp" else
+                                                                       [b"h%d" % v for v in range(SHT_N + 40)])
+        if x < 0.22:
+            return ["SRANDMEMBER", k]
+        if x < 0.40:
+            return ["SRANDMEMBER", k, r.choice([b"1", b"3", b"5", b"20", b"400", b"-3", b"-25", b"0"])]
+        if x < 0.55:
+            return ["SPOP", k]
+        if x < 0.62:
+            return ["SPOP", k, r.choice([b"1", b"2", b"5", b"0"])]
+        if x < 0.92:
+            return ["SADD", k] + [r.choice(pool) for _ in range(r.choice([1, 1, 3]))]
+        return ["SREM", k, r.choice(pool)]
+    if kind.startswith("h"):
+        nf = 10 if kind == "hlp" else HHT_N + 20
+        if x < 0.30:
+            return ["HRANDFIELD", k]
+        if x < 0.60:
+            return ["HRANDFIELD", k, r.choice([b"1", b"3", b"5", b"400", b"-4", b"-30", b"0"])] + \
+                (["WITHVALUES"] if r.random() < 0.5 else [])
+        if x < 0.85:
+            f = b"f%d" % r.randrange(nf)
+            return ["HSET", k, f, b"w%d" % r.randrange(1000)]
+        return ["HDEL", k, b"f%d" % r.randrange(nf)]
+    nm = 14 if kind == "zlp" else ZSL_N + 20
+    if x < 0.30:
+        return ["ZRANDMEMBER", k]
+    if x < 0.60:
+        return ["ZRANDMEMBER", k, r.choice([b"1", b"3", b"5", b"400", b"-4", b"-30", b"0"])] + \
+            (["WITHSCORES"] if r.random() < 0.5 else [])
+    if x < 0.85:
+        return ["ZADD", k, b"%d" % r.randrange(-50, 300), b"z%d" % r.randrange(nm)]
+    return ["ZREM", k, b"z%d" % r.randrange(nm)]
+
+
+def rand_validate(cmd, rep, model, k):
+    """Check a reply against the model and apply the command to it. Returns an error string or None."""
+    m = model.get(k)
+    c = cmd[0]
+    if isinstance(rep, Err):
+        return "error reply %r" % rep
+    if c in ("SADD", "SREM", "HSET", "HDEL", "ZADD", "ZREM"):
+        if m is None:
+            m = set() if c in ("SADD", "SREM") else {}
+        args = cmd[2:]
+        if c == "SADD":
+            want = len(set(args) - m)
+            m |= set(args)
+        elif c == "SREM":
+            want = len(set(args) & m)
+            m -= set(args)
+        elif c == "HSET":
+            want = 0 if args[0] in m else 1
+            m[args[0]] = args[1]
+        elif c == "HDEL":
+            want = 1 if args[0] in m else 0
+            m.pop(args[0], None)
+        elif c == "ZADD":
+            want = 0 if args[1] in m else 1
+            m[args[1]] = args[0]
+        else:
+            want = 1 if args[0] in m else 0
+            m.pop(args[0], None)
+        model[k] = m if m else None
+        return None if rep == want else "count %r, model %d" % (rep, want)
+    items = m if m else (set() if c in ("SRANDMEMBER", "SPOP") else {})
+    if len(cmd) == 2:  # one element or nil
+        if not items:
+            return None if rep is None else "nil wanted, got %r" % rep
+        if rep not in items:
+            return "%r not in the collection (%d)" % (rep, len(items))
+        if c == "SPOP":
+            items.discard(rep)
+            model[k] = items if items else None
+        return None
+    n = int(cmd[2])
+    pairs = len(cmd) > 3
+    if not isinstance(rep, list):
+        return "array wanted, got %r" % rep
+    got = list(zip(rep[0::2], rep[1::2])) if pairs else [(e, None) for e in rep]
+    if pairs and len(rep) % 2:
+        return "odd pair reply"
+    els = [e for e, _ in got]
+    if n == 0 or not items:
+        return None if not rep else "empty wanted, got %d" % len(rep)
+    if n > 0:
+        want = min(n, len(items))
+        if len(els) != want or len(set(els)) != want:
+            return "%d distinct wanted, got %d (%d distinct)" % (want, len(els), len(set(els)))
+    elif len(els) != -n:
+        return "%d wanted, got %d" % (-n, len(els))
+    for e, v in got:
+        if e not in items:
+            return "%r not in the collection" % e
+        if pairs and items[e] != v:
+            return "%r: %r, model %r" % (e, v, items[e])
+    if c == "SPOP":
+        for e in els:
+            items.discard(e)
+        model[k] = items if items else None
+    return None
+
+
+def rand_conn(port, seed, keys, ops, out, idx_, setup_port=None):
+    """One connection's model run. out[idx_] = (commands, tail commands, bad replies, first bad, model)."""
+    r = random.Random(seed)
+    c = Conn(port)
+    model = rand_setup(c, keys)
+    kinds = dict(keys)
+    sent = tail = bad = 0
+    first = None
+    try:
+        while sent < ops:
+            batch = []
+            for _ in range(r.choice([1, 1, 2, 4, 8, 12])):
+                k = r.choice(keys)[0]
+                # the model before this batch's earlier commands is not what the server sees: validate in order
+                batch.append(rand_op(r, k, kinds[k], model.get(k)))
+            c.send(batch)
+            for cm in batch:
+                rep = c.read()
+                err = rand_validate(cm, rep, model, cm[1])
+                sent += 1
+                tail += cm[0] in RANDALL
+                if err:
+                    bad += 1
+                    if first is None:
+                        first = "%s: %s" % (cm[:4], err)
+    finally:
+        out[idx_] = (sent, tail, bad, first, model, kinds, c)  # closed after the counters are read (a close is a handoff)
+
+
+def model_values(model, kinds):
+    """The model in values()'s form (type, has ttl, value), as dump() reads the keyspace."""
+    d = {}
+    for k, m in model.items():
+        if not m:
+            continue
+        kind = kinds[k][0]
+        if kind == "s":
+            d[k] = ("set", False, sorted(m))
+        elif kind == "h":
+            d[k] = ("hash", False, sorted(m.items()))
+        else:
+            d[k] = ("zset", False, sum(([e, s] for e, s in sorted(m.items(), key=lambda t: (float(t[1]), t[0]))), []))
+    return d
+
+
+def rand_model(srv, a, seed):
+    """Every owner port and the plain port at once, each connection on its own keys (in its owner's slots)."""
+    adm = Conn(srv.port)
+    i0 = info(adm, "owners")
+    T = srv.n + 1
+    out, ths = [None] * T, []
+    for i in range(T):
+        plain = i == srv.n
+        keys = rand_keys("r", i, srv.n, -1 if plain else i)
+        port = srv.port if plain else srv.oport + i
+        ths.append(threading.Thread(target=rand_conn, args=(port, seed * 1000 + i, keys, a.rand_ops, out, i)))
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    i1 = info(adm, "owners")
+    adm.close()
+    for o in out:
+        o[6].close()
+    d = lambda k: int(i1.get(k, "-1")) - int(i0.get(k, "-1"))
+    model, kinds = {}, {}
+    for o in out:
+        model.update(o[4])
+        kinds.update(o[5])
+    owner_tail = sum(o[1] for o in out[:srv.n])
+    return out, model, kinds, owner_tail, d("owner_tail_commands"), d("owner_handoffs_to_main")
+
+
+def chi2(counts, n_draws, cells):
+    exp = n_draws / cells
+    return sum((counts.get(j, 0) - exp) ** 2 / exp for j in range(cells)) + \
+        sum(v ** 2 / exp for j, v in counts.items() if not isinstance(j, int))
+
+
+def chi2_crit(df, z=3.719):
+    """Wilson-Hilferty: the chi-square value with upper tail p = 1e-4 (z = 3.719)."""
+    return df * (1 - 2 / (9 * df) + z * (2 / (9 * df)) ** 0.5) ** 3
+
+
+def rand_dist(srv, a):
+    """Per owner, draws from compact and big collections on the owner's own keys: single draws (pipelined), one
+    call with a negative count, and SPOP + SADD back; each a chi-square statistic over the members."""
+    res = {}
+    for i in range(srv.n):
+        c = Conn(srv.oport + i)
+        ks = make_keys("d%d" % i, 7, i, srv.n, 1.0)
+        cols = [("slp", ks[0], ["SADD", ks[0]] + SHORT[:10], 10),
+                ("sint", ks[1], ["SADD", ks[1]] + [b"%d" % v for v in range(12)], 12),
+                ("sht", ks[2], ["SADD", ks[2]] + [b"h%d" % v for v in range(64)], 64),
+                ("hlp", ks[3], ["HSET", ks[3]] + sum(([b"f%d" % v, b"v"] for v in range(6)), []), 6),
+                ("hht", ks[4], ["HSET", ks[4]] + sum(([b"f%d" % v, b"v"] for v in range(64)), []), 64),
+                ("zlp", ks[5], ["ZADD", ks[5]] + sum(([b"%d" % v, b"z%d" % v] for v in range(10)), []), 10),
+                ("zsl", ks[6], ["ZADD", ks[6]] + sum(([b"%d" % v, b"z%d" % v] for v in range(64)), []), 64)]
+        for name, k, mk, size in cols:
+            c.cmd(*mk)
+            members = sorted(rand_read(c, k, name).keys() if name[0] != "s" else rand_read(c, k, name))
+            ix = {e: j for j, e in enumerate(members)}
+            cmd = {"s": "SRANDMEMBER", "h": "HRANDFIELD", "z": "ZRANDMEMBER"}[name[0]]
+            N = 50 * size
+            c.send([[cmd, k]] * N)
+            cnt = {}
+            for _ in range(N):
+                e = c.read()
+                cnt[ix.get(e, e)] = cnt.get(ix.get(e, e), 0) + 1
+            res[(i, name, "single")] = (chi2(cnt, N, size), size - 1)
+            rep = c.cmd(cmd, k, str(-N))
+            cnt = {}
+            for e in rep:
+                cnt[ix.get(e, e)] = cnt.get(ix.get(e, e), 0) + 1
+            res[(i, name, "negcount")] = (chi2(cnt, N, size), size - 1)
+            if name in ("slp", "sint", "sht"):
+                M = 20 * size
+                cnt = {}
+                for _ in range(M):
+                    e = c.cmd("SPOP", k)
+                    c.cmd("SADD", k, e)
+                    cnt[ix.get(e, e)] = cnt.get(ix.get(e, e), 0) + 1
+                res[(i, name, "spop")] = (chi2(cnt, M, size), size - 1)
+        c.close()
+    return res
+
+
+def rand_streams(srv):
+    """Each owner's first 48 SRANDMEMBER draws on the same 10- and 64-member sets: no two owners alike."""
+    seqs = []
+    for i in range(srv.n):
+        c = Conn(srv.oport + i)
+        ks = make_keys("q%d" % i, 2, i, srv.n, 1.0)
+        c.cmd("SADD", ks[0], *SHORT[:10])
+        c.cmd("SADD", ks[1], *[b"h%d" % v for v in range(64)])
+        c.send([["SRANDMEMBER", ks[0]]] * 48 + [["SRANDMEMBER", ks[1]]] * 48)
+        seqs.append(tuple(c.read() for _ in range(96)))
+        c.close()
+    return seqs
+
+
+def rand_suite(a, name, seed):
+    extra = SUITES[name]
+    cand = Server(a, "rand-" + name + "-cand", a.bin, a.port, a.owner_port, a.cpus, a.main_cpu, extra, a.n)
+    ref = Server(a, "rand-" + name + "-ref", a.ref_bin, a.ref_port, a.ref_owner_port, a.ref_cpus, a.ref_main_cpu, extra, a.n)
+    reps = []
+    cand.start()
+    ref.start()
+    nm = "rand-" + name
+    try:
+        if name == "aofrepl":
+            reps = [start_replica(a, nm + "-cand-replica", a.replica_port, cand, extra),
+                    start_replica(a, nm + "-ref-replica", a.replica_port + 1, ref, extra)]
+            check(nm + ".replica_synced", wait_repl(cand, reps[0])[0] and wait_repl(ref, reps[1])[0])
+        dumps = {}
+        for tag, srv in (("cand", cand), ("ref", ref)):
+            out, model, kinds, owner_tail, dtail, dhand = rand_model(srv, a, seed)
+            sent = sum(o[0] for o in out)
+            bad = sum(o[2] for o in out)
+            first = next((o[3] for o in out if o[3]), "")
+            check(nm + ".model.replies_valid." + tag, bad == 0,
+                  "%d connections, %d commands (%d random), bad %d %s" % (len(out), sent, sum(o[1] for o in out), bad, first))
+            if tag == "cand":
+                if name == "mm":  # the hashtable / tree collections' random commands go to main under maxmemory
+                    ok = dtail >= 0.2 * owner_tail
+                else:
+                    ok = dtail >= owner_tail and dhand == 0
+                check(nm + ".model.owners_ran_them", ok,
+                      "owner_tail_commands +%d for %d random commands on owner ports, handoffs +%d" % (dtail, owner_tail, dhand))
+            else:
+                check(nm + ".model.ref_main_path", dtail == 0, "ref owner_tail_commands field delta %d" % dtail)
+            d, g = dump(srv)
+            dumps[tag] = (d, g)
+            mv = model_values(model, kinds)
+            check(nm + ".model.keyspace_equal." + tag, values(d) == mv,
+                  "%d keys, model %d; diff %s" % (len(d), len(mv), diff_dumps(values(d), mv)))
+        if reps:
+            for tag, srv, rp in (("cand", cand, reps[0]), ("ref", ref, reps[1])):
+                ok, off = wait_repl(srv, rp)
+                dp, gp = dump(rp)
+                d, g = dumps[tag]
+                check(nm + ".replica.keyspace_equal." + tag, ok and values(dp) == values(d) and gp == g,
+                      "offset %s, %d keys, digest %s; diff %s" % (off, len(dp), gp == g, diff_dumps(values(d), values(dp))))
+        if "--appendonly" in extra:
+            time.sleep(1.5)
+            for tag, s in (("cand", cand), ("ref", ref)):
+                s.stop()
+                rdir = os.path.join(a.dir, s.name + "-reload")
+                shutil.rmtree(rdir, ignore_errors=True)
+                shutil.copytree(s.dir, rdir)
+                os.remove(os.path.join(rdir, "log"))
+                rl = Server(a, s.name + "-reload", s.bin, s.port, s.oport, s.cpus, s.main_cpu, extra, a.n)
+                rl.start(fresh=False)
+                dl, gl = dump(rl)
+                d, g = dumps[tag]
+                check(nm + ".aof.reload_keyspace_equal." + tag, values(dl) == values(d) and gl == g and rl.crashed() == 0,
+                      "%d keys, digest %s; diff %s" % (len(dl), gl == g, diff_dumps(values(d), values(dl))))
+                rl.stop()
+                shutil.rmtree(os.path.join(rdir, "appendonlydir"), ignore_errors=True)
+        if name in ("plain", "mm"):
+            dc, dr = rand_dist(cand, a), rand_dist(ref, a)
+            worst, fails = (0, None), []
+            for key in sorted(dc):
+                x, df = dc[key]
+                y = max(dr[(o,) + key[1:]][0] for o in range(a.n))  # the parent's main path, every owner's keys
+                crit = chi2_crit(df)
+                ratio = x / max(y, df)
+                if ratio > worst[0]:
+                    worst = (ratio, key)
+                if not (x < crit or x <= 2 * y):
+                    fails.append((key, round(x, 1), round(y, 1), round(crit, 1)))
+            check(nm + ".distribution", not fails,
+                  "%d chi-square tests (owner, collection, method); fails %s; worst cand / max(ref, df) %.2f at %s" %
+                  (len(dc), fails[:4], worst[0], worst[1]))
+            seqs = rand_streams(cand)
+            same = [(i, j) for i in range(len(seqs)) for j in range(i + 1, len(seqs)) if seqs[i] == seqs[j]]
+            check(nm + ".streams_per_owner", not same, "%d owners, identical pairs %s" % (len(seqs), same))
+        check(nm + ".no_crash", cand.crashed() == 0 and ref.crashed() == 0 and all(r.crashed() == 0 for r in reps),
+              "cand %d ref %d" % (cand.crashed(), ref.crashed()))
+    finally:
+        for s in [cand, ref] + reps:
+            s.stop()
+        for d in os.listdir(a.dir):
+            shutil.rmtree(os.path.join(a.dir, d, "appendonlydir"), ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -729,14 +1167,21 @@ def main():
     ap.add_argument("--native-ops", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--suites", default="plain,mm,aofrepl,aofresp")
+    ap.add_argument("--rand-suites", default="plain,mm,aofrepl,aofresp", help="RL-g3g: the random-command suites")
+    ap.add_argument("--rand-ops", type=int, default=3000, help="RL-g3g: random-suite commands per connection")
     a = ap.parse_args()
     os.makedirs(a.dir, exist_ok=True)
     t0 = time.time()
-    for i, s in enumerate(a.suites.split(",")):
+    for i, s in enumerate([x for x in a.suites.split(",") if x]):
         try:
             suite(a, s, a.seed + i)
         except Exception as e:  # a crash or a hang is a FAIL, not a skip
             check(s + ".ran", False, repr(e))
+    for i, s in enumerate([x for x in a.rand_suites.split(",") if x]):
+        try:
+            rand_suite(a, s, a.seed + 100 + i)
+        except Exception as e:
+            check("rand-" + s + ".ran", False, repr(e))
     fails = [r for r in RESULTS if not r["ok"]]
     print("RLTAIL " + json.dumps(dict(passed=len(RESULTS) - len(fails), failed=len(fails),
                                       secs=round(time.time() - t0, 1))), flush=True)

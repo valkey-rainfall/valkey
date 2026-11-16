@@ -156,6 +156,7 @@
 #include "intset.h"
 #include "listpack.h"
 #include "call_reply.h"
+#include "mt19937-64.h"
 
 #include <ctype.h>
 #include <pthread.h>
@@ -305,6 +306,24 @@ enum {
     OWN_PEXPIRETIME,
     OWN_UNLINK,
     OWN_TOUCH,
+    /* RL-g3g-long-tail-rand: the random reads and SPOP (each owner thread draws from its own random state,
+     * mt19937-64.c threadRandom / genrand64: the shared state was not thread-safe), and the commands whose keys are
+     * not at argv[1] (a numkeys argument first, or OBJECT's key at argv[2]). */
+    OWN_SPOP,
+    OWN_SRANDMEMBER,
+    OWN_HRANDFIELD,
+    OWN_ZRANDMEMBER,
+    OWN_SINTERCARD,
+    OWN_ZINTERCARD,
+    OWN_ZUNION,
+    OWN_ZINTER,
+    OWN_ZDIFF,
+    OWN_LMPOP,
+    OWN_ZMPOP,
+    OWN_OBJECT_ENCODING,
+    OWN_OBJECT_REFCOUNT,
+    OWN_OBJECT_IDLETIME,
+    OWN_OBJECT_FREQ,
     OWN_NCMDS
 };
 /* RL-g2o-long-tail: every kind a script may run (OWN_K_SCRIPT) is below OWN_DECRBY + 1, so a script run's
@@ -325,7 +344,9 @@ enum {
     OWN_KEYS_ALL,    /* argv[1..]: every one in the same slot */
     OWN_KEYS_PAIRS,  /* argv[1], argv[3], ...: key value pairs, every key in the same slot */
     OWN_KEYS_SCRIPT, /* EVALSHA / EVAL: numkeys at argv[2], the keys after it, all in one slot (at least one) */
-    OWN_KEYS_TWO     /* RL-g2o: argv[1] and argv[2] (source, destination), in the same slot */
+    OWN_KEYS_TWO,    /* RL-g2o: argv[1] and argv[2] (source, destination), in the same slot */
+    OWN_KEYS_NUMKEYS, /* RL-g3g: numkeys at argv[1], then that many keys (SINTERCARD, ZUNION, LMPOP, ...), one slot */
+    OWN_KEYS_ARG2     /* RL-g3g: the key at argv[2] (OBJECT ENCODING key) */
 };
 /* own_kinds[].mm: what the command can add under maxmemory beyond its arguments and a reply block,
  * which ownerMmCmdFits counts for every command (ownerMmMore). */
@@ -342,6 +363,8 @@ enum {
     OWN_MM_COLL_R, /* SMEMBERS, ZRANGE: at most the whole compact collection; no cheap bound on a hashtable
                     * or a tree (ownerSetZsetBound) */
     OWN_MM_KEYVAL, /* RL-g2o: its reply holds the string stored at argv[1] (GETEX, GETDEL, GETSET, GETRANGE) */
+    OWN_MM_RAND,   /* RL-g3g: SPOP, SRANDMEMBER, HRANDFIELD, ZRANDMEMBER: count elements of a compact collection
+                    * (ownerRandBound); no cheap bound on a hashtable or a tree */
     OWN_MM_UNBOUND /* RL-g2o: no cheap bound (APPEND and SETRANGE grow a string by sds growth, SMOVE grows its
                     * destination): under maxmemory main runs it */
 };
@@ -471,6 +494,25 @@ static const ownKind own_kinds[OWN_NCMDS] = {
     [OWN_PEXPIRETIME] = {"pexpiretime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_UNLINK] = {"unlink", OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
     [OWN_TOUCH] = {"touch", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    /* RL-g3g-long-tail-rand: as RL-g2o's rows (not queued natively, not run by a script, a veto sends them to main).
+     * SPOP propagates as its stock proc makes it: SREM (one element, or batches of them), or DEL / UNLINK when it
+     * pops the whole set; the other random commands only read. HRANDFIELD keeps the hash rule (main while the table
+     * has field expiry). ZUNION, ZINTER, ZDIFF, LMPOP and ZMPOP reply up to whole collections: main under maxmemory. */
+    [OWN_SPOP] = {"spop", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
+    [OWN_SRANDMEMBER] = {"srandmember", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
+    [OWN_HRANDFIELD] = {"hrandfield", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_HASH},
+    [OWN_ZRANDMEMBER] = {"zrandmember", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_RAND, OWN_FAM_SETZSET},
+    [OWN_SINTERCARD] = {"sintercard", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZINTERCARD] = {"zintercard", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZUNION] = {"zunion", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_ZINTER] = {"zinter", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_ZDIFF] = {"zdiff", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_LMPOP] = {"lmpop", OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_LIST},
+    [OWN_ZMPOP] = {"zmpop", OWN_K_TAIL, OWN_KEYS_NUMKEYS, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_OBJECT_ENCODING] = {"object|encoding", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_OBJECT_REFCOUNT] = {"object|refcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_OBJECT_IDLETIME] = {"object|idletime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_OBJECT_FREQ] = {"object|freq", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ARG2, OWN_MM_NONE, OWN_FAM_KEYSPACE},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
@@ -566,6 +608,7 @@ typedef struct owner {
     int id;
     int cpu; /* -1: not pinned */
     int slot_lo, slot_hi;
+    unsigned long long rng_seed; /* RL-g3g: this owner's own random state (genrand64, threadRandom), drawn by main */
     int port; /* 0: no listener */
     int lfd[CONFIG_BINDADDR_MAX];
     int nlfd;
@@ -3068,6 +3111,42 @@ static size_t ownerSetZsetBound(client *c, int slot, robj *key, int argc, int mm
     }
 }
 
+/* RL-g3g-long-tail-rand: what SPOP, SRANDMEMBER, HRANDFIELD or ZRANDMEMBER [count] can add on this owner's
+ * compact collection (intset or listpack) at argv[1]: up to k = |count| (1 without a count; with a positive count at
+ * most the whole collection) elements in the reply, each at most the collection's bytes, with a field and a value or
+ * a member and a score each (2x), plus SPOP's and the distinct samples' rebuild or helper table (4x the bytes + 128 B
+ * an entry). A hashtable or a tree: SIZE_MAX (no cheap bound: main runs it). No key, another type or a bad count:
+ * nothing beyond the command's own bound (an empty or error reply). */
+static size_t ownerRandBound(client *c, int slot, robj **argv, int argc) {
+    void *found;
+    if (slot < 0 || !kvstoreHashtableFind(c->db->keys, OWNER_TABLE_OF_SLOT(slot), objectGetVal(argv[1]), &found))
+        return 0;
+    robj *v = found;
+    int t = objectGetType(v), enc = objectGetEncoding(v);
+    size_t bytes, n;
+    if (t == OBJ_SET && enc == OBJ_ENCODING_INTSET) {
+        bytes = intsetBlobLen(objectGetVal(v));
+        n = intsetLen(objectGetVal(v));
+    } else if ((t == OBJ_SET || t == OBJ_HASH || t == OBJ_ZSET) && enc == OBJ_ENCODING_LISTPACK) {
+        bytes = lpBytes(objectGetVal(v));
+        n = lpLength(objectGetVal(v));
+    } else if (t == OBJ_SET || t == OBJ_HASH || t == OBJ_ZSET) {
+        return SIZE_MAX;
+    } else {
+        return 0;
+    }
+    unsigned long long k = 1;
+    if (argc >= 3) {
+        long long cnt;
+        if (!string2ll(objectGetVal(argv[2]), sdslen(objectGetVal(argv[2])), &cnt) || cnt == LLONG_MIN) return 0;
+        k = cnt < 0 ? (unsigned long long)-cnt : (unsigned long long)cnt;
+        if (cnt >= 0 && k > n) k = n;
+    }
+    size_t each = 2 * (bytes + 64);
+    if (k > (SIZE_MAX / 4) / each) return SIZE_MAX;
+    return 4 * bytes + 128 * n + (size_t)k * each;
+}
+
 /* What native command `kind` can add under maxmemory beyond what ownerMmCmdFits counts for every
  * command, by its own_kinds[].mm bound; SIZE_MAX when nothing cheap bounds it (main runs it). */
 static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int kind) {
@@ -3080,6 +3159,7 @@ static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int
     case OWN_MM_ZSET_W:
     case OWN_MM_COLL_R: return ownerSetZsetBound(c, slot, argv[1], argc, own_kinds[kind].mm);
     case OWN_MM_KEYVAL: return ownerStoredLenOf(c, slot, argv[1]);
+    case OWN_MM_RAND: return ownerRandBound(c, slot, argv, argc);
     case OWN_MM_UNBOUND: return SIZE_MAX;
     default: return 0;
     }
@@ -3170,6 +3250,27 @@ static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int re
         int slot = ownerKeyHashSlot(key, sdslen(key));
         key = objectGetVal(argv[2]);
         return ownerKeyHashSlot(key, sdslen(key)) == slot ? slot : -1;
+    }
+    case OWN_KEYS_NUMKEYS: {
+        /* RL-g3g: numkeys at argv[1] (1 .. argc - 2), the keys right after it, all in one slot. A bad numkeys:
+         * main replies the error. */
+        long long nk;
+        if (argc < 3 || !string2ll(objectGetVal(argv[1]), sdslen(objectGetVal(argv[1])), &nk) || nk < 1 ||
+            nk > argc - 2)
+            return -1;
+        sds key = objectGetVal(argv[2]);
+        int slot = ownerKeyHashSlot(key, sdslen(key));
+        for (int j = 3; j < 2 + nk; j++) {
+            key = objectGetVal(argv[j]);
+            if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
+        }
+        return slot;
+    }
+    case OWN_KEYS_ARG2: {
+        /* RL-g3g: OBJECT <subcommand> key. */
+        if (argc < 3) return -1;
+        sds key = objectGetVal(argv[2]);
+        return ownerKeyHashSlot(key, sdslen(key));
     }
     default: return -1;
     }
@@ -5595,6 +5696,10 @@ static void *ownerThreadMain(void *arg) {
     own_self = o;
     ectx = &o->ectx;
     atomic_store_explicit(&o->tid, (int)gettid(), memory_order_relaxed);
+    /* RL-g3g-long-tail-rand: this thread's own random states (mt19937-64.c), for SPOP, SRANDMEMBER, HRANDFIELD and
+     * ZRANDMEMBER (hashtable, listpack and intset sampling): no random state is shared with main or another owner. */
+    init_genrand64(o->rng_seed);
+    threadRandomSeed((unsigned int)(o->rng_seed >> 32) ^ (unsigned int)o->rng_seed);
     ioThreadsMarkOwnerThread();
     initSharedQueryBuf();
 #ifdef HAVE_LIBURING
@@ -5757,6 +5862,7 @@ void ownerThreadsStart(void) {
                   server.owner_busy_poll_prefer ? "yes" : "no", on, own_n, bp_ok);
     }
     for (int i = 0; i < own_n; i++) {
+        owners[i].rng_seed = genrand64_int64(); /* main's generator, seeded by the time at startup */
         if (pthread_create(&owners[i].thread, NULL, ownerThreadMain, &owners[i]) != 0) {
             serverLog(LL_WARNING, "owner threads: cannot start owner %d", i);
             exit(1);
