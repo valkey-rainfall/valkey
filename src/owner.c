@@ -553,6 +553,16 @@ typedef struct owner {
     size_t peak_in[CLIENTS_PEAK_MEM_USAGE_SLOTS], peak_out[CLIENTS_PEAK_MEM_USAGE_SLOTS]; /* clientsCron's peaks */
     long long cmem[CLIENT_TYPE_COUNT]; /* stat_clients_type_memory changes, folded by main under the stop */
     long long cron_clients, cron_slices, cron_timeouts, cron_closes; /* INFO, never cleared */
+    /* RL-g2f-owner-spin: adaptive spinning on the owner's own core, always outside a window (active 0),
+     * so main's stop never waits for a spinning owner. spin_ok: the owner is pinned to a CPU main is not
+     * pinned to (an owner sharing main's core never spins: it would take main's CPU). The budgets adapt:
+     * a spin that found work grows its budget by a quarter (up to the config), one that found none
+     * halves it; a sleep that ended sooner than the config sets it to twice that sleep. */
+    int spin_ok;
+    int spin_us;      /* idle budget now: poll the owner's epoll this long before sleeping in it */
+    int spin_stop_us; /* stop budget now: spin this long on own_stop before sleeping on own_wait_cv */
+    long long spins, spin_hits, spin_time_us, waits;   /* INFO, never cleared */
+    long long stop_spins, stop_spin_hits, stop_sleeps; /* INFO, never cleared */
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -595,6 +605,8 @@ static void ownerRerunAdd(client *c);
 static void ownerRerunOnMain(void);
 
 static long long own_stops = 0, own_stop_wait_us = 0, own_stop_wait_max_us = 0;
+/* RL-g2f: resumes that had to wake owners sleeping on own_wait_cv, and main's time in those wakes. */
+static long long own_resume_broadcasts = 0, own_resume_broadcast_us = 0;
 static long long own_takes = 0, own_returns = 0;
 static long long own_home_now = 0; /* RL-g2a: handed-over clients sent home right after their command */
 /* RL-g4a: work an owner left for its next window because main asked for the world (ownerStopPending). */
@@ -974,16 +986,61 @@ void ownerThreadsInit(void) {
  * The world: main stops the owners whenever it runs
  * ---------------------------------------------------------------------------------------------- */
 
-static void ownerWaitWorld(void) {
+/* RL-g2f: the spin budgets' caps from the configs (CONFIG SET on main; read here without a lock). */
+static inline int ownerSpinCap(const int *cfg) {
+    return __atomic_load_n(cfg, __ATOMIC_RELAXED);
+}
+
+static inline int ownerSpinGrow(int b, int cap) {
+    b += b / 4 + 1;
+    return b > cap ? cap : b;
+}
+
+/* After a sleep of `slept` us that the budget did not cover: a sleep shorter than the cap means work
+ * comes about that often, so the next spin covers twice that. */
+static inline void ownerSpinSeed(int *budget, long long slept, int cap) {
+    if (slept >= cap) return;
+    int g = (int)(2 * slept + 1);
+    if (g > cap) g = cap;
+    if (g > *budget) *budget = g;
+}
+
+static void ownerWaitWorld(owner *o) {
     for (int i = 0; i < 4096; i++) {
         if (!atomic_load_explicit(&own_stop, memory_order_relaxed)) return;
         ownerCpuRelax();
     }
+    /* RL-g2f: keep spinning on this owner's own core (outside the window: active is 0, main is not
+     * waiting for it) while main's stops end within the budget, so main's resume has no one to wake. */
+    int cap = o->spin_ok ? ownerSpinCap(&server.owner_spin_stop_us) : 0;
+    monotime t0 = 0;
+    if (cap > 0) {
+        t0 = getMonotonicUs();
+        int b = o->spin_stop_us < cap ? o->spin_stop_us : cap;
+        if (b > 0) {
+            o->stop_spins++;
+            monotime end = t0 + (monotime)b;
+            for (;;) {
+                for (int i = 0; i < 64; i++) {
+                    if (!atomic_load_explicit(&own_stop, memory_order_relaxed)) {
+                        o->stop_spin_hits++;
+                        o->spin_stop_us = ownerSpinGrow(b, cap);
+                        return;
+                    }
+                    ownerCpuRelax();
+                }
+                if (getMonotonicUs() >= end) break;
+            }
+            o->spin_stop_us = b / 2;
+        }
+    }
+    o->stop_sleeps++;
     pthread_mutex_lock(&own_wait_mu);
     atomic_fetch_add_explicit(&own_waiters, 1, memory_order_seq_cst);
     while (atomic_load_explicit(&own_stop, memory_order_seq_cst)) pthread_cond_wait(&own_wait_cv, &own_wait_mu);
     atomic_fetch_sub_explicit(&own_waiters, 1, memory_order_relaxed);
     pthread_mutex_unlock(&own_wait_mu);
+    if (cap > 0) ownerSpinSeed(&o->spin_stop_us, (long long)(getMonotonicUs() - t0), cap);
 }
 
 static void ownerEnter(owner *o) {
@@ -992,7 +1049,7 @@ static void ownerEnter(owner *o) {
         atomic_thread_fence(memory_order_seq_cst);
         if (!atomic_load_explicit(&own_stop, memory_order_relaxed)) break;
         atomic_store_explicit(&o->active, 0, memory_order_release);
-        ownerWaitWorld();
+        ownerWaitWorld(o);
     }
     /* Pairs with main's release of own_stop: everything main did before resuming is visible. */
     atomic_thread_fence(memory_order_acquire);
@@ -1334,9 +1391,12 @@ static void ownerResumeWorld(void) {
     own_held = 0;
     atomic_store_explicit(&own_stop, 0, memory_order_seq_cst);
     if (atomic_load_explicit(&own_waiters, memory_order_seq_cst)) {
+        monotime b0 = getMonotonicUs();
         pthread_mutex_lock(&own_wait_mu);
         pthread_cond_broadcast(&own_wait_cv);
         pthread_mutex_unlock(&own_wait_mu);
+        own_resume_broadcasts++;
+        own_resume_broadcast_us += (long long)(getMonotonicUs() - b0);
     }
     /* RL-g1g / RL-g2a: one wakeup per owner whose inbox main filled at this stop (ownerSendToOwner), not one per
      * client. The owner could not have taken them before now: the world was held. */
@@ -5037,6 +5097,43 @@ static int ownerCronTimeout(owner *o) {
     return ms > period ? (int)period : (int)ms;
 }
 
+/* RL-g2f: the owner's wait for work. Without spinning (owner-spin-us 0, or an owner that shares main's
+ * core, or one that is not pinned) this is the parent's sleep in epoll_wait. With it, an owner that
+ * finds nothing ready polls its own epoll (non-blocking, no lock taken while nothing is ready) for up
+ * to its budget, a few pipeline flushes apart, and sleeps only when that found nothing. It runs
+ * outside any window, so main's stops never wait for it. */
+static int ownerPoll(owner *o, struct epoll_event *evs) {
+    if (o->ntlsp) return epoll_wait(o->epfd, evs, OWNER_EVENTS, 0); /* RL-g1d: TLS input may wait */
+    int cap = o->spin_ok ? ownerSpinCap(&server.owner_spin_us) : 0;
+    o->waits++;
+    if (cap <= 0) return epoll_wait(o->epfd, evs, OWNER_EVENTS, ownerCronTimeout(o)); /* RL-g2c: cron slices */
+    int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, 0);
+    if (n != 0) return n;
+    monotime t0 = getMonotonicUs();
+    int b = o->spin_us < cap ? o->spin_us : cap;
+    if (b > 0) {
+        o->spins++;
+        monotime end = t0 + (monotime)b, now;
+        do {
+            for (int i = 0; i < 32; i++) ownerCpuRelax();
+            n = epoll_wait(o->epfd, evs, OWNER_EVENTS, 0);
+            now = getMonotonicUs();
+        } while (n == 0 && now < end);
+        o->spin_time_us += (long long)(now - t0);
+        if (n != 0) {
+            if (n > 0) {
+                o->spin_hits++;
+                o->spin_us = ownerSpinGrow(b, cap);
+            }
+            return n;
+        }
+        o->spin_us = b / 2;
+    }
+    n = epoll_wait(o->epfd, evs, OWNER_EVENTS, ownerCronTimeout(o));
+    if (n > 0) ownerSpinSeed(&o->spin_us, (long long)(getMonotonicUs() - t0), cap);
+    return n;
+}
+
 static void *ownerThreadMain(void *arg) {
     owner *o = arg;
     char name[32];
@@ -5059,7 +5156,7 @@ static void *ownerThreadMain(void *arg) {
 
     struct epoll_event evs[OWNER_EVENTS];
     for (;;) {
-        int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, o->ntlsp ? 0 : ownerCronTimeout(o));
+        int n = ownerPoll(o, evs);
         if (n < 0) {
             if (errno != EINTR) serverLog(LL_WARNING, "owner %d: epoll_wait: %s", o->id, strerror(errno));
             continue;
@@ -5181,6 +5278,18 @@ static void *ownerThreadMain(void *arg) {
 }
 
 void ownerThreadsStart(void) {
+    /* RL-g2f: main's CPUs are set by now (serverSetCpuAffinity runs just before this). An owner spins
+     * only on a core of its own: pinned, and not on a CPU main is pinned to. */
+    cpu_set_t mainset;
+    CPU_ZERO(&mainset);
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int main_pinned = sched_getaffinity(0, sizeof(mainset), &mainset) == 0 && CPU_COUNT(&mainset) < ncpu;
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        o->spin_ok = o->cpu >= 0 && !(main_pinned && CPU_ISSET(o->cpu, &mainset));
+        o->spin_us = server.owner_spin_us;
+        o->spin_stop_us = server.owner_spin_stop_us;
+    }
     for (int i = 0; i < own_n; i++) {
         if (pthread_create(&owners[i].thread, NULL, ownerThreadMain, &owners[i]) != 0) {
             serverLog(LL_WARNING, "owner threads: cannot start owner %d", i);
@@ -5399,6 +5508,30 @@ void ownerInfo(sds *info) {
     }
     *info = sdscatprintf(*info, "owner_script_runs:%lld\r\nowner_script_aborts:%lld\r\nowner_script_misses:%lld\r\n",
                          s_runs, s_aborts, s_misses);
+    /* RL-g2f: adaptive spinning. owner_spin_owners = owners allowed to spin (pinned, not on main's CPU);
+     * waits = times an owner waited for work, spins / hits = idle spins and those that found work;
+     * stop_spins / hits / sleeps = waits for main's stop to end; resume_broadcasts = resumes that had to
+     * wake sleeping owners (main's time in those wakes: resume_broadcast_us). */
+    long long sp = 0, sph = 0, spt = 0, wts = 0, ssp = 0, ssph = 0, ssl = 0;
+    int spok = 0;
+    for (int i = 0; i < own_n; i++) {
+        owner *o = &owners[i];
+        spok += o->spin_ok;
+        sp += o->spins;
+        sph += o->spin_hits;
+        spt += o->spin_time_us;
+        wts += o->waits;
+        ssp += o->stop_spins;
+        ssph += o->stop_spin_hits;
+        ssl += o->stop_sleeps;
+    }
+    *info = sdscatprintf(*info,
+                         "owner_spin_us:%d\r\nowner_spin_stop_us:%d\r\nowner_spin_owners:%d\r\nowner_waits:%lld\r\n"
+                         "owner_spins:%lld\r\nowner_spin_hits:%lld\r\nowner_spin_time_us:%lld\r\n"
+                         "owner_stop_spins:%lld\r\nowner_stop_spin_hits:%lld\r\nowner_stop_sleeps:%lld\r\n"
+                         "owner_resume_broadcasts:%lld\r\nowner_resume_broadcast_us:%lld\r\n",
+                         server.owner_spin_us, server.owner_spin_stop_us, spok, wts, sp, sph, spt, ssp, ssph, ssl,
+                         own_resume_broadcasts, own_resume_broadcast_us);
     *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
                          server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
     /* D3-all-g14-fold: owner_repl_split: the owners encode each record twice (compact AOF, RESP stream). */

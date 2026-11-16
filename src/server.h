@@ -2186,6 +2186,8 @@ struct valkeyServer {
     int owner_adopt_all;                      /* owner-adopt-all (debug): every TCP client is served by an owner. */
     int owner_uring;                          /* owner-uring: owners batch socket reads and writes through io_uring. */
     int owner_uring_deep;                     /* owner-uring-deep: a client whose last read had this many commands skips the batch (0: none). */
+    int owner_spin_us;                        /* owner-spin-us: an idle owner polls its own epoll up to this long before it sleeps (adaptive; 0: off, RL-g2f). */
+    int owner_spin_stop_us;                   /* owner-spin-stop-us: an owner waiting for main's stop to end spins up to this long before it sleeps (adaptive; 0: off, RL-g2f). */
     int owner_uring_aof;                      /* owner-uring-aof: owners batch under appendonly too (default no: the syscall path). */
     int owner_set_burst;                      /* owner-set-burst: owners answer plain SET frames off the query buffer (default yes). */
     int owner_pipeline_resume;                /* owner-pipeline-resume N: a guest goes home before N commands in a row its owner runs, or at the end of its input; 0: off (default 4). */
