@@ -753,6 +753,7 @@ typedef struct owner {
     int exp_timelimit;            /* the last cycle stopped on its time limit (stock timelimit_exit) */
     int exp_fold;                 /* something for main to fold */
     int exp_tfd, exp_hz, exp_due; /* the slow cycles' timer (timerfd, period 1/exp_hz; 0: off); it fired */
+    int cron_tick; /* RL-g3f: the expire timer fired; while it runs it also ticks RL-g2c / RL-g3b's cron slices */
     monotime exp_last_fast;
     double exp_stale;             /* stock stat_expired_keys_stale_perc, over this owner's keys */
     long long exp_us, exp_cap;    /* folded and cleared by main: cycle time, time-limit stops */
@@ -5616,6 +5617,9 @@ static int ownerClientsCron(owner *o, long long now_us) {
 
 /* Owner, outside a window: the epoll timeout until its next cron slice (-1 with no client). */
 static int ownerCronTimeout(owner *o) {
+    /* RL-g3f: while the owner's expire timer runs (RL-g2b, 1/hz), it wakes the owner for the cron slices too: one
+     * tick a period instead of two (an epoll timeout and the timer, out of phase). */
+    if (o->exp_hz > 0) return -1;
     /* RL-g3b: an owner with tables to keep wakes for them with no client too */
     if (!o->nclients && !atomic_load_explicit(&own_tables, memory_order_relaxed)) return -1;
     long long left = o->cron_next_us - (long long)getMonotonicUs();
@@ -6048,6 +6052,7 @@ static void *ownerThreadMain(void *arg) {
                 if (read(o->exp_tfd, &ticks, sizeof(ticks)) == -1) { /* EAGAIN: already read */
                 }
                 o->exp_due = 1;
+                o->cron_tick = 1; /* RL-g3f */
                 continue;
             }
             int fd = (int)(uint32_t)d;
@@ -6117,7 +6122,12 @@ static void *ownerThreadMain(void *arg) {
          * owners' cron off (main runs it) the owner only looks again a period later. */
         {
             long long now_us = (long long)getMonotonicUs();
-            if (now_us >= o->cron_next_us) {
+            /* RL-g3f: a tick of the expire timer runs a slice due within half a period (the timer and the slices'
+             * deadline drift apart by the wakeup latency; a busy owner that ran one by its deadline skips the tick). */
+            long long half_us = 500LL * (o->cron_period_ms ? o->cron_period_ms : 100);
+            int tick = o->cron_tick;
+            o->cron_tick = 0;
+            if (now_us >= o->cron_next_us || (tick && now_us >= o->cron_next_us - half_us)) {
                 if (!atomic_load_explicit(&own_cron, memory_order_relaxed))
                     o->cron_next_us = now_us + 1000LL * (o->cron_period_ms ? o->cron_period_ms : 100);
                 else if (!atomic_load_explicit(&own_stop, memory_order_relaxed))
