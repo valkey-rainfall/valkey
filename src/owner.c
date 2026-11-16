@@ -6869,11 +6869,14 @@ static void ownerExpireScanCb(void *privdata, void *entry, int didx) {
     d->sampled++;
 }
 
-/* This owner's keys with an expire in kvs, counted up to cap. */
+/* This owner's keys with an expire in kvs, at most cap (activeExpireCycleJob's num, capped at keys_per_loop).
+ * RL-g7e-idle-cpu: the sum stops at the first table that reaches cap, and that table's size alone could be far
+ * more than cap (1,600 keys per table with the North Star keyspace over 1,024 tables): every round then sampled a
+ * whole table instead of keys_per_loop keys (~93 us per slow cycle per owner, 10 a second, at 0 ops/s). */
 static unsigned long ownerExpireCount(owner *o, kvstore *kvs, unsigned long cap) {
     unsigned long n = 0;
     for (int t = 0; t < o->exp_ntables && n < cap; t++) n += kvstoreHashtableSize(kvs, o->exp_t0 + t);
-    return n;
+    return n < cap ? n : cap;
 }
 
 /* One sampling round over this owner's tables of a db: up to num keys in at most num * 10 buckets,

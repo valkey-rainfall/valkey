@@ -3596,6 +3596,7 @@ standardConfig static_configs[] = {
     createBoolConfig("owner-mm-lease", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_mm_lease, 1, NULL, NULL), /* vkevo g11-maxmem: batched reads and SET bursts inside each owner's memory lease */
     createBoolConfig("owner-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_cron, 1, NULL, NULL), /* vkevo RL-g2c: owners run their own clients' cron */
     createBoolConfig("owner-light-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_light_cron, 1, NULL, NULL), /* vkevo RL-g3b: timer wakes without owner-state work do not stop the owners */
+    createBoolConfig("lazy-malloc-stats", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.lazy_malloc_stats, 1, NULL, NULL), /* vkevo RL-g7e-idle-cpu: INFO / MEMORY sample the allocator stats, not serverCron */
     createBoolConfig("owner-active-expire", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_active_expire, 1, NULL, NULL), /* vkevo RL-g2b: owners run active expiry over their own keys; no = main, as before */
     createBoolConfig("owner-repl-native", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_native, 1, NULL, NULL), /* vkevo g11-repl: owners native with replicas attached */
     createBoolConfig("owner-repl-combine", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_combine, 1, NULL, NULL), /* vkevo RL-g7b: owners' stream appends combine on own_aof_mu (replication only) */

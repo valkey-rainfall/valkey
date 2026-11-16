@@ -2211,6 +2211,7 @@ struct valkeyServer {
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
     int owner_cron;                           /* owner-cron (RL-g2c): owners run the per-client cron of the clients they serve (default yes). */
     int owner_light_cron;                     /* owner-light-cron (RL-g3b): timer wakes with no owner-state work leave the owners running (default yes). */
+    int lazy_malloc_stats;                    /* lazy-malloc-stats (RL-g7e): cron_malloc_stats sampled by INFO / MEMORY when 100 ms old, not by serverCron (default yes). */
     int owner_active_expire;                  /* owner-active-expire: owners run the active expire cycle over their own keys (default yes, RL-g2b). */
     int owner_repl_native;                    /* owner-repl-native: owners stay native with replicas / a backlog (g11-repl, default yes). */
     int owner_repl_combine;                   /* owner-repl-combine: RL-g7b, the owners' stream appends combine (default yes). */
@@ -4242,6 +4243,7 @@ const char *evictPolicyToString(void);
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);
 robj *createStringObjectWithKeyAndExpire(const char *ptr, size_t len, const_sds key, long long expire);
 struct serverMemOverhead *getMemoryOverheadData(void);
+void memoryStatsFreshen(void); /* RL-g7e-idle-cpu: cron_malloc_stats sampled by its readers (lazy-malloc-stats) */
 void freeMemoryOverheadData(struct serverMemOverhead *mh);
 void checkChildrenDone(void);
 int setOOMScoreAdj(int process_class);

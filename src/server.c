@@ -1688,12 +1688,11 @@ static void sumEngineUsedMemory(scriptingEngine *engine, void *context) {
     *total_memory += mem_info.used_memory;
 }
 
-/* Called from serverCron and cronUpdateMemoryStats to update cached memory metrics. */
-void cronUpdateMemoryStats(void) {
-    /* Record the max memory used since the server was started. */
-    if (zmalloc_used_memory() > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used_memory();
-
-    run_with_period(100) {
+/* The slow part of the memory metrics: RSS, the allocator's stats and fragmentation (cron_malloc_stats). */
+static monotime malloc_stats_at; /* RL-g7e-idle-cpu: when they were last sampled (0: never) */
+static void sampleMallocStats(void) {
+    malloc_stats_at = getMonotonicUs();
+    {
         /* Sample the RSS and other metrics here since this is a relatively slow call.
          * We must sample the zmalloc_used at the same time we take the rss, otherwise
          * the frag ratio calculate may be off (ratio of two samples at different times) */
@@ -1721,6 +1720,29 @@ void cronUpdateMemoryStats(void) {
             server.cron_malloc_stats.allocator_active = server.cron_malloc_stats.allocator_resident;
         if (!server.cron_malloc_stats.allocator_allocated)
             server.cron_malloc_stats.allocator_allocated = server.cron_malloc_stats.zmalloc_used;
+    }
+}
+
+/* RL-g7e-idle-cpu (lazy-malloc-stats, default yes): cron_malloc_stats has no reader but INFO memory, MEMORY STATS
+ * and MEMORY DOCTOR (all through getMemoryOverheadData), so instead of every 100 ms in serverCron they are sampled
+ * when one of those reads them and the last sample is 100 ms old or more: a reader never sees older values than with
+ * the cron's sample, and a server nobody asks does not pay for them. The allocator's epoch refresh merges every
+ * arena's stats (one per owner thread and io thread): ~200 us of main's CPU per tick with 16 owners, 2.3 ms a second
+ * on an idle server. */
+void memoryStatsFreshen(void) {
+    if (!server.lazy_malloc_stats) return;
+    if (malloc_stats_at && getMonotonicUs() - malloc_stats_at < 100000) return;
+    sampleMallocStats();
+}
+
+/* Called from serverCron and cronUpdateMemoryStats to update cached memory metrics. */
+void cronUpdateMemoryStats(void) {
+    /* Record the max memory used since the server was started. */
+    if (zmalloc_used_memory() > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used_memory();
+
+    if (server.lazy_malloc_stats) return; /* RL-g7e-idle-cpu: sampled by their readers (memoryStatsFreshen) */
+    run_with_period(100) {
+        sampleMallocStats();
     }
 }
 

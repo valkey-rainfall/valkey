@@ -1590,6 +1590,7 @@ struct serverMemOverhead *getMemoryOverheadData(void) {
     int j;
     size_t mem_total = 0;
     size_t mem = 0;
+    memoryStatsFreshen(); /* RL-g7e-idle-cpu: cron_malloc_stats at most 100 ms old, as serverCron's sample */
     size_t zmalloc_used = zmalloc_used_memory();
     struct serverMemOverhead *mh = zcalloc(sizeof(*mh));
 
