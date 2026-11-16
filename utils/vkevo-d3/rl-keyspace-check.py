@@ -308,6 +308,21 @@ class Model:
         for key in [x for x, e in self.k.items() if e[2] is not None and e[2][1] < t]:
             del self.k[key]
 
+    def gtlt_ambiguous(self, op, t):
+        """RL-2: a GT / LT whose new expiry is within MARGIN of the key's current one compares two times that each
+        server fixed at its own clock (a relative TTL set a few ms apart on the two): the reply may differ between
+        two correct servers, so the op is not picked (as keys near their expiry are not)."""
+        if op[0] not in ("EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT") or not any(f in ("GT", "LT") for f in op[3:]):
+            return False
+        e = self.k.get(op[1])
+        if e is None or e[2] is None:
+            return False
+        v = op[2]
+        new = {"EXPIRE": (t + v * 1000, t + v * 1000 + 50), "PEXPIRE": (t + v, t + v + 50),
+               "EXPIREAT": (v * 1000, v * 1000), "PEXPIREAT": (v, v)}[op[0]]
+        lo, hi = e[2]
+        return new[0] - MARGIN <= hi and new[1] + MARGIN >= lo
+
 
 def gen_op(rng, keys_of_tag, tags, m, t):
     tag = rng.choice(tags)
@@ -506,7 +521,7 @@ def model_worker(wid, a, r, out, stop_at, seed):
                 ks = keys_of(op)
                 # touch no key within MARGIN of its expiry during the batch (+50 ms for the batch itself), and one
                 # op per key per batch (the model updates after the batch)
-                if any(m.ambiguous(k, t, t + 50) for k in ks) or any(k in used for k in ks):
+                if any(m.ambiguous(k, t, t + 50) for k in ks) or any(k in used for k in ks) or m.gtlt_ambiguous(op, t):
                     skipped += 1
                     continue
                 used.update(ks)
