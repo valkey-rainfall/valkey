@@ -1123,7 +1123,6 @@ int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms) {
  *
  * When we want to know what was recently the peak memory usage, we just scan
  * such few slots searching for the maximum value. */
-#define CLIENTS_PEAK_MEM_USAGE_SLOTS 8
 size_t ClientsPeakMemInput[CLIENTS_PEAK_MEM_USAGE_SLOTS] = {0};
 size_t ClientsPeakMemOutput[CLIENTS_PEAK_MEM_USAGE_SLOTS] = {0};
 
@@ -1255,6 +1254,8 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
         if (ClientsPeakMemInput[j] > i) i = ClientsPeakMemInput[j];
         if (ClientsPeakMemOutput[j] > o) o = ClientsPeakMemOutput[j];
     }
+    /* RL-g2c: the clients owner threads serve have their peaks on their owners. */
+    if (ownerThreadsEnabled()) ownerPeakMemInfo(&i, &o);
     *in_usage = i;
     *out_usage = o;
 }
@@ -1283,6 +1284,10 @@ static bool clientsCronTcpIsClosing(client *c) {
     return true;
 }
 
+/* clientsTimeProc's bounds on the clients one cron cycle processes. */
+#define CLIENTS_CRON_MIN_PER_CYCLE 5
+#define CLIENTS_CRON_MAX_PER_CYCLE 200
+
 /* This function is called by clientsTimeProc() and is used in order to perform
  * operations on clients that are important to perform constantly. For instance
  * we use this function in order to disconnect clients after a timeout, including
@@ -1297,11 +1302,14 @@ static bool clientsCronTcpIsClosing(client *c) {
  * very fast. Sometimes the server has tens of thousands of connected clients, and all
  * of them need to be processed every second.
  */
-static void clientsCron(int clients_this_cycle) {
+static void clientsCron(int clients_this_cycle, int max_visits) {
     /* for debug purposes: skip actual cron work if pause_cron is on */
     if (server.pause_cron) return;
 
     mstime_t now = mstime();
+    /* RL-g2c: the clients owner threads serve get their cron there (owner.c ownerClientsCron); main passes over them
+     * (max_visits bounds the walk; without owners every visit is a client processed, as before). */
+    int skip_owned = ownerCronOnOwners();
 
     int curr_peak_mem_usage_slot = server.unixtime % CLIENTS_PEAK_MEM_USAGE_SLOTS;
     /* Always zero the next sample, so that when we switch to that second, we'll
@@ -1319,7 +1327,7 @@ static void clientsCron(int clients_this_cycle) {
     ClientsPeakMemInput[zeroidx] = 0;
     ClientsPeakMemOutput[zeroidx] = 0;
 
-    while (listLength(server.clients) && clients_this_cycle--) {
+    while (listLength(server.clients) && clients_this_cycle > 0 && max_visits-- > 0) {
         client *c;
         listNode *head;
 
@@ -1328,6 +1336,8 @@ static void clientsCron(int clients_this_cycle) {
         head = listFirst(server.clients);
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
+        if (skip_owned && c->owner_tid != OWNER_ON_MAIN) continue;
+        clients_this_cycle--;
         if (c->flag.fastpath) {
             /* Crons run between staged phases, so the idle timeout may close a staged client, and its
              * memory, unwritten replies included, is accounted for maxmemory-clients; a close takes effect
@@ -1394,13 +1404,26 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
     UNUSED(id);
     UNUSED(clientData);
 
-    const int MIN_CLIENTS_PER_CYCLE = 5;
-    const int MAX_CLIENTS_PER_CYCLE = 200;
+    const int MIN_CLIENTS_PER_CYCLE = CLIENTS_CRON_MIN_PER_CYCLE;
+    const int MAX_CLIENTS_PER_CYCLE = CLIENTS_CRON_MAX_PER_CYCLE;
 
     monotime start_time;
     elapsedStart(&start_time);
+    ownerNoteCron();
 
     int numclients = listLength(server.clients);
+    int owned = 0;
+    if (ownerCronOnOwners()) {
+        /* RL-g2c: only main's own clients are left to this cron. While they fit the per-cycle bound at server.hz,
+         * serverCron runs them in its own wake (clientsCronOnServerCron), so this timer only looks again in a second:
+         * every wake of main stops the owner threads. */
+        owned = ownerResidentClients();
+        numclients -= owned;
+        if (numclients <= MAX_CLIENTS_PER_CYCLE * server.hz) {
+            server.clients_hz = server.hz;
+            return 1000;
+        }
+    }
     int clients_this_cycle = numclients / server.hz; /* Initial computation based on standard hz */
     int delay_ms;
 
@@ -1417,12 +1440,28 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
         delay_ms = 1000 / server.hz;
     }
 
-    clientsCron(clients_this_cycle);
+    /* With owners, the walk passes over their clients too: enough visits to go round the whole list in a second. */
+    int visits = owned ? (int)((long long)(numclients + owned) * delay_ms / 1000) + clients_this_cycle : clients_this_cycle;
+    clientsCron(clients_this_cycle, visits);
 
     server.clients_hz = 1000 / delay_ms;
     cronStatsRecord(CRON_JOB_CLIENTS_TIMEPROC, elapsedUs(start_time));
     server.el_cron_duration += elapsedUs(start_time);
     return delay_ms;
+}
+
+/* RL-g2c-owner-cron: with owner threads running their own clients' cron, main's clients (plain-port clients, guests,
+ * replicas) get theirs in serverCron's wake while they fit CLIENTS_CRON_MAX_PER_CYCLE per tick at server.hz (beyond
+ * that clientsTimeProc runs them, as stock). The walk visits a 1/hz share of the whole list per tick, so every client
+ * is looked at once a second, as stock. */
+static void clientsCronOnServerCron(void) {
+    if (!ownerCronOnOwners()) return;
+    int owned = ownerResidentClients();
+    int all = listLength(server.clients);
+    if (all - owned > CLIENTS_CRON_MAX_PER_CYCLE * server.hz) return; /* clientsTimeProc's */
+    monotime t0 = getMonotonicUs();
+    clientsCron(CLIENTS_CRON_MAX_PER_CYCLE, (all + server.hz - 1) / server.hz + CLIENTS_CRON_MIN_PER_CYCLE);
+    cronStatsRecord(CRON_JOB_CLIENTS_TIMEPROC, getMonotonicUs() - t0);
 }
 
 /* This function handles 'background' operations we are required to do
@@ -1694,6 +1733,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     /* for debug purposes: skip actual cron work if pause_cron is on */
     if (server.pause_cron) return 1000 / server.hz;
+    ownerNoteCron();
 
     monotime cron_start = getMonotonicUs();
     uint64_t sc_sub_before = cronStatsUsecRange(CRON_JOB_SC_EXPIRE_SLOW, CRON_JOB_SC_PERSISTENCE);
@@ -1778,6 +1818,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     }
 
     /* Handle background operations on databases. */
+    clientsCronOnServerCron(); /* RL-g2c: main's own clients, in this wake */
     databasesCron();
 
     /* Persistence: child reaping plus bgsave/AOF-rewrite decisions. */
@@ -2424,6 +2465,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     fastGetRefreshMainGate();
 
     /* Owner threads stop for as long as main runs, and their handed-off clients join main. */
+    ownerNoteWake(numevents);
     ownerAfterSleep();
 }
 

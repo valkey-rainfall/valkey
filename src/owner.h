@@ -41,6 +41,14 @@ int ownerClusterCommand(struct client *c); /* CLUSTER on a standalone server wit
 void ownerInfo(sds *info);
 void ownerFoldLatencyHistograms(void);  /* INFO latencystats, LATENCY HISTOGRAM: fold the owners' histograms */
 void ownerResetLatencyHistograms(void); /* CONFIG RESETSTAT */
+
+/* RL-g2c-owner-cron: owners run the per-client cron (timeouts, buffer resizes, memory stats, output buffer limits)
+ * of the clients they serve; main's clients cron covers only its own clients then. */
+int ownerCronOnOwners(void);          /* main: the owners run their clients' cron now */
+int ownerResidentClients(void);       /* main, world held: clients served by owner threads */
+void ownerPeakMemInfo(size_t *in_usage, size_t *out_usage); /* main, world held: owners' recent client peaks */
+void ownerNoteWake(int numevents);    /* main, afterSleep: file events that woke this iteration (INFO counters) */
+void ownerNoteCron(void);             /* main: a cron timer proc ran in this iteration (INFO counters) */
 extern int owner_accept_home; /* createClient: home owner of the connection being accepted */
 
 /* WATCH (multi.c): an owner keeps its own registry (a dict like db->watched_keys) of the keys its

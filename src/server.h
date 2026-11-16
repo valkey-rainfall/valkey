@@ -388,6 +388,8 @@ typedef enum blocking_type {
 #define CLIENT_TYPE_OBUF_COUNT 3  /* Number of clients to expose to output \
                                      buffer configuration. Just the first  \
                                      three: normal, replica, pubsub. */
+/* Seconds of recent client buffer peaks INFO clients reports (server.c clientsCron; owner.c keeps its own). */
+#define CLIENTS_PEAK_MEM_USAGE_SLOTS 8
 
 /* Type of commandlog */
 typedef enum {
@@ -2189,6 +2191,7 @@ struct valkeyServer {
     int owner_pipeline_resume;                /* owner-pipeline-resume N: a guest goes home before N commands in a row its owner runs, or at the end of its input; 0: off (default 4). */
     int owner_bigreply_min;                   /* owner-bigreply-min: owners send GET values of this many bytes or more from where they are (default 2048; 0: copy all). */
     int owner_mm_lease;                       /* owner-mm-lease: under maxmemory owners batch reads and run SET bursts inside their memory lease (default yes). */
+    int owner_cron;                           /* owner-cron (RL-g2c): owners run the per-client cron of the clients they serve (default yes). */
     int owner_repl_native;                    /* owner-repl-native: owners stay native with replicas / a backlog (g11-repl, default yes). */
     int owner_repl_sender;                    /* owner-repl-sender: with owner threads, repl-stream-sender starts as append (default yes). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */

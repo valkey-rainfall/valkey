@@ -360,7 +360,7 @@ static const char *const own_fam_names[OWN_NFAM] = {
 
 /* Why an owner handed a client to main (client->owner_why). OWN_WHY_ACCEPTED: its TLS handshake ended
  * on the owner (done or failed); main runs the accept handler (RL-g1d). */
-enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE, OWN_WHY_ACCEPTED };
+enum { OWN_WHY_RUN = 1, OWN_WHY_CLOSE, OWN_WHY_QBLIMIT, OWN_WHY_IDLE, OWN_WHY_ACCEPTED, OWN_WHY_TIMEOUT };
 
 /* RL-g1d owner TLS ports: a listener's accept-handler data is the owner id, | OWN_LISTEN_TLS for its TLS twin. */
 #define OWN_LISTEN_TLS 0x10000
@@ -546,6 +546,13 @@ typedef struct owner {
     unsigned long long sans_epoch;
     client *sc;
     long long script_runs, script_aborts, script_misses;
+    /* RL-g2c-owner-cron: the cron of this owner's clients (ownerClientsCron), run in its windows. */
+    long long cron_next_us; /* monotonic: when the next slice is due */
+    int cron_period_ms;     /* 1000 / hz, as of the last slice (epoll timeout outside windows) */
+    int cron_fd;            /* fdmap cursor: each slice walks fdmap_cap / hz entries, the whole map once a second */
+    size_t peak_in[CLIENTS_PEAK_MEM_USAGE_SLOTS], peak_out[CLIENTS_PEAK_MEM_USAGE_SLOTS]; /* clientsCron's peaks */
+    long long cmem[CLIENT_TYPE_COUNT]; /* stat_clients_type_memory changes, folded by main under the stop */
+    long long cron_clients, cron_slices, cron_timeouts, cron_closes; /* INFO, never cleared */
 #ifdef HAVE_LIBURING
     struct io_uring ring;
 #endif
@@ -642,6 +649,15 @@ static robj *own_burst_name[2]; /* "GET", "get" */
 /* SET bursts (ownerSetBurst, D3-all-g10-setburst): the same for "SET"/"set" frames and setCommand. */
 static struct serverCommand *own_setburst_cmd = NULL;
 static robj *own_setburst_name[2]; /* "SET", "set" */
+
+/* RL-g2c-owner-cron: whether the owners run their clients' cron this period (set by main at resume:
+ * ownerCronOnOwners() and no pause-cron). Main's clientsCron passes over owner clients under the same rule. */
+static _Atomic int own_cron = 0;
+/* Main's wakes: what woke each iteration and how long the world was held (INFO). A cron stop is a stop of an
+ * iteration that no file event woke and that ran serverCron or clientsTimeProc: the owners stopped for cron alone. */
+static monotime own_stop_t0 = 0;
+static int own_iter_events = 0, own_iter_cron = 0;
+static long long own_held_us = 0, own_cron_stops = 0, own_cron_held_us = 0;
 
 int ownerThreadsEnabled(void) {
     return own_n > 0;
@@ -1145,6 +1161,7 @@ static void ownerStopWorld(void) {
     atomic_store_explicit(&own_stop, 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_seq_cst);
     monotime t0 = getMonotonicUs();
+    own_stop_t0 = t0;
     for (int i = 0; i < own_n; i++) {
         unsigned spins = 0;
         while (atomic_load_explicit(&owners[i].active, memory_order_acquire)) {
@@ -1284,6 +1301,16 @@ static void ownerResumeWorld(void) {
     ownerSettleTable(server.commands);
     ownerSettleTable(server.orig_commands);
     dbLanePhaseBegin();
+    atomic_store_explicit(&own_cron, ownerCronOnOwners() && !server.pause_cron, memory_order_relaxed);
+    if (own_stop_t0) {
+        long long held = (long long)(getMonotonicUs() - own_stop_t0);
+        own_held_us += held;
+        if (own_iter_cron && !own_iter_events) {
+            own_cron_stops++;
+            own_cron_held_us += held;
+        }
+    }
+    own_iter_cron = 0;
     own_held = 0;
     atomic_store_explicit(&own_stop, 0, memory_order_seq_cst);
     if (atomic_load_explicit(&own_waiters, memory_order_seq_cst)) {
@@ -1345,6 +1372,11 @@ static void ownerFoldStats(void) {
         server.stat_total_writes_processed += o->writes;
         server.stat_client_outbuf_limit_disconnections += o->outbuf_disconnects;
         o->net_in = o->net_out = o->reads = o->writes = o->outbuf_disconnects = 0;
+        /* RL-g2c: client memory the owner's cron measured (updateClientMemoryUsage's changes) */
+        for (int t = 0; t < CLIENT_TYPE_COUNT; t++) {
+            server.stat_clients_type_memory[t] += o->cmem[t];
+            o->cmem[t] = 0;
+        }
     }
 }
 
@@ -1426,6 +1458,12 @@ static void ownerTakeOne(client *c) {
     if (c->flag.close_asap) {
         /* The owner asked for the close (output buffer limit); main's queue frees it. */
         c->flag.close_asap = 0;
+        freeClientAsync(c);
+        return;
+    }
+    if (why == OWN_WHY_TIMEOUT) {
+        /* RL-g2c: clientsCronHandleTimeout on its owner found it idle past the timeout. */
+        serverLog(LL_VERBOSE, "Closing idle client");
         freeClientAsync(c);
         return;
     }
@@ -1779,6 +1817,39 @@ void ownerBeforeSleepEnd(void) {
     if (own_dormant) return;
     if (home) ownerReturnGuests();
     ownerResumeWorld();
+}
+
+/* RL-g2c-owner-cron (main). The owners run the per-client cron of the clients they serve unless owner-cron is off,
+ * they sleep (io-threads > 1: main has every client), or maxmemory-clients is set: client eviction needs main to keep
+ * every client's memory bucket current (clientsCron's updateClientMemUsageAndBucket), so main's cron then covers the
+ * owner clients again, with the world stopped, as before. */
+int ownerCronOnOwners(void) {
+    return own_n && server.owner_cron && !own_dormant && !server.maxmemory_clients;
+}
+
+int ownerResidentClients(void) {
+    int n = 0;
+    for (int i = 0; i < own_n; i++) n += owners[i].nclients;
+    return n;
+}
+
+/* Main, world held (INFO clients): the owners' recent peaks, with main's (getExpensiveClientsInfo). */
+void ownerPeakMemInfo(size_t *in_usage, size_t *out_usage) {
+    for (int i = 0; i < own_n; i++) {
+        for (int j = 0; j < CLIENTS_PEAK_MEM_USAGE_SLOTS; j++) {
+            if (owners[i].peak_in[j] > *in_usage) *in_usage = owners[i].peak_in[j];
+            if (owners[i].peak_out[j] > *out_usage) *out_usage = owners[i].peak_out[j];
+        }
+    }
+}
+
+void ownerNoteWake(int numevents) {
+    if (!own_n || ProcessingEventsWhileBlocked) return;
+    own_iter_events = numevents;
+}
+
+void ownerNoteCron(void) {
+    own_iter_cron = 1;
 }
 
 static void ownerAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -4870,6 +4941,81 @@ static void ownerUringInit(owner *o) {
 }
 #endif
 
+/* RL-g2c-owner-cron: one client's share of clientsCron, on its owner, in a window. The stock checks in the stock order
+ * (clientsCronHandleTimeout, clientsCronResizeQueryBuffer, clientsCronResizeOutputBuffer,
+ * clientsCronTrackExpensiveClients, updateClientMemoryUsage, closeClientOnOutputBufferLimitReached); the parts that
+ * write shared state keep it on the owner (the peaks, the memory-by-type changes) for main to read or fold under the
+ * stop, and a client to close goes to main (as the owner's other closes do). Returns 1 when the client left. */
+static int ownerClientCron(owner *o, client *c, mstime_t now_ms, int peak_slot) {
+    if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) return 0;
+    if (c->flag.close_asap) return ownerHandOff(o, c, OWN_WHY_CLOSE);
+    /* An owner client is never a replica, primary, blocked or subscribed (those are main's); the stock test anyway. */
+    if (server.maxidletime && !c->flag.replica && !mustObeyClient(c) && !c->flag.blocked && !c->flag.pubsub &&
+        (server.unixtime - c->last_interaction > server.maxidletime)) {
+        o->cron_timeouts++;
+        return ownerHandOff(o, c, OWN_WHY_TIMEOUT);
+    }
+    if (c->owner_hs) return 0; /* a TLS handshake: no buffers yet */
+    /* The thread's shared query buffer is never a client's between windows; never resize it anyway. */
+    if (c->querybuf != thread_shared_qb) clientResizeQueryBuffer(c, server.unixtime - c->last_interaction);
+    /* An expansion allocates: under maxmemory only within this owner's lease. */
+    if (!own_mm || ownerMmFits(o, PROTO_REPLY_CHUNK_BYTES)) clientsCronResizeOutputBuffer(c, now_ms);
+    size_t qb = c->querybuf ? sdsAllocSize(c->querybuf) : 0;
+    size_t in = qb + c->argv_len_sum + (c->argv ? zmalloc_size(c->argv) : 0);
+    size_t out = getClientOutputBufferMemoryUsage(c);
+    if (in > o->peak_in[peak_slot]) o->peak_in[peak_slot] = in;
+    if (out > o->peak_out[peak_slot]) o->peak_out[peak_slot] = out;
+    /* updateClientMemoryUsage into this owner's changes. A client still in a memory usage bucket (maxmemory-clients
+     * was on) is main's to update: the buckets are main's lists. */
+    if (!c->mem_usage_bucket) {
+        size_t mem = getClientMemoryUsage(c, NULL);
+        int type = getClientType(c);
+        o->cmem[c->last_memory_type] -= (long long)c->last_memory_usage;
+        o->cmem[type] += (long long)mem;
+        c->last_memory_type = type;
+        c->last_memory_usage = mem;
+    }
+    /* On an owner the close is asynchronous (freeClientAsync flags it): main frees it once it has it. */
+    if (closeClientOnOutputBufferLimitReached(c, 1)) {
+        o->cron_closes++;
+        return ownerHandOff(o, c, OWN_WHY_CLOSE);
+    }
+    return 0;
+}
+
+/* RL-g2c-owner-cron: a slice of this owner's clients' cron, once every 1000 / hz ms, as clientsCron spreads main's:
+ * fdmap_cap / hz entries of the fd map from a cursor, so each client is looked at once a second. Returns 1 when a
+ * client went to main. */
+static int ownerClientsCron(owner *o, long long now_us) {
+    int hz = server.hz > 0 ? server.hz : 1;
+    o->cron_period_ms = 1000 / hz;
+    o->cron_next_us = now_us + 1000000LL / hz;
+    o->cron_slices++;
+    int slot = server.unixtime % CLIENTS_PEAK_MEM_USAGE_SLOTS;
+    int next = (slot + 1) % CLIENTS_PEAK_MEM_USAGE_SLOTS;
+    o->peak_in[next] = o->peak_out[next] = 0;
+    if (!o->nclients) return 0;
+    mstime_t now_ms = server.mstime;
+    int handed = 0, span = (o->fdmap_cap + hz - 1) / hz;
+    for (int k = 0; k < span; k++) {
+        if (o->cron_fd >= o->fdmap_cap) o->cron_fd = 0;
+        client *c = o->fdmap[o->cron_fd++];
+        if (!c || !c->owner_onloop) continue;
+        o->cron_clients++;
+        handed |= ownerClientCron(o, c, now_ms, slot);
+    }
+    return handed;
+}
+
+/* Owner, outside a window: the epoll timeout until its next cron slice (-1 with no client). */
+static int ownerCronTimeout(owner *o) {
+    if (!o->nclients) return -1;
+    long long left = o->cron_next_us - (long long)getMonotonicUs();
+    if (left <= 0) return 0;
+    long long ms = (left + 999) / 1000, period = o->cron_period_ms ? o->cron_period_ms : 100;
+    return ms > period ? (int)period : (int)ms;
+}
+
 static void *ownerThreadMain(void *arg) {
     owner *o = arg;
     char name[32];
@@ -4892,7 +5038,7 @@ static void *ownerThreadMain(void *arg) {
 
     struct epoll_event evs[OWNER_EVENTS];
     for (;;) {
-        int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, o->ntlsp ? 0 : -1);
+        int n = epoll_wait(o->epfd, evs, OWNER_EVENTS, o->ntlsp ? 0 : ownerCronTimeout(o));
         if (n < 0) {
             if (errno != EINTR) serverLog(LL_WARNING, "owner %d: epoll_wait: %s", o->id, strerror(errno));
             continue;
@@ -4992,6 +5138,17 @@ static void *ownerThreadMain(void *arg) {
         if (o->unflushed && own_aof_drain && !atomic_load_explicit(&own_stop, memory_order_relaxed))
             ownerDrainAof(o);
         if (o->nrefc) ownerRefsSettle(o); /* no value reference outlives the window */
+        /* RL-g2c: this owner's clients' cron, when a slice is due (not while main waits: the next window). With the
+         * owners' cron off (main runs it) the owner only looks again a period later. */
+        {
+            long long now_us = (long long)getMonotonicUs();
+            if (now_us >= o->cron_next_us) {
+                if (!atomic_load_explicit(&own_cron, memory_order_relaxed))
+                    o->cron_next_us = now_us + 1000LL * (o->cron_period_ms ? o->cron_period_ms : 100);
+                else if (!atomic_load_explicit(&own_stop, memory_order_relaxed))
+                    handed |= ownerClientsCron(o, now_us);
+            }
+        }
         ownerLeave(o);
         if (handed || o->wake_main) {
             uint64_t one = 1;
@@ -5246,6 +5403,22 @@ void ownerInfo(sds *info) {
                          "owner_bigreply_min:%d\r\nowner_ref_replies:%lld\r\nowner_ref_bytes:%lld\r\n"
                          "owner_ref_writes:%lld\r\nowner_ref_copied:%lld\r\nowner_ref_copied_bytes:%lld\r\n",
                          server.owner_bigreply_min, r_replies, r_bytes, r_writes, r_copied, r_copied_bytes);
+    /* RL-g2c-owner-cron: the owners' clients cron, and main's wakes. owner_world_held_us: the time main held the
+     * world (stop to resume); owner_cron_stops / _held_us: stops of iterations no file event woke that ran a cron
+     * timer proc (serverCron, clientsTimeProc), i.e. the owners stopped for cron alone. */
+    long long cc = 0, cs = 0, ct = 0, ccl = 0;
+    for (int i = 0; i < own_n; i++) {
+        cc += owners[i].cron_clients;
+        cs += owners[i].cron_slices;
+        ct += owners[i].cron_timeouts;
+        ccl += owners[i].cron_closes;
+    }
+    *info = sdscatprintf(*info,
+                         "owner_cron:%s\r\nowner_cron_clients:%lld\r\nowner_cron_slices:%lld\r\nowner_cron_timeouts:%lld\r\n"
+                         "owner_cron_obuf_closes:%lld\r\nowner_world_held_us:%lld\r\nowner_cron_stops:%lld\r\n"
+                         "owner_cron_stop_held_us:%lld\r\n",
+                         atomic_load_explicit(&own_cron, memory_order_relaxed) ? "yes" : "no", cc, cs, ct, ccl,
+                         own_held_us, own_cron_stops, own_cron_held_us);
     for (int i = 0; i < own_n; i++) {
         owner *o = &owners[i];
         *info = sdscatprintf(*info, "owner%d:port=%d,cpu=%d,slots=%d-%d,clients=%d,native=%lld,handoffs=%lld\r\n", i,
