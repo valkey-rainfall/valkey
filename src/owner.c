@@ -18,6 +18,8 @@
  * (EXPIRE ... TYPE, EXISTS), each by its stock proc; own_kinds[] lists every native command and its
  * properties. Hash commands stay main's while any hash in the key's table has fields with their own
  * expiry (keys_with_volatile_items): field expiry, its HSETEX rewrites and its tracking are main's.
+ * RL-g2o-long-tail: the real-world long tail of single-key and single-slot data commands too (GETEX ...
+ * TOUCH, OWN_K_TAIL rows), each by its stock proc; under maxmemory APPEND, SETRANGE and SMOVE go to main.
  * MULTI/EXEC too, while every queued command is a queueable one (OWN_K_TXN) on the
  * owner's keys: the owner
  * queues them and runs EXEC within one window. WATCH/UNWATCH of its own keys too: an owner keeps its
@@ -248,8 +250,65 @@ enum {
     OWN_INCRBY,
     OWN_DECR,
     OWN_DECRBY,
+    /* RL-g2o-long-tail: the real-world tail of single-key (or single-slot) data commands, each by its stock
+     * proc as above (OWN_K_TAIL counts them). Left on main on purpose: SPOP, SRANDMEMBER, HRANDFIELD and
+     * ZRANDMEMBER (hashtable sampling draws from genrand64, one global state that is not thread-safe), the
+     * blocking variants, SORT (BY / GET read other keys), commands whose keys are not at a fixed place
+     * (SINTERCARD, ZINTERCARD, OBJECT), field-expiry hash commands (main's keys_with_volatile_items), and
+     * every keyless, admin, pub/sub, stream, script-only and module command. */
+    OWN_GETEX,
+    OWN_GETDEL,
+    OWN_GETSET,
+    OWN_SETNX,
+    OWN_SETEX,
+    OWN_PSETEX,
+    OWN_APPEND,
+    OWN_STRLEN,
+    OWN_GETRANGE,
+    OWN_SUBSTR,
+    OWN_SETRANGE,
+    OWN_INCRBYFLOAT,
+    OWN_MSETNX,
+    OWN_HSETNX,
+    OWN_HINCRBYFLOAT,
+    OWN_HKEYS,
+    OWN_HVALS,
+    OWN_HSTRLEN,
+    OWN_LPUSHX,
+    OWN_RPUSHX,
+    OWN_LSET,
+    OWN_LINSERT,
+    OWN_LREM,
+    OWN_LTRIM,
+    OWN_LPOS,
+    OWN_RPOPLPUSH,
+    OWN_LMOVE,
+    OWN_SMISMEMBER,
+    OWN_SMOVE,
+    OWN_ZREVRANGE,
+    OWN_ZRANGEBYSCORE,
+    OWN_ZREVRANGEBYSCORE,
+    OWN_ZRANGEBYLEX,
+    OWN_ZREVRANGEBYLEX,
+    OWN_ZRANK,
+    OWN_ZREVRANK,
+    OWN_ZCOUNT,
+    OWN_ZLEXCOUNT,
+    OWN_ZMSCORE,
+    OWN_ZPOPMIN,
+    OWN_ZPOPMAX,
+    OWN_ZREMRANGEBYSCORE,
+    OWN_ZREMRANGEBYRANK,
+    OWN_ZREMRANGEBYLEX,
+    OWN_EXPIRETIME,
+    OWN_PEXPIRETIME,
+    OWN_UNLINK,
+    OWN_TOUCH,
     OWN_NCMDS
 };
+/* RL-g2o-long-tail: every kind a script may run (OWN_K_SCRIPT) is below OWN_DECRBY + 1, so a script run's
+ * per-kind stats (ownerScriptRunState) stay as long as the parent's (ownerThreadsInit checks it). */
+#define OWN_SCRIPT_NCMDS (OWN_DECRBY + 1)
 
 /* own_kinds[].flags */
 #define OWN_K_READ 1 /* only reads its keys: runs under a write veto (OWN_VETO_WRITE), as GET does */
@@ -257,13 +316,15 @@ enum {
                       * goes to main with the transaction */
 #define OWN_K_SCRIPT 4 /* RL-g1f: a script on an owner may run it (ownerScriptCommand) */
 #define OWN_K_INNER 8  /* RL-g1f: only inside an owner's script; a client's own command goes to main */
+#define OWN_K_TAIL 16  /* RL-g2o-long-tail: a long-tail kind (INFO owner_tail_commands) */
 /* own_kinds[].keys: where the keys are (ownerKeySlot). */
 enum {
-    OWN_KEYS_NONE,  /* no key (PING, MULTI, EXEC, ...): no slot */
-    OWN_KEYS_ONE,   /* argv[1] only (the rest are fields, values, options) */
-    OWN_KEYS_ALL,   /* argv[1..]: every one in the same slot */
-    OWN_KEYS_PAIRS, /* argv[1], argv[3], ...: key value pairs, every key in the same slot */
-    OWN_KEYS_SCRIPT /* EVALSHA / EVAL: numkeys at argv[2], the keys after it, all in one slot (at least one) */
+    OWN_KEYS_NONE,   /* no key (PING, MULTI, EXEC, ...): no slot */
+    OWN_KEYS_ONE,    /* argv[1] only (the rest are fields, values, options) */
+    OWN_KEYS_ALL,    /* argv[1..]: every one in the same slot */
+    OWN_KEYS_PAIRS,  /* argv[1], argv[3], ...: key value pairs, every key in the same slot */
+    OWN_KEYS_SCRIPT, /* EVALSHA / EVAL: numkeys at argv[2], the keys after it, all in one slot (at least one) */
+    OWN_KEYS_TWO     /* RL-g2o: argv[1] and argv[2] (source, destination), in the same slot */
 };
 /* own_kinds[].mm: what the command can add under maxmemory beyond its arguments and a reply block,
  * which ownerMmCmdFits counts for every command (ownerMmMore). */
@@ -277,8 +338,11 @@ enum {
                     * hashtable (ownerHashBound) */
     OWN_MM_SET_W,  /* SADD: an intset or listpack may be rebuilt (ownerSetZsetBound) */
     OWN_MM_ZSET_W, /* ZADD, ZINCRBY: a listpack may be rebuilt, a tree node may split (ownerSetZsetBound) */
-    OWN_MM_COLL_R  /* SMEMBERS, ZRANGE: at most the whole compact collection; no cheap bound on a hashtable
+    OWN_MM_COLL_R, /* SMEMBERS, ZRANGE: at most the whole compact collection; no cheap bound on a hashtable
                     * or a tree (ownerSetZsetBound) */
+    OWN_MM_KEYVAL, /* RL-g2o: its reply holds the string stored at argv[1] (GETEX, GETDEL, GETSET, GETRANGE) */
+    OWN_MM_UNBOUND /* RL-g2o: no cheap bound (APPEND and SETRANGE grow a string by sds growth, SMOVE grows its
+                    * destination): under maxmemory main runs it */
 };
 /* own_kinds[].family: the per-family INFO counters (owner_<family>_commands). */
 enum { OWN_FAM_STRING, OWN_FAM_TXN, OWN_FAM_LIST, OWN_FAM_KEYSPACE, OWN_FAM_HASH, OWN_FAM_SETZSET, OWN_FAM_SCRIPT, OWN_NFAM };
@@ -349,9 +413,63 @@ static const ownKind own_kinds[OWN_NCMDS] = {
      * DECR and DECRBY only inside an owner's script. */
     [OWN_EVALSHA] = {"evalsha", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
     [OWN_EVAL] = {"eval", 0, OWN_KEYS_SCRIPT, OWN_MM_NONE, OWN_FAM_SCRIPT},
-    [OWN_INCRBY] = {"incrby", OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_DECR] = {"decr", OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
-    [OWN_DECRBY] = {"decrby", OWN_K_SCRIPT | OWN_K_INNER, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    /* RL-g2o-long-tail: a client's own INCRBY, DECR and DECRBY run natively too (incrDecrCommand, as INCR). */
+    [OWN_INCRBY] = {"incrby", OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_DECR] = {"decr", OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_DECRBY] = {"decrby", OWN_K_SCRIPT | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    /* RL-g2o-long-tail: not queued natively (inside MULTI main queues them), not run by an owner's script.
+     * Reads (OWN_K_READ) only read their keys. Writes propagate as their stock procs rewrite them (GETEX:
+     * PEXPIREAT or PERSIST; GETDEL: DEL; SETEX, PSETEX: SET PXAT; INCRBYFLOAT, HINCRBYFLOAT: SET KEEPTTL,
+     * HSET; ZPOPMIN, ZPOPMAX as they are); a push wakes nobody (any blocked client vetoes the native path,
+     * as for LPUSH). */
+    [OWN_GETEX] = {"getex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_GETDEL] = {"getdel", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_GETSET] = {"getset", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SETNX] = {"setnx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_SETEX] = {"setex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_PSETEX] = {"psetex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_APPEND] = {"append", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
+    [OWN_STRLEN] = {"strlen", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_GETRANGE] = {"getrange", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SUBSTR] = {"substr", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_KEYVAL, OWN_FAM_STRING},
+    [OWN_SETRANGE] = {"setrange", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_UNBOUND, OWN_FAM_STRING},
+    [OWN_INCRBYFLOAT] = {"incrbyfloat", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_MSETNX] = {"msetnx", OWN_K_TAIL, OWN_KEYS_PAIRS, OWN_MM_NONE, OWN_FAM_STRING},
+    [OWN_HSETNX] = {"hsetnx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HINCRBYFLOAT] = {"hincrbyfloat", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_W, OWN_FAM_HASH},
+    [OWN_HKEYS] = {"hkeys", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HVALS] = {"hvals", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_HASH_R, OWN_FAM_HASH},
+    [OWN_HSTRLEN] = {"hstrlen", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_HASH},
+    [OWN_LPUSHX] = {"lpushx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_RPUSHX] = {"rpushx", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LSET] = {"lset", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LINSERT] = {"linsert", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LREM] = {"lrem", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LTRIM] = {"ltrim", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_LIST},
+    [OWN_LPOS] = {"lpos", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_RPOPLPUSH] = {"rpoplpush", OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_LMOVE] = {"lmove", OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_LIST, OWN_FAM_LIST},
+    [OWN_SMISMEMBER] = {"smismember", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_SMOVE] = {"smove", OWN_K_TAIL, OWN_KEYS_TWO, OWN_MM_UNBOUND, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGE] = {"zrevrange", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANGEBYSCORE] = {"zrangebyscore", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGEBYSCORE] = {"zrevrangebyscore", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANGEBYLEX] = {"zrangebylex", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREVRANGEBYLEX] = {"zrevrangebylex", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZRANK] = {"zrank", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREVRANK] = {"zrevrank", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZCOUNT] = {"zcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZLEXCOUNT] = {"zlexcount", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZMSCORE] = {"zmscore", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZPOPMIN] = {"zpopmin", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZPOPMAX] = {"zpopmax", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_COLL_R, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYSCORE] = {"zremrangebyscore", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYRANK] = {"zremrangebyrank", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_ZREMRANGEBYLEX] = {"zremrangebylex", OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_SETZSET},
+    [OWN_EXPIRETIME] = {"expiretime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_PEXPIRETIME] = {"pexpiretime", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ONE, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_UNLINK] = {"unlink", OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
+    [OWN_TOUCH] = {"touch", OWN_K_READ | OWN_K_TAIL, OWN_KEYS_ALL, OWN_MM_NONE, OWN_FAM_KEYSPACE},
 };
 static const char *const own_fam_names[OWN_NFAM] = {
     [OWN_FAM_STRING] = "string", [OWN_FAM_TXN] = "txn",   [OWN_FAM_LIST] = "list",
@@ -515,6 +633,7 @@ typedef struct owner {
     long long burst_total, bursts_total; /* GETs answered by bursts, and the bursts (ownerGetBurst) */
     long long setburst_total, setbursts_total; /* SETs answered by SET bursts, and those bursts (ownerSetBurst) */
     long long fam_total[OWN_NFAM]; /* RL-1: native commands by family (own_kinds[].family; in native_total too) */
+    long long tail_total;          /* RL-g2o: native long-tail commands (OWN_K_TAIL; in native_total too) */
     /* io_uring (owner-uring): the owner's own ring, used only by the owner thread, inside its windows.
      * Every op is MSG_DONTWAIT and completes inside the io_uring_enter that submits it, so no op is in
      * flight outside a window and main never sees one: the sockets, query buffers and replies are
@@ -899,6 +1018,7 @@ void ownerThreadsInit(void) {
         /* By original name: rename-command moves the same command under another name. */
         own_cmds[k] = lookupCommandByCStringLogic(server.orig_commands, own_kinds[k].name);
         serverAssert(own_cmds[k] != NULL);
+        serverAssert(!(own_kinds[k].flags & OWN_K_SCRIPT) || k < OWN_SCRIPT_NCMDS);
         own_cmds[k]->owner_kind = k + 1; /* ownerKindOf */
     }
     /* A burst takes "GET"/"get" frames for getCommand: only while that name still means it. */
@@ -2952,6 +3072,8 @@ static size_t ownerMmMore(client *c, struct serverCommand *cmd, robj **argv, int
     case OWN_MM_SET_W:
     case OWN_MM_ZSET_W:
     case OWN_MM_COLL_R: return ownerSetZsetBound(c, slot, argv[1], argc, own_kinds[kind].mm);
+    case OWN_MM_KEYVAL: return ownerStoredLenOf(c, slot, argv[1]);
+    case OWN_MM_UNBOUND: return SIZE_MAX;
     default: return 0;
     }
 }
@@ -3033,6 +3155,14 @@ static int ownerKeySlot(struct serverCommand *cmd, robj **argv, int argc, int re
             if (ownerKeyHashSlot(key, sdslen(key)) != slot) return -1;
         }
         return slot;
+    }
+    case OWN_KEYS_TWO: {
+        /* RL-g2o: source and destination (RPOPLPUSH, LMOVE, SMOVE), in one slot. */
+        if (argc < 3) return -1;
+        sds key = objectGetVal(argv[1]);
+        int slot = ownerKeyHashSlot(key, sdslen(key));
+        key = objectGetVal(argv[2]);
+        return ownerKeyHashSlot(key, sdslen(key)) == slot ? slot : -1;
     }
     default: return -1;
     }
@@ -3155,7 +3285,7 @@ typedef struct ownerScriptRunState {
     int nundo, nops;
     ownerUndo undo[OWN_SCRIPT_UNDO_MAX];
     int ops[OWN_SCRIPT_OPS_MAX]; /* indices in ectx->also_propagate of the run's write ops */
-    long long calls[OWN_NCMDS], usec[OWN_NCMDS];
+    long long calls[OWN_SCRIPT_NCMDS], usec[OWN_SCRIPT_NCMDS];
 } ownerScriptRunState;
 
 sds evalScriptBodyForOwner(const char *sha);
@@ -3452,7 +3582,7 @@ static int ownerScriptRun(owner *o, client *c) {
     if (r == 0 && !st->abort) {
         addReplyProto(c, out, out_len);
         zfree(out);
-        for (int k = 0; k < OWN_NCMDS; k++) {
+        for (int k = 0; k < OWN_SCRIPT_NCMDS; k++) {
             o->cs[k].calls += st->calls[k];
             o->cs[k].usec += st->usec[k];
         }
@@ -3817,6 +3947,7 @@ static int ownerCall(owner *o, client *c, struct serverCommand *cmd, int kind, i
     ectx->stat_numcommands++;
     o->native_total++;
     o->fam_total[own_kinds[kind].family]++;
+    if (own_kinds[kind].flags & OWN_K_TAIL) o->tail_total++;
     ectx->in_call--;
     ectx->executing_client = prev_client;
     return 1;
@@ -5696,6 +5827,10 @@ void ownerInfo(sds *info) {
         for (int i = 0; i < own_n; i++) n += owners[i].fam_total[f];
         *info = sdscatprintf(*info, "owner_%s_commands:%lld\r\n", own_fam_names[f], n);
     }
+    /* RL-g2o-long-tail: native long-tail commands (OWN_K_TAIL kinds; counted in their families too). */
+    long long tail_n = 0;
+    for (int i = 0; i < own_n; i++) tail_n += owners[i].tail_total;
+    *info = sdscatprintf(*info, "owner_tail_commands:%lld\r\n", tail_n);
     /* RL-g1d: owner TLS ports; handshakes and TLS reads the owners ran. */
     long long tls_hs = 0, tls_rd = 0;
     for (int i = 0; i < own_n; i++) {
