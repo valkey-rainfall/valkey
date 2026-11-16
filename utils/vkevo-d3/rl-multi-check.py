@@ -6,8 +6,10 @@
 
 Servers (127.0.0.1, appendonly always RESP, stream-node-max-entries 8): the candidate (owners) at P / OP+, its
 replica at P+1 / OP+30+, the parent at P+20 / OP+20+ and its replica at P+21 / OP+50+; AOF reloads of each at P+2 and
-P+3. Every reply uses explicit stream IDs and no wall-clock field, so replies are deterministic; DEBUG DIGEST (whole
-db, includes expires) is the keyspace / replica / reload check.
+P+3. Every reply uses explicit stream IDs and no wall-clock field, so replies are deterministic. A.digest / B compare
+the whole db (DEBUG DIGEST, incl. expire markers) before any background load; the final primary / replica / reload
+checks compare DEBUG DIGEST-VALUE over the explicit model keyspace, so the candidate-only memtier load below is
+excluded.
   A  lockstep: one seeded sequence of MULTI/EXEC blocks (2-6 one-slot commands across strings, counters, hashes, lists,
      sets, zsets, keyspace, the long-tail kinds and streams), interleaved with single commands, DISCARD, WATCH ... EXEC
      and WATCH ... (touch) ... EXEC races, nested MULTI, EXEC without MULTI, a queued bad-arity / unknown command
@@ -130,7 +132,9 @@ class Gen:
         if c < 0.65:
             return ["SADD", k + ":t", "m%d" % r.randrange(20)]
         if c < 0.68:
-            return ["SPOP", k + ":t"]
+            # SREM of a seeded member (not SPOP): the popped member is random per process, so
+            # SPOP replies/digests would diverge between two independent servers; SREM is deterministic.
+            return ["SREM", k + ":t", "m%d" % r.randrange(20)]
         if c < 0.72:
             return ["ZADD", k + ":z", str(r.randrange(100)), "m%d" % r.randrange(20)]
         if c < 0.75:
@@ -178,6 +182,33 @@ def norm(rep):
 
 def digest(c):
     return c.cmd("DEBUG", "DIGEST")
+
+
+def kdigest(c, keys):
+    # Per-key value digests over an explicit key set (DEBUG DIGEST-VALUE). Excludes unrelated keys such as the
+    # memtier background-load keys, which hit the candidate only and would otherwise skew a whole-db DIGEST between
+    # the candidate and the parent (and between their replicas / AOF reloads).
+    out = []
+    for i in range(0, len(keys), 256):
+        out += c.cmd("DEBUG", "DIGEST-VALUE", *keys[i:i + 256])
+    return out
+
+
+# key suffixes the generator and the atomicity test create under each one-slot group
+GEN_SUFFIXES = (":s", ":c", ":h", ":l", ":l2", ":t", ":z", ":x", ":w")
+ATOM_SUFFIXES = (":a", ":b", ":log")
+
+
+def model_keys(groups, tgroups):
+    allk = []
+    for g in groups:
+        allk += ["{%s}%s" % (g, s) for s in GEN_SUFFIXES]
+    for j in range(4):
+        allk += ["{atom%d}%s" % (j, s) for s in ATOM_SUFFIXES]
+    for tg in tgroups:
+        for g in tg:
+            allk += ["{%s}%s" % (g, s) for s in GEN_SUFFIXES]
+    return sorted(set(allk))
 
 
 def run_block(conn, block):
@@ -308,7 +339,7 @@ def main():
                 g = "atom%d" % (j % 4)
                 s = key_slot("{%s}" % g)
                 p = port if host == "main" else oport_of(s)
-                conns.append((Conn("127.0.0.1", p), g))
+                conns.append((Conn(p), g))
             for _ in range(rounds):
                 for conn, g in conns:
                     conn.cmd("MULTI")
@@ -402,14 +433,18 @@ def main():
         check("native.txn", ival(o1, "owner_txn_commands") > 0,
               "owner_txn_commands %s, owner_handoffs_to_main %s" % (o1.get("owner_txn_commands"), o1.get("owner_handoffs_to_main")))
 
-        # digests: primary, replica, reload (all vs the parent's own)
+        # digests over the explicit model keyspace (not whole-db): the memtier load above writes only to the
+        # candidate, so a whole-db DIGEST would differ on that noise; A.digest / B.atomicity already compared the
+        # whole db (incl. expire markers) before any load.
+        allk = model_keys(groups, tgroups)
         if not (bp_wait(cand, crep) and bp_wait(ref, rrep)):
             check("state.replica_sync", False, "a replica did not catch up")
-        dprimc, dprimr = digest(cand.c()), digest(ref.c())
-        check("state.cand_vs_parent", dprimc == dprimr, "primary DIGEST cand %s parent %s" % (dprimc, dprimr))
-        drepc, drepr = digest(crep.c()), digest(rrep.c())
-        check("state.replica", drepc == drepr, "replica DIGEST cand %s parent %s (each vs its own primary: cand %s, parent %s)" % (
-            drepc, drepr, drepc == dprimc, drepr == dprimr))
+        sc, sr = kdigest(cand.c(), allk), kdigest(ref.c(), allk)
+        ndiff = sum(1 for x, y in zip(sc, sr) if x != y)
+        check("state.cand_vs_parent", sc == sr, "%d model keys DIGEST-VALUE equal; %d differ" % (len(allk), ndiff))
+        scr, srr = kdigest(crep.c(), allk), kdigest(rrep.c(), allk)
+        check("state.replica", scr == srr, "%d model keys: cand replica == parent replica (%d differ); each vs its own primary: cand %s, parent %s" % (
+            len(allk), sum(1 for x, y in zip(scr, srr) if x != y), scr == sc, srr == sr))
         for s in servers:
             s.stop()
         servers = []
@@ -421,8 +456,9 @@ def main():
                      ["--appendonly", "yes", "--aof-incr-format", "resp", "--stream-node-max-entries", "8"])
         shutil.copytree(os.path.join(ref.dir, "appendonlydir"), os.path.join(rr2.dir, "appendonlydir"))
         rr2.start(); servers.append(rr2)
-        dlc, dlr = digest(rl.c()), digest(rr2.c())
-        check("state.aof_reload", dlc == dlr, "AOF reload DIGEST cand %s parent %s" % (dlc, dlr))
+        slc, slr = kdigest(rl.c(), allk), kdigest(rr2.c(), allk)
+        check("state.aof_reload", slc == slr, "%d model keys AOF reload DIGEST-VALUE equal; %d differ" % (
+            len(allk), sum(1 for x, y in zip(slc, slr) if x != y)))
     except Exception as e:
         import traceback
         traceback.print_exc()
