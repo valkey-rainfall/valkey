@@ -42,6 +42,8 @@ static int repl_sender_stop = 0;
 static _Atomic(long long) repl_sender_wake_offset;      /* stable offset last published */
 static _Atomic(long long) repl_sender_last_wake_offset; /* stable offset at the sender's last append-mode wake */
 static _Atomic int repl_sender_idle;                    /* 1 while the sender is parked in cond_wait */
+static __thread int repl_sender_defer;                  /* RL-g7b: this thread defers its sender wakes */
+static __thread int repl_sender_wake_due;               /* RL-g7b: a deferred wake is pending */
 
 /* RL-g3h replica flow control. After each pass the sender knows, for every replica it feeds, how many published
  * bytes it has not been able to send (stable offset minus the replica's sent offset): a replica that applies slower
@@ -186,6 +188,14 @@ static int replStreamSendOne(client *replica, long long stable) {
 static void *replStreamSenderMain(void *arg) {
     UNUSED(arg);
     valkey_set_thread_title("repl_sender");
+    /* RL-g7b-repl-primary: a thread starts with its creator's CPUs, and main creates the sender, so it ran on main's
+     * CPU, which in the owner layout is owner 0's (server-cpulist = the first owner CPU). There it took about a sixth
+     * of owner 0's core at a W=16 primary's 330 MB/s stream and preempted owner 0 at each of its wakes, so owner 0
+     * served its clients slower than the others. Run it with main's helpers instead: repl-stream-sender-cpulist
+     * (hidden) when set ("main" keeps main's CPUs), else bio-cpulist when set, else main's CPUs as before. Where the
+     * sender runs changes nothing it sends: the same bytes in the same order, below the same stable offset. */
+    const char *cpus = server.repl_sender_cpulist ? server.repl_sender_cpulist : server.bio_cpulist;
+    if (cpus && strcasecmp(cpus, "main")) serverSetCpuAffinity(cpus);
     /* Scratch for one pass's snapshot, grown as the replica set grows. The sender is the
      * only user, so no locking on it. */
     client **snapshot = NULL;
@@ -312,6 +322,30 @@ void replStreamSenderPublishAppend(long long offset) {
     if (listLength(repl_sender_replicas) == 0) return; /* RL-2d: nothing to send to */
     long long since = atomic_load_explicit(&repl_sender_last_wake_offset, memory_order_acquire);
     if (offset - since < server.repl_stream_sender_wake_bytes) return;
+    if (repl_sender_defer) { /* RL-g7b: an owner holding own_aof_mu wakes the sender once it has let go */
+        repl_sender_wake_due = 1;
+        return;
+    }
+    atomic_fetch_add_explicit(&server.stat_repl_sender_main_wakes, 1, memory_order_relaxed);
+    pthread_cond_signal(&repl_sender_cond);
+}
+
+/* RL-g7b-repl-primary: owners append their records to the stream one at a time under own_aof_mu
+ * (ownerDrainAof), and the append's wake of a parked sender (replStreamSenderPublishAppend:
+ * pthread_cond_signal, a futex syscall) ran inside that lock, so every owner waiting for the lock
+ * waited behind the syscall too. With wakes deferred (on this thread only) the append just notes the
+ * wake; replStreamSenderWakeDeferred, called once the lock is released, issues it. The stable offset
+ * is still published inside the append, so the bytes and their order are unchanged; only the wake
+ * comes a few instructions later (and the sender's 1 ms backstop covers a sender that parks in
+ * between, as it already covered a signal racing its wait). */
+void replStreamSenderDeferWakes(int on) {
+    repl_sender_defer = on;
+}
+
+void replStreamSenderWakeDeferred(void) {
+    if (!repl_sender_wake_due) return;
+    repl_sender_wake_due = 0;
+    if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
     atomic_fetch_add_explicit(&server.stat_repl_sender_main_wakes, 1, memory_order_relaxed);
     pthread_cond_signal(&repl_sender_cond);
 }
@@ -648,6 +682,11 @@ void replStreamSenderPublishStable(long long offset) {
 }
 void replStreamSenderPublishAppend(long long offset) {
     UNUSED(offset);
+}
+void replStreamSenderDeferWakes(int on) {
+    UNUSED(on);
+}
+void replStreamSenderWakeDeferred(void) {
 }
 void replStreamSenderAdd(client *replica) {
     UNUSED(replica);

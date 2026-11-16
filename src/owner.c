@@ -765,6 +765,7 @@ typedef struct owner {
     ownerPropUnit *units;
     int nunits, units_cap;
     int unflushed;  /* ops not written to the AOF yet: this owner's replies wait (ownerReplyOut) */
+    _Atomic int drain_req; /* RL-g7b: 1 = this window's stream records wait for the lock holder, 2 = appended */
     int release;    /* main: the AOF has them now, write the held replies (ownerWriteHeld) */
     int may_leave;    /* RL-g4a: this window may leave work for the next one on a pending stop (ownerStopPending) */
     int left_early;   /* RL-g4a: this window left work for the next one */
@@ -985,6 +986,12 @@ static int own_split = 0;
 static long long own_split_ops = 0; /* INFO: ops the owners encoded twice (compact for the AOF, RESP for the stream) */
 static pthread_mutex_t own_aof_mu = PTHREAD_MUTEX_INITIALIZER;
 static long long own_aof_drains = 0;      /* owner AOF writes (under own_aof_mu) */
+/* RL-g7b: own_aof_mu taken by owners (ownerAofLock): at once, after a short spin, after sleeping on it */
+static _Atomic long long own_aof_lock_takes = 0, own_aof_lock_spun = 0, own_aof_lock_sleeps = 0;
+/* RL-g7b: replication only, no maxmemory (owner-repl-combine): the lock holder appends the waiting owners' records
+ * too (ownerDrainCombined); batches appended for another owner, and holds that appended any */
+static int own_combine = 0;
+static _Atomic long long own_drain_combined = 0, own_drain_combines = 0;
 #define OWN_AOF_FSYNC_BYTES (32LL << 20) /* everysec: an owner drain starts an fsync once this much is unsynced */
 static int own_mm = 0;                    /* maxmemory: native steps check their headroom */
 static long long own_mm_slice = 0;        /* bytes each owner may add this period */
@@ -1832,6 +1839,9 @@ static void ownerResumeWorld(void) {
     /* Each owner appends its own records at the end of its window, except under appendfsync always
      * (main writes every owner's records at its stop and fsyncs them once). */
     own_aof_drain = own_keep && !(own_aof && server.aof_fsync == AOF_FSYNC_ALWAYS);
+    /* RL-g7b: replication without the AOF and without maxmemory (the owners' memory leases count each owner's
+     * own allocations, and a combined append allocates for another owner): the drains combine. */
+    own_combine = server.owner_repl_combine && own_repl && !own_aof && server.maxmemory == 0;
     /* RL-g2b: the owners expire their own keys while nothing vetoes the native path and the stock
      * cycle would run (activeExpireCycle's conditions on main); otherwise main expires every key. */
     int expire = server.owner_active_expire && !own_last_veto && server.active_expire_enabled && iAmPrimary() &&
@@ -3324,8 +3334,96 @@ static void ownerTakeProp(owner *o, client *c) {
  * than stock: data is fsynced sooner; the write policy and the reply release are unchanged.
  * shortcut: one byte threshold for every disk. Upgrade: derive it from the measured fsync time if
  * disks differ a lot. */
-static void ownerDrainAof(owner *o) {
+/* RL-g7b-repl-primary: with a replica every owner window that wrote ends here, so own_aof_mu is taken
+ * once per such window by every owner (86,000 times a second at a W=16 primary's 3.2M ops/s), each
+ * hold a few microseconds (the records' copy into the replication buffer). A pthread mutex sleeps on a
+ * futex as soon as it is held: 21% of those takes went to sleep (1,150 sleeps a second per owner),
+ * each a futex wait, a futex wake by the holder and a scheduler round trip, longer than the hold
+ * itself. ownerAofLock first spins up to OWN_AOF_LOCK_SPINS tries (a few holds' worth), then
+ * sleeps as before. The lock, what it covers and the order in which owners append are the same. */
+#define OWN_AOF_LOCK_SPINS 512
+static void ownerAofLock(void) {
+    if (pthread_mutex_trylock(&own_aof_mu) == 0) {
+        atomic_fetch_add_explicit(&own_aof_lock_takes, 1, memory_order_relaxed);
+        return;
+    }
+    for (int i = 0; i < OWN_AOF_LOCK_SPINS; i++) {
+        ownerCpuRelax();
+        if (pthread_mutex_trylock(&own_aof_mu) == 0) {
+            atomic_fetch_add_explicit(&own_aof_lock_spun, 1, memory_order_relaxed);
+            return;
+        }
+    }
     pthread_mutex_lock(&own_aof_mu);
+    atomic_fetch_add_explicit(&own_aof_lock_sleeps, 1, memory_order_relaxed);
+}
+
+/* RL-g7b-repl-primary: replication only (own_combine), flat combining on own_aof_mu. At a W=32 loopback primary
+ * half of the owners' takes of the lock found it held and the lock went round 680,000 times a second, each time
+ * pulling the mutex, the replication buffer's tail and the backlog's and the replica's state to another core: the
+ * lock was the primary's limit, and owners waiting on it sat idle (futex) or spun. Here an owner that finds it
+ * held posts its records (drain_req = 1) and waits on its own flag; whichever owner holds the lock appends its own
+ * records and then every posted owner's, in owner order, each as ownerAofAppend appends one owner's (SELECT, the
+ * bytes, the WAIT offsets), and marks each done (2) before letting go. Every owner's records still go in whole and
+ * in its execution order, and owners still go one at a time, so the stream is one the lock could have produced:
+ * the same bytes, each owner's in order. An owner touches another's records and clients only while that owner
+ * waits for its flag (release / acquire), as a lock handoff would hand them over. A poster that sees the lock
+ * free takes it and appends what is still posted. Under maxmemory (each owner's lease counts its own allocations)
+ * or with the AOF this stays off: ownerDrainAof's path. */
+#define OWN_COMBINE_SPINS 200000
+static void ownerDrainCombined(owner *o) {
+    int got = pthread_mutex_trylock(&own_aof_mu) == 0;
+    if (got) {
+        atomic_fetch_add_explicit(&own_aof_lock_takes, 1, memory_order_relaxed);
+    } else {
+        atomic_store_explicit(&o->drain_req, 1, memory_order_release);
+        for (long i = 0;; i++) {
+            if (atomic_load_explicit(&o->drain_req, memory_order_acquire) == 2) break;
+            if ((i & 31) == 31 && pthread_mutex_trylock(&own_aof_mu) == 0) {
+                got = 1;
+                atomic_fetch_add_explicit(&own_aof_lock_spun, 1, memory_order_relaxed);
+                break;
+            }
+            if (i >= OWN_COMBINE_SPINS) {
+                pthread_mutex_lock(&own_aof_mu);
+                got = 1;
+                atomic_fetch_add_explicit(&own_aof_lock_sleeps, 1, memory_order_relaxed);
+                break;
+            }
+            ownerCpuRelax();
+        }
+    }
+    if (got) {
+        replStreamSenderDeferWakes(1);
+        if (atomic_load_explicit(&o->drain_req, memory_order_acquire) != 2) ownerAofAppend(o);
+        long long served = 0;
+        for (int i = 0; i < own_n; i++) {
+            owner *x = &owners[i];
+            if (x == o || atomic_load_explicit(&x->drain_req, memory_order_acquire) != 1) continue;
+            ownerAofAppend(x);
+            atomic_store_explicit(&x->drain_req, 2, memory_order_release);
+            served++;
+        }
+        pthread_mutex_unlock(&own_aof_mu);
+        replStreamSenderDeferWakes(0);
+        replStreamSenderWakeDeferred();
+        if (served) {
+            atomic_fetch_add_explicit(&own_drain_combined, served, memory_order_relaxed);
+            atomic_fetch_add_explicit(&own_drain_combines, 1, memory_order_relaxed);
+        }
+    }
+    atomic_store_explicit(&o->drain_req, 0, memory_order_relaxed);
+    o->unflushed = 0;
+    if (o->nheld) ownerWriteHeld(o);
+}
+
+static void ownerDrainAof(owner *o) {
+    if (own_combine) {
+        ownerDrainCombined(o);
+        return;
+    }
+    ownerAofLock();
+    replStreamSenderDeferWakes(1);
     ownerAofAppend(o);
     int hold = 0, err = 0;
     if (own_aof) {
@@ -3342,6 +3440,8 @@ static void ownerDrainAof(owner *o) {
         if (own_repl && !hold) replStreamSenderPublishStable(server.primary_repl_offset);
     }
     pthread_mutex_unlock(&own_aof_mu);
+    replStreamSenderDeferWakes(0);
+    replStreamSenderWakeDeferred();
     if (err) {
         atomic_fetch_or_explicit(&own_veto, OWN_VETO_WRITE, memory_order_relaxed);
         o->wake_main = 1;
@@ -7403,6 +7503,14 @@ void ownerInfo(sds *info) {
                          own_resume_broadcasts, own_resume_broadcast_us);
     *info = sdscatprintf(*info, "owner_repl_native:%s\r\nowner_repl:%s\r\nowner_repl_ops:%lld\r\nowner_repl_bytes:%lld\r\n",
                          server.owner_repl_native ? "yes" : "no", own_repl ? "yes" : "no", own_repl_ops, own_repl_bytes);
+    /* RL-g7b: how owners got own_aof_mu at the end of their windows (ownerAofLock) */
+    *info = sdscatprintf(*info, "owner_drain_lock_takes:%lld\r\nowner_drain_lock_spun:%lld\r\nowner_drain_lock_sleeps:%lld\r\n",
+                         atomic_load_explicit(&own_aof_lock_takes, memory_order_relaxed),
+                         atomic_load_explicit(&own_aof_lock_spun, memory_order_relaxed),
+                         atomic_load_explicit(&own_aof_lock_sleeps, memory_order_relaxed));
+    *info = sdscatprintf(*info, "owner_repl_combine:%s\r\nowner_drain_combined:%lld\r\nowner_drain_combines:%lld\r\n",
+                         own_combine ? "yes" : "no", atomic_load_explicit(&own_drain_combined, memory_order_relaxed),
+                         atomic_load_explicit(&own_drain_combines, memory_order_relaxed));
     /* D3-all-g14-fold: owner_repl_split: the owners encode each record twice (compact AOF, RESP stream). */
     *info = sdscatprintf(*info, "owner_repl_split:%s\r\nowner_repl_split_ops:%lld\r\n", own_split ? "yes" : "no",
                          own_split_ops);

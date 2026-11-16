@@ -2211,6 +2211,7 @@ struct valkeyServer {
     int owner_light_cron;                     /* owner-light-cron (RL-g3b): timer wakes with no owner-state work leave the owners running (default yes). */
     int owner_active_expire;                  /* owner-active-expire: owners run the active expire cycle over their own keys (default yes, RL-g2b). */
     int owner_repl_native;                    /* owner-repl-native: owners stay native with replicas / a backlog (g11-repl, default yes). */
+    int owner_repl_combine;                   /* owner-repl-combine: RL-g7b, the owners' stream appends combine (default yes). */
     int owner_repl_sender;                    /* owner-repl-sender: with owner threads, repl-stream-sender starts as append (default yes). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
@@ -2868,6 +2869,7 @@ struct valkeyServer {
     /* cpu affinity */
     char *server_cpulist;         /* cpu affinity list of server main/io thread. */
     char *bio_cpulist;            /* cpu affinity list of bio thread. */
+    char *repl_sender_cpulist;    /* RL-g7b: repl-stream-sender thread's (unset: bio_cpulist; "main": main's) */
     char *aof_rewrite_cpulist;    /* cpu affinity list of aof rewrite process. */
     char *bgsave_cpulist;         /* cpu affinity list of bgsave process. */
     char *slot_migration_cpulist; /* cpu affinity list of slot migration process. */
@@ -3879,6 +3881,8 @@ void replStreamAccountCursor(client *c, long long sent);
 int replStreamSenderEligible(client *replica);
 void replStreamSenderPublishStable(long long offset);
 void replStreamSenderPublishAppend(long long offset);
+void replStreamSenderDeferWakes(int on);
+void replStreamSenderWakeDeferred(void);
 void replStreamSenderAdd(client *replica);
 void replStreamSenderAdoptSettled(client *replica);
 int replStreamSenderAdoptStarted(client *replica);

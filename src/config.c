@@ -3596,6 +3596,7 @@ standardConfig static_configs[] = {
     createBoolConfig("owner-light-cron", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_light_cron, 1, NULL, NULL), /* vkevo RL-g3b: timer wakes without owner-state work do not stop the owners */
     createBoolConfig("owner-active-expire", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_active_expire, 1, NULL, NULL), /* vkevo RL-g2b: owners run active expiry over their own keys; no = main, as before */
     createBoolConfig("owner-repl-native", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_native, 1, NULL, NULL), /* vkevo g11-repl: owners native with replicas attached */
+    createBoolConfig("owner-repl-combine", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_combine, 1, NULL, NULL), /* vkevo RL-g7b: owners' stream appends combine on own_aof_mu (replication only) */
     createBoolConfig("owner-repl-sender", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.owner_repl_sender, 1, NULL, NULL), /* vkevo g11-repl: owner threads start repl-stream-sender append */
     createIntConfig("owner-uring-deep", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.owner_uring_deep, 0, INTEGER_CONFIG, NULL, NULL), /* vkevo g9-fold: 0 = batch deep pipelines too */
     createIntConfig("owner-spin-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 100000, server.owner_spin_us, 50, INTEGER_CONFIG, NULL, NULL), /* vkevo RL-g2f: idle owners poll before sleeping (0: off) */
@@ -3639,6 +3640,7 @@ standardConfig static_configs[] = {
     createStringConfig("appenddirname", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.aof_dirname, "appendonlydir", isValidAOFdirname, NULL),
     createStringConfig("server-cpulist", "server_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.server_cpulist, NULL, NULL, NULL),
     createStringConfig("bio-cpulist", "bio_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bio_cpulist, NULL, NULL, NULL),
+    createStringConfig("repl-stream-sender-cpulist", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, EMPTY_STRING_IS_NULL, server.repl_sender_cpulist, NULL, NULL, NULL), /* vkevo RL-g7b: unset = bio-cpulist, "main" = main's CPUs */
     createStringConfig("aof-rewrite-cpulist", "aof_rewrite_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.aof_rewrite_cpulist, NULL, NULL, NULL),
     createStringConfig("bgsave-cpulist", "bgsave_cpulist", IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bgsave_cpulist, NULL, NULL, NULL),
     createStringConfig("ignore-warnings", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.ignore_warnings, "", NULL, NULL),
