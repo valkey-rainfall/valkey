@@ -14,6 +14,7 @@
 #include "hotkeys.h"
 #include "cluster_slot_stats.h"
 #include "hdr_histogram.h"
+#include <sched.h>
 
 
 _Thread_local int repl_apply_in_lane = 0;
@@ -417,8 +418,15 @@ static void rpResetChunk(rpChunk *k) {
 #define RP_SPEC_MIN (128 * 1024) /* bytes of a read below which one thread scans it */
 #define RP_SPEC_SEARCH 65536     /* bytes searched from a guessed cut for a command start */
 
-/* A spin step while a thread waits for the scans of the chunks before its own (as phase_barrier.c's). */
-static inline void rpRelax(void) {
+/* A spin step while a thread waits for the scans of the chunks before its own (as phase_barrier.c's). After
+ * RP_SPEC_SPIN steps it yields the CPU: on an oversubscribed host (tests, several servers on a few CPUs) the thread
+ * it waits for may be the one it keeps off the CPU. */
+#define RP_SPEC_SPIN 4096
+static inline void rpRelax(unsigned *i) {
+    if (++*i > RP_SPEC_SPIN) {
+        sched_yield();
+        return;
+    }
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
 #elif defined(__aarch64__)
@@ -540,7 +548,8 @@ static void rpSpecChunk(int t) {
     int first = 1;
     for (int j = 0; j < t; j++) {
         rpChunk *b = &rp.ch[j];
-        while (!atomic_load_explicit(&b->spec_done, memory_order_acquire)) rpRelax();
+        unsigned spins = 0;
+        while (!atomic_load_explicit(&b->spec_done, memory_order_acquire)) rpRelax(&spins);
         if (!b->spec_exact || b->spec_sel) return; /* its start is not proved, or its state not known */
         first += b->n;
         if (b->spec_txn) st.in_multi = b->spec_txn == 1;
