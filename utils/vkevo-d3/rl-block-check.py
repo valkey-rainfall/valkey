@@ -44,6 +44,17 @@ Conn, Err, Server, check, info, dump, diff_dumps, values, wait_repl = (T.Conn, T
                                                                       T.diff_dumps, T.values, T.wait_repl)
 key_slot, owner_of_slot = T.key_slot, T.owner_of_slot
 
+
+def _conn_close(self):
+    """Close the connection for real. rl-tail-check's Conn.close() closes the socket object only, and its makefile()
+    reader keeps the descriptor (and the TCP connection) open until it is garbage collected: a consumer the scenario
+    closed stayed connected, and blocked, until the next step dropped it."""
+    self.f.close()
+    self.s.close()
+
+
+Conn.close = _conn_close
+
 SUITES = {
     "plain": ["--zset-max-listpack-entries", "16", "--list-max-listpack-size", "8"],
     "aofrepl": ["--appendonly", "yes", "--appendfsync", "everysec"],
