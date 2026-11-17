@@ -917,6 +917,7 @@ static inline int ownerSlotBlocked(int slot) {
 }
 static void ownerParkedToMainSlot(int slot);
 static void ownerServeReady(struct owner *o);
+static void ownerReadyDropFrom(struct owner *o, unsigned long mark);
 static int ownerParkedRead(struct owner *o, client *c);
 static void ownerUnpark(struct owner *o, client *c);
 static int ownerParkWaitMs(struct owner *o);
@@ -4389,6 +4390,10 @@ static int ownerScriptRun(owner *o, client *c) {
     st->start = getMonotonicUs();
     st->now_us = ustime();
     st->abort = st->nundo = st->nops = st->ntk = 0;
+    /* RL-2f (RL-g6g x RL-g4c): the keys this run makes ready for clients parked here; an aborted run drops them
+     * with its undo (ownerReadyDropFrom), else a woken waiter would find the restored key empty and park again
+     * at the tail (the waiters' order would differ from stock, where main runs the script once). */
+    unsigned long ready_mark = listLength(o->ready);
     long long dirty = ectx->dirty, hits = ectx->stat_keyspace_hits, misses = ectx->stat_keyspace_misses;
     long long errors = ectx->stat_total_error_replies, ncmds = ectx->stat_numcommands;
     long long processed = c->commands_processed;
@@ -4435,6 +4440,7 @@ static int ownerScriptRun(owner *o, client *c) {
     /* RL-g6g-scripts: put the kept keys back while the lookups still hash each key (c->slot -1): a kept key in
      * another of this owner's slots went back into the declared keys' table before. */
     ownerUndoEnd(st, 1);
+    ownerReadyDropFrom(o, ready_mark);
     c->slot = slot;
     serverOpArray *oa = &ectx->also_propagate;
     int w = 0, k = 0;
@@ -6140,6 +6146,17 @@ static void ownerServeReady(owner *o) {
         zfree(r);
     }
     o->serving = 0;
+}
+
+/* RL-2f: drop the ready keys queued after mark (an aborted owner script's, ownerScriptRun). */
+static void ownerReadyDropFrom(owner *o, unsigned long mark) {
+    while (listLength(o->ready) > mark) {
+        listNode *ln = listLast(o->ready);
+        ownerReady *r = listNodeValue(ln);
+        listDelNode(o->ready, ln);
+        decrRefCount(r->key);
+        zfree(r);
+    }
 }
 
 /* Owner, in its window: parked clients whose timeout passed (deadline < now, as handleBlockedClientsTimeout) get
