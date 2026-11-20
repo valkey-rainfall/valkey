@@ -137,7 +137,7 @@ proc fpi_logged_set_keys {c prefix} {
     return $keys
 }
 
-start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
     r client setname fpi-control
     r select 0
     r config set notify-keyspace-events ""
@@ -168,14 +168,14 @@ start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides 
     }
 }
 
-start_server {tags {"fastpath repl external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+start_server {tags {"fastpath repl external:skip tls:skip logreqres:skip"} overrides {io-threads 5 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
     $primary client setname fpi-control
     $primary select 0
     $primary config set notify-keyspace-events ""
-    start_server {overrides {io-threads 3 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+    start_server {overrides {io-threads 3 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
         set replica [srv 0 client]
         $replica client setname fpi-replica-control
         $replica select 0
@@ -218,7 +218,7 @@ proc fpi_histogram_calls {c cmd} {
     return [dict get [lindex $h 1] calls]
 }
 
-start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
+start_server {tags {"fastpath external:skip tls:skip logreqres:skip"} overrides {io-threads 5 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1}} {
     r client setname fpi-control
     r select 0
     r config set notify-keyspace-events ""

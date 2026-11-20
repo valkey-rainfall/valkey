@@ -77,7 +77,7 @@ set far_sleep 400
 # the forkless save, the module write and the first rewrite under always, and the lane route under
 # everysec and no only.
 # ---------------------------------------------------------------------------------------------------
-start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 keyspace-shard-bits 10 io-threads-parallel-writes-min 1 appendonly yes appendfsync always enable-debug-command yes save ""}} {
+start_server {tags {"fastpath aof external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes keyspace-shard-bits 10 io-threads-parallel-writes-min 1 appendonly yes appendfsync always enable-debug-command yes save ""}} {
     r client setname far-control
     r select 0
     r config set notify-keyspace-events "" ;# the test default (KEA) turns the write lanes off
