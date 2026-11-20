@@ -2380,7 +2380,7 @@ void bgIteration_unlinkInUseEntries(kvstore *keys, kvstore *expires, kvstore *ke
 bool bgIteration_blockClientIfRequired(client *c) {
     serverAssert(hasMainThreadExclusivity());
     // Don't clear this when in a nested command (like a GET inside a MULTI)
-    if (server.in_call == 0) iteratorReplicationFlagsWereUpdated = false;
+    if (ectx->in_call == 0) iteratorReplicationFlagsWereUpdated = false;
     if (!bgIteration_iterationActive()) return false;
     if (!isWriteCmd(c->cmd)) return false;
 
@@ -2521,7 +2521,7 @@ void bgIteration_handleCommandReplication(int dbid,
      * remember that the replication flags might not have been updated and we can still arrive here.
      * Example, a top-level read command (which doesn't update replication flags) causes an
      * expiration (which replicates a DEL). */
-    bool blockClientIfRequiredWasCalled = (server.in_call > 0);
+    bool blockClientIfRequiredWasCalled = (ectx->in_call > 0);
     bool useReplicationFlags = (blockClientIfRequiredWasCalled && iteratorReplicationFlagsWereUpdated);
     if (!useReplicationFlags) {
         // curCmdMissingKeys is only valid when we are using the replication flags (and stale otherwise)

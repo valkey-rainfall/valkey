@@ -937,7 +937,7 @@ class BgIterationTest : public ::testing::Test {
         argv[2] = createStringObjectFromCString("f1");
         serverCommand *cmd = lookupCommandByCString("HDEL");
 
-        ASSERT_EQ(server.in_call, 0); // test sanity check
+        ASSERT_EQ(ectx->in_call, 0); // test sanity check
         bgIteration_handleCommandReplication(db, cmd, 3, argv);
         for (int i = 0; i < 3; i++) decrRefCount(argv[i]);
     }
@@ -3095,18 +3095,18 @@ TEST_F(BgIterationTest, multiCreatesNewKeyThenReadExpiresKey_eventual) {
     EXPECT_CALL(mock, blockClientInUseOnKeys(c, _, _)).Times(0);
     bool blocked = bgIteration_blockClientIfRequired(c);
     EXPECT_FALSE(blocked);
-    server.in_call++;
+    ectx->in_call++;
     robj *value = dupStringObject(c->argv[2]);
     setKey(c, c->db, c->argv[1], &value, SETKEY_ADD_OR_UPDATE);
     struct serverCommand *cmd_multi = lookupCommandByCString("multi");
     bgIteration_handleCommandReplication(dbid, cmd_multi, 1, &shared.multi);
     bgIteration_handleCommandReplication(dbid, c->cmd, c->argc, c->argv);
-    server.in_call--;
+    ectx->in_call--;
 
     advanceMultiClientToCommand(c, 1); // GET B0 - B0 is found to be expired
     blocked = bgIteration_blockClientIfRequired(c);
     EXPECT_FALSE(blocked);
-    server.in_call++;
+    ectx->in_call++;
     bgIteration_keyDelete(dbid, static_cast<sds>(objectGetVal(c->argv[1])));
     simpleDelItem(0);
     robj *argv[2];
@@ -3114,13 +3114,13 @@ TEST_F(BgIterationTest, multiCreatesNewKeyThenReadExpiresKey_eventual) {
     argv[1] = c->argv[1];
     bgIteration_handleCommandReplication(dbid, lookupCommandByCString("DEL"), 2, argv);
     decrRefCount(argv[0]);
-    server.in_call--;
+    ectx->in_call--;
     server.in_exec = 0;
 
     // propagatePendingCommands() closes the transaction with EXEC
     struct serverCommand *cmd_exec = lookupCommandByCString("exec");
     bgIteration_handleCommandReplication(dbid, cmd_exec, 1, &shared.exec);
-    server.in_call--;
+    ectx->in_call--;
 
     expectReadKeySequence(it, 3, 4); // already queued
     expectReadMultiReplication(it);
