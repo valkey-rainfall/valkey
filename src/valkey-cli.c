@@ -5251,12 +5251,12 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
         if (config.conn_info.input_dbnum == dbnum) {
             break;
         }
+        char *dots = NULL;
+        valkeyReply *reply = NULL, *migrate_reply = NULL;
         if (cliSelect(&config, source->context) == VALKEY_ERR) {
             success = 0;
             goto next;
         }
-        char *dots = NULL;
-        valkeyReply *reply = NULL, *migrate_reply = NULL;
         reply = CLUSTER_MANAGER_COMMAND(source,
                                         "CLUSTER "
                                         "GETKEYSINSLOT %d %d",
@@ -7947,7 +7947,7 @@ static int clusterManagerCommandReshard(int argc, char **argv) {
     int opts = CLUSTER_MANAGER_OPT_VERBOSE;
     if (config.cluster_manager_command.flags & CLUSTER_MANAGER_CMD_FLAG_USE_ATOMIC_SLOT_MIGRATION)
         opts |= CLUSTER_MANAGER_OPT_USE_ATOMIC_SLOT_MIGRATION;
-    if (!clusterApplyReshardTable(table, target, opts)) {
+    if (!(result = clusterApplyReshardTable(table, target, opts))) {
         goto cleanup;
     }
 cleanup:
@@ -8102,7 +8102,7 @@ static int clusterManagerCommandRebalance(int argc, char **argv) {
                 if (config.cluster_manager_command.flags & CLUSTER_MANAGER_CMD_FLAG_USE_ATOMIC_SLOT_MIGRATION) {
                     opts |= CLUSTER_MANAGER_OPT_USE_ATOMIC_SLOT_MIGRATION;
                 }
-                if (!clusterApplyReshardTable(table, dst, opts)) {
+                if (!(result = clusterApplyReshardTable(table, dst, opts))) {
                     goto end_move;
                 }
             }
@@ -10002,6 +10002,7 @@ void testHint(const char *input) {
 
     sds hint = getHintForInput(input);
     printf("%s\n", hint);
+    sdsfree(hint);
     exit(0);
 }
 

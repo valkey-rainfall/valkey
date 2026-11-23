@@ -780,7 +780,7 @@ hashtableType hashWithVolatileItemsHashtableType = {
 
 /* Hashtable type without destructor */
 hashtableType sdsReplyHashtableType = {
-    .hashFunction = dictSdsCaseHash,
+    .hashFunction = dictSdsHash,
     .keyCompare = dictSdsKeyCompare};
 
 /* Keylist hash table type has unencoded Objects as keys and
@@ -891,6 +891,9 @@ void updateDictResizePolicy(void) {
     } else {
         hashtableSetResizePolicy(HASHTABLE_RESIZE_ALLOW);
     }
+    /* Leaf compaction in B+tree sorted sets rewrites node pages the same way
+     * a rehash does, so it follows the same fork-aware policy. */
+    orderedIndexSetCompactionAllowed(server.in_fork_child == CHILD_TYPE_NONE && !hasActiveChildProcess());
 }
 
 const char *strChildType(int type) {
@@ -1811,7 +1814,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * because we want to give priority to RDB savings for replication. */
     if (!hasActiveSaveOrChild() && server.rdb_bgsave_scheduled &&
         (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY || server.lastbgsave_status == C_OK)) {
-        if (rdbStartBgsave(server.rdb_bgsave_scheduled) == C_OK) server.rdb_bgsave_scheduled = RDB_BGSAVE_TYPE_NONE;
+        if (rdbStartBgsave(resolveBgsaveType()) == C_OK) server.rdb_bgsave_scheduled = 0;
     }
 
     /* TLS auto-reload if enabled (only when TLS is built-in). */
@@ -2431,6 +2434,7 @@ void initServerConfig(void) {
     int j;
     char *default_bindaddr[CONFIG_DEFAULT_BINDADDR_COUNT] = CONFIG_DEFAULT_BINDADDR;
 
+    server.debug_libbacktrace_wait_iterations = 50;
     initConfigValues();
     updateCachedTime(1);
     server.cmd_time_snapshot = server.mstime;
@@ -2519,6 +2523,7 @@ void initServerConfig(void) {
     server.primary = NULL;
     server.cached_primary = NULL;
     server.primary_initial_offset = -1;
+    server.primary_initial_offset_in_rdb = false;
     server.repl_state = REPL_STATE_NONE;
     server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
     server.repl_transfer_tmpfile = NULL;
@@ -2958,6 +2963,11 @@ void resetServerStats(void) {
     server.stat_fork_time = 0;
     server.stat_fork_rate = 0;
     server.stat_total_forks = 0;
+    server.stat_forkless_fallbacks_module = 0;
+    server.stat_forkless_fallbacks_slot_import = 0;
+    server.stat_forkless_fallbacks_exclude_data = 0;
+    server.stat_forkless_fallbacks_missing_inband_repl = 0;
+    server.stat_forkless_fallbacks_compression = 0;
     server.stat_rejected_conn = 0;
     server.stat_rejected_priority_conn = 0;
     server.stat_sync_full = 0;
@@ -3199,7 +3209,7 @@ void initServer(void) {
     server.rdb_pipe_numconns_writing = 0;
     server.rdb_pipe_buff = NULL;
     server.rdb_pipe_bufflen = 0;
-    server.rdb_bgsave_scheduled = RDB_BGSAVE_TYPE_NONE;
+    server.rdb_bgsave_scheduled = 0;
     server.child_info_pipe[0] = -1;
     server.child_info_pipe[1] = -1;
     server.child_info_nread = 0;
@@ -4060,7 +4070,8 @@ static void propagatePendingCommands(void) {
  * Must stay an OR of every condition below - never drop one as an
  * optimization, since that would silently skip real pending work. */
 static inline int hasPostExecutionUnitPendingWork(void) {
-    return moduleHasPostExecUnitJobs() || server.also_propagate.numops || server.busy_module_yield_flags;
+    return moduleHasPostExecUnitJobs() || server.also_propagate.numops || server.busy_module_yield_flags ||
+           bgIteration_iterationActive();
 }
 
 /* Performs operations that should be performed after an execution unit ends.
@@ -4645,6 +4656,9 @@ void unprepareCommand(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    /* evictClients() below relies on this flag to skip clients that are still
+     * executing further up the stack. Callers must go through processCommandAndResetClient(). */
+    debugServerAssert(c->flag.processing_command);
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
 
     if (!scriptIsTimedOut()) {
@@ -7200,13 +7214,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         }
     }
 
-    /* Hotkeys */
-    if (all_sections || (dictFind(section_dict, "hotkeys") != NULL)) {
-        if (sections++) info = sdscat(info, "\r\n");
-        info = sdscatprintf(info, "# Hotkeys\r\n");
-        info = genHotkeysInfoString(info);
-    }
-
     /* Throttling */
     if (all_sections || (dictFind(section_dict, "throttling") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
@@ -7241,7 +7248,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_priority_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].max,
                 "eventloop_priority_cmd_per_cycle_max:%lld\r\n", server.priority_el_cmd_cnt_max,
                 "io_threaded_reads_pending:%lld\r\n", server.stat_io_reads_pending,
-                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending));
+                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending,
+                "forkless_fallbacks_module:%lld\r\n", server.stat_forkless_fallbacks_module,
+                "forkless_fallbacks_slot_import:%lld\r\n", server.stat_forkless_fallbacks_slot_import,
+                "forkless_fallbacks_exclude_data:%lld\r\n", server.stat_forkless_fallbacks_exclude_data,
+                "forkless_fallbacks_missing_inband_repl:%lld\r\n", server.stat_forkless_fallbacks_missing_inband_repl,
+                "forkless_fallbacks_compression:%lld\r\n", server.stat_forkless_fallbacks_compression));
 
         info = forkless_catDebugInfo(info);
         info = throttleRepl_sdscatInfoDebugMetrics(info);

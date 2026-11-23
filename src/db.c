@@ -1431,8 +1431,8 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
             orderedIndexItemGetElement(item, &element, &len);
             addReplyBulkCBuffer(c, element, len);
             if (opts->only_keys) continue;
-            char buf[MAX_LONG_DOUBLE_CHARS];
-            int score_len = ld2string(buf, sizeof(buf), orderedIndexItemGetScore(item), LD_STR_AUTO);
+            char buf[MAX_D2STRING_CHARS];
+            int score_len = d2string(buf, sizeof(buf), orderedIndexItemGetScore(item));
             addReplyBulkCBuffer(c, buf, score_len);
         }
     } else {
@@ -1828,6 +1828,7 @@ static void copyDbExpiry(serverDb *target, const serverDb *source) {
 int dbSwapDatabases(int id1, int id2) {
     if (id1 < 0 || id1 >= server.dbnum || id2 < 0 || id2 >= server.dbnum) return C_ERR;
     if (id1 == id2) return C_OK;
+    bgIteration_swapdb(id1, id2);
     serverDb *db1 = createDatabaseIfNeeded(id1);
     serverDb *db2 = createDatabaseIfNeeded(id2);
     serverDb aux = *db1;
@@ -2427,6 +2428,15 @@ int getKeysUsingKeySpecs(struct serverCommand *cmd, robj **argv, int argc, int s
         first = 0;
         if (spec->begin_search_type == KSPEC_BS_INDEX) {
             first = spec->bs.index.pos;
+            /* The optional arguments holding this spec's keys were omitted, e.g.
+             * PFMERGE with no source keys. Like a missing keyword, the spec matches
+             * nothing, instead of invalidating the keys found by the other specs.
+             * An incomplete spec still defers to the getkeys callback, which may
+             * find keys elsewhere. */
+            if (first >= argc) {
+                if (spec->flags & CMD_KEY_INCOMPLETE) goto invalid_spec;
+                continue;
+            }
         } else if (spec->begin_search_type == KSPEC_BS_KEYWORD) {
             int start_index =
                 spec->bs.keyword.startfrom > 0 ? spec->bs.keyword.startfrom : argc + spec->bs.keyword.startfrom;
@@ -2462,7 +2472,7 @@ int getKeysUsingKeySpecs(struct serverCommand *cmd, robj **argv, int argc, int s
         } else if (spec->find_keys_type == KSPEC_FK_KEYNUM) {
             step = spec->fk.keynum.keystep;
             long long numkeys;
-            if (spec->fk.keynum.keynumidx >= argc) goto invalid_spec;
+            if (spec->fk.keynum.keynumidx >= argc - first) goto invalid_spec;
 
             sds keynum_str = objectGetVal(argv[first + spec->fk.keynum.keynumidx]);
             if (!string2ll(keynum_str, sdslen(keynum_str), &numkeys) || numkeys < 0) {
@@ -2792,6 +2802,11 @@ int genericGetKeys(int storeKeyOfs,
 int sintercardGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     UNUSED(cmd);
     return genericGetKeys(0, 1, 2, 1, argv, argc, result);
+}
+
+int msetexGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    UNUSED(cmd);
+    return genericGetKeys(0, 1, 2, 2, argv, argc, result);
 }
 
 int zunionInterDiffStoreGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
