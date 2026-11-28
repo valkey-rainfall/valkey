@@ -44,6 +44,7 @@
 #include "lrulfu.h"
 #include "throttle_repl.h"
 
+#include "phase_barrier.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -3660,6 +3661,7 @@ standardConfig static_configs[] = {
     createIntConfig("io-threads-epoll-threads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 4, server.io_threads_epoll_threads, 1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThread),
     createIntConfig("io-threads-epoll-thread-cpu", NULL, MODIFIABLE_CONFIG, -1, 1023, server.io_threads_epoll_thread_cpu, -1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThreadCpu),
     createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("phase-barrier-spin-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, phase_barrier_spin_us, 100, INTEGER_CONFIG, NULL, NULL), /* diagnostic */
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-parallel-writes-min", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, INT_MAX, server.io_threads_parallel_writes_min, 32, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),

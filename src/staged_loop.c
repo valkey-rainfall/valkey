@@ -13,6 +13,7 @@
 #include "repl_apply.h"
 #include "cronstats.h"
 #include "maint.h"
+#include "phase_barrier.h"
 #include <time.h>
 
 /* Phase timing. Main's wall time per part of a staged iteration; per phase id, every worker's busy
@@ -123,6 +124,7 @@ void stagedInfo(char **info) {
     sds s = *info;
     s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
     s = sdscatprintf(s, "staged_active_workers:%d\r\n", stagedWorkerCount());
+    s = sdscatprintf(s, "staged_active_io_threads:%d\r\n", stagedActiveIOThreads()); /* diagnostic; -1: all */
     s = sdscatprintf(s, "staged_last_iteration_work_ns:%llu\r\n", (unsigned long long)stagedLastIterationWorkNs());
     s = sdscatprintf(s, "staged_epoll_thread:%d\r\n", stagedEpollThreadRunning());
     s = sdscatprintf(s, "staged_main_lane:%d\r\nstaged_main_shares_cpu:%d\r\n", stagedMainTakesLane(),
@@ -141,6 +143,9 @@ void stagedInfo(char **info) {
         s = sdscatprintf(s, "staged_%s_phases:%llu\r\nstaged_%s_worker_us:%llu\r\nstaged_%s_critical_us:%llu\r\n",
                          sl_phase_names[p], (unsigned long long)sl_phases[p], sl_phase_names[p],
                          (unsigned long long)(busy / 1000), sl_phase_names[p], (unsigned long long)(sl_crit_ns[p] / 1000));
+        s = sdscatprintf(s, "staged_%s_worker_sleeps:%llu\r\nstaged_%s_main_sleeps:%llu\r\n", sl_phase_names[p],
+                         (unsigned long long)phaseBarrierWorkerSleeps(p), sl_phase_names[p],
+                         (unsigned long long)phaseBarrierMainSleeps(p)); /* diagnostic */
     }
     *info = s;
 }
@@ -150,6 +155,7 @@ void stagedResetStats(void) {
     sl_iterations = 0;
     memset(sl_phases, 0, sizeof(sl_phases));
     memset(sl_crit_ns, 0, sizeof(sl_crit_ns));
+    phaseBarrierResetSleeps();
     for (int tid = 0; tid < IO_THREADS_MAX_NUM; tid++)
         for (int p = 0; p < STAGED_PHASE_KINDS; p++) atomic_store_explicit(&sl_worker_ns[tid][p], 0, memory_order_relaxed);
 }

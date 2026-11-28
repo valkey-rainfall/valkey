@@ -252,6 +252,8 @@ static void fpPhaseClockStart(void) {
 static int fp_prop_mode = FP_PROP_OPS;
 /* INFO, main only. */
 static long long fp_stat_lane_phases = 0, fp_stat_lane_entries = 0, fp_stat_barriers = 0, fp_stat_serial_segments = 0;
+/* Diagnostic: the largest segment a lane phase ran, and the lane phases that ran fewer than 64 entries. */
+static long long fp_stat_segment_entries_max = 0, fp_stat_lane_phases_small = 0;
 static long long fp_stat_lane_prefetches = 0;
 
 #define FP_GROW(arr, n, cap, init)                                   \
@@ -1795,6 +1797,7 @@ static void fpInfoTotals(long long *t) {
 void fastpathResetStats(void) {
     fpInfoTotals(fp_info_base);
     fp_stat_lane_phases = fp_stat_lane_entries = fp_stat_barriers = fp_stat_serial_segments = 0;
+    fp_stat_segment_entries_max = fp_stat_lane_phases_small = 0;
 }
 
 void fastpathInfo(sds *info) {
@@ -1816,10 +1819,13 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_lane_entries:%lld\r\n"
                          "fastpath_write_barriers:%lld\r\n"
                          "fastpath_write_serial_segments:%lld\r\n"
-                         "fastpath_write_lane_prefetches:%lld\r\n",
+                         "fastpath_write_lane_prefetches:%lld\r\n"
+                         "fastpath_write_segment_entries_max:%lld\r\n"
+                         "fastpath_write_lane_phases_small:%lld\r\n",
                          fastpath_clients + (fp_handback_client != NULL), stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments, fp_stat_lane_prefetches);
+                         fp_stat_serial_segments, fp_stat_lane_prefetches, fp_stat_segment_entries_max,
+                         fp_stat_lane_phases_small);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -3028,6 +3034,8 @@ static int fpRunSegment(int pending, int serial, int use_prefetch) {
         dbLanePhaseEnd();
         fpMergeLanes();
         fp_stat_lane_phases++;
+        if (pending > fp_stat_segment_entries_max) fp_stat_segment_entries_max = pending;
+        if (pending < 64) fp_stat_lane_phases_small++;
         n = pending;
     }
     fp_nparts = 0;

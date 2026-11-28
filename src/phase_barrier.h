@@ -41,6 +41,16 @@ typedef struct phaseBarrier {
 
 /* Returns 0, or -1 if nparticipants is out of range or pthread init fails. */
 int phaseBarrierInit(phaseBarrier *b, int nparticipants);
+
+/* Diagnostic (hidden config phase-barrier-spin-us): how long a waiter allowed to spin does so before it
+ * sleeps, in microseconds. Written by main on CONFIG SET, read relaxed by every waiter. */
+extern int phase_barrier_spin_us;
+/* Diagnostic: waits that ended in a sleep (a condition wait), by the phase id the wait ended on, for
+ * workers (phaseBarrierAwaitPhase) and for main (phaseBarrierWaitAllDone). Ids above 15 count as 15. */
+#define PHASE_BARRIER_SLEEP_KINDS 16
+uint64_t phaseBarrierWorkerSleeps(int phase_id);
+uint64_t phaseBarrierMainSleeps(int phase_id);
+void phaseBarrierResetSleeps(void);
 void phaseBarrierDestroy(phaseBarrier *b);
 
 /* Main. Change the participant count (0..PHASE_BARRIER_MAX_PARTICIPANTS) for phases opened after

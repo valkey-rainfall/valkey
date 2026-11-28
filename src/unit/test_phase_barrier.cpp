@@ -222,3 +222,28 @@ TEST(PhaseBarrierTest, ShutdownWakesParkedAndWaitingWorkers) {
     EXPECT_EQ(h.ran[0], 1);
     EXPECT_EQ(h.ran[5], 0);
 }
+
+/* Diagnostic counters: a worker's wait that ended in a sleep counts once, under the phase that woke it. A
+ * spin budget of 0 makes a spinning waiter give up at its first clock check. */
+TEST(PhaseBarrierTest, SleepsAreCountedByThePhaseThatEndsThem) {
+    int saved = phase_barrier_spin_us;
+    phase_barrier_spin_us = 0;
+    phaseBarrierResetSleeps();
+    Harness h(1, 1);
+    h.start(1);
+    for (int i = 0; i < 2000; i++) { /* wait until the worker sleeps on the next phase, at most 2 s */
+        pthread_mutex_lock(&h.b.lock);
+        int sleeping = h.b.open_sleepers;
+        pthread_mutex_unlock(&h.b.lock);
+        if (sleeping) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    h.runPhase(3, 1, 1);
+    EXPECT_EQ(phaseBarrierWorkerSleeps(3), 1u);
+    EXPECT_EQ(phaseBarrierWorkerSleeps(4), 0u);
+    phaseBarrierResetSleeps();
+    EXPECT_EQ(phaseBarrierWorkerSleeps(3), 0u);
+    h.stop();
+    phase_barrier_spin_us = saved;
+    EXPECT_EQ(h.errors.load(), 0);
+}

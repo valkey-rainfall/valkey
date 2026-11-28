@@ -18,6 +18,29 @@
 #define PHASE_BARRIER_SPIN_US 100
 #define PHASE_BARRIER_SPIN_CHECK 64
 
+int phase_barrier_spin_us = PHASE_BARRIER_SPIN_US;
+static _Atomic(uint64_t) pb_worker_sleeps[PHASE_BARRIER_SLEEP_KINDS];
+static _Atomic(uint64_t) pb_main_sleeps[PHASE_BARRIER_SLEEP_KINDS];
+
+static inline int sleepKind(int phase_id) {
+    return phase_id < 0 ? 0 : phase_id >= PHASE_BARRIER_SLEEP_KINDS ? PHASE_BARRIER_SLEEP_KINDS - 1 : phase_id;
+}
+
+uint64_t phaseBarrierWorkerSleeps(int phase_id) {
+    return atomic_load_explicit(&pb_worker_sleeps[sleepKind(phase_id)], memory_order_relaxed);
+}
+
+uint64_t phaseBarrierMainSleeps(int phase_id) {
+    return atomic_load_explicit(&pb_main_sleeps[sleepKind(phase_id)], memory_order_relaxed);
+}
+
+void phaseBarrierResetSleeps(void) {
+    for (int i = 0; i < PHASE_BARRIER_SLEEP_KINDS; i++) {
+        atomic_store_explicit(&pb_worker_sleeps[i], 0, memory_order_relaxed);
+        atomic_store_explicit(&pb_main_sleeps[i], 0, memory_order_relaxed);
+    }
+}
+
 static inline void phaseBarrierRelax(void) {
 #if defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
@@ -29,7 +52,8 @@ static inline void phaseBarrierRelax(void) {
 /* Spin step i (from 1) of a wait that started at start: 0 once the spin budget is spent. */
 static inline int phaseBarrierKeepSpinning(unsigned i, monotime start) {
     phaseBarrierRelax();
-    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 || getMonotonicUs() - start < PHASE_BARRIER_SPIN_US;
+    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 ||
+           getMonotonicUs() - start < (monotime)__atomic_load_n(&phase_barrier_spin_us, __ATOMIC_RELAXED);
 }
 
 static inline uint32_t stateSeq(uint64_t st) {
@@ -107,12 +131,17 @@ void phaseBarrierWaitAllDone(phaseBarrier *b, int spin) {
         }
     }
     pthread_mutex_lock(&b->lock);
+    int slept = 0;
     while (atomic_load_explicit(&b->pending, memory_order_acquire) != 0) {
         b->done_sleeper = 1;
         pthread_cond_wait(&b->done_cv, &b->lock);
         b->done_sleeper = 0;
+        slept = 1;
     }
     pthread_mutex_unlock(&b->lock);
+    if (slept)
+        atomic_fetch_add_explicit(&pb_main_sleeps[sleepKind(statePhase(atomic_load_explicit(&b->state, memory_order_relaxed)))],
+                                  1, memory_order_relaxed);
 }
 
 void phaseBarrierShutdown(phaseBarrier *b) {
@@ -151,6 +180,7 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
     pthread_mutex_lock(&b->lock);
     /* pthread_cond_wait is a cancellation point that returns holding the lock: a worker cancelled
      * there (the crash report's memory test joins every IO thread) must not exit holding it. */
+    int slept = 0; /* outside the cleanup block, which is a scope of its own */
     pthread_cleanup_push(phaseBarrierUnlock, &b->lock);
     for (;;) {
         if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) {
@@ -167,9 +197,12 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
             b->open_sleepers++;
             pthread_cond_wait(&b->open_cv, &b->lock);
             b->open_sleepers--;
+            slept = 1;
         }
     }
     pthread_cleanup_pop(1);
+    if (slept && phase != PHASE_BARRIER_EXIT)
+        atomic_fetch_add_explicit(&pb_worker_sleeps[sleepKind(phase)], 1, memory_order_relaxed);
     return phase;
 }
 
